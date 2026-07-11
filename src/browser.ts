@@ -224,13 +224,10 @@ class WebkitSession {
 
   launch(opts: LaunchOptions) {
     return this.mutex.run(async () => {
-      if (this.context) {
-        await this.closeInternal();
-      }
-
-      const userDataDir = opts.userDataDir ? untildify(opts.userDataDir) : DEFAULT_PROFILE_DIR;
-      fs.mkdirSync(userDataDir, { recursive: true });
-
+      // Validate BEFORE tearing down any existing session — a bad launch
+      // call (typo'd path, headless+extension conflict) must be a no-op on
+      // a working session, not destroy it before finding out the new one
+      // can't start either.
       const extensionPath = opts.loadExtensionPath ? untildify(opts.loadExtensionPath) : null;
       if (extensionPath && !fs.existsSync(extensionPath)) {
         throw new Error(`loadExtensionPath does not exist: ${extensionPath}`);
@@ -245,6 +242,13 @@ class WebkitSession {
           "headless cannot be true when loadExtensionPath is set — Chrome does not load unpacked extensions headless.",
         );
       }
+
+      if (this.context) {
+        await this.closeInternal();
+      }
+
+      const userDataDir = opts.userDataDir ? untildify(opts.userDataDir) : DEFAULT_PROFILE_DIR;
+      fs.mkdirSync(userDataDir, { recursive: true });
 
       const args: string[] = ["--no-first-run", "--no-default-browser-check"];
       if (extensionPath) {
