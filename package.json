@@ -1,0 +1,34 @@
+{
+  "name": "webkitui-mcp",
+  "version": "0.1.0",
+  "description": "Local MCP server that drives a real Chrome (Playwright/CDP), including unpacked MV3 extension loading, as a reliable replacement for the Claude in Chrome extension for extension-development testing.",
+  "license": "MIT",
+  "author": "LorisLabs",
+  "type": "module",
+  "bin": {
+    "webkitui-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "prepare": "tsc",
+    "smoke-test": "node scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "playwright": "^1.49.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
