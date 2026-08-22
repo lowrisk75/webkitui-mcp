@@ -40,17 +40,22 @@ private final class ConfirmationPresenterStub: BrowserConfirmationPresenting {
 @Suite("MCP 2026-07-28 wire server", .serialized)
 @MainActor
 struct MCPServerTests {
-  @Test("Native confirmation helper failures deny authority")
+  @Test("Confirmation helpers fail closed and closed pipes cannot terminate the server")
   func nativeConfirmationHelperFailClosed() {
     let accepts = NativeBrowserConfirmationPresenter(
-      helperURL: URL(fileURLWithPath: "/usr/bin/true"))
+      helperURL: URL(fileURLWithPath: "/usr/bin/sed"),
+      helperArguments: ["-n", ""])
     let rejects = NativeBrowserConfirmationPresenter(
       helperURL: URL(fileURLWithPath: "/usr/bin/false"))
+    let closesInput = NativeBrowserConfirmationPresenter(
+      helperURL: URL(fileURLWithPath: "/bin/sh"),
+      helperArguments: ["-c", "exec 0<&-; sleep 0.1; exit 0"])
     let missing = NativeBrowserConfirmationPresenter(
       helperURL: URL(fileURLWithPath: "/path/does/not/exist"))
 
     #expect(accepts.confirm(title: "Title", message: "Message", approveLabel: "Approve"))
     #expect(!rejects.confirm(title: "Title", message: "Message", approveLabel: "Approve"))
+    _ = closesInput.confirm(title: "Title", message: "Message", approveLabel: "Approve")
     #expect(!missing.confirm(title: "Title", message: "Message", approveLabel: "Approve"))
   }
 

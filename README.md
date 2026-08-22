@@ -104,6 +104,16 @@ the current site in its title. The Dock remains active while any session is
 under human control. If
 handoff is requested before navigation, it shows an explicit empty-page message
 instead of a blank browser surface.
+The window installs the standard macOS Edit responder chain, including
+Command-X, Command-C, Command-V, and Command-A. Clipboard contents remain under
+human control and are never returned in an MCP result.
+
+Passkeys for arbitrary relying-party domains are not claimed by the unsigned
+CLI build. Apple requires a signed browser app with the managed
+`com.apple.developer.web-browser.public-key-credential` entitlement for that
+capability. WebKitUI does not inspect, proxy, or synthesize WebAuthn credentials;
+until Apple grants that capability to a qualifying browser bundle, use another
+site authentication method during human handoff.
 
 ## Linux headless lane
 

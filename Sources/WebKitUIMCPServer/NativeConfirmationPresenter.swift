@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 @MainActor
@@ -8,9 +9,11 @@ protocol BrowserConfirmationPresenting: AnyObject {
 @MainActor
 final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   private let helperURL: URL
+  private let helperArguments: [String]
 
-  init(helperURL: URL? = nil) {
+  init(helperURL: URL? = nil, helperArguments: [String] = []) {
     self.helperURL = helperURL ?? Self.defaultHelperURL()
+    self.helperArguments = helperArguments
   }
 
   func confirm(title: String, message: String, approveLabel: String) -> Bool {
@@ -28,7 +31,11 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     let process = Process()
     let input = Pipe()
     process.executableURL = helperURL
+    process.arguments = helperArguments
     process.standardInput = input
+    guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+      return false
+    }
     do {
       try process.run()
       try input.fileHandleForWriting.write(contentsOf: payload)

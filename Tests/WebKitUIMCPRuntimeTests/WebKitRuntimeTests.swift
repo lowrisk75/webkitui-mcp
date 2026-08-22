@@ -613,6 +613,12 @@ struct WebKitRuntimeTests {
     let window = try #require(runtime.webView.window)
     #expect(window.isVisible)
     #expect(NSApplication.shared.activationPolicy() == .regular)
+    let editMenu = NSApplication.shared.mainMenu?.items.first {
+      $0.submenu?.title == "Edit"
+    }?.submenu
+    #expect(
+      editMenu?.items.first(where: { $0.keyEquivalent == "v" })?.action == #selector(
+        NSText.paste(_:)))
 
     try registry.close(handle)
 

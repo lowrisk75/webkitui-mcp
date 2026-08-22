@@ -42,6 +42,7 @@ private enum HumanControlPresentationCoordinator {
     visibleRuntimeSlots[identifier] = slot
     let application = NSApplication.shared
     application.finishLaunching()
+    installStandardEditMenu(in: application)
     application.setActivationPolicy(.regular)
     application.applicationIconImage = WebKitRuntime.humanControlApplicationIcon()
     application.dockTile.display()
@@ -60,6 +61,33 @@ private enum HumanControlPresentationCoordinator {
   private static func firstAvailableSlot() -> Int {
     let occupied = Set(visibleRuntimeSlots.values)
     return (0..<8).first(where: { !occupied.contains($0) }) ?? 0
+  }
+
+  private static func installStandardEditMenu(in application: NSApplication) {
+    let mainMenu = application.mainMenu ?? NSMenu(title: "Main Menu")
+    guard mainMenu.items.first(where: { $0.submenu?.title == "Edit" }) == nil else {
+      return
+    }
+
+    let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+    let editMenu = NSMenu(title: "Edit")
+    editMenu.addItem(
+      withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+    let redo = editMenu.addItem(
+      withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+    redo.keyEquivalentModifierMask = [.command, .shift]
+    editMenu.addItem(.separator())
+    editMenu.addItem(
+      withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    editMenu.addItem(
+      withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    editMenu.addItem(
+      withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    editMenu.addItem(
+      withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    editItem.submenu = editMenu
+    mainMenu.addItem(editItem)
+    application.mainMenu = mainMenu
   }
 }
 

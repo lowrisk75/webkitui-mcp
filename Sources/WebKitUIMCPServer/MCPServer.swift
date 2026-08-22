@@ -18,7 +18,7 @@ private enum MCPServerError: Error {
 
 @MainActor
 public final class WebKitMCPServer {
-  public static let version = "0.3.0"
+  public static let version = "0.3.1"
   public static let protocolVersion = "2026-07-28"
   public static let legacyProtocolVersion = "2025-11-25"
 
