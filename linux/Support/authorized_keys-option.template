@@ -1,0 +1,1 @@
+from="HYPERVISOR_MANAGEMENT_IP",restrict,command="/usr/local/bin/webkitui-mcp-linux" SSH_PUBLIC_KEY

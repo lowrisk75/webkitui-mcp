@@ -6,9 +6,17 @@ dist/
 .DS_Store
 .env*
 !.env.example
+*.har
+*.trace.zip
+playwright-report/
+test-results/
+blob-report/
+**/storage-state.json
+**/.auth/
 *.key
 *.pem
 *.p12
 *.mobileprovision
+known_hosts*
 .internal/
 docs/private/

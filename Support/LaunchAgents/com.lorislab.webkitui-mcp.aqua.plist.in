@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lorislab.webkitui-mcp.aqua</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/webkitui-mcp-aqua-broker</string>
+  </array>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>Sockets</key>
+  <dict>
+    <key>MCP</key>
+    <dict>
+      <key>SockPathName</key>
+      <string>__HOME__/Library/Application Support/WebkitUIMCP/mcp.sock</string>
+      <key>SockPathMode</key>
+      <integer>384</integer>
+      <key>SockType</key>
+      <string>stream</string>
+    </dict>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>2</integer>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/WebkitUIMCP-launchd.log</string>
+</dict>
+</plist>

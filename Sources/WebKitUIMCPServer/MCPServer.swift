@@ -12,6 +12,8 @@ private struct RPCRequest: Decodable {
 
 private enum MCPServerError: Error {
   case invalidParams(String)
+  case missingRequiredClientCapability
+  case unsupportedProtocolVersion(String)
 }
 
 @MainActor
@@ -21,6 +23,7 @@ public final class WebKitMCPServer {
 
   private let registry: WebKitSessionRegistry
   private let presentHumanWindows: Bool
+  private let credentialBroker: any CredentialBrokerFilling
   private let capabilityAuthority = CapabilityAuthority()
   private var observations: [WebKitSessionHandle: WebKitPageObservation] = [:]
   private var coordinators: [WebKitSessionHandle: WebKitTransactionCoordinator] = [:]
@@ -110,14 +113,22 @@ public final class WebKitMCPServer {
     let expiresAt: Date
   }
 
-  public init(maximumSessions: Int = 1) throws {
-    self.registry = try WebKitSessionRegistry(maximumSessions: maximumSessions)
+  public init(maximumSessions: Int = 1, enforceHostExclusiveSession: Bool = false) throws {
+    self.registry = try WebKitSessionRegistry(
+      maximumSessions: maximumSessions,
+      enforceHostExclusiveSession: enforceHostExclusiveSession)
     self.presentHumanWindows = true
+    self.credentialBroker = SyntheticCredentialBrokerXPCClient()
   }
 
-  init(registry: WebKitSessionRegistry, presentHumanWindows: Bool = false) {
+  init(
+    registry: WebKitSessionRegistry,
+    presentHumanWindows: Bool = false,
+    credentialBroker: any CredentialBrokerFilling = SyntheticCredentialBrokerXPCClient()
+  ) {
     self.registry = registry
     self.presentHumanWindows = presentHumanWindows
+    self.credentialBroker = credentialBroker
   }
 
   public func handle(_ input: Data) async -> Data? {
@@ -136,7 +147,36 @@ public final class WebKitMCPServer {
       return nil
     }
 
-    let modern = isModern(request)
+    let modern: Bool
+    do {
+      modern = try isModern(request)
+    } catch let error {
+      switch error {
+      case .invalidParams(let detail):
+        return encode(errorResponse(id: request.id ?? .null, code: -32602, message: detail))
+      case .unsupportedProtocolVersion(let requested):
+        return encode(
+          errorResponse(
+            id: request.id ?? .null,
+            code: -32022,
+            message: "Unsupported protocol version",
+            data: .object([
+              "supported": .array([.string(Self.protocolVersion)]),
+              "requested": .string(requested),
+            ])
+          ))
+      case .missingRequiredClientCapability:
+        return encode(
+          errorResponse(
+            id: request.id ?? .null,
+            code: -32021,
+            message: "Missing required client capability",
+            data: .object([
+              "requiredCapabilities": .object(["elicitation": .object([:])])
+            ])
+          ))
+      }
+    }
     let result: JSONValue
     do {
       switch request.method {
@@ -149,7 +189,11 @@ public final class WebKitMCPServer {
       case "tools/call":
         result = try await callTool(params: request.params, modern: modern)
       case "ping":
-        result = modern ? .object(["resultType": .string("complete")]) : .object([:])
+        guard !modern else {
+          return encode(
+            errorResponse(id: request.id ?? .null, code: -32601, message: "Method not found"))
+        }
+        result = .object([:])
       default:
         return encode(
           errorResponse(id: request.id ?? .null, code: -32601, message: "Method not found")
@@ -159,6 +203,27 @@ public final class WebKitMCPServer {
       let message: String
       switch error {
       case .invalidParams(let detail): message = detail
+      case .missingRequiredClientCapability:
+        return encode(
+          errorResponse(
+            id: request.id ?? .null,
+            code: -32021,
+            message: "Missing required client capability",
+            data: .object([
+              "requiredCapabilities": .object(["elicitation": .object([:])])
+            ])
+          ))
+      case .unsupportedProtocolVersion(let requested):
+        return encode(
+          errorResponse(
+            id: request.id ?? .null,
+            code: -32022,
+            message: "Unsupported protocol version",
+            data: .object([
+              "supported": .array([.string(Self.protocolVersion)]),
+              "requested": .string(requested),
+            ])
+          ))
       }
       return encode(errorResponse(id: request.id ?? .null, code: -32602, message: message))
     } catch {
@@ -226,6 +291,8 @@ public final class WebKitMCPServer {
         ]
         if modern { result["resultType"] = .string("complete") }
         return .object(result)
+      case "browser_fill_siliconpass":
+        return try await credentialFillTool(arguments: arguments, modern: modern)
       case "browser_transaction":
         let handle = try sessionHandle(arguments)
         guard let coordinator = coordinators[handle] else {
@@ -298,6 +365,7 @@ public final class WebKitMCPServer {
       return try toolError(
         "browser_navigate requires MCP 2026-07-28 multi-round tool results", modern: false)
     }
+    try requireFormElicitationCapability(params)
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
     let url = try safeNavigationURL(try requireString(arguments["url"], named: "url"))
@@ -356,7 +424,9 @@ public final class WebKitMCPServer {
     guard params["inputResponses"] == nil else {
       throw MCPServerError.invalidParams("inputResponses requires requestState")
     }
-    pendingNavigations = pendingNavigations.filter { $0.value.expiresAt > Date() }
+    pendingNavigations = pendingNavigations.filter {
+      $0.value.expiresAt > Date() && $0.value.session != handle
+    }
     let requestState = UUID().uuidString
     pendingNavigations[requestState] = PendingNavigation(
       arguments: arguments,
@@ -396,6 +466,50 @@ public final class WebKitMCPServer {
     ])
   }
 
+  private func credentialFillTool(
+    arguments: [String: JSONValue],
+    modern: Bool
+  ) async throws -> JSONValue {
+    guard modern else {
+      return try toolError(
+        "SiliconPass credential fill requires MCP 2026-07-28",
+        modern: false
+      )
+    }
+    let allowedKeys = Set([
+      "session_id", "observation_id", "username_element_id", "password_element_id",
+    ])
+    guard Set(arguments.keys).isSubset(of: allowedKeys) else {
+      throw MCPServerError.invalidParams(
+        "browser_fill_siliconpass accepts only secretless target identifiers"
+      )
+    }
+    let handle = try sessionHandle(arguments)
+    let observationID = try requireString(
+      arguments["observation_id"], named: "observation_id")
+    guard observations[handle]?.observationID == observationID else {
+      throw MCPServerError.invalidParams("Call browser_observe and use its fresh observation_id")
+    }
+    let runtime = try registry.runtime(for: handle)
+    let binding = try runtime.credentialFormBinding(
+      observationID: observationID,
+      usernameElementID: try requireString(
+        arguments["username_element_id"], named: "username_element_id"),
+      passwordElementID: try requireString(
+        arguments["password_element_id"], named: "password_element_id")
+    )
+    let status: CredentialBrokerWireStatus
+    do {
+      status = try await credentialBroker.fill(binding: binding, runtime: runtime).status
+    } catch {
+      status = .failed
+    }
+    return try toolResult(
+      structured: .object(["status": .string(status.rawValue)]),
+      modern: true
+    )
+  }
+
   private func safeNavigationURL(_ rawValue: String) throws -> URL {
     guard
       let components = URLComponents(string: rawValue),
@@ -432,6 +546,7 @@ public final class WebKitMCPServer {
       return try toolError(
         "Human handoff requires MCP 2026-07-28 multi-round tool results", modern: false)
     }
+    try requireFormElicitationCapability(params)
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
     if let requestState = params["requestState"]?.stringValue {
@@ -466,7 +581,9 @@ public final class WebKitMCPServer {
     default:
       throw MCPServerError.invalidParams("handoff transition is already in progress")
     }
-    pendingHandoffs = pendingHandoffs.filter { $0.value.expiresAt > Date() }
+    pendingHandoffs = pendingHandoffs.filter {
+      $0.value.expiresAt > Date() && $0.value.session != handle
+    }
     let requestState = UUID().uuidString
     pendingHandoffs[requestState] = PendingHandoff(
       arguments: arguments,
@@ -509,6 +626,7 @@ public final class WebKitMCPServer {
       return try toolError(
         "browser_act requires MCP 2026-07-28 multi-round tool results", modern: false)
     }
+    try requireFormElicitationCapability(params)
     let handle = try sessionHandle(arguments)
     guard let observation = observations[handle] else {
       throw MCPServerError.invalidParams("Call browser_observe before browser_act")
@@ -593,7 +711,9 @@ public final class WebKitMCPServer {
     guard params["inputResponses"] == nil else {
       throw MCPServerError.invalidParams("inputResponses requires requestState")
     }
-    pendingActuations = pendingActuations.filter { $0.value.expiresAt > Date() }
+    pendingActuations = pendingActuations.filter {
+      $0.value.expiresAt > Date() && $0.value.session != handle
+    }
     let requestState = UUID().uuidString
     let untrustedLabel = target.accessibleName ?? target.label ?? target.text
     let label = String((untrustedLabel?.segments.map(\.text).joined() ?? "").prefix(120))
@@ -785,9 +905,7 @@ public final class WebKitMCPServer {
   private func discoverResult() -> JSONValue {
     .object([
       "resultType": .string("complete"),
-      "supportedVersions": .array([
-        .string(Self.protocolVersion), .string(Self.legacyProtocolVersion),
-      ]),
+      "supportedVersions": .array([.string(Self.protocolVersion)]),
       "capabilities": .object([
         "tools": .object(["listChanged": .bool(false)])
       ]),
@@ -802,9 +920,10 @@ public final class WebKitMCPServer {
 
   private func legacyInitializeResult(_ params: JSONValue?) -> JSONValue {
     let requested = params?.objectValue?["protocolVersion"]?.stringValue
+    let supported = [Self.legacyProtocolVersion, "2025-06-18"]
     let negotiated =
-      requested == Self.legacyProtocolVersion
-      ? Self.legacyProtocolVersion : "2025-06-18"
+      requested.flatMap { supported.contains($0) ? $0 : nil }
+      ?? Self.legacyProtocolVersion
     return .object([
       "protocolVersion": .string(negotiated),
       "capabilities": .object([
@@ -895,11 +1014,61 @@ public final class WebKitMCPServer {
     return converted
   }
 
-  private func isModern(_ request: RPCRequest) -> Bool {
-    request.method == "server/discover"
-      || request.params?.objectValue?["_meta"]?.objectValue?[
-        "io.modelcontextprotocol/protocolVersion"
-      ]?.stringValue == Self.protocolVersion
+  private func isModern(_ request: RPCRequest) throws(MCPServerError) -> Bool {
+    guard let metaValue = request.params?.objectValue?["_meta"] else {
+      if request.method == "server/discover" {
+        throw MCPServerError.invalidParams(
+          "MCP 2026-07-28 requests require params._meta")
+      }
+      return false
+    }
+    guard let meta = metaValue.objectValue else {
+      throw MCPServerError.invalidParams("params._meta must be an object")
+    }
+    guard let protocolValue = meta["io.modelcontextprotocol/protocolVersion"] else {
+      if request.method == "server/discover" {
+        throw MCPServerError.invalidParams(
+          "params._meta requires io.modelcontextprotocol/protocolVersion")
+      }
+      return false
+    }
+    guard let requested = protocolValue.stringValue else {
+      throw MCPServerError.invalidParams(
+        "io.modelcontextprotocol/protocolVersion must be a string")
+    }
+    guard requested == Self.protocolVersion else {
+      throw MCPServerError.unsupportedProtocolVersion(requested)
+    }
+    guard
+      meta["io.modelcontextprotocol/clientCapabilities"]?.objectValue != nil
+    else {
+      throw MCPServerError.invalidParams(
+        "params._meta requires io.modelcontextprotocol/clientCapabilities")
+    }
+    if let clientInfo = meta["io.modelcontextprotocol/clientInfo"] {
+      guard
+        let object = clientInfo.objectValue,
+        let name = object["name"]?.stringValue,
+        !name.isEmpty,
+        let version = object["version"]?.stringValue,
+        !version.isEmpty
+      else {
+        throw MCPServerError.invalidParams(
+          "io.modelcontextprotocol/clientInfo must contain name and version")
+      }
+    }
+    return true
+  }
+
+  private func requireFormElicitationCapability(
+    _ params: [String: JSONValue]
+  ) throws(MCPServerError) {
+    guard
+      params["_meta"]?.objectValue?["io.modelcontextprotocol/clientCapabilities"]?
+        .objectValue?["elicitation"]?.objectValue != nil
+    else {
+      throw MCPServerError.missingRequiredClientCapability
+    }
   }
 
   private func successResponse(id: JSONValue, result: JSONValue, modern: Bool) -> JSONValue {
@@ -1002,6 +1171,21 @@ public final class WebKitMCPServer {
       properties: sessionSchemaProperties,
       required: ["session_id"],
       readOnly: true
+    ),
+    tool(
+      name: "browser_fill_siliconpass",
+      description:
+        "Request one native-confirmed synthetic SiliconPass credential fill into one fresh HTTPS main-frame username/password pair. The tool accepts no credential value, account, provider, submit action, or reusable authorization and returns only a terminal status.",
+      properties: sessionSchemaProperties.merging([
+        "observation_id": .object(["type": .string("string")]),
+        "username_element_id": .object(["type": .string("string")]),
+        "password_element_id": .object(["type": .string("string")]),
+      ]) { _, new in new },
+      required: [
+        "session_id", "observation_id", "username_element_id", "password_element_id",
+      ],
+      readOnly: false,
+      destructive: true
     ),
     tool(
       name: "browser_navigate",
