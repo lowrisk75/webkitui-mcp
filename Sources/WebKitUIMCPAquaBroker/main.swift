@@ -97,7 +97,7 @@ struct WebKitUIMCPAquaBroker {
     let connection = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     do {
       let server = try await WebKitMCPServer(
-        maximumSessions: 1, enforceHostExclusiveSession: true)
+        maximumSessions: 8, enforceHostExclusiveSession: false)
       for try await line in connection.bytes.lines {
         guard let response = await server.handle(Data(line.utf8)) else { continue }
         try connection.write(contentsOf: response)

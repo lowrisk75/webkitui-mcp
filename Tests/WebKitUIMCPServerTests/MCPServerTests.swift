@@ -187,7 +187,7 @@ struct MCPServerTests {
     )
     let result = try object(response["result"])
     #expect(result["protocolVersion"] == .string("2025-11-25"))
-    #expect(try object(result["serverInfo"])["version"] == .string("0.2.0"))
+    #expect(try object(result["serverInfo"])["version"] == .string(WebKitMCPServer.version))
     #expect(result["resultType"] == nil)
     #expect(result["_meta"] == nil)
 

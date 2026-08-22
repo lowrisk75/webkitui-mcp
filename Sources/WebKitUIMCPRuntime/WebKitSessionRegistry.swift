@@ -92,7 +92,9 @@ public final class WebKitSessionRegistry {
     let lease = try enforceHostExclusiveSession ? HostControllerLease() : nil
     let handle = WebKitSessionHandle(rawValue: UUID())
     do {
-      sessions[handle] = try WebKitRuntime(protectedWebsiteDataStore: .default())
+      // Every session gets a distinct ephemeral WebKit store. This prevents cookies,
+      // local storage, caches, and authenticated state from crossing project boundaries.
+      sessions[handle] = try WebKitRuntime(protectedWebsiteDataStore: .nonPersistent())
       hostControllerLease = lease
     } catch {
       throw WebKitSessionRegistryError.networkBoundaryUnavailable
@@ -101,9 +103,10 @@ public final class WebKitSessionRegistry {
   }
 
   public func close(_ handle: WebKitSessionHandle) throws {
-    guard sessions.removeValue(forKey: handle) != nil else {
+    guard let runtime = sessions.removeValue(forKey: handle) else {
       throw WebKitSessionRegistryError.unknownSession
     }
+    runtime.invalidate()
     if sessions.isEmpty { hostControllerLease = nil }
   }
 

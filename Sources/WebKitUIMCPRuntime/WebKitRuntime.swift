@@ -32,6 +32,37 @@ final class HumanControlWebView: WKWebView {
   }
 }
 
+@MainActor
+private enum HumanControlPresentationCoordinator {
+  private static var visibleRuntimeSlots: [ObjectIdentifier: Int] = [:]
+
+  static func present(runtime: WebKitRuntime) -> Int {
+    let identifier = ObjectIdentifier(runtime)
+    let slot = visibleRuntimeSlots[identifier] ?? firstAvailableSlot()
+    visibleRuntimeSlots[identifier] = slot
+    let application = NSApplication.shared
+    application.finishLaunching()
+    application.setActivationPolicy(.regular)
+    application.applicationIconImage = WebKitRuntime.humanControlApplicationIcon()
+    application.dockTile.display()
+    application.unhide(nil)
+    application.activate(ignoringOtherApps: true)
+    return slot
+  }
+
+  static func dismiss(runtime: WebKitRuntime) {
+    visibleRuntimeSlots.removeValue(forKey: ObjectIdentifier(runtime))
+    if visibleRuntimeSlots.isEmpty {
+      NSApplication.shared.setActivationPolicy(.accessory)
+    }
+  }
+
+  private static func firstAvailableSlot() -> Int {
+    let occupied = Set(visibleRuntimeSlots.values)
+    return (0..<8).first(where: { !occupied.contains($0) }) ?? 0
+  }
+}
+
 public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case unsupportedURLScheme
   case navigationFailed(String)
@@ -646,10 +677,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     latestTargets.removeAll(keepingCapacity: true)
     topLevelOriginLock = nil
     if presentWindow {
-      let application = NSApplication.shared
-      application.finishLaunching()
-      application.setActivationPolicy(.regular)
-      application.applicationIconImage = Self.humanControlApplicationIcon()
+      let presentationSlot = HumanControlPresentationCoordinator.present(runtime: self)
       let window =
         humanControlWindow
         ?? NSWindow(
@@ -658,14 +686,21 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
           backing: .buffered,
           defer: false
         )
-      window.title = "WebkitUIMCP — Human control"
+      let site = webView.url?.host ?? "No page"
+      window.title = "WebkitUIMCP — Human control — \(site)"
       window.isReleasedWhenClosed = false
       window.collectionBehavior.insert(.moveToActiveSpace)
       window.contentView = humanControlContentView()
       window.center()
+      let cascadeOffset = CGFloat(presentationSlot * 28)
+      window.setFrameOrigin(
+        .init(
+          x: window.frame.origin.x + cascadeOffset,
+          y: window.frame.origin.y - cascadeOffset
+        ))
       window.makeKeyAndOrderFront(nil)
       window.orderFrontRegardless()
-      application.activate(ignoringOtherApps: true)
+      NSApplication.shared.activate(ignoringOtherApps: true)
       humanControlWindow = window
     }
     transition(to: .humanControlled, observationID: nil)
@@ -676,11 +711,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       throw WebKitRuntimeError.invalidControlTransition
     }
     humanControlWindow?.orderOut(nil)
-    NSApplication.shared.setActivationPolicy(.accessory)
+    HumanControlPresentationCoordinator.dismiss(runtime: self)
     topLevelOriginLock = (webView.url ?? lastCommittedHTTPURL).flatMap {
       navigationOrigin(for: $0)
     }
     transition(to: .resumeRequested, observationID: nil)
+  }
+
+  func invalidate() {
+    humanControlWindow?.orderOut(nil)
+    humanControlWindow?.contentView = nil
+    humanControlWindow?.close()
+    humanControlWindow = nil
+    webView.stopLoading()
+    HumanControlPresentationCoordinator.dismiss(runtime: self)
   }
 
   private func humanControlContentView() -> NSView {
@@ -724,11 +768,32 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     return container
   }
 
-  private static func humanControlApplicationIcon() -> NSImage? {
-    NSImage(
-      systemSymbolName: "globe.americas.fill",
-      accessibilityDescription: "WebkitUIMCP")?
-      .withSymbolConfiguration(.init(pointSize: 128, weight: .medium))
+  fileprivate static func humanControlApplicationIcon() -> NSImage? {
+    let size = NSSize(width: 512, height: 512)
+    let image = NSImage(size: size, flipped: false) { bounds in
+      NSColor.systemBlue.setFill()
+      NSBezierPath(roundedRect: bounds.insetBy(dx: 28, dy: 28), xRadius: 112, yRadius: 112)
+        .fill()
+
+      NSColor.white.setStroke()
+      let globe = NSBezierPath(ovalIn: bounds.insetBy(dx: 104, dy: 104))
+      globe.lineWidth = 26
+      globe.stroke()
+      let meridian = NSBezierPath(ovalIn: NSRect(x: 188, y: 104, width: 136, height: 304))
+      meridian.lineWidth = 22
+      meridian.stroke()
+      for y in [196.0, 316.0] {
+        let latitude = NSBezierPath()
+        latitude.move(to: .init(x: 124, y: y))
+        latitude.line(to: .init(x: 388, y: y))
+        latitude.lineWidth = 20
+        latitude.stroke()
+      }
+      return true
+    }
+    image.isTemplate = false
+    image.accessibilityDescription = "WebkitUIMCP"
+    return image
   }
 
   /// The returned observation is the only address space valid after handoff.
@@ -737,6 +802,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
   {
     guard controlState == .resumeRequested else {
       throw WebKitRuntimeError.invalidControlTransition
+    }
+    if !processTerminated,
+      let url = webView.url,
+      let scheme = url.scheme?.lowercased(),
+      ["http", "https"].contains(scheme)
+    {
+      _ = try await awaitReadiness(
+        timeout: .seconds(30),
+        quietWindow: .milliseconds(300)
+      )
     }
     if processTerminated {
       guard

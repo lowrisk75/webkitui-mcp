@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Network
 import Testing
@@ -362,6 +363,36 @@ struct WebKitRuntimeTests {
     #expect(registry.count == 0)
   }
 
+  @Test("Concurrent sessions isolate website data")
+  func concurrentSessionIsolation() async throws {
+    let registry = try WebKitSessionRegistry(maximumSessions: 2)
+    let firstHandle = try registry.open()
+    let secondHandle = try registry.open()
+    let first = try registry.runtime(for: firstHandle)
+    let second = try registry.runtime(for: secondHandle)
+    let baseURL = URL(string: "https://fixture.invalid/")!
+
+    _ = try await first.loadHTML(
+      "<title>First</title>", baseURL: baseURL, timeout: .seconds(2),
+      quietWindow: .milliseconds(40))
+    _ = try await second.loadHTML(
+      "<title>Second</title>", baseURL: baseURL, timeout: .seconds(2),
+      quietWindow: .milliseconds(40))
+    _ = try await first.webView.evaluateJavaScript("localStorage.setItem('project', 'first')")
+
+    let firstValue =
+      try await first.webView.evaluateJavaScript(
+        "localStorage.getItem('project')") as? String
+    let secondValue =
+      try await second.webView.evaluateJavaScript(
+        "localStorage.getItem('project')") as? String
+    #expect(firstValue == "first")
+    #expect(secondValue == nil)
+
+    try registry.close(firstHandle)
+    try registry.close(secondHandle)
+  }
+
   @Test("Production registries enforce one host controller")
   func hostExclusiveSession() throws {
     let first = try WebKitSessionRegistry(enforceHostExclusiveSession: true)
@@ -563,5 +594,61 @@ struct WebKitRuntimeTests {
     let observation = try await runtime.resumeAfterHumanControl()
     #expect(observation.title.segments.first?.text == "OAuth Provider")
     #expect(observation.url.segments.first?.text.contains("/oauth") == true)
+  }
+
+  @Test("Closing a session tears down its visible human-control window")
+  func closingSessionDismissesHumanWindow() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Visible handoff</title><button>Continue</button>",
+      baseURL: URL(string: "https://fixture.invalid/login"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl()
+    try await Task.sleep(for: .milliseconds(40))
+    let window = try #require(runtime.webView.window)
+    #expect(window.isVisible)
+    #expect(NSApplication.shared.activationPolicy() == .regular)
+
+    try registry.close(handle)
+
+    #expect(!window.isVisible)
+    #expect(runtime.webView.window == nil)
+    #expect(NSApplication.shared.activationPolicy() == .accessory)
+  }
+
+  @Test("Concurrent human-control windows keep the Dock active until the last close")
+  func concurrentHumanWindowsKeepDockActive() async throws {
+    let registry = try WebKitSessionRegistry(maximumSessions: 2)
+    let firstHandle = try registry.open()
+    let secondHandle = try registry.open()
+    let first = try registry.runtime(for: firstHandle)
+    let second = try registry.runtime(for: secondHandle)
+    _ = try await first.loadHTML(
+      "<title>First project</title>", baseURL: URL(string: "https://first.invalid/")!,
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    _ = try await second.loadHTML(
+      "<title>Second project</title>", baseURL: URL(string: "https://second.invalid/")!,
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+
+    try first.requestHumanHandoff()
+    try first.beginHumanControl()
+    try second.requestHumanHandoff()
+    try second.beginHumanControl()
+    #expect(first.webView.window?.title.contains("first.invalid") == true)
+    #expect(second.webView.window?.title.contains("second.invalid") == true)
+    #expect(first.webView.window?.frame.origin != second.webView.window?.frame.origin)
+    #expect(NSApplication.shared.activationPolicy() == .regular)
+
+    try registry.close(firstHandle)
+    #expect(NSApplication.shared.activationPolicy() == .regular)
+    #expect(second.webView.window?.isVisible == true)
+
+    try registry.close(secondHandle)
+    #expect(NSApplication.shared.activationPolicy() == .accessory)
   }
 }

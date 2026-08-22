@@ -18,6 +18,7 @@ private enum MCPServerError: Error {
 
 @MainActor
 public final class WebKitMCPServer {
+  public static let version = "0.3.0"
   public static let protocolVersion = "2026-07-28"
   public static let legacyProtocolVersion = "2025-11-25"
 
@@ -1182,7 +1183,7 @@ public final class WebKitMCPServer {
   }
 
   private func serverInfo() -> JSONValue {
-    .object(["name": .string("webkitui-mcp"), "version": .string("0.2.0")])
+    .object(["name": .string("webkitui-mcp"), "version": .string(Self.version)])
   }
 
   private func encode(_ value: JSONValue) -> Data? {

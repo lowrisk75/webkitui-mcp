@@ -8,7 +8,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 
 ## What exists
 
-- Native `WKWebView` runtime using the persistent system WebKit data store for real authenticated sessions.
+- Native `WKWebView` runtime with an isolated ephemeral WebKit data store per MCP session; authentication remains available for that session without crossing project boundaries.
 - MCP 2026-07-28 stdio server with legacy initialization compatibility.
 - Six bounded tools: `browser_session`, `browser_navigate`, `browser_observe`, `browser_capture`, `browser_act`, and `browser_transaction`.
 - Observation-scoped element symbols backed by semantic locator recipes and fresh action-time resolution.
@@ -24,7 +24,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   forge the approval value.
 - Local human handoff: the actual WebKit session becomes a visible window for login, MFA, CAPTCHA, or sensitive input; the agent is locked out until confirmed resume and fresh re-observation.
 - MCP sessions use a per-session loopback SOCKS5 boundary with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
-- The production CLI enforces one browser controller across all local/remote MCP processes for the macOS account; the lease is released on close or process death.
+- Each client can hold up to eight isolated browser sessions, and independent local/remote MCP clients can run concurrently. Every session owns its WebKit runtime, proxy boundary, cookies, storage, observations, transactions, and human-control window.
 - Private remote clients can use the Aqua LaunchAgent broker plus a forced-command SSH relay; WebKit and authenticated profile data remain on the logged-in Mac.
 - Web-content termination invalidates every observation immediately; recovery reloads the host-owned last URL without replaying an action. A forced-crash fixture verifies that an `HttpOnly` authenticated cookie plus `localStorage` and `sessionStorage` survive in the same view/data-store lifetime.
 
@@ -37,7 +37,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Cross-origin frame contents are opaque.
 - `takeSnapshot` may omit GPU-composited effects.
 - No exactly-once or rollback claim for an uncooperative website.
-- Low concurrency is intentional because WKWebView has no per-view hard memory quota.
+- Concurrency is deliberately bounded to eight sessions per client because WKWebView has no per-view hard memory quota.
 - The protected network path is the MCP session registry or `WebKitRuntime(protectedWebsiteDataStore:)`; the lower-level `WebKitRuntime(websiteDataStore:)` initializer is intentionally unprotected for fixtures and embedding.
 - Proxy tests currently prove HTTP/TCP main-frame and fetch-subresource routing, pin reuse, local-address denial, and UDP-ASSOCIATE rejection. HTTPS, WebSocket, WebRTC, system IPC, and existing socket-pool behavior are not yet measured.
 
@@ -58,7 +58,8 @@ Run the server:
 swift run -c release --arch arm64 webkitui-mcp
 ```
 
-`webkitui-mcp --help` prints the stdio contract without starting the server.
+`webkitui-mcp --help` prints the stdio contract and `webkitui-mcp --version`
+prints the traceable server version without starting the server.
 The sibling `webkitui-mcp-confirm` helper owns legacy native dialogs so closing
 an AppKit alert cannot terminate or corrupt the long-lived stdio server.
 
@@ -98,7 +99,9 @@ agent-generated JavaScript click remains intentionally untrusted. During human
 control, HTTP(S) `target=_blank` and `window.open` requests are followed in the
 same visible, observable WebKit view. Popup requests remain denied while the
 agent controls the session.
-The handoff window becomes a regular foreground Mac app with a Dock icon. If
+Each handoff window becomes a regular foreground Mac app with a Dock icon and
+the current site in its title. The Dock remains active while any session is
+under human control. If
 handoff is requested before navigation, it shows an explicit empty-page message
 instead of a blank browser surface.
 
