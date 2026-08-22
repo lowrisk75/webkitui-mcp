@@ -540,7 +540,7 @@ public final class WebKitMCPServer {
           structured: .object([
             "control_state": .string(runtime.interactionControlState().rawValue),
             "instructions": .string(
-              "Complete login, MFA, CAPTCHA, or sensitive input in the local WebKit window, then call browser_session operation=handoff again to request agent resume."
+              "Complete login, MFA, CAPTCHA, sensitive input, and any OAuth or popup-opening click yourself in the local WebKit window. Agent-generated clicks remain untrusted. Then call browser_session operation=handoff again to request agent resume."
             ),
           ]),
           modern: false
@@ -621,7 +621,7 @@ public final class WebKitMCPServer {
           "params": .object([
             "mode": .string("form"),
             "message": .string(
-              "Human control is active in the local WebKit window. Complete login, MFA, CAPTCHA, or sensitive input there. Confirm only when the agent may resume."
+              "Human control is active in the local WebKit window. Complete login, MFA, CAPTCHA, sensitive input, and any OAuth or popup-opening click yourself. Agent-generated clicks remain untrusted. Confirm only when the agent may resume."
             ),
             "requestedSchema": .object([
               "type": .string("object"),

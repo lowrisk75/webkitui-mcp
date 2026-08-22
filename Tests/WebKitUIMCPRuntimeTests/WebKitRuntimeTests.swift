@@ -520,4 +520,48 @@ struct WebKitRuntimeTests {
     let encoded = String(decoding: try JSONEncoder().encode(events), as: UTF8.self)
     #expect(!encoded.contains("private"))
   }
+
+  @Test("OAuth popup policy requires handoff and follows in the observable web view")
+  func humanControlledPopup() async throws {
+    let server = try FormFixtureServer { request in
+      let body =
+        request.contains("GET /oauth ")
+        ? "<title>OAuth Provider</title><p>Continue authentication</p>"
+        : "<title>Login</title><a id='oauth' target='_blank' href='/oauth'>Log in</a>"
+      return FormFixtureServer.response(body: body)
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/login")!,
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(20)
+    )
+    _ = try await runtime.webView.evaluateJavaScript("document.getElementById('oauth').click()")
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(runtime.webView.url?.path == "/login")
+    #expect(!runtime.webView.configuration.preferences.javaScriptCanOpenWindowsAutomatically)
+    #expect(
+      !runtime.followHumanPopupRequest(
+        URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/oauth")!)))
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    _ = try await runtime.webView.evaluateJavaScript("document.getElementById('oauth').click()")
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(runtime.webView.url?.path == "/login")
+    let humanWebView = try #require(runtime.webView as? HumanControlWebView)
+    humanWebView.recordNativeUserGesture()
+    _ = try await runtime.webView.evaluateJavaScript("document.getElementById('oauth').click()")
+    let deadline = ContinuousClock.now + .seconds(2)
+    while runtime.webView.url?.path != "/oauth", ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+
+    #expect(runtime.webView.url?.path == "/oauth")
+    #expect(runtime.interactionControlState() == .humanControlled)
+    try runtime.requestAgentResume()
+    let observation = try await runtime.resumeAfterHumanControl()
+    #expect(observation.title.segments.first?.text == "OAuth Provider")
+    #expect(observation.url.segments.first?.text.contains("/oauth") == true)
+  }
 }

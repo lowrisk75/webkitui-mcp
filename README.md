@@ -93,6 +93,11 @@ and approve the native resume dialog. MCP 2026-07-28 clients continue to use
 multi-round `input_required` results.
 
 Use `browser_session { operation: "handoff" }` when a human must control the same local WebKit session. Declining resume leaves human control active.
+OAuth and popup-gated actions must be clicked by the human after handoff; an
+agent-generated JavaScript click remains intentionally untrusted. During human
+control, HTTP(S) `target=_blank` and `window.open` requests are followed in the
+same visible, observable WebKit view. Popup requests remain denied while the
+agent controls the session.
 The handoff window becomes a regular foreground Mac app with a Dock icon. If
 handoff is requested before navigation, it shows an explicit empty-page message
 instead of a blank browser surface.

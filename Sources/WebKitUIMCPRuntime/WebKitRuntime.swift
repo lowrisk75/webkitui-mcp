@@ -4,6 +4,34 @@ import Foundation
 import WebKit
 import WebKitUIMCPCore
 
+@MainActor
+final class HumanControlWebView: WKWebView {
+  private var nativeGestureNanoseconds: UInt64?
+
+  override func mouseDown(with event: NSEvent) {
+    recordNativeUserGesture()
+    super.mouseDown(with: event)
+  }
+
+  override func keyDown(with event: NSEvent) {
+    if [36, 49, 76].contains(event.keyCode) {
+      recordNativeUserGesture()
+    }
+    super.keyDown(with: event)
+  }
+
+  func recordNativeUserGesture() {
+    nativeGestureNanoseconds = DispatchTime.now().uptimeNanoseconds
+  }
+
+  func consumeRecentNativeUserGesture() -> Bool {
+    guard let recorded = nativeGestureNanoseconds else { return false }
+    nativeGestureNanoseconds = nil
+    let now = DispatchTime.now().uptimeNanoseconds
+    return now >= recorded && now - recorded <= 1_000_000_000
+  }
+}
+
 public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case unsupportedURLScheme
   case navigationFailed(String)
@@ -129,7 +157,7 @@ public struct WebContentTerminationEvent: Codable, Equatable, Sendable {
 }
 
 @MainActor
-public final class WebKitRuntime: NSObject, WKNavigationDelegate {
+public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
   public let webView: WKWebView
 
   private let instrumentationWorld: WKContentWorld
@@ -179,14 +207,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate {
     )
     configuration.userContentController = contentController
     configuration.websiteDataStore = websiteDataStore
+    configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
     self.instrumentationWorld = world
-    self.webView = WKWebView(
+    self.webView = HumanControlWebView(
       frame: .init(x: 0, y: 0, width: 1280, height: 800),
       configuration: configuration
     )
     super.init()
     webView.navigationDelegate = self
+    webView.uiDelegate = self
   }
 
   public func navigate(
@@ -655,7 +685,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate {
 
   private func humanControlContentView() -> NSView {
     guard webView.url == nil || webView.url?.absoluteString == "about:blank" else {
-      return webView
+      let container = NSView()
+      webView.translatesAutoresizingMaskIntoConstraints = false
+      container.addSubview(webView)
+      NSLayoutConstraint.activate([
+        webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+        webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        webView.topAnchor.constraint(equalTo: container.topAnchor),
+        webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      ])
+      return container
     }
     let title = NSTextField(labelWithString: "No page is loaded")
     title.font = .systemFont(ofSize: 28, weight: .semibold)
@@ -795,6 +834,43 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate {
       return .cancel
     }
     return .allow
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    createWebViewWith configuration: WKWebViewConfiguration,
+    for navigationAction: WKNavigationAction,
+    windowFeatures: WKWindowFeatures
+  ) -> WKWebView? {
+    guard
+      navigationAction.targetFrame == nil,
+      (webView as? HumanControlWebView)?.consumeRecentNativeUserGesture() == true
+    else {
+      return nil
+    }
+    _ = followHumanPopupRequest(navigationAction.request)
+    return nil
+  }
+
+  @discardableResult
+  func followHumanPopupRequest(_ request: URLRequest) -> Bool {
+    guard
+      controlState == .humanControlled,
+      let url = request.url,
+      let scheme = url.scheme?.lowercased(),
+      ["http", "https"].contains(scheme)
+    else { return false }
+    if egressProxy != nil {
+      guard let host = url.host else { return false }
+      do {
+        try PublicNetworkAddressPolicy().validateNavigationHost(host)
+      } catch {
+        return false
+      }
+    }
+    topLevelOriginLock = nil
+    webView.load(request)
+    return true
   }
 
   public func webView(
