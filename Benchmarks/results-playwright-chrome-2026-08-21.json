@@ -1,0 +1,341 @@
+{
+  "engine": "Playwright 1.61.1 + Google Chrome 151 stable",
+  "mode": "headless-incognito",
+  "viewportPoints": [
+    1280,
+    800
+  ],
+  "browserLaunchNanoseconds": 630577500,
+  "samples": [
+    {
+      "contextInitializationNanoseconds": 301863125,
+      "readinessNanoseconds": 341718084,
+      "observationNanoseconds": 54200792,
+      "captureNanoseconds": 64035958,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 118632416,
+      "readinessNanoseconds": 333106333,
+      "observationNanoseconds": 42858709,
+      "captureNanoseconds": 71801709,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 101474541,
+      "readinessNanoseconds": 335861125,
+      "observationNanoseconds": 32929875,
+      "captureNanoseconds": 56236792,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 114571709,
+      "readinessNanoseconds": 340291208,
+      "observationNanoseconds": 39560667,
+      "captureNanoseconds": 57707917,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 101798166,
+      "readinessNanoseconds": 329843208,
+      "observationNanoseconds": 44792000,
+      "captureNanoseconds": 63371667,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 100015000,
+      "readinessNanoseconds": 335780208,
+      "observationNanoseconds": 47973042,
+      "captureNanoseconds": 58841000,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 106006667,
+      "readinessNanoseconds": 339416750,
+      "observationNanoseconds": 37619000,
+      "captureNanoseconds": 58768250,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 110560417,
+      "readinessNanoseconds": 335453541,
+      "observationNanoseconds": 47694666,
+      "captureNanoseconds": 56800167,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 112791833,
+      "readinessNanoseconds": 334838500,
+      "observationNanoseconds": 43942583,
+      "captureNanoseconds": 64433875,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 110770042,
+      "readinessNanoseconds": 332831625,
+      "observationNanoseconds": 43570459,
+      "captureNanoseconds": 60461459,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 103603334,
+      "readinessNanoseconds": 335845250,
+      "observationNanoseconds": 40102834,
+      "captureNanoseconds": 59828375,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 106821084,
+      "readinessNanoseconds": 337721458,
+      "observationNanoseconds": 47581541,
+      "captureNanoseconds": 59091292,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 107245833,
+      "readinessNanoseconds": 337950500,
+      "observationNanoseconds": 59754833,
+      "captureNanoseconds": 90719583,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 167890167,
+      "readinessNanoseconds": 332798041,
+      "observationNanoseconds": 35440417,
+      "captureNanoseconds": 64254833,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 151604833,
+      "readinessNanoseconds": 332692500,
+      "observationNanoseconds": 36912333,
+      "captureNanoseconds": 67726791,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 114080792,
+      "readinessNanoseconds": 332477542,
+      "observationNanoseconds": 43356083,
+      "captureNanoseconds": 66216500,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 159408333,
+      "readinessNanoseconds": 339828792,
+      "observationNanoseconds": 39875875,
+      "captureNanoseconds": 63241834,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 117366083,
+      "readinessNanoseconds": 340078334,
+      "observationNanoseconds": 43885917,
+      "captureNanoseconds": 58040416,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 110260334,
+      "readinessNanoseconds": 333728208,
+      "observationNanoseconds": 45347792,
+      "captureNanoseconds": 61479042,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 109732083,
+      "readinessNanoseconds": 336833500,
+      "observationNanoseconds": 35414750,
+      "captureNanoseconds": 63669167,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 118335083,
+      "readinessNanoseconds": 333399042,
+      "observationNanoseconds": 36294625,
+      "captureNanoseconds": 71073666,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 117502125,
+      "readinessNanoseconds": 343767042,
+      "observationNanoseconds": 44929833,
+      "captureNanoseconds": 65033583,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 120837709,
+      "readinessNanoseconds": 337287000,
+      "observationNanoseconds": 34139000,
+      "captureNanoseconds": 73354292,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 122647291,
+      "readinessNanoseconds": 344935000,
+      "observationNanoseconds": 43370250,
+      "captureNanoseconds": 76255875,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 143389292,
+      "readinessNanoseconds": 339646792,
+      "observationNanoseconds": 36016958,
+      "captureNanoseconds": 105649208,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 119993750,
+      "readinessNanoseconds": 333879500,
+      "observationNanoseconds": 43446500,
+      "captureNanoseconds": 65730458,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 114707917,
+      "readinessNanoseconds": 335548541,
+      "observationNanoseconds": 44857542,
+      "captureNanoseconds": 66558584,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 126708500,
+      "readinessNanoseconds": 336352250,
+      "observationNanoseconds": 34837458,
+      "captureNanoseconds": 57739000,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 107255792,
+      "readinessNanoseconds": 337545333,
+      "observationNanoseconds": 33919958,
+      "captureNanoseconds": 74843625,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    },
+    {
+      "contextInitializationNanoseconds": 114754709,
+      "readinessNanoseconds": 337778125,
+      "observationNanoseconds": 34786000,
+      "captureNanoseconds": 75488416,
+      "observationBytes": 106981,
+      "elementCount": 500,
+      "pngBytes": 256978,
+      "pixelWidth": 2560,
+      "pixelHeight": 1600
+    }
+  ]
+}

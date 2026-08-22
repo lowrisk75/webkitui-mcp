@@ -1,0 +1,340 @@
+{
+  "engine" : "WKWebView",
+  "mode" : "offscreen-nonpersistent",
+  "samples" : [
+    {
+      "captureNanoseconds" : 41711167,
+      "contextInitializationNanoseconds" : 61444083,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20179958,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 457391166
+    },
+    {
+      "captureNanoseconds" : 34460667,
+      "contextInitializationNanoseconds" : 2872042,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 14568625,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 386923750
+    },
+    {
+      "captureNanoseconds" : 37609458,
+      "contextInitializationNanoseconds" : 3987625,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 18949500,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 386057875
+    },
+    {
+      "captureNanoseconds" : 38618667,
+      "contextInitializationNanoseconds" : 2395625,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20348000,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 373408750
+    },
+    {
+      "captureNanoseconds" : 38210125,
+      "contextInitializationNanoseconds" : 2169000,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 19640959,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 395556584
+    },
+    {
+      "captureNanoseconds" : 37840458,
+      "contextInitializationNanoseconds" : 2425459,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20255583,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 385213375
+    },
+    {
+      "captureNanoseconds" : 37459250,
+      "contextInitializationNanoseconds" : 5178541,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 17206708,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 368967875
+    },
+    {
+      "captureNanoseconds" : 37939958,
+      "contextInitializationNanoseconds" : 2246292,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20105500,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 373794916
+    },
+    {
+      "captureNanoseconds" : 37682375,
+      "contextInitializationNanoseconds" : 2272042,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 19756125,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 378139125
+    },
+    {
+      "captureNanoseconds" : 39007542,
+      "contextInitializationNanoseconds" : 4035083,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20349666,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 384098792
+    },
+    {
+      "captureNanoseconds" : 39858708,
+      "contextInitializationNanoseconds" : 2406958,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20631125,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 392290208
+    },
+    {
+      "captureNanoseconds" : 35698000,
+      "contextInitializationNanoseconds" : 3108125,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20467416,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 387694583
+    },
+    {
+      "captureNanoseconds" : 39475708,
+      "contextInitializationNanoseconds" : 4713209,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 19520750,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 378703834
+    },
+    {
+      "captureNanoseconds" : 60547042,
+      "contextInitializationNanoseconds" : 3880375,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20476917,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 409521584
+    },
+    {
+      "captureNanoseconds" : 37754375,
+      "contextInitializationNanoseconds" : 5428791,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 18715500,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 427931292
+    },
+    {
+      "captureNanoseconds" : 38364833,
+      "contextInitializationNanoseconds" : 2384542,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20906334,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 384550416
+    },
+    {
+      "captureNanoseconds" : 38180459,
+      "contextInitializationNanoseconds" : 2147667,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20258500,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 380260709
+    },
+    {
+      "captureNanoseconds" : 37479042,
+      "contextInitializationNanoseconds" : 2180833,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20886542,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 384314042
+    },
+    {
+      "captureNanoseconds" : 37757625,
+      "contextInitializationNanoseconds" : 2308417,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 17619833,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 410544792
+    },
+    {
+      "captureNanoseconds" : 38033083,
+      "contextInitializationNanoseconds" : 2230666,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20922833,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 377787125
+    },
+    {
+      "captureNanoseconds" : 38589000,
+      "contextInitializationNanoseconds" : 3424542,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 19680250,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 369625333
+    },
+    {
+      "captureNanoseconds" : 38513875,
+      "contextInitializationNanoseconds" : 2281791,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 19617458,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 384865250
+    },
+    {
+      "captureNanoseconds" : 38181958,
+      "contextInitializationNanoseconds" : 5752709,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 18262542,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 493508500
+    },
+    {
+      "captureNanoseconds" : 40088208,
+      "contextInitializationNanoseconds" : 2314916,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20107250,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 392579625
+    },
+    {
+      "captureNanoseconds" : 37964125,
+      "contextInitializationNanoseconds" : 2222791,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20029708,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 380804083
+    },
+    {
+      "captureNanoseconds" : 40890375,
+      "contextInitializationNanoseconds" : 2292750,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 21593875,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 382106709
+    },
+    {
+      "captureNanoseconds" : 40455667,
+      "contextInitializationNanoseconds" : 4416375,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20574791,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 388561333
+    },
+    {
+      "captureNanoseconds" : 38066958,
+      "contextInitializationNanoseconds" : 2220042,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 19926917,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 368584916
+    },
+    {
+      "captureNanoseconds" : 38547000,
+      "contextInitializationNanoseconds" : 2162167,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 18027958,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 401187291
+    },
+    {
+      "captureNanoseconds" : 40380500,
+      "contextInitializationNanoseconds" : 2141916,
+      "elementCount" : 500,
+      "observationBytes" : 993627,
+      "observationNanoseconds" : 20666916,
+      "pixelHeight" : 1600,
+      "pixelWidth" : 2560,
+      "pngBytes" : 342401,
+      "readinessNanoseconds" : 372067250
+    }
+  ],
+  "viewportPoints" : [
+    1280,
+    800
+  ]
+}

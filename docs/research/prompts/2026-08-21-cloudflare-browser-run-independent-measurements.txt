@@ -1,0 +1,23 @@
+Deep Research request: Cloudflare Browser Run for LLM agents — independent measurements only
+
+Date boundary: use sources available through 21 August 2026.
+
+Find reproducible, independent evidence about Cloudflare Browser Run (formerly Browser Rendering) used by LLM agents. Prioritize primary benchmark artifacts, code, datasets, issue reproductions, and measured traces. Do not repeat vendor feature claims as performance evidence.
+
+Questions:
+1. Has Browser Run been evaluated on WebArena, WorkArena, Web Bench, WebVoyager, BrowserGym, or authenticated write tasks? Give exact setup, model, sample count, success rate, latency, and failures.
+2. Is there a same-hardware or controlled comparison against local Playwright Chromium, Browserbase, Browser Use, Steel, or local WKWebView?
+3. What are measured cold-start, per-step CDP latency, screenshot/DOM transfer cost, memory, crash rate, and session-resume reliability?
+4. Are stale target, DOM replacement, ambiguity, layout drift, or wrong-logical-target failures separately instrumented anywhere?
+5. Do durable reuse sessions preserve cookies, SSO, WebAuthn/passkeys, client certificates, VPN/device posture, and human handoff reliably? Separate supported, unsupported, and untested.
+6. For model-authored CDP/Code Mode, what prevents generated code from bypassing action approval, provenance policy, or post-condition verification? Find implementation code and adversarial tests.
+7. For rrweb recording, what sensitive data can still leak despite masked inputs (DOM text, attributes, URLs, console/network data), and what has been measured?
+8. For WebMCP, find independent evidence for task success, token reduction, contract drift, prompt injection, and state-changing tool authorization.
+
+Output:
+- Executive answer in 10 lines.
+- Evidence table: claim, exact measurement, source URL, source date, independence, limitations.
+- Explicit “no evidence found” rows.
+- Contradictions between current Cloudflare docs and code.
+- Five experiments feasible on one 16 GB Apple Silicon Mac plus a Cloudflare free/paid account.
+- Never infer benchmark success from feature availability.

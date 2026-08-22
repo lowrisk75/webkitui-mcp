@@ -1,243 +1,77 @@
-# webkitui-mcp
+# WebkitUIMCP
 
-A local **Model Context Protocol** server that drives a **real Chrome** via
-**Playwright/CDP** — a self-contained, reliable replacement for the "Claude in
-Chrome" extension for the one thing it can't do: **load an unpacked browser
-extension** and reliably inspect its console/network behavior, including the
-extension's own **service worker console** (which Playwright has no public
-API for at all — see the CDP section below).
+Native WebKit automation for Apple Silicon, exposed through MCP and designed for an LLM rather than a human.
 
-It launches Google Chrome (the real browser, via `channel: "chrome"` — not
-Playwright's bundled Chromium, *except* when loading an unpacked extension,
-which forces the bundled Chromium — see "Why not always real Chrome?" below)
-with a persistent user-data dir, optionally side-loading an unpacked MV3
-extension, and exposes multi-tab navigation/interaction, screenshots, JS
-evaluation, console/network/worker-console capture, extension-id lookup, and
-a raw CDP escape hatch as MCP tools.
+This repository is a Swift rewrite. The retained TypeScript/Playwright files are prior art only and are not the implementation being extended.
 
----
+## What exists
 
-## Why this server exists
+- Native `WKWebView` runtime using the persistent system WebKit data store for real authenticated sessions.
+- MCP 2026-07-28 stdio server with legacy initialization compatibility.
+- Six bounded tools: `browser_session`, `browser_navigate`, `browser_observe`, `browser_capture`, `browser_act`, and `browser_transaction`.
+- Observation-scoped element symbols backed by semantic locator recipes and fresh action-time resolution.
+- Five separate addressing counters: `address_resolution_failed`, `address_now_ambiguous`, `logical_target_changed`, `node_replaced_but_semantic_locator_recovered`, and `coordinate_invalidated_by_layout_change`.
+- Provenance attached to every serialized page string.
+- Checkpoint-plus-delta observation history and Minimal Failure Set coverage metrics.
+- Optional local Ollama ranker with `think: false`, strict budgets, and deterministic fallback.
+- Transaction ledger with preconditions, exact post-conditions, idempotency keys, indeterminate outcomes, receipts, and reconciliation without replay.
+- Human confirmation through MCP multi-round tool results before every exposed
+  click and open-world navigation.
+- Local human handoff: the actual WebKit session becomes a visible window for login, MFA, CAPTCHA, or sensitive input; the agent is locked out until confirmed resume and fresh re-observation.
+- MCP sessions use a per-session loopback SOCKS5 boundary with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
+- Web-content termination invalidates every observation immediately; recovery reloads the host-owned last URL without replaying an action. A forced-crash fixture verifies that an `HttpOnly` authenticated cookie plus `localStorage` and `sessionStorage` survive in the same view/data-store lifetime.
 
-Claude in Chrome cannot load an unpacked extension (`chrome://extensions` →
-"Load unpacked") and has been unreliable for extension-development-loop
-testing (frequent disconnects). This server is a **separate, long-lived
-process** driving Chrome directly over CDP via Playwright — no extension
-dependency, no reconnect flakiness, and full support for the
-`--load-extension` launch flag that unpacked-extension testing requires.
+## Deliberate limits
 
-**Key constraint:** Chrome refuses to load unpacked extensions in headless
-mode, full stop, regardless of channel. `webkitui_launch` enforces this —
-`headless: true` + `loadExtensionPath` throws instead of silently loading a
-browser without your extension.
+- `browser_act` exposes click, native submit-control click, and bounded non-sensitive input/textarea fill. Fill verifies the freshly re-resolved semantic target's exact value; click/submit require an exact URL or newly appearing semantic text. UI state does not prove backend commit.
+- Fill dispatches normal `input`/`change` events, so site handlers may autosave or cause server effects. It is destructive and human-confirmed; password controls require local human handoff.
+- Actions are JavaScript-dispatched and report `trustedUserGesture: false`; they cannot satisfy browser APIs requiring physical user activation.
+- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim.
+- Cross-origin frame contents are opaque.
+- `takeSnapshot` may omit GPU-composited effects.
+- No exactly-once or rollback claim for an uncooperative website.
+- Low concurrency is intentional because WKWebView has no per-view hard memory quota.
+- The protected network path is the MCP session registry or `WebKitRuntime(protectedWebsiteDataStore:)`; the lower-level `WebKitRuntime(websiteDataStore:)` initializer is intentionally unprotected for fixtures and embedding.
+- Proxy tests currently prove HTTP/TCP main-frame and fetch-subresource routing, pin reuse, local-address denial, and UDP-ASSOCIATE rejection. HTTPS, WebSocket, WebRTC, system IPC, and existing socket-pool behavior are not yet measured.
 
-### Why not always real Chrome?
+## Build and test
 
-Google removed the `--load-extension` CLI flag from **branded** Chrome/Edge
-builds in Chrome 137 (June 2025), to stop malware from side-loading unpacked
-extensions — it's silently ignored there (no error, the extension just never
-appears). It still works in Playwright's bundled Chromium ("Chrome for
-Testing"), so `webkitui_launch` automatically pins extension loads to that,
-regardless of any requested `channel`, and uses real Chrome (`channel:
-"chrome"` by default) only when no extension is being loaded.
-
----
-
-## Tools
-
-| Tool | Purpose |
-|---|---|
-| `webkitui_launch` | Launch real Chrome (`launchPersistentContext`) with a persistent profile dir. `loadExtensionPath` side-loads an unpacked extension (forces `headless: false`, pins to bundled Chromium). Re-launching closes any prior session. |
-| `webkitui_list_tabs` | List open tabs — id, url, title, which is active. |
-| `webkitui_new_tab` | Open a tab, make it active, optionally navigate it. |
-| `webkitui_switch_tab` | Make a tab active (subsequent tools target it) and bring it to front. |
-| `webkitui_close_tab` | Close a tab. Another open tab becomes active if it was. |
-| `webkitui_navigate` | Navigate the active tab to a URL. Clears that tab's console/network buffers. |
-| `webkitui_click` | Click the first element matching a Playwright locator string (CSS or `text=`) in the active tab. |
-| `webkitui_type` | Fill text into the first matching element in the active tab. |
-| `webkitui_press_key` | Press a key/chord (e.g. `"Enter"`, `"Control+A"`), optionally focusing a selector first. |
-| `webkitui_wait_for` | Block until a selector reaches a state (default `visible`) or the URL matches — use instead of guessing a fixed delay. |
-| `webkitui_screenshot` | Screenshot the active tab — file path or base64. |
-| `webkitui_get_page_text` | Return the active tab's visible body text — cheaper than a screenshot for content checks. |
-| `webkitui_evaluate` | Run a JS expression/IIFE in the active tab via `page.evaluate`, return the JSON result. |
-| `webkitui_console_logs` | Return `console.*`/`pageerror` messages captured since the last navigate, for a tab (default: active). |
-| `webkitui_network_requests` | Return network requests (method/status/ok/failure/postDataPreview) since the last navigate, optional URL substring filter, for a tab (default: active). |
-| `webkitui_worker_console_logs` | Return console output from **service/shared workers** (e.g. an extension's MV3 `background.js`) — see below, this is the capability Playwright has no public API for. |
-| `webkitui_extension_id` | Resolve the `chrome-extension://<id>` generated for the side-loaded unpacked extension, via its registered service worker. |
-| `webkitui_cdp_send` | Send a raw CDP command against the active tab and return the result — escape hatch for anything not covered above. |
-| `webkitui_close` | Close the browser context and all tabs cleanly. |
-
----
-
-## Service worker console capture (`webkitui_worker_console_logs`)
-
-Playwright's `Worker` class has no `'console'` event — there is no public API
-to see what an extension's background script logs. This server fills that
-gap with a raw CDP `Target.attachToTarget` session (legacy, non-flat mode;
-Playwright's `CDPSession` wrapper can't address flat sub-sessions), set up
-automatically at `webkitui_launch` and covering every `service_worker` /
-`worker` / `shared_worker` target for the session's lifetime.
-
-**Load-bearing detail, found by hours of empirical elimination:** attaching
-with only `Runtime.enable` unreliably misses `console.*` calls made from
-*inside* a `chrome.*` extension API event callback (`chrome.runtime
-.onMessage`, a native-messaging `Port`'s `onDisconnect`, etc.) — the callback
-demonstrably runs (state it sets is observable via a follow-up
-`Runtime.evaluate`) but no `Runtime.consoleAPICalled` event arrives, and
-`Target.targetCreated`/`targetDestroyed` tracking rules out the target simply
-respawning around it. Also sending `Log.enable` on the same session fixes
-this — confirmed clean across repeated runs. `Log.entryAdded` is captured
-too, as a bonus: Chrome's own internal diagnostics for these events (e.g.
-`"Unchecked runtime.lastError: Native host has exited."`) surface there even
-in the rare case a developer's own `console.*` call still doesn't fire.
-
----
-
-## Build
+Requires the macOS 27 SDK for the current `WKJSHandle` probe.
 
 ```bash
-cd ~/GitHub/webkitui-mcp
-npm install     # also runs `tsc` via the prepare script
-npm run build   # tsc → dist/
+swift build -c release --arch arm64
+xcrun swift-format lint --strict --recursive Sources Tests Package.swift
+swift test --arch arm64
+swift test -c release --arch arm64
 ```
 
-Requirements: Node 18+, Google Chrome installed at the default macOS location
-(`/Applications/Google Chrome.app`) for non-extension sessions. Uses the full
-`playwright` package (not `playwright-core`) so its bundled Chromium ("Chrome
-for Testing") downloads on `npm install` — extension loads always use that
-build, real Chrome is driven via the `chrome` channel otherwise.
-
----
-
-## Register in Claude Code
+Run the server:
 
 ```bash
-claude mcp add webkitui-mcp -s user -- node ~/GitHub/webkitui-mcp/dist/index.js
+swift run -c release --arch arm64 webkitui-mcp
 ```
 
-`-s user` registers it globally (available from any project), matching how
-this instance was set up. Use `-s local` instead to scope it to one project
-only.
+The process reads newline-delimited JSON-RPC from stdin, writes protocol responses only to stdout, and reserves stderr for diagnostics.
 
-...or add directly to `~/.claude.json` (user scope) or a project's `.mcp.json`:
+## MCP flow
 
-```json
-{
-  "mcpServers": {
-    "webkitui-mcp": {
-      "command": "node",
-      "args": ["/Users/kevinnadjarian/GitHub/webkitui-mcp/dist/index.js"]
-    }
-  }
-}
-```
+1. `browser_session { operation: "open" }`
+2. `browser_navigate` returns `input_required`; approve the exact destination.
+3. `browser_observe`
+4. Use the fresh `observationID` and `elementID` once.
+5. `browser_act` returns `input_required`; approve the exact bound action.
+6. Read or reconcile the receipt with `browser_transaction`.
 
-No one-time TCC/permission grant is needed (unlike `shotkit-mcp` — this
-server doesn't screen-capture the desktop, Playwright drives Chrome directly
-over CDP).
+Use `browser_session { operation: "handoff" }` when a human must control the same local WebKit session. Declining resume leaves human control active.
 
----
+## Evidence
 
-## Example: testing an unpacked MV3 extension end-to-end
+- Architecture: [`docs/architecture/`](docs/architecture/)
+- Dated research and NotebookLM audits: [`docs/research/`](docs/research/)
+- Same-Mac runtime benchmark: [`Benchmarks/README.md`](Benchmarks/README.md)
 
-```jsonc
-// 1. webkitui_launch
-{ "loadExtensionPath": "~/GitHub/RGPD/dlp-endpoint/extension" }
+The first measured local lane uses 30 runs of the same deterministic fixture at 2560×1600. It compares WKWebView with Playwright 1.61.1 driving installed Chrome 151. It does **not** yet measure full process-tree memory, visible-window behavior, authenticated task success, or Playwright's pinned Chromium binary; no broader superiority claim is made.
 
-// 2. webkitui_extension_id
-{}
-// → { "extensionId": "abcdefghijklmnopabcdefghijklmnop", "url": "chrome-extension://.../background.js" }
+## Safety
 
-// 3. (separate terminal) install the Native Messaging host for that id — see
-//    the "Native Messaging + custom userDataDir" gotcha below, this needs the
-//    userDataDir arg or the extension silently can't reach its native host:
-//    ~/GitHub/RGPD/dlp-endpoint/scripts/install_native_host.sh <extension-id> ~/.webkitui-mcp/chrome-profile
-
-// 4. webkitui_navigate
-{ "url": "https://chatgpt.com" }
-
-// 5. webkitui_evaluate — confirm interceptor.js patched fetch in the MAIN world
-{ "script": "window.fetch.toString()" }
-
-// 6. webkitui_console_logs
-{}
-
-// 7. webkitui_network_requests
-{ "urlContains": "backend-api" }
-```
-
----
-
-## Native Messaging + custom userDataDir (real gotcha, cost hours to find)
-
-If your extension talks to a Native Messaging host (like `dlp-endpoint`'s
-`com.lorislab.dlp`), the **standard per-user manifest locations
-(`~/Library/Application Support/Google/Chrome/NativeMessagingHosts/`,
-`.../Chrome for Testing/...`, `.../Chromium/...`) do not work here** and
-Chrome fails silently by default — `chrome.runtime.connectNative()` returns a
-port, but `onDisconnect` fires almost immediately with
-`chrome.runtime.lastError.message === "Specified native messaging host not
-found."`. If the extension doesn't log `chrome.runtime.lastError` in its
-`onDisconnect` handler (an easy thing to skip — nothing about the API forces
-it), this fails **open** and invisible: secrets go out in cleartext with zero
-error anywhere in sight. Use `webkitui_worker_console_logs` (above) to see it
-either way, logged or not — Chrome's own `"Unchecked runtime.lastError"`
-diagnostic surfaces there regardless.
-
-**Root cause:** when Chrome/Chromium is launched via
-`launchPersistentContext(userDataDir, ...)` with a *custom* `userDataDir`
-(which every `webkitui_launch` call does), the Native Messaging host manifest
-lookup follows that custom dir instead of the OS-default profile location. The
-manifest has to be installed at:
-
-```
-<userDataDir>/NativeMessagingHosts/<host-name>.json
-```
-
-e.g. for the default profile dir, `~/.webkitui-mcp/chrome-profile/NativeMessagingHosts/com.lorislab.dlp.json`.
-Confirmed by directly `worker.evaluate()`-ing `chrome.runtime.connectNative()`
-diagnostics against the extension's own service worker — every other
-candidate directory (including the literal `/Library/Google/ChromeForTesting/NativeMessagingHosts`
-string found via `strings` on the Chrome for Testing binary) left the port
-disconnected with "not found"; only the userDataDir-relative path connected.
-
-`dlp-endpoint/scripts/install_native_host.sh` now takes this `userDataDir` as
-an optional second argument and installs the manifest to both the standard
-location and `<userDataDir>/NativeMessagingHosts` in one call:
-
-```bash
-./scripts/install_native_host.sh <extension-id> ~/.webkitui-mcp/chrome-profile
-```
-
----
-
-## Notes & assumptions
-
-- `userDataDir` defaults to `~/.webkitui-mcp/chrome-profile` and persists
-  across launches (extension installs, cookies, etc. survive restarts) unless
-  you pass a different path or delete it.
-- `webkitui_evaluate` passes your `script` string straight to
-  `page.evaluate()`. Simple expressions work as-is (`"window.fetch.toString()"`);
-  multi-statement scripts need an IIFE wrapper: `"(() => { ...; return x; })()"`.
-- Console/network buffers are cleared on every `webkitui_navigate` and capped
-  at 2000 entries (oldest dropped first) to avoid unbounded memory growth in
-  a long-lived process.
-- `webkitui_click` / `webkitui_type` / `webkitui_press_key` accept any
-  Playwright locator string — CSS (`"button.submit"`), text (`"text=Sign
-  in"`), or other built-in engines.
-- Multiple tabs are tracked (including ones opened by the page itself —
-  `target=_blank`, `window.open`, extension popups); everything except
-  `webkitui_list_tabs`/`new_tab`/`switch_tab`/`close_tab`/`worker_console_logs`
-  operates on the *active* tab. Console/network buffers are per-tab and
-  cleared on that tab's `webkitui_navigate`; worker console logs are
-  session-wide (workers aren't tied to one tab). All buffers cap at 2000
-  entries (oldest dropped first).
-- Only one browser session (one `launchPersistentContext`) is tracked at a
-  time; `webkitui_launch` closes any existing session first.
-- `webkitui_evaluate` times out after 30s by default so a hung script can't
-  block the server forever, but the script keeps running in the page after
-  that (no true mid-eval cancellation over CDP) — prefer `webkitui_navigate`
-  or closing/reopening the tab to recover a wedged one.
-- This server does not itself install Native Messaging hosts, build native
-  daemons, or manage extension IDs at rest — pair it with the target
-  project's own install scripts (e.g. `dlp-endpoint/scripts/install_native_host.sh`).
+The model cannot mint capability handles. Page content never becomes trusted policy. Password values are omitted from observations. Unknown dispatch is indeterminate and is never automatically retried. No commit, push, deployment, or external account mutation is performed by the project itself.
