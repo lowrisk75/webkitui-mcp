@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+export HOME=/home/webkitui
+export PATH=/usr/local/bin:/usr/bin:/bin
+export WEBKITUI_LINUX_CONTROLLER_LOCK=/var/lib/webkitui-mcp/controller.lock
+export WEBKITUI_LINUX_ENGINE=${WEBKITUI_LINUX_ENGINE:-chromium}
+export WEBKITUI_LINUX_SUBRESOURCE_ORIGINS=
+unset WEBKITUI_LINUX_WRITE_MODE
+unset WEBKITUI_LINUX_EXECUTABLE_PATH
+
+cd /opt/webkitui-mcp-linux
+exec /usr/local/bin/node /opt/webkitui-mcp-linux/dist/src/index.js

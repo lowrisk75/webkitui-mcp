@@ -1,0 +1,4 @@
+module CLaunchShim [system] {
+  header "include/CLaunchShim.h"
+  export *
+}

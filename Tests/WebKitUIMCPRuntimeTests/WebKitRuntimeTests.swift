@@ -165,26 +165,26 @@ struct WebKitRuntimeTests {
 
   @Test("An approved-origin lock cancels later cross-origin top-level navigation")
   func approvedOriginLock() async throws {
+    let server = try FormFixtureServer()
     let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
-    do {
-      _ = try await runtime.navigate(
-        to: URL(string: "https://fixture.invalid/")!,
-        timeout: .milliseconds(60),
-        quietWindow: .milliseconds(20),
-        constrainToInitialOrigin: true
-      )
-    } catch {
-      // The synthetic host need not resolve; the origin lock is installed first.
-    }
+    let approvedURL = URL(string: "http://127.0.0.1:\(server.port)/inside")!
+    _ = try await runtime.navigate(
+      to: approvedURL,
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(20),
+      constrainToInitialOrigin: true
+    )
     do {
       _ = try await runtime.loadHTML(
         """
         <title>Locked</title>
         <script>
-          setTimeout(() => { window.location.href = 'https://attacker.invalid/escape'; }, 100);
+          setTimeout(() => {
+            window.location.href = 'http://localhost:\(server.port)/escape';
+          }, 100);
         </script>
         """,
-        baseURL: URL(string: "https://fixture.invalid/inside"),
+        baseURL: approvedURL,
         timeout: .seconds(2),
         quietWindow: .milliseconds(20)
       )
@@ -193,7 +193,7 @@ struct WebKitRuntimeTests {
     }
     try await Task.sleep(for: .milliseconds(180))
 
-    #expect(runtime.webView.url?.host == "fixture.invalid")
+    #expect(runtime.webView.url?.host == "127.0.0.1")
   }
 
   @Test("macOS 27 willSubmitForm does not cover programmatic requestSubmit")
@@ -360,6 +360,19 @@ struct WebKitRuntimeTests {
     }
     try registry.close(handle)
     #expect(registry.count == 0)
+  }
+
+  @Test("Production registries enforce one host controller")
+  func hostExclusiveSession() throws {
+    let first = try WebKitSessionRegistry(enforceHostExclusiveSession: true)
+    let second = try WebKitSessionRegistry(enforceHostExclusiveSession: true)
+    let handle = try first.open()
+    #expect(throws: WebKitSessionRegistryError.hostControllerBusy) {
+      try second.open()
+    }
+    try first.close(handle)
+    let secondHandle = try second.open()
+    try second.close(secondHandle)
   }
 
   @Test("Click re-resolves semantics and reports an untrusted JS gesture")

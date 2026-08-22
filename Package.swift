@@ -12,10 +12,17 @@ let package = Package(
     .library(name: "WebKitUIMCPRuntime", targets: ["WebKitUIMCPRuntime"]),
     .library(name: "WebKitUIMCPServer", targets: ["WebKitUIMCPServer"]),
     .executable(name: "webkitui-mcp", targets: ["WebKitUIMCPCLI"]),
+    .executable(name: "webkitui-mcp-aqua-broker", targets: ["WebKitUIMCPAquaBroker"]),
+    .executable(name: "webkitui-mcp-relay", targets: ["WebKitUIMCPRelay"]),
     .executable(name: "wkjs-handle-probe", targets: ["WKJSHandleProbe"]),
     .executable(name: "webkitui-benchmark", targets: ["WebKitUIMCPBenchmark"]),
+    .executable(
+      name: "credential-broker-physical-validation",
+      targets: ["CredentialBrokerPhysicalValidation"]
+    ),
   ],
   targets: [
+    .systemLibrary(name: "CLaunchShim"),
     .target(name: "WebKitUIMCPCore"),
     .target(
       name: "WebKitUIMCPRuntime",
@@ -29,9 +36,18 @@ let package = Package(
       name: "WebKitUIMCPCLI",
       dependencies: ["WebKitUIMCPServer"]
     ),
+    .executableTarget(
+      name: "WebKitUIMCPAquaBroker",
+      dependencies: ["CLaunchShim", "WebKitUIMCPServer"]
+    ),
+    .executableTarget(name: "WebKitUIMCPRelay"),
     .executableTarget(name: "WKJSHandleProbe"),
     .executableTarget(
       name: "WebKitUIMCPBenchmark",
+      dependencies: ["WebKitUIMCPRuntime"]
+    ),
+    .executableTarget(
+      name: "CredentialBrokerPhysicalValidation",
       dependencies: ["WebKitUIMCPRuntime"]
     ),
     .testTarget(
