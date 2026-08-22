@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import WebKit
 import WebKitUIMCPCore
 import WebKitUIMCPRuntime
 
@@ -18,7 +19,7 @@ private enum MCPServerError: Error {
 
 @MainActor
 public final class WebKitMCPServer {
-  public static let version = "0.4.0"
+  public static let version = "0.5.0"
   public static let protocolVersion = "2026-07-28"
   public static let legacyProtocolVersion = "2025-11-25"
 
@@ -26,6 +27,7 @@ public final class WebKitMCPServer {
   private let presentHumanWindows: Bool
   private let credentialBroker: any CredentialBrokerFilling
   private let confirmationPresenter: any BrowserConfirmationPresenting
+  private let profileCatalog: PersistentProfileCatalog
   private let capabilityAuthority = CapabilityAuthority()
   private let sessionAuthorizations = SessionAuthorizationStore()
   private var observations: [WebKitSessionHandle: WebKitPageObservation] = [:]
@@ -34,6 +36,8 @@ public final class WebKitMCPServer {
   private var pendingHandoffs: [String: PendingHandoff] = [:]
   private var pendingNavigations: [String: PendingNavigation] = [:]
   private var pendingAuthorizations: [String: PendingAuthorization] = [:]
+  private var pendingProfileOperations: [String: PendingProfileOperation] = [:]
+  private var pendingSessionOpens: [String: PendingSessionOpen] = [:]
 
   private enum ActPostcondition {
     case urlEquals(String)
@@ -127,6 +131,23 @@ public final class WebKitMCPServer {
     let confirmationExpiresAt: Date
   }
 
+  private enum ProfileMutation {
+    case create
+    case delete(UUID)
+  }
+
+  private struct PendingProfileOperation {
+    let arguments: [String: JSONValue]
+    let mutation: ProfileMutation
+    let expiresAt: Date
+  }
+
+  private struct PendingSessionOpen {
+    let arguments: [String: JSONValue]
+    let profileID: UUID
+    let expiresAt: Date
+  }
+
   public init(maximumSessions: Int = 1, enforceHostExclusiveSession: Bool = false) throws {
     self.registry = try WebKitSessionRegistry(
       maximumSessions: maximumSessions,
@@ -134,6 +155,7 @@ public final class WebKitMCPServer {
     self.presentHumanWindows = true
     self.credentialBroker = SyntheticCredentialBrokerXPCClient()
     self.confirmationPresenter = NativeBrowserConfirmationPresenter()
+    self.profileCatalog = try PersistentProfileCatalog()
   }
 
   init(
@@ -141,12 +163,14 @@ public final class WebKitMCPServer {
     presentHumanWindows: Bool = false,
     credentialBroker: any CredentialBrokerFilling = SyntheticCredentialBrokerXPCClient(),
     confirmationPresenter: any BrowserConfirmationPresenting =
-      NativeBrowserConfirmationPresenter()
+      NativeBrowserConfirmationPresenter(),
+    profileCatalog: PersistentProfileCatalog? = nil
   ) {
     self.registry = registry
     self.presentHumanWindows = presentHumanWindows
     self.credentialBroker = credentialBroker
     self.confirmationPresenter = confirmationPresenter
+    self.profileCatalog = try! profileCatalog ?? PersistentProfileCatalog()
   }
 
   public func handle(_ input: Data) async -> Data? {
@@ -271,6 +295,8 @@ public final class WebKitMCPServer {
         return try await navigateTool(params: params, arguments: arguments, modern: modern)
       case "browser_authorization":
         return try await authorizationTool(params: params, arguments: arguments, modern: modern)
+      case "browser_profile":
+        return try await profileTool(params: params, arguments: arguments, modern: modern)
       case "browser_observe":
         let handle = try sessionHandle(arguments)
         let runtime = try registry.runtime(for: handle)
@@ -348,17 +374,60 @@ public final class WebKitMCPServer {
     let operation = try requireString(arguments["operation"], named: "operation")
     switch operation {
     case "open":
-      guard arguments.keys.allSatisfy({ $0 == "operation" }) else {
-        throw MCPServerError.invalidParams("open accepts only operation")
+      let allowedKeys = Set(["operation", "profile_id"])
+      guard Set(arguments.keys).isSubset(of: allowedKeys) else {
+        throw MCPServerError.invalidParams("open accepts only operation and optional profile_id")
       }
-      let handle = try registry.open()
-      coordinators[handle] = WebKitTransactionCoordinator(
-        runtime: try registry.runtime(for: handle))
-      return try toolResult(
-        structured: .object([
-          "session_id": .string(handle.rawValue.uuidString),
-          "maximum_sessions": .int(Int64(registry.maximumSessions)),
-        ]), modern: modern)
+      guard let profileValue = arguments["profile_id"] else {
+        guard params["requestState"] == nil, params["inputResponses"] == nil else {
+          throw MCPServerError.invalidParams("ephemeral open is not multi-round")
+        }
+        return try openSession(profileID: nil, modern: modern)
+      }
+      let profileID = try requireUUID(profileValue, named: "profile_id")
+      guard try profileCatalog.contains(profileID) else {
+        throw MCPServerError.invalidParams("persistent profile is unknown")
+      }
+      if modern, let requestState = params["requestState"]?.stringValue {
+        guard let pending = pendingSessionOpens.removeValue(forKey: requestState) else {
+          throw MCPServerError.invalidParams("requestState is unknown or already used")
+        }
+        guard pending.expiresAt > Date(), pending.arguments == arguments else {
+          throw MCPServerError.invalidParams("profile attachment expired or arguments changed")
+        }
+        guard acceptedConfirmation(params["inputResponses"]) else {
+          return try toolError("The user did not approve persistent profile access", modern: true)
+        }
+        return try openSession(profileID: pending.profileID, modern: true)
+      }
+      guard params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams("inputResponses requires requestState")
+      }
+      let message =
+        "Open one browser session using persistent profile \(jsonQuoted(profileID.uuidString))? "
+        + "This may expose that profile's existing authenticated website state to browser tools. "
+        + "Cookies and credentials remain inside WebKit and are never returned by MCP."
+      if !modern {
+        guard
+          confirmationPresenter.confirm(
+            title: "Open Persistent Browser Profile",
+            message: message,
+            approveLabel: "Open Profile"
+          )
+        else {
+          return try toolError("The user did not approve persistent profile access", modern: false)
+        }
+        return try openSession(profileID: profileID, modern: false)
+      }
+      try requireFormElicitationCapability(params)
+      pendingSessionOpens = pendingSessionOpens.filter { $0.value.expiresAt > Date() }
+      let requestState = UUID().uuidString
+      pendingSessionOpens[requestState] = PendingSessionOpen(
+        arguments: arguments, profileID: profileID, expiresAt: Date().addingTimeInterval(60))
+      return confirmationInputRequired(
+        requestState: requestState,
+        message: message,
+        title: "Allow access to this persistent browser profile")
     case "status":
       return try toolResult(
         structured: .encoded(try registry.status(sessionHandle(arguments))), modern: modern)
@@ -473,6 +542,185 @@ public final class WebKitMCPServer {
                 "confirm": .object([
                   "type": .string("boolean"),
                   "title": .string("Approve this exact navigation"),
+                ])
+              ]),
+              "required": .array([.string("confirm")]),
+            ]),
+          ]),
+        ])
+      ]),
+    ])
+  }
+
+  private func openSession(profileID: UUID?, modern: Bool) throws -> JSONValue {
+    let handle = try registry.open(persistentProfileID: profileID)
+    coordinators[handle] = WebKitTransactionCoordinator(
+      runtime: try registry.runtime(for: handle))
+    var structured: [String: JSONValue] = [
+      "session_id": .string(handle.rawValue.uuidString),
+      "maximum_sessions": .int(Int64(registry.maximumSessions)),
+      "storage_mode": .string(profileID == nil ? "ephemeral" : "persistent_profile"),
+    ]
+    if let profileID { structured["profile_id"] = .string(profileID.uuidString) }
+    return try toolResult(structured: .object(structured), modern: modern)
+  }
+
+  private func profileTool(
+    params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
+  ) async throws -> JSONValue {
+    let operation = try requireString(arguments["operation"], named: "operation")
+    switch operation {
+    case "status":
+      guard params["requestState"] == nil, params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams("profile status is not multi-round")
+      }
+      guard Set(arguments.keys) == Set(["operation", "profile_id"]) else {
+        throw MCPServerError.invalidParams("profile status requires only operation and profile_id")
+      }
+      let profileID = try requireUUID(arguments["profile_id"], named: "profile_id")
+      let exists = try profileCatalog.contains(profileID)
+      return try toolResult(
+        structured: .object([
+          "exists": .bool(exists),
+          "active": .bool(exists && registry.hasActiveSession(persistentProfileID: profileID)),
+        ]), modern: modern)
+    case "create", "delete":
+      let mutation: ProfileMutation
+      if operation == "create" {
+        guard Set(arguments.keys) == Set(["operation"]) else {
+          throw MCPServerError.invalidParams("profile create accepts only operation")
+        }
+        mutation = .create
+      } else {
+        guard Set(arguments.keys) == Set(["operation", "profile_id"]) else {
+          throw MCPServerError.invalidParams(
+            "profile delete requires only operation and profile_id")
+        }
+        let profileID = try requireUUID(arguments["profile_id"], named: "profile_id")
+        guard try profileCatalog.contains(profileID) else {
+          throw MCPServerError.invalidParams("persistent profile is unknown")
+        }
+        guard !registry.hasActiveSession(persistentProfileID: profileID) else {
+          throw MCPServerError.invalidParams(
+            "close every session using this profile before deletion")
+        }
+        mutation = .delete(profileID)
+      }
+      if modern, let requestState = params["requestState"]?.stringValue {
+        guard let pending = pendingProfileOperations.removeValue(forKey: requestState) else {
+          throw MCPServerError.invalidParams("requestState is unknown or already used")
+        }
+        guard pending.expiresAt > Date(), pending.arguments == arguments else {
+          throw MCPServerError.invalidParams("profile confirmation expired or arguments changed")
+        }
+        guard acceptedConfirmation(params["inputResponses"]) else {
+          return try toolError("The user did not approve this profile operation", modern: true)
+        }
+        return try await executeProfileMutation(pending.mutation, modern: true)
+      }
+      guard params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams("inputResponses requires requestState")
+      }
+      let message = profileConfirmationMessage(mutation)
+      if !modern {
+        guard
+          confirmationPresenter.confirm(
+            title: operation == "create"
+              ? "Create Persistent Browser Profile" : "Delete Persistent Browser Profile",
+            message: message,
+            approveLabel: operation == "create" ? "Create Profile" : "Delete Permanently"
+          )
+        else {
+          return try toolError("The user did not approve this profile operation", modern: false)
+        }
+        return try await executeProfileMutation(mutation, modern: false)
+      }
+      try requireFormElicitationCapability(params)
+      pendingProfileOperations = pendingProfileOperations.filter { $0.value.expiresAt > Date() }
+      let requestState = UUID().uuidString
+      pendingProfileOperations[requestState] = PendingProfileOperation(
+        arguments: arguments, mutation: mutation, expiresAt: Date().addingTimeInterval(60))
+      return confirmationInputRequired(
+        requestState: requestState,
+        message: message,
+        title: operation == "create"
+          ? "Create this local persistent profile"
+          : "Permanently delete this profile and its website data")
+    default:
+      throw MCPServerError.invalidParams("profile operation must be create, status, or delete")
+    }
+  }
+
+  private func profileConfirmationMessage(_ mutation: ProfileMutation) -> String {
+    switch mutation {
+    case .create:
+      return
+        "Create one isolated persistent WebKit profile on this Mac? It may retain cookies, local storage, caches, and authenticated state across MCP restarts. MCP cannot read or export cookies or credentials. The returned opaque profile ID is required to reopen or delete it."
+    case .delete(let profileID):
+      return
+        "Permanently delete persistent WebKit profile \(jsonQuoted(profileID.uuidString)) and its cookies, local storage, caches, and authenticated state? This cannot be undone."
+    }
+  }
+
+  private func executeProfileMutation(
+    _ mutation: ProfileMutation, modern: Bool
+  ) async throws -> JSONValue {
+    switch mutation {
+    case .create:
+      let profileID = try profileCatalog.create()
+      _ = WKWebsiteDataStore(forIdentifier: profileID)
+      return try toolResult(
+        structured: .object([
+          "created": .bool(true),
+          "profile_id": .string(profileID.uuidString),
+          "storage_mode": .string("persistent_profile"),
+        ]), modern: modern)
+    case .delete(let profileID):
+      do {
+        try await removePersistentDataStoreWhenReleased(profileID)
+      } catch {
+        return try toolError(
+          "WebKit could not delete the persistent profile; it may still be active in another client",
+          modern: modern)
+      }
+      try profileCatalog.remove(profileID)
+      return try toolResult(
+        structured: .object(["deleted": .bool(true)]), modern: modern)
+    }
+  }
+
+  private func removePersistentDataStoreWhenReleased(_ profileID: UUID) async throws {
+    var lastError: Error?
+    for _ in 0..<20 {
+      do {
+        try await WKWebsiteDataStore.remove(forIdentifier: profileID)
+        return
+      } catch {
+        lastError = error
+        try await Task.sleep(for: .milliseconds(50))
+      }
+    }
+    if let lastError { throw lastError }
+  }
+
+  private func confirmationInputRequired(
+    requestState: String, message: String, title: String
+  ) -> JSONValue {
+    .object([
+      "resultType": .string("input_required"),
+      "requestState": .string(requestState),
+      "inputRequests": .object([
+        "confirmation": .object([
+          "method": .string("elicitation/create"),
+          "params": .object([
+            "mode": .string("form"),
+            "message": .string(message),
+            "requestedSchema": .object([
+              "type": .string("object"),
+              "properties": .object([
+                "confirm": .object([
+                  "type": .string("boolean"),
+                  "title": .string(title),
                 ])
               ]),
               "required": .array([.string("confirm")]),
@@ -1313,11 +1561,16 @@ public final class WebKitMCPServer {
   }
 
   private func sessionHandle(_ arguments: [String: JSONValue]) throws -> WebKitSessionHandle {
-    let raw = try requireString(arguments["session_id"], named: "session_id")
-    guard let id = UUID(uuidString: raw) else {
-      throw MCPServerError.invalidParams("session_id must be a UUID")
+    WebKitSessionHandle(
+      rawValue: try requireUUID(arguments["session_id"], named: "session_id"))
+  }
+
+  private func requireUUID(_ value: JSONValue?, named name: String) throws -> UUID {
+    let raw = try requireString(value, named: name)
+    guard let identifier = UUID(uuidString: raw), identifier.uuidString == raw.uppercased() else {
+      throw MCPServerError.invalidParams("\(name) must be a canonical UUID")
     }
-    return WebKitSessionHandle(rawValue: id)
+    return identifier
   }
 
   private func requireObject(
@@ -1588,16 +1841,38 @@ public final class WebKitMCPServer {
       readOnly: true
     ),
     tool(
+      name: "browser_profile",
+      description:
+        "Create, inspect, or permanently delete one opaque local persistent WebKit profile. Create and delete require exact human confirmation. Status requires the exact profile ID and never lists profiles. Cookies, credentials, domains, and website data remain inside WebKit and are never returned by MCP. Delete is refused while any session uses the profile.",
+      properties: [
+        "operation": .object([
+          "type": .string("string"),
+          "enum": .array([.string("create"), .string("status"), .string("delete")]),
+        ]),
+        "profile_id": .object([
+          "type": .string("string"), "format": .string("uuid"),
+          "description": .string("Opaque handle returned by browser_profile operation=create."),
+        ]),
+      ],
+      required: ["operation"],
+      readOnly: false,
+      destructive: true
+    ),
+    tool(
       name: "browser_session",
       description:
-        "Open, inspect, or close one bounded native WebKit session. Open uses the default persistent WebKit data store.",
+        "Open, inspect, close, or hand off one bounded native WebKit session. Open is ephemeral by default. Supplying an existing profile_id requires exact human confirmation and attaches only that isolated persistent WebKit profile; cookies and credentials are never returned by MCP.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
           "enum": .array([
             .string("open"), .string("status"), .string("close"), .string("handoff"),
           ]),
-        ])
+        ]),
+        "profile_id": .object([
+          "type": .string("string"), "format": .string("uuid"),
+          "description": .string("Optional opaque persistent profile handle for operation=open."),
+        ]),
       ]) { _, new in new },
       required: ["operation"],
       readOnly: false,

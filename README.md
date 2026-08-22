@@ -10,7 +10,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 
 - Native `WKWebView` runtime with an isolated ephemeral WebKit data store per MCP session; authentication remains available for that session without crossing project boundaries.
 - MCP 2026-07-28 stdio server with legacy initialization compatibility.
-- Eight bounded tools: `browser_session`, `browser_authorization`, `browser_navigate`, `browser_observe`, `browser_capture`, `browser_act`, `browser_fill_siliconpass`, and `browser_transaction`.
+- Nine bounded tools: `browser_session`, `browser_profile`, `browser_authorization`, `browser_navigate`, `browser_observe`, `browser_capture`, `browser_act`, `browser_fill_siliconpass`, and `browser_transaction`.
 - Observation-scoped element symbols backed by semantic locator recipes and fresh action-time resolution.
 - Five separate addressing counters: `address_resolution_failed`, `address_now_ambiguous`, `logical_target_changed`, `node_replaced_but_semantic_locator_recovered`, and `coordinate_invalidated_by_layout_change`.
 - Provenance attached to every serialized page string.
@@ -30,6 +30,11 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Local human handoff: the actual WebKit session becomes a visible window for login, MFA, CAPTCHA, or sensitive input; the agent is locked out until confirmed resume and fresh re-observation.
 - MCP sessions use a per-session loopback SOCKS5 boundary with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
 - Each client can hold up to eight isolated browser sessions, and independent local/remote MCP clients can run concurrently. Every session owns its WebKit runtime, proxy boundary, cookies, storage, observations, transactions, and human-control window.
+- Sessions are ephemeral by default. An opt-in persistent profile can retain a
+  site's WebKit-managed cookies and storage across MCP restarts without sharing
+  them with another profile. Profile creation, attachment, and permanent
+  deletion are exact-confirmed; profile enumeration and cookie export do not
+  exist.
 - Private remote clients can use the Aqua LaunchAgent broker plus a forced-command SSH relay; WebKit and authenticated profile data remain on the logged-in Mac.
 - Web-content termination invalidates every observation immediately; recovery reloads the host-owned last URL without replaying an action. A forced-crash fixture verifies that an `HttpOnly` authenticated cookie plus `localStorage` and `sessionStorage` survive in the same view/data-store lifetime.
 
@@ -93,6 +98,16 @@ for a running conversation and are not retroactively replaced.
 5. Use the fresh `observationID` and `elementID` once.
 6. `browser_act` returns `input_required`; approve the exact bound action.
 7. Read or reconcile the receipt with `browser_transaction`.
+
+For a site that should remain signed in, first create an opaque profile with
+`browser_profile { operation: "create" }` and approve it. Store the returned
+`profile_id` only in the local project configuration, never in Git. On a future
+run, call `browser_session { operation: "open", profile_id: "..." }` and approve
+access to that existing authenticated state. The confirmation exposes no cookie
+or credential value. `browser_profile { operation: "status", profile_id: "..." }`
+checks one exact handle without enumerating other projects. `operation: "delete"`
+permanently removes the WebKit data after confirmation and is refused while the
+profile is active in any detectable WebKit process.
 
 Use `browser_authorization { operation: "status", ... }` to inspect active
 grants and `operation: "revoke"` with an exact origin—or without one for the

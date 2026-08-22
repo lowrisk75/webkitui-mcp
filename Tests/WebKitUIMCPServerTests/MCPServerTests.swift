@@ -142,6 +142,7 @@ struct MCPServerTests {
         "browser_fill_siliconpass",
         "browser_navigate",
         "browser_observe",
+        "browser_profile",
         "browser_session",
         "browser_transaction",
       ]

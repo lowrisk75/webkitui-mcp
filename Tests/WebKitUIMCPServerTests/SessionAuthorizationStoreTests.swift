@@ -256,6 +256,88 @@ struct SessionAuthorizationStoreTests {
     #expect(presenter.requests.first?.1.contains("example.test") == true)
   }
 
+  @Test("Persistent profiles require confirmation, attach exactly, and delete only when inactive")
+  func persistentProfileLifecycle() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-profile-server-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let catalog = try PersistentProfileCatalog(directoryURL: directory)
+    let registry = try WebKitSessionRegistry()
+    let server = WebKitMCPServer(registry: registry, profileCatalog: catalog)
+
+    let createArguments: [String: JSONValue] = ["operation": .string("create")]
+    let createPrepared = try await toolCall(
+      server, id: 1, name: "browser_profile", arguments: createArguments)
+    let createState = try string(try object(createPrepared["result"])["requestState"])
+    let created = try await roundTripToolCall(
+      server,
+      id: 2,
+      name: "browser_profile",
+      arguments: createArguments,
+      requestState: createState,
+      action: "accept",
+      confirm: true)
+    let profileID = try string(
+      try object(try object(created["result"])["structuredContent"])["profile_id"])
+
+    let openArguments: [String: JSONValue] = [
+      "operation": .string("open"), "profile_id": .string(profileID),
+    ]
+    let openPrepared = try await toolCall(
+      server, id: 3, name: "browser_session", arguments: openArguments)
+    let openState = try string(try object(openPrepared["result"])["requestState"])
+    let opened = try await roundTripToolCall(
+      server,
+      id: 4,
+      name: "browser_session",
+      arguments: openArguments,
+      requestState: openState,
+      action: "accept",
+      confirm: true)
+    let openedBody = try object(try object(opened["result"])["structuredContent"])
+    let sessionID = try string(openedBody["session_id"])
+    #expect(openedBody["profile_id"] == .string(profileID))
+    #expect(openedBody["storage_mode"] == .string("persistent_profile"))
+
+    let activeDelete = try await toolCall(
+      server,
+      id: 5,
+      name: "browser_profile",
+      arguments: ["operation": .string("delete"), "profile_id": .string(profileID)])
+    #expect(try object(activeDelete["error"])["code"] == .int(-32602))
+
+    _ = try await toolCall(
+      server,
+      id: 6,
+      name: "browser_session",
+      arguments: ["operation": .string("close"), "session_id": .string(sessionID)])
+
+    let deleteArguments: [String: JSONValue] = [
+      "operation": .string("delete"), "profile_id": .string(profileID),
+    ]
+    let deletePrepared = try await toolCall(
+      server, id: 7, name: "browser_profile", arguments: deleteArguments)
+    let deleteState = try string(try object(deletePrepared["result"])["requestState"])
+    let deleted = try await roundTripToolCall(
+      server,
+      id: 8,
+      name: "browser_profile",
+      arguments: deleteArguments,
+      requestState: deleteState,
+      action: "accept",
+      confirm: true)
+    #expect(
+      try object(try object(deleted["result"])["structuredContent"])["deleted"] == .bool(true))
+
+    let status = try await toolCall(
+      server,
+      id: 9,
+      name: "browser_profile",
+      arguments: ["operation": .string("status"), "profile_id": .string(profileID)])
+    #expect(
+      try object(try object(status["result"])["structuredContent"])["exists"] == .bool(false))
+  }
+
   private func toolCall(
     _ server: WebKitMCPServer,
     id: Int64,

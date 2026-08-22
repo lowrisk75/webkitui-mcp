@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import WebKit
 
 public struct WebKitSessionHandle: Codable, Hashable, Sendable {
   public let rawValue: UUID
@@ -11,6 +12,7 @@ public struct WebKitSessionHandle: Codable, Hashable, Sendable {
 
 public struct WebKitSessionStatus: Codable, Equatable, Sendable {
   public let sessionID: UUID
+  public let persistentProfileID: UUID?
   public let currentURL: String?
   public let isLoading: Bool
 }
@@ -72,9 +74,14 @@ private final class HostControllerLease {
 
 @MainActor
 public final class WebKitSessionRegistry {
+  private struct SessionEntry {
+    let runtime: WebKitRuntime
+    let persistentProfileID: UUID?
+  }
+
   public let maximumSessions: Int
   private let enforceHostExclusiveSession: Bool
-  private var sessions: [WebKitSessionHandle: WebKitRuntime] = [:]
+  private var sessions: [WebKitSessionHandle: SessionEntry] = [:]
   private var hostControllerLease: HostControllerLease?
 
   public init(maximumSessions: Int = 1, enforceHostExclusiveSession: Bool = false) throws {
@@ -85,16 +92,19 @@ public final class WebKitSessionRegistry {
 
   public var count: Int { sessions.count }
 
-  public func open() throws -> WebKitSessionHandle {
+  public func open(persistentProfileID: UUID? = nil) throws -> WebKitSessionHandle {
     guard sessions.count < maximumSessions else {
       throw WebKitSessionRegistryError.capacityReached
     }
     let lease = try enforceHostExclusiveSession ? HostControllerLease() : nil
     let handle = WebKitSessionHandle(rawValue: UUID())
     do {
-      // Every session gets a distinct ephemeral WebKit store. This prevents cookies,
-      // local storage, caches, and authenticated state from crossing project boundaries.
-      sessions[handle] = try WebKitRuntime(protectedWebsiteDataStore: .nonPersistent())
+      let dataStore =
+        persistentProfileID.map(WKWebsiteDataStore.init(forIdentifier:))
+        ?? .nonPersistent()
+      sessions[handle] = SessionEntry(
+        runtime: try WebKitRuntime(protectedWebsiteDataStore: dataStore),
+        persistentProfileID: persistentProfileID)
       hostControllerLease = lease
     } catch {
       throw WebKitSessionRegistryError.networkBoundaryUnavailable
@@ -103,26 +113,34 @@ public final class WebKitSessionRegistry {
   }
 
   public func close(_ handle: WebKitSessionHandle) throws {
-    guard let runtime = sessions.removeValue(forKey: handle) else {
+    guard let entry = sessions.removeValue(forKey: handle) else {
       throw WebKitSessionRegistryError.unknownSession
     }
-    runtime.invalidate()
+    entry.runtime.invalidate()
     if sessions.isEmpty { hostControllerLease = nil }
   }
 
   public func runtime(for handle: WebKitSessionHandle) throws -> WebKitRuntime {
-    guard let runtime = sessions[handle] else {
+    guard let runtime = sessions[handle]?.runtime else {
       throw WebKitSessionRegistryError.unknownSession
     }
     return runtime
   }
 
   public func status(_ handle: WebKitSessionHandle) throws -> WebKitSessionStatus {
-    let runtime = try runtime(for: handle)
+    guard let entry = sessions[handle] else {
+      throw WebKitSessionRegistryError.unknownSession
+    }
+    let runtime = entry.runtime
     return WebKitSessionStatus(
       sessionID: handle.rawValue,
+      persistentProfileID: entry.persistentProfileID,
       currentURL: runtime.webView.url?.absoluteString,
       isLoading: runtime.webView.isLoading
     )
+  }
+
+  public func hasActiveSession(persistentProfileID: UUID) -> Bool {
+    sessions.values.contains { $0.persistentProfileID == persistentProfileID }
   }
 }
