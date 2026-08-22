@@ -12,6 +12,7 @@ let package = Package(
     .library(name: "WebKitUIMCPRuntime", targets: ["WebKitUIMCPRuntime"]),
     .library(name: "WebKitUIMCPServer", targets: ["WebKitUIMCPServer"]),
     .executable(name: "webkitui-mcp", targets: ["WebKitUIMCPCLI"]),
+    .executable(name: "webkitui-mcp-confirm", targets: ["WebKitUIMCPConfirm"]),
     .executable(name: "webkitui-mcp-aqua-broker", targets: ["WebKitUIMCPAquaBroker"]),
     .executable(name: "webkitui-mcp-relay", targets: ["WebKitUIMCPRelay"]),
     .executable(name: "wkjs-handle-probe", targets: ["WKJSHandleProbe"]),
@@ -36,6 +37,7 @@ let package = Package(
       name: "WebKitUIMCPCLI",
       dependencies: ["WebKitUIMCPServer"]
     ),
+    .executableTarget(name: "WebKitUIMCPConfirm"),
     .executableTarget(
       name: "WebKitUIMCPAquaBroker",
       dependencies: ["CLaunchShim", "WebKitUIMCPServer"]

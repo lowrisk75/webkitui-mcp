@@ -24,6 +24,7 @@ public final class WebKitMCPServer {
   private let registry: WebKitSessionRegistry
   private let presentHumanWindows: Bool
   private let credentialBroker: any CredentialBrokerFilling
+  private let confirmationPresenter: any BrowserConfirmationPresenting
   private let capabilityAuthority = CapabilityAuthority()
   private var observations: [WebKitSessionHandle: WebKitPageObservation] = [:]
   private var coordinators: [WebKitSessionHandle: WebKitTransactionCoordinator] = [:]
@@ -119,16 +120,20 @@ public final class WebKitMCPServer {
       enforceHostExclusiveSession: enforceHostExclusiveSession)
     self.presentHumanWindows = true
     self.credentialBroker = SyntheticCredentialBrokerXPCClient()
+    self.confirmationPresenter = NativeBrowserConfirmationPresenter()
   }
 
   init(
     registry: WebKitSessionRegistry,
     presentHumanWindows: Bool = false,
-    credentialBroker: any CredentialBrokerFilling = SyntheticCredentialBrokerXPCClient()
+    credentialBroker: any CredentialBrokerFilling = SyntheticCredentialBrokerXPCClient(),
+    confirmationPresenter: any BrowserConfirmationPresenting =
+      NativeBrowserConfirmationPresenter()
   ) {
     self.registry = registry
     self.presentHumanWindows = presentHumanWindows
     self.credentialBroker = credentialBroker
+    self.confirmationPresenter = confirmationPresenter
   }
 
   public func handle(_ input: Data) async -> Data? {
@@ -361,11 +366,9 @@ public final class WebKitMCPServer {
   private func navigateTool(
     params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
-    guard modern else {
-      return try toolError(
-        "browser_navigate requires MCP 2026-07-28 multi-round tool results", modern: false)
+    if modern {
+      try requireFormElicitationCapability(params)
     }
-    try requireFormElicitationCapability(params)
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
     let url = try safeNavigationURL(try requireString(arguments["url"], named: "url"))
@@ -375,7 +378,7 @@ public final class WebKitMCPServer {
       arguments["quiet_window_ms"], defaultValue: 300, range: 20...5_000,
       name: "quiet_window_ms")
 
-    if let requestState = params["requestState"]?.stringValue {
+    if modern, let requestState = params["requestState"]?.stringValue {
       guard let pending = pendingNavigations.removeValue(forKey: requestState) else {
         throw MCPServerError.invalidParams("requestState is unknown or already used")
       }
@@ -385,50 +388,16 @@ public final class WebKitMCPServer {
       guard acceptedConfirmation(params["inputResponses"]) else {
         return try toolError("The user did not approve this navigation", modern: true)
       }
-      guard
-        let scheme = pending.url.scheme,
-        let host = pending.url.host
-      else { throw MCPServerError.invalidParams("navigation URL has no security origin") }
-      let origin = SecurityOrigin(scheme: scheme, host: host, port: pending.url.port)
-      let capability = await capabilityAuthority.issue(
-        CapabilityScope(
-          actions: [.navigate], origins: [origin],
-          acceptedInputProvenance: [.modelGenerated],
-          expiresAt: Date().addingTimeInterval(15)))
-      let decision = await capabilityAuthority.evaluate(
-        CapabilityRequest(
-          action: .navigate, liveOrigin: origin, inputProvenance: [.modelGenerated]),
-        using: capability,
-        now: Date()
-      )
-      guard decision == .allowed else {
-        await capabilityAuthority.revoke(capability)
-        return try toolError("Private navigation capability was denied", modern: true)
-      }
-      do {
-        let result = try await runtime.navigate(
-          to: pending.url,
-          timeout: .milliseconds(pending.timeoutMilliseconds),
-          quietWindow: .milliseconds(pending.quietWindowMilliseconds),
-          constrainToInitialOrigin: true
-        )
-        await capabilityAuthority.revoke(capability)
-        observations.removeValue(forKey: handle)
-        return try toolResult(structured: .encoded(result), modern: modern)
-      } catch {
-        await capabilityAuthority.revoke(capability)
-        throw error
-      }
+      return try await executeNavigation(pending, runtime: runtime, modern: true)
     }
 
     guard params["inputResponses"] == nil else {
       throw MCPServerError.invalidParams("inputResponses requires requestState")
     }
-    pendingNavigations = pendingNavigations.filter {
-      $0.value.expiresAt > Date() && $0.value.session != handle
+    guard params["requestState"] == nil else {
+      throw MCPServerError.invalidParams("requestState is unavailable without MCP 2026-07-28")
     }
-    let requestState = UUID().uuidString
-    pendingNavigations[requestState] = PendingNavigation(
+    let pending = PendingNavigation(
       arguments: arguments,
       session: handle,
       url: url,
@@ -436,6 +405,24 @@ public final class WebKitMCPServer {
       quietWindowMilliseconds: quiet,
       expiresAt: Date().addingTimeInterval(60)
     )
+    if !modern {
+      let currentURL = runtime.webView.url?.absoluteString ?? "no current page"
+      guard
+        confirmationPresenter.confirm(
+          title: "Approve Web Navigation",
+          message: navigationConfirmationMessage(currentURL: currentURL, url: url),
+          approveLabel: "Navigate"
+        )
+      else {
+        return try toolError("The user did not approve this navigation", modern: false)
+      }
+      return try await executeNavigation(pending, runtime: runtime, modern: false)
+    }
+    pendingNavigations = pendingNavigations.filter {
+      $0.value.expiresAt > Date() && $0.value.session != handle
+    }
+    let requestState = UUID().uuidString
+    pendingNavigations[requestState] = pending
     let currentURL = runtime.webView.url?.absoluteString ?? "no current page"
     return .object([
       "resultType": .string("input_required"),
@@ -445,11 +432,7 @@ public final class WebKitMCPServer {
           "method": .string("elicitation/create"),
           "params": .object([
             "mode": .string("form"),
-            "message": .string(
-              "Approve one exact open-world navigation? Current page: "
-                + "\(jsonQuoted(currentURL)). Destination: \(jsonQuoted(url.absoluteString)). "
-                + "A GET can still change state on a non-conforming site."
-            ),
+            "message": .string(navigationConfirmationMessage(currentURL: currentURL, url: url)),
             "requestedSchema": .object([
               "type": .string("object"),
               "properties": .object([
@@ -470,12 +453,6 @@ public final class WebKitMCPServer {
     arguments: [String: JSONValue],
     modern: Bool
   ) async throws -> JSONValue {
-    guard modern else {
-      return try toolError(
-        "SiliconPass credential fill requires MCP 2026-07-28",
-        modern: false
-      )
-    }
     let allowedKeys = Set([
       "session_id", "observation_id", "username_element_id", "password_element_id",
     ])
@@ -506,11 +483,14 @@ public final class WebKitMCPServer {
     }
     return try toolResult(
       structured: .object(["status": .string(status.rawValue)]),
-      modern: true
+      modern: modern
     )
   }
 
   private func safeNavigationURL(_ rawValue: String) throws -> URL {
+    guard rawValue.utf8.count <= 8_192 else {
+      throw MCPServerError.invalidParams("url must contain at most 8192 UTF-8 bytes")
+    }
     guard
       let components = URLComponents(string: rawValue),
       let scheme = components.scheme?.lowercased(),
@@ -542,13 +522,55 @@ public final class WebKitMCPServer {
   private func handoffTool(
     params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
-    guard modern else {
-      return try toolError(
-        "Human handoff requires MCP 2026-07-28 multi-round tool results", modern: false)
+    if modern {
+      try requireFormElicitationCapability(params)
     }
-    try requireFormElicitationCapability(params)
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
+    if !modern {
+      guard params["requestState"] == nil, params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams(
+          "multi-round handoff fields require MCP 2026-07-28")
+      }
+      switch runtime.interactionControlState() {
+      case .agentControlled, .freshlyReobserved:
+        try runtime.requestHumanHandoff()
+        try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+        return try toolResult(
+          structured: .object([
+            "control_state": .string(runtime.interactionControlState().rawValue),
+            "instructions": .string(
+              "Complete login, MFA, CAPTCHA, or sensitive input in the local WebKit window, then call browser_session operation=handoff again to request agent resume."
+            ),
+          ]),
+          modern: false
+        )
+      case .humanControlled:
+        guard
+          confirmationPresenter.confirm(
+            title: "Return Browser Control",
+            message:
+              "Return control of the visible WebKit session to the requesting agent? A fresh observation will be required.",
+            approveLabel: "Return Control"
+          )
+        else {
+          return try toolError(
+            "Human control remains active until an explicit resume confirmation", modern: false)
+        }
+        try runtime.requestAgentResume()
+        let observation = try await runtime.resumeAfterHumanControl()
+        observations[handle] = observation
+        return try toolResult(
+          structured: .object([
+            "control_state": .string(runtime.interactionControlState().rawValue),
+            "observation": try .encoded(observation),
+          ]),
+          modern: false
+        )
+      default:
+        throw MCPServerError.invalidParams("handoff transition is already in progress")
+      }
+    }
     if let requestState = params["requestState"]?.stringValue {
       guard let pending = pendingHandoffs.removeValue(forKey: requestState) else {
         throw MCPServerError.invalidParams("requestState is unknown or already used")
@@ -622,11 +644,9 @@ public final class WebKitMCPServer {
     arguments: [String: JSONValue],
     modern: Bool
   ) async throws -> JSONValue {
-    guard modern else {
-      return try toolError(
-        "browser_act requires MCP 2026-07-28 multi-round tool results", modern: false)
+    if modern {
+      try requireFormElicitationCapability(params)
     }
-    try requireFormElicitationCapability(params)
     let handle = try sessionHandle(arguments)
     guard let observation = observations[handle] else {
       throw MCPServerError.invalidParams("Call browser_observe before browser_act")
@@ -692,7 +712,7 @@ public final class WebKitMCPServer {
     let idempotencyKey = try requireString(
       arguments["idempotency_key"], named: "idempotency_key")
 
-    if let requestState = params["requestState"]?.stringValue {
+    if modern, let requestState = params["requestState"]?.stringValue {
       guard let pending = pendingActuations.removeValue(forKey: requestState) else {
         throw MCPServerError.invalidParams("requestState is unknown or already used")
       }
@@ -711,14 +731,10 @@ public final class WebKitMCPServer {
     guard params["inputResponses"] == nil else {
       throw MCPServerError.invalidParams("inputResponses requires requestState")
     }
-    pendingActuations = pendingActuations.filter {
-      $0.value.expiresAt > Date() && $0.value.session != handle
+    guard params["requestState"] == nil else {
+      throw MCPServerError.invalidParams("requestState is unavailable without MCP 2026-07-28")
     }
-    let requestState = UUID().uuidString
-    let untrustedLabel = target.accessibleName ?? target.label ?? target.text
-    let label = String((untrustedLabel?.segments.map(\.text).joined() ?? "").prefix(120))
-    let currentURL = observation.url.segments.first?.text ?? "unknown"
-    pendingActuations[requestState] = PendingActuation(
+    let pending = PendingActuation(
       arguments: arguments,
       session: handle,
       observation: observation,
@@ -728,6 +744,30 @@ public final class WebKitMCPServer {
       postcondition: postcondition,
       expiresAt: Date().addingTimeInterval(60)
     )
+    let confirmationMessage = actuationConfirmationMessage(
+      operation: operation,
+      currentURL: observation.url.segments.first?.text ?? "unknown",
+      elementID: elementID,
+      label: String(
+        ((target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text).joined() ?? "")
+          .prefix(120)),
+      postcondition: postcondition
+    )
+    if !modern {
+      guard
+        confirmationPresenter.confirm(
+          title: "Approve Browser Action",
+          message: confirmationMessage,
+          approveLabel: "Approve Once"
+        )
+      else { return try toolError("The user did not approve this action", modern: false) }
+      return try await executeActuation(pending, modern: false)
+    }
+    pendingActuations = pendingActuations.filter {
+      $0.value.expiresAt > Date() && $0.value.session != handle
+    }
+    let requestState = UUID().uuidString
+    pendingActuations[requestState] = pending
     return .object([
       "resultType": .string("input_required"),
       "requestState": .string(requestState),
@@ -737,13 +777,7 @@ public final class WebKitMCPServer {
           "params": .object([
             "mode": .string("form"),
             "message": .string(
-              actuationConfirmationMessage(
-                operation: operation,
-                currentURL: currentURL,
-                elementID: elementID,
-                label: label,
-                postcondition: postcondition
-              )),
+              confirmationMessage),
             "requestedSchema": .object([
               "type": .string("object"),
               "properties": .object([
@@ -772,8 +806,56 @@ public final class WebKitMCPServer {
   }
 
   private func jsonQuoted(_ value: String) -> String {
-    guard let data = try? JSONEncoder().encode(value) else { return "\"unavailable\"" }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .withoutEscapingSlashes
+    guard let data = try? encoder.encode(value) else { return "\"unavailable\"" }
     return String(decoding: data, as: UTF8.self)
+  }
+
+  private func navigationConfirmationMessage(currentURL: String, url: URL) -> String {
+    "Approve one exact open-world navigation? Current page: \(jsonQuoted(currentURL)). "
+      + "Destination: \(jsonQuoted(url.absoluteString)). "
+      + "A GET can still change state on a non-conforming site."
+  }
+
+  private func executeNavigation(
+    _ pending: PendingNavigation,
+    runtime: WebKitRuntime,
+    modern: Bool
+  ) async throws -> JSONValue {
+    guard let scheme = pending.url.scheme, let host = pending.url.host else {
+      throw MCPServerError.invalidParams("navigation URL has no security origin")
+    }
+    let origin = SecurityOrigin(scheme: scheme, host: host, port: pending.url.port)
+    let capability = await capabilityAuthority.issue(
+      CapabilityScope(
+        actions: [.navigate], origins: [origin],
+        acceptedInputProvenance: [.modelGenerated],
+        expiresAt: Date().addingTimeInterval(15)))
+    let decision = await capabilityAuthority.evaluate(
+      CapabilityRequest(
+        action: .navigate, liveOrigin: origin, inputProvenance: [.modelGenerated]),
+      using: capability,
+      now: Date()
+    )
+    guard decision == .allowed else {
+      await capabilityAuthority.revoke(capability)
+      return try toolError("Private navigation capability was denied", modern: modern)
+    }
+    do {
+      let result = try await runtime.navigate(
+        to: pending.url,
+        timeout: .milliseconds(pending.timeoutMilliseconds),
+        quietWindow: .milliseconds(pending.quietWindowMilliseconds),
+        constrainToInitialOrigin: true
+      )
+      await capabilityAuthority.revoke(capability)
+      observations.removeValue(forKey: pending.session)
+      return try toolResult(structured: .encoded(result), modern: modern)
+    } catch {
+      await capabilityAuthority.revoke(capability)
+      throw error
+    }
   }
 
   private func actuationConfirmationMessage(
@@ -1100,7 +1182,7 @@ public final class WebKitMCPServer {
   }
 
   private func serverInfo() -> JSONValue {
-    .object(["name": .string("webkitui-mcp"), "version": .string("0.1.0")])
+    .object(["name": .string("webkitui-mcp"), "version": .string("0.2.0")])
   }
 
   private func encode(_ value: JSONValue) -> Data? {
@@ -1119,7 +1201,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_act",
       description:
-        "Prepare one transactionally verified click, native form-submit click, or non-sensitive input fill. Every operation requires a fresh observation, idempotency key, and exact human confirmation. Click/submit require an exact URL or newly appearing semantic-text postcondition; fill verifies the freshly resolved target's exact value. UI state does not prove backend commit.",
+        "Prepare one transactionally verified click, native form-submit click, or non-sensitive input fill. Every operation requires a fresh observation, idempotency key, and exact human confirmation through MCP multi-round results or the server-owned native legacy fallback. Click/submit require an exact URL or newly appearing semantic-text postcondition; fill verifies the freshly resolved target's exact value. UI state does not prove backend commit.",
       properties: sessionSchemaProperties.merging([
         "observation_id": .object(["type": .string("string")]),
         "element_id": .object(["type": .string("string")]),
@@ -1190,9 +1272,12 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_navigate",
       description:
-        "Prepare one exact open-world HTTP(S) navigation for human confirmation, then wait for document completion plus mutation quiescence, never network-idle or rAF. URL credentials, local names, and IP literals are blocked.",
+        "Prepare one exact open-world HTTP(S) navigation for human confirmation through MCP multi-round results or the server-owned native legacy fallback, then wait for document completion plus mutation quiescence, never network-idle or rAF. URL credentials, local names, and IP literals are blocked.",
       properties: sessionSchemaProperties.merging([
-        "url": .object(["type": .string("string"), "format": .string("uri")]),
+        "url": .object([
+          "type": .string("string"), "format": .string("uri"),
+          "maxLength": .int(8_192),
+        ]),
         "timeout_ms": integerSchema(minimum: 100, maximum: 120_000, defaultValue: 30_000),
         "quiet_window_ms": integerSchema(minimum: 20, maximum: 5_000, defaultValue: 300),
       ]) { _, new in new },

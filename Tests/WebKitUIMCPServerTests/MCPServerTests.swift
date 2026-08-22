@@ -22,9 +22,38 @@ private final class InProcessSyntheticBrokerStub: CredentialBrokerFilling {
   }
 }
 
+@MainActor
+private final class ConfirmationPresenterStub: BrowserConfirmationPresenting {
+  private(set) var requests: [(title: String, message: String, approveLabel: String)] = []
+  private var responses: [Bool]
+
+  init(responses: [Bool]) {
+    self.responses = responses
+  }
+
+  func confirm(title: String, message: String, approveLabel: String) -> Bool {
+    requests.append((title, message, approveLabel))
+    return responses.isEmpty ? false : responses.removeFirst()
+  }
+}
+
 @Suite("MCP 2026-07-28 wire server", .serialized)
 @MainActor
 struct MCPServerTests {
+  @Test("Native confirmation helper failures deny authority")
+  func nativeConfirmationHelperFailClosed() {
+    let accepts = NativeBrowserConfirmationPresenter(
+      helperURL: URL(fileURLWithPath: "/usr/bin/true"))
+    let rejects = NativeBrowserConfirmationPresenter(
+      helperURL: URL(fileURLWithPath: "/usr/bin/false"))
+    let missing = NativeBrowserConfirmationPresenter(
+      helperURL: URL(fileURLWithPath: "/path/does/not/exist"))
+
+    #expect(accepts.confirm(title: "Title", message: "Message", approveLabel: "Approve"))
+    #expect(!rejects.confirm(title: "Title", message: "Message", approveLabel: "Approve"))
+    #expect(!missing.confirm(title: "Title", message: "Message", approveLabel: "Approve"))
+  }
+
   @Test("Discovery advertises stateless modern protocol metadata")
   func discovery() async throws {
     let server = try WebKitMCPServer()
@@ -158,6 +187,7 @@ struct MCPServerTests {
     )
     let result = try object(response["result"])
     #expect(result["protocolVersion"] == .string("2025-11-25"))
+    #expect(try object(result["serverInfo"])["version"] == .string("0.2.0"))
     #expect(result["resultType"] == nil)
     #expect(result["_meta"] == nil)
 
@@ -516,11 +546,14 @@ struct MCPServerTests {
 
   @Test("Navigation approval is exact-argument-bound and unsafe URL forms fail closed")
   func navigationApprovalBoundary() async throws {
-    let server = try WebKitMCPServer()
-    let opened = try await toolCall(
-      server, id: 1, name: "browser_session", arguments: ["operation": .string("open")])
-    let sessionID = try string(
-      try object(try object(opened["result"])["structuredContent"])["session_id"])
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let confirmationPresenter = ConfirmationPresenterStub(responses: [false])
+    let server = WebKitMCPServer(
+      registry: registry,
+      confirmationPresenter: confirmationPresenter
+    )
+    let sessionID = handle.rawValue.uuidString
     let arguments: [String: JSONValue] = [
       "session_id": .string(sessionID),
       "url": .string("https://example.com/account"),
@@ -593,6 +626,101 @@ struct MCPServerTests {
       modern: false
     )
     #expect(try object(legacy["result"])["isError"] == .bool(true))
+    #expect(confirmationPresenter.requests.count == 1)
+    #expect(confirmationPresenter.requests.first?.title == "Approve Web Navigation")
+    #expect(
+      confirmationPresenter.requests.first?.message.contains("https://example.com/account") == true)
+  }
+
+  @Test("Legacy actuation uses one native exact-action confirmation")
+  func legacyNativeActuationFallback() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <button aria-label="Save" onclick="
+        const status = document.createElement('div');
+        status.textContent = 'Saved by legacy fallback';
+        document.body.appendChild(status);
+      ">Save</button>
+      """,
+      baseURL: URL(string: "https://example.test/settings")
+    )
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let confirmationPresenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(
+      registry: registry,
+      confirmationPresenter: confirmationPresenter
+    )
+    let observed = try await legacyToolCall(
+      server,
+      id: 1,
+      name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)]
+    )
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try object(try array(observation["elements"]).first)
+    let acted = try await legacyToolCall(
+      server,
+      id: 2,
+      name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(target["elementID"])),
+        "operation": .string("click"),
+        "idempotency_key": .string("legacy-save-once"),
+        "postcondition": .object([
+          "type": .string("semantic_text_appears"),
+          "value": .string("Saved by legacy fallback"),
+        ]),
+      ]
+    )
+    #expect(try object(acted["result"])["structuredContent"] != nil)
+    #expect(confirmationPresenter.requests.count == 1)
+    #expect(confirmationPresenter.requests.first?.message.contains("legacy-save-once") == false)
+    #expect(confirmationPresenter.requests.first?.message.contains("Save") == true)
+  }
+
+  @Test("Legacy handoff remains human-controlled until native resume approval")
+  func legacyNativeHandoffFallback() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Continue</button>",
+      baseURL: URL(string: "https://example.test/login"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+    let confirmationPresenter = ConfirmationPresenterStub(responses: [false, true])
+    let server = WebKitMCPServer(
+      registry: registry,
+      presentHumanWindows: false,
+      confirmationPresenter: confirmationPresenter
+    )
+    let arguments: [String: JSONValue] = [
+      "operation": .string("handoff"),
+      "session_id": .string(handle.rawValue.uuidString),
+    ]
+
+    let handedOff = try await legacyToolCall(
+      server, id: 1, name: "browser_session", arguments: arguments)
+    let handoffResult = try object(try object(handedOff["result"])["structuredContent"])
+    #expect(handoffResult["control_state"] == .string("human_controlled"))
+
+    let declined = try await legacyToolCall(
+      server, id: 2, name: "browser_session", arguments: arguments)
+    #expect(try object(declined["result"])["isError"] == .bool(true))
+    #expect(runtime.interactionControlState() == .humanControlled)
+
+    let resumed = try await legacyToolCall(
+      server, id: 3, name: "browser_session", arguments: arguments)
+    let resumedResult = try object(try object(resumed["result"])["structuredContent"])
+    #expect(resumedResult["control_state"] == .string("freshly_reobserved"))
+    #expect(resumedResult["observation"] != nil)
+    #expect(confirmationPresenter.requests.count == 2)
   }
 
   @Test("Human handoff keeps control until an accepted resume and returns a fresh observation")
@@ -733,6 +861,24 @@ struct MCPServerTests {
         "arguments": .object(arguments),
       ]),
       modern: true
+    )
+  }
+
+  private func legacyToolCall(
+    _ server: WebKitMCPServer,
+    id: Int64,
+    name: String,
+    arguments: [String: JSONValue]
+  ) async throws -> [String: JSONValue] {
+    try await call(
+      server,
+      id: id,
+      method: "tools/call",
+      params: .object([
+        "name": .string(name),
+        "arguments": .object(arguments),
+      ]),
+      modern: false
     )
   }
 

@@ -19,6 +19,9 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Transaction ledger with preconditions, exact post-conditions, idempotency keys, indeterminate outcomes, receipts, and reconciliation without replay.
 - Human confirmation through MCP multi-round tool results before every exposed
   click and open-world navigation.
+- Legacy MCP clients receive the same exact-action authority boundary through a
+  server-owned native macOS confirmation dialog; the model cannot supply or
+  forge the approval value.
 - Local human handoff: the actual WebKit session becomes a visible window for login, MFA, CAPTCHA, or sensitive input; the agent is locked out until confirmed resume and fresh re-observation.
 - MCP sessions use a per-session loopback SOCKS5 boundary with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
 - The production CLI enforces one browser controller across all local/remote MCP processes for the macOS account; the lease is released on close or process death.
@@ -55,6 +58,10 @@ Run the server:
 swift run -c release --arch arm64 webkitui-mcp
 ```
 
+`webkitui-mcp --help` prints the stdio contract without starting the server.
+The sibling `webkitui-mcp-confirm` helper owns legacy native dialogs so closing
+an AppKit alert cannot terminate or corrupt the long-lived stdio server.
+
 The process reads newline-delimited JSON-RPC from stdin, writes protocol responses only to stdout, and reserves stderr for diagnostics.
 
 Install the ARM64 binary and register it for future local sessions:
@@ -77,6 +84,13 @@ for a running conversation and are not retroactively replaced.
 4. Use the fresh `observationID` and `elementID` once.
 5. `browser_act` returns `input_required`; approve the exact bound action.
 6. Read or reconcile the receipt with `browser_transaction`.
+
+With a legacy MCP client, navigation and actuation block on an exact native
+macOS confirmation and return a normal terminal tool result. Human handoff is
+two calls: the first transfers control to the visible window; after completing
+the sensitive step, call `browser_session { operation: "handoff", ... }` again
+and approve the native resume dialog. MCP 2026-07-28 clients continue to use
+multi-round `input_required` results.
 
 Use `browser_session { operation: "handoff" }` when a human must control the same local WebKit session. Declining resume leaves human control active.
 The handoff window becomes a regular foreground Mac app with a Dock icon. If
