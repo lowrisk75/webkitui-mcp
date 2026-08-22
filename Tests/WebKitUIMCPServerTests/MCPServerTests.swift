@@ -4,6 +4,24 @@ import WebKitUIMCPRuntime
 
 @testable import WebKitUIMCPServer
 
+@MainActor
+private final class InProcessSyntheticBrokerStub: CredentialBrokerFilling {
+  static let username = "synthetic-user@example.test"
+  static let password = "SP-MVP0-synthetic-only-7f3a"
+
+  func fill(
+    binding: CredentialSinkFormBinding,
+    runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt {
+    _ = try await runtime.performCredentialFill(
+      binding: binding,
+      username: CredentialSecretBuffer(copying: Array(Self.username.utf8)),
+      password: CredentialSecretBuffer(copying: Array(Self.password.utf8))
+    )
+    return CredentialBrokerWireReceipt(status: .filled)
+  }
+}
+
 @Suite("MCP 2026-07-28 wire server", .serialized)
 @MainActor
 struct MCPServerTests {
@@ -22,9 +40,39 @@ struct MCPServerTests {
     #expect(result["resultType"] == .string("complete"))
     #expect(
       result["supportedVersions"]
-        == .array([.string("2026-07-28"), .string("2025-11-25")])
+        == .array([.string("2026-07-28")])
     )
     #expect(try object(result["_meta"])["io.modelcontextprotocol/serverInfo"] != nil)
+  }
+
+  @Test("Modern requests require metadata and reject unsupported revisions")
+  func modernMetadataValidation() async throws {
+    let server = try WebKitMCPServer()
+    let missing = try await call(
+      server,
+      id: 1,
+      method: "server/discover",
+      params: .object([:]),
+      modern: false
+    )
+    #expect(try object(missing["error"])["code"] == .int(-32602))
+
+    let unsupported = try await rawCall(
+      server,
+      id: 2,
+      method: "tools/list",
+      params: .object([
+        "_meta": .object([
+          "io.modelcontextprotocol/protocolVersion": .string("2026-08-01"),
+          "io.modelcontextprotocol/clientCapabilities": .object([:]),
+        ])
+      ])
+    )
+    let error = try object(unsupported["error"])
+    #expect(error["code"] == .int(-32022))
+    let data = try object(error["data"])
+    #expect(data["supported"] == .array([.string("2026-07-28")]))
+    #expect(data["requested"] == .string("2026-08-01"))
   }
 
   @Test("Tool list is deterministic, bounded and cacheable")
@@ -56,6 +104,7 @@ struct MCPServerTests {
       names == [
         "browser_act",
         "browser_capture",
+        "browser_fill_siliconpass",
         "browser_navigate",
         "browser_observe",
         "browser_session",
@@ -111,6 +160,66 @@ struct MCPServerTests {
     #expect(result["protocolVersion"] == .string("2025-11-25"))
     #expect(result["resultType"] == nil)
     #expect(result["_meta"] == nil)
+
+    let fallback = try await call(
+      server,
+      id: 2,
+      method: "initialize",
+      params: .object(["protocolVersion": .string("2026-07-28")]),
+      modern: false
+    )
+    #expect(try object(fallback["result"])["protocolVersion"] == .string("2025-11-25"))
+
+    let older = try await call(
+      server,
+      id: 3,
+      method: "initialize",
+      params: .object(["protocolVersion": .string("2025-06-18")]),
+      modern: false
+    )
+    #expect(try object(older["result"])["protocolVersion"] == .string("2025-06-18"))
+
+    let progressMetadata = try await rawCall(
+      server,
+      id: 4,
+      method: "tools/list",
+      params: .object([
+        "_meta": .object(["progressToken": .string("legacy-progress")])
+      ])
+    )
+    let progressResult = try object(progressMetadata["result"])
+    #expect(progressResult["tools"] != nil)
+    #expect(progressResult["resultType"] == nil)
+    #expect(progressResult["_meta"] == nil)
+  }
+
+  @Test("Modern ping is not part of the stateless protocol")
+  func modernPingRejected() async throws {
+    let server = try WebKitMCPServer()
+    let response = try await call(
+      server, id: 1, method: "ping", params: .object([:]), modern: true)
+    #expect(try object(response["error"])["code"] == .int(-32601))
+  }
+
+  @Test("Multi-round tools require the elicitation capability")
+  func modernElicitationCapabilityRequired() async throws {
+    let server = try WebKitMCPServer()
+    let response = try await rawCall(
+      server,
+      id: 1,
+      method: "tools/call",
+      params: .object([
+        "name": .string("browser_navigate"),
+        "arguments": .object([:]),
+        "_meta": .object([
+          "io.modelcontextprotocol/protocolVersion": .string("2026-07-28"),
+          "io.modelcontextprotocol/clientCapabilities": .object([:]),
+        ]),
+      ])
+    )
+    let error = try object(response["error"])
+    #expect(error["code"] == .int(-32021))
+    #expect(try object(error["data"])["requiredCapabilities"] != nil)
   }
 
   @Test("Actuation requires one bound, single-use human confirmation")
@@ -420,13 +529,27 @@ struct MCPServerTests {
       server, id: 2, name: "browser_navigate", arguments: arguments)
     let required = try object(prepared["result"])
     #expect(required["resultType"] == .string("input_required"))
-    let requestState = try string(required["requestState"])
+    let supersededState = try string(required["requestState"])
+
+    let preparedAgain = try await toolCall(
+      server, id: 3, name: "browser_navigate", arguments: arguments)
+    let requestState = try string(try object(preparedAgain["result"])["requestState"])
+    let supersededAttempt = try await roundTripToolCall(
+      server,
+      id: 4,
+      name: "browser_navigate",
+      arguments: arguments,
+      requestState: supersededState,
+      action: "accept",
+      confirm: true
+    )
+    #expect(try object(supersededAttempt["error"])["code"] == .int(-32602))
 
     var changed = arguments
     changed["url"] = .string("https://example.org/account")
     let mutationAttempt = try await call(
       server,
-      id: 3,
+      id: 5,
       method: "tools/call",
       params: .object([
         "name": .string("browser_navigate"),
@@ -453,7 +576,7 @@ struct MCPServerTests {
     ] {
       let blocked = try await toolCall(
         server,
-        id: 4,
+        id: 6,
         name: "browser_navigate",
         arguments: ["session_id": .string(sessionID), "url": .string(blockedURL)]
       )
@@ -462,7 +585,7 @@ struct MCPServerTests {
 
     let legacy = try await call(
       server,
-      id: 5,
+      id: 7,
       method: "tools/call",
       params: .object([
         "name": .string("browser_navigate"), "arguments": .object(arguments),
@@ -510,6 +633,68 @@ struct MCPServerTests {
     let observation = try object(structured["observation"])
     #expect(structured["control_state"] == .string("freshly_reobserved"))
     #expect(try string(observation["observationID"]) != before.observationID)
+  }
+
+  @Test("The SiliconPass MCP shim is secretless and never submits")
+  func siliconPassShim() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <form>
+        <label for='username'>Username</label><input id='username'>
+        <label for='password'>Password</label><input id='password' type='password'>
+        <button type='submit'>Sign in</button>
+      </form>
+      <script>
+        globalThis.submitCount = 0;
+        document.querySelector('form').addEventListener('submit', event => {
+          globalThis.submitCount += 1; event.preventDefault();
+        });
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/login"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+    let server = WebKitMCPServer(
+      registry: registry,
+      credentialBroker: InProcessSyntheticBrokerStub()
+    )
+    let observed = try await toolCall(
+      server,
+      id: 1,
+      name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)]
+    )
+    let structured = try object(try object(observed["result"])["structuredContent"])
+    let observationID = try string(structured["observationID"])
+    let filled = try await toolCall(
+      server,
+      id: 2,
+      name: "browser_fill_siliconpass",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(observationID),
+        "username_element_id": .string("e1"),
+        "password_element_id": .string("e2"),
+      ]
+    )
+    let result = try object(filled["result"])
+    #expect(try object(result["structuredContent"])["status"] == .string("filled"))
+
+    let wire = String(decoding: try JSONEncoder().encode(JSONValue.object(filled)), as: UTF8.self)
+    #expect(!wire.contains(InProcessSyntheticBrokerStub.username))
+    #expect(!wire.contains(InProcessSyntheticBrokerStub.password))
+    let page = try #require(
+      await runtime.webView.evaluateJavaScript(
+        "JSON.stringify([username.value,password.value,globalThis.submitCount])") as? String
+    )
+    #expect(
+      page
+        == "[\"\(InProcessSyntheticBrokerStub.username)\",\"\(InProcessSyntheticBrokerStub.password)\",0]"
+    )
   }
 
   @Test("Malformed requests and tool arguments fail at the right boundary")
@@ -596,12 +781,29 @@ struct MCPServerTests {
         "io.modelcontextprotocol/clientInfo": .object([
           "name": .string("tests"), "version": .string("1"),
         ]),
-        "io.modelcontextprotocol/clientCapabilities": .object([:]),
+        "io.modelcontextprotocol/clientCapabilities": .object([
+          "elicitation": .object([:])
+        ]),
       ])
       request["params"] = .object(parameterObject)
     }
     let data = try JSONEncoder().encode(JSONValue.object(request))
     return try decode(await server.handle(data))
+  }
+
+  private func rawCall(
+    _ server: WebKitMCPServer,
+    id: Int64,
+    method: String,
+    params: JSONValue
+  ) async throws -> [String: JSONValue] {
+    let request: JSONValue = .object([
+      "jsonrpc": .string("2.0"),
+      "id": .int(id),
+      "method": .string(method),
+      "params": params,
+    ])
+    return try decode(await server.handle(try JSONEncoder().encode(request)))
   }
 
   private func decode(_ data: Data?) throws -> [String: JSONValue] {

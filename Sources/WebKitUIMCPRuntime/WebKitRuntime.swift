@@ -19,6 +19,9 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case targetNotActionable
   case targetGeometryChanged
   case sensitiveInputRequiresHuman
+  case invalidCredentialOrigin
+  case invalidCredentialBinding
+  case invalidCredentialSecret
   case humanControlActive
   case invalidControlTransition
 }
@@ -388,6 +391,100 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate {
     return target.recipe
   }
 
+  /// Captures the exact native address used by the private credential sink.
+  /// This API is intentionally absent from the MCP server/tool catalogue.
+  public func credentialFormBinding(
+    observationID: String,
+    usernameElementID: String,
+    passwordElementID: String
+  ) throws -> CredentialSinkFormBinding {
+    try requireAgentControl()
+    guard !processTerminated,
+      observationID == latestObservationID,
+      usernameElementID != passwordElementID,
+      let username = latestTargets[usernameElementID],
+      let password = latestTargets[passwordElementID],
+      !username.sensitive,
+      password.sensitive,
+      username.recipe.observationGeneration == password.recipe.observationGeneration,
+      let url = webView.url
+    else { throw WebKitRuntimeError.invalidCredentialBinding }
+
+    let origin: CredentialSinkOrigin
+    do {
+      origin = try CredentialSinkOrigin(url: url)
+    } catch {
+      throw WebKitRuntimeError.invalidCredentialOrigin
+    }
+    return CredentialSinkFormBinding(
+      origin: origin,
+      documentID: documentID,
+      observationID: observationID,
+      observationGeneration: username.recipe.observationGeneration,
+      usernameTarget: CredentialSinkElementBinding(
+        elementID: usernameElementID,
+        physicalElementIdentity: username.physicalIdentity
+      ),
+      passwordTarget: CredentialSinkElementBinding(
+        elementID: passwordElementID,
+        physicalElementIdentity: password.physicalIdentity
+      )
+    )
+  }
+
+  /// Private native sink. It resolves only the two physical nodes captured in
+  /// `credentialFormBinding`; semantic fallback and form submission are absent.
+  public func performCredentialFill(
+    binding: CredentialSinkFormBinding,
+    username: CredentialSecretBuffer,
+    password: CredentialSecretBuffer
+  ) async throws -> CredentialSinkReceipt {
+    defer {
+      username.wipe()
+      password.wipe()
+    }
+    try requireAgentControl()
+    guard !processTerminated,
+      binding.documentID == documentID,
+      binding.observationID == latestObservationID,
+      let liveURL = webView.url,
+      let liveOrigin = try? CredentialSinkOrigin(url: liveURL),
+      liveOrigin == binding.origin,
+      let usernameTarget = latestTargets[binding.usernameTarget.elementID],
+      let passwordTarget = latestTargets[binding.passwordTarget.elementID],
+      usernameTarget.recipe.observationGeneration == binding.observationGeneration,
+      passwordTarget.recipe.observationGeneration == binding.observationGeneration,
+      usernameTarget.physicalIdentity == binding.usernameTarget.physicalElementIdentity,
+      passwordTarget.physicalIdentity == binding.passwordTarget.physicalElementIdentity,
+      !usernameTarget.sensitive,
+      passwordTarget.sensitive
+    else { throw WebKitRuntimeError.invalidCredentialBinding }
+
+    let usernameString = try username.asciiString(maximumBytes: 320)
+    let passwordString = try password.asciiString(maximumBytes: 1_024)
+    let arguments: [String: Any] = [
+      "usernamePhysicalIdentity": binding.usernameTarget.physicalElementIdentity,
+      "passwordPhysicalIdentity": binding.passwordTarget.physicalElementIdentity,
+      "usernameExpectedBox": Self.boxDictionary(usernameTarget.boundingBox),
+      "passwordExpectedBox": Self.boxDictionary(passwordTarget.boundingBox),
+      "username": usernameString,
+      "password": passwordString,
+    ]
+    guard
+      let json = try await webView.callAsyncJavaScript(
+        Self.credentialFillSource,
+        arguments: arguments,
+        in: nil,
+        contentWorld: instrumentationWorld
+      ) as? String,
+      let data = json.data(using: .utf8),
+      let result = try? JSONDecoder().decode(RawCredentialFillResult.self, from: data),
+      result.filled
+    else { throw WebKitRuntimeError.invalidCredentialBinding }
+
+    return CredentialSinkReceipt(status: .filled)
+  }
+
   public func preflightResolution(
     observationID: String,
     elementID: String
@@ -519,6 +616,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate {
     latestTargets.removeAll(keepingCapacity: true)
     topLevelOriginLock = nil
     if presentWindow {
+      let application = NSApplication.shared
+      application.finishLaunching()
+      application.setActivationPolicy(.regular)
+      application.applicationIconImage = Self.humanControlApplicationIcon()
       let window =
         humanControlWindow
         ?? NSWindow(
@@ -528,10 +629,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate {
           defer: false
         )
       window.title = "WebkitUIMCP — Human control"
-      window.contentView = webView
+      window.isReleasedWhenClosed = false
+      window.collectionBehavior.insert(.moveToActiveSpace)
+      window.contentView = humanControlContentView()
       window.center()
       window.makeKeyAndOrderFront(nil)
-      NSApplication.shared.activate(ignoringOtherApps: true)
+      window.orderFrontRegardless()
+      application.activate(ignoringOtherApps: true)
       humanControlWindow = window
     }
     transition(to: .humanControlled, observationID: nil)
@@ -542,10 +646,50 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate {
       throw WebKitRuntimeError.invalidControlTransition
     }
     humanControlWindow?.orderOut(nil)
+    NSApplication.shared.setActivationPolicy(.accessory)
     topLevelOriginLock = (webView.url ?? lastCommittedHTTPURL).flatMap {
       navigationOrigin(for: $0)
     }
     transition(to: .resumeRequested, observationID: nil)
+  }
+
+  private func humanControlContentView() -> NSView {
+    guard webView.url == nil || webView.url?.absoluteString == "about:blank" else {
+      return webView
+    }
+    let title = NSTextField(labelWithString: "No page is loaded")
+    title.font = .systemFont(ofSize: 28, weight: .semibold)
+    title.alignment = .center
+    let detail = NSTextField(
+      wrappingLabelWithString:
+        "Return control to the agent, navigate to the approved page, then request human control again."
+    )
+    detail.font = .systemFont(ofSize: 16)
+    detail.textColor = .secondaryLabelColor
+    detail.alignment = .center
+    detail.maximumNumberOfLines = 0
+    let stack = NSStackView(views: [title, detail])
+    stack.orientation = .vertical
+    stack.spacing = 14
+    stack.alignment = .centerX
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    let container = NSView()
+    container.addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+      stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+      stack.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 48),
+      stack.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -48),
+      detail.widthAnchor.constraint(lessThanOrEqualToConstant: 620),
+    ])
+    return container
+  }
+
+  private static func humanControlApplicationIcon() -> NSImage? {
+    NSImage(
+      systemSymbolName: "globe.americas.fill",
+      accessibilityDescription: "WebkitUIMCP")?
+      .withSymbolConfiguration(.init(pointSize: 128, weight: .medium))
   }
 
   /// The returned observation is the only address space valid after handoff.
@@ -1211,11 +1355,61 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate {
       }
       return JSON.stringify({ count: matches.length, candidate });
       """
+
+  private static func boxDictionary(_ box: ObservedBoundingBox) -> [String: Double] {
+    ["x": box.x, "y": box.y, "width": box.width, "height": box.height]
+  }
+
+  private static let credentialFillSource = """
+    const nodeFor = identity => {
+      for (const element of document.querySelectorAll('input')) {
+        if (globalThis.__webkituiState?.nodeIDs?.get(element) === identity) return element;
+      }
+      return null;
+    };
+    const usernameElement = nodeFor(usernamePhysicalIdentity);
+    const passwordElement = nodeFor(passwordPhysicalIdentity);
+    const stable = (element, expectedBox, requiresPassword) => {
+      if (!(element instanceof HTMLInputElement) || !element.isConnected) return false;
+      if (requiresPassword ? element.type !== 'password' : element.type === 'password') return false;
+      if (element.disabled || element.readOnly || element.getAttribute('aria-disabled') === 'true') {
+        return false;
+      }
+      const box = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      if (!(box.width > 0 && box.height > 0) || style.visibility === 'hidden'
+          || style.display === 'none' || Number(style.opacity) === 0) return false;
+      const tolerance = 0.5;
+      if (!['x', 'y', 'width', 'height'].every(key =>
+          Math.abs(box[key] - expectedBox[key]) <= tolerance)) return false;
+      const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      const hit = document.elementFromPoint(centerX, centerY);
+      return Boolean(hit && (hit === element || element.contains(hit)));
+    };
+    if (!stable(usernameElement, usernameExpectedBox, false)
+        || !stable(passwordElement, passwordExpectedBox, true)) {
+      return JSON.stringify({ filled: false });
+    }
+    const setValue = (element, value) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(element, value); else element.value = value;
+    };
+    // MVP0 deliberately dispatches no DOM event: hostile input/change handlers
+    // must not gain an opportunity to autosave or submit the synthetic values.
+    setValue(usernameElement, username);
+    setValue(passwordElement, password);
+    return JSON.stringify({ filled: true });
+    """
 }
 
 private struct RawInstrumentationState: Decodable {
   let mutationCount: UInt64
   let readyState: String
+}
+
+private struct RawCredentialFillResult: Decodable {
+  let filled: Bool
 }
 
 private struct RawObservation: Decodable {

@@ -21,6 +21,8 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   click and open-world navigation.
 - Local human handoff: the actual WebKit session becomes a visible window for login, MFA, CAPTCHA, or sensitive input; the agent is locked out until confirmed resume and fresh re-observation.
 - MCP sessions use a per-session loopback SOCKS5 boundary with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
+- The production CLI enforces one browser controller across all local/remote MCP processes for the macOS account; the lease is released on close or process death.
+- Private remote clients can use the Aqua LaunchAgent broker plus a forced-command SSH relay; WebKit and authenticated profile data remain on the logged-in Mac.
 - Web-content termination invalidates every observation immediately; recovery reloads the host-owned last URL without replaying an action. A forced-crash fixture verifies that an `HttpOnly` authenticated cookie plus `localStorage` and `sessionStorage` survive in the same view/data-store lifetime.
 
 ## Deliberate limits
@@ -55,6 +57,18 @@ swift run -c release --arch arm64 webkitui-mcp
 
 The process reads newline-delimited JSON-RPC from stdin, writes protocol responses only to stdout, and reserves stderr for diagnostics.
 
+Install the ARM64 binary and register it for future local sessions:
+
+```bash
+release_bin="$(swift build --show-bin-path -c release --arch arm64)/webkitui-mcp"
+install -m 0755 "$release_bin" "$HOME/.local/bin/webkitui-mcp"
+codex mcp add webkitui-mcp -- "$HOME/.local/bin/webkitui-mcp"
+claude mcp add --scope user webkitui-mcp -- "$HOME/.local/bin/webkitui-mcp"
+```
+
+Restart conversations opened before registration: MCP tool catalogs are fixed
+for a running conversation and are not retroactively replaced.
+
 ## MCP flow
 
 1. `browser_session { operation: "open" }`
@@ -65,12 +79,27 @@ The process reads newline-delimited JSON-RPC from stdin, writes protocol respons
 6. Read or reconcile the receipt with `browser_transaction`.
 
 Use `browser_session { operation: "handoff" }` when a human must control the same local WebKit session. Declining resume leaves human control active.
+The handoff window becomes a regular foreground Mac app with a Dock icon. If
+handoff is requested before navigation, it shows an explicit empty-page message
+instead of a blank browser surface.
+
+## Linux headless lane
+
+`linux/` is a separate, ephemeral Playwright worker for disposable workloads on
+a dedicated Linux VM. It does not inherit Mac cookies or passwords and it does
+not replace native WebKit. Route authenticated sessions and human handoff to the
+Mac; route public, unauthenticated headless work to Linux. See
+[`linux/README.md`](linux/README.md) and
+[`docs/architecture/linux-headless-worker.md`](docs/architecture/linux-headless-worker.md).
 
 ## Evidence
 
 - Architecture: [`docs/architecture/`](docs/architecture/)
+- Private remote transport and deployment gates: [`docs/architecture/private-remote-transport.md`](docs/architecture/private-remote-transport.md)
 - Dated research and NotebookLM audits: [`docs/research/`](docs/research/)
 - Same-Mac runtime benchmark: [`Benchmarks/README.md`](Benchmarks/README.md)
+- Public/private publication boundary: [`docs/architecture/public-private-boundary.md`](docs/architecture/public-private-boundary.md)
+- Vulnerability reporting and release invariants: [`SECURITY.md`](SECURITY.md)
 
 The first measured local lane uses 30 runs of the same deterministic fixture at 2560×1600. It compares WKWebView with Playwright 1.61.1 driving installed Chrome 151. It does **not** yet measure full process-tree memory, visible-window behavior, authenticated task success, or Playwright's pinned Chromium binary; no broader superiority claim is made.
 
