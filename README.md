@@ -1,0 +1,81 @@
+# WebkitUIMCP
+
+Native WebKit automation for Apple Silicon, exposed through MCP and designed for an LLM rather than a human.
+
+This public repository contains the reusable engine, tests, architecture, sanitized research, and reproducible benchmarks. Private infrastructure endpoints, authenticated-site evidence, incident material, credentials, and user data are intentionally excluded and belong to a separate access-controlled companion repository; secrets never belong in either Git repository.
+
+This repository is a Swift rewrite. The retained TypeScript/Playwright files are prior art only and are not the implementation being extended.
+
+## What exists
+
+- Native `WKWebView` runtime using the persistent system WebKit data store for real authenticated sessions.
+- MCP 2026-07-28 stdio server with legacy initialization compatibility.
+- Six bounded tools: `browser_session`, `browser_navigate`, `browser_observe`, `browser_capture`, `browser_act`, and `browser_transaction`.
+- Observation-scoped element symbols backed by semantic locator recipes and fresh action-time resolution.
+- Five separate addressing counters: `address_resolution_failed`, `address_now_ambiguous`, `logical_target_changed`, `node_replaced_but_semantic_locator_recovered`, and `coordinate_invalidated_by_layout_change`.
+- Provenance attached to every serialized page string.
+- Checkpoint-plus-delta observation history and Minimal Failure Set coverage metrics.
+- Optional local Ollama ranker with `think: false`, strict budgets, and deterministic fallback.
+- Transaction ledger with preconditions, exact post-conditions, idempotency keys, indeterminate outcomes, receipts, and reconciliation without replay.
+- Human confirmation through MCP multi-round tool results before every exposed
+  click and open-world navigation.
+- Local human handoff: the actual WebKit session becomes a visible window for login, MFA, CAPTCHA, or sensitive input; the agent is locked out until confirmed resume and fresh re-observation.
+- MCP sessions use a per-session loopback SOCKS5 boundary with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
+- Web-content termination invalidates every observation immediately; recovery reloads the host-owned last URL without replaying an action. A forced-crash fixture verifies that an `HttpOnly` authenticated cookie plus `localStorage` and `sessionStorage` survive in the same view/data-store lifetime.
+
+## Deliberate limits
+
+- `browser_act` exposes click, native submit-control click, and bounded non-sensitive input/textarea fill. Fill verifies the freshly re-resolved semantic target's exact value; click/submit require an exact URL or newly appearing semantic text. UI state does not prove backend commit.
+- Fill dispatches normal `input`/`change` events, so site handlers may autosave or cause server effects. It is destructive and human-confirmed; password controls require local human handoff.
+- Actions are JavaScript-dispatched and report `trustedUserGesture: false`; they cannot satisfy browser APIs requiring physical user activation.
+- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim.
+- Cross-origin frame contents are opaque.
+- `takeSnapshot` may omit GPU-composited effects.
+- No exactly-once or rollback claim for an uncooperative website.
+- Low concurrency is intentional because WKWebView has no per-view hard memory quota.
+- The protected network path is the MCP session registry or `WebKitRuntime(protectedWebsiteDataStore:)`; the lower-level `WebKitRuntime(websiteDataStore:)` initializer is intentionally unprotected for fixtures and embedding.
+- Proxy tests currently prove HTTP/TCP main-frame and fetch-subresource routing, pin reuse, local-address denial, and UDP-ASSOCIATE rejection. HTTPS, WebSocket, WebRTC, system IPC, and existing socket-pool behavior are not yet measured.
+
+## Build and test
+
+Requires the macOS 27 SDK for the current `WKJSHandle` probe.
+
+```bash
+swift build -c release --arch arm64
+xcrun swift-format lint --strict --recursive Sources Tests Package.swift
+swift test --arch arm64
+swift test -c release --arch arm64
+```
+
+Run the server:
+
+```bash
+swift run -c release --arch arm64 webkitui-mcp
+```
+
+The process reads newline-delimited JSON-RPC from stdin, writes protocol responses only to stdout, and reserves stderr for diagnostics.
+
+## MCP flow
+
+1. `browser_session { operation: "open" }`
+2. `browser_navigate` returns `input_required`; approve the exact destination.
+3. `browser_observe`
+4. Use the fresh `observationID` and `elementID` once.
+5. `browser_act` returns `input_required`; approve the exact bound action.
+6. Read or reconcile the receipt with `browser_transaction`.
+
+Use `browser_session { operation: "handoff" }` when a human must control the same local WebKit session. Declining resume leaves human control active.
+
+## Evidence
+
+- Architecture: [`docs/architecture/`](docs/architecture/)
+- Dated research and NotebookLM audits: [`docs/research/`](docs/research/)
+- Same-Mac runtime benchmark: [`Benchmarks/README.md`](Benchmarks/README.md)
+
+The first measured local lane uses 30 runs of the same deterministic fixture at 2560×1600. It compares WKWebView with Playwright 1.61.1 driving installed Chrome 151. It does **not** yet measure full process-tree memory, visible-window behavior, authenticated task success, or Playwright's pinned Chromium binary; no broader superiority claim is made.
+
+## Safety
+
+The model cannot mint capability handles. Page content never becomes trusted policy. Password values are omitted from observations. Unknown dispatch is indeterminate and is never automatically retried. No commit, push, deployment, or external account mutation is performed by the project itself.
+
+Please report vulnerabilities through GitHub private vulnerability reporting as described in [`SECURITY.md`](SECURITY.md).

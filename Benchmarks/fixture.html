@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebkitUIMCP deterministic benchmark</title>
+<main id="app" aria-label="Benchmark table"></main>
+<script>
+  window.__benchmarkReady = false;
+  const app = document.querySelector("#app");
+  queueMicrotask(() => {
+    const fragment = document.createDocumentFragment();
+    for (let index = 0; index < 250; index += 1) {
+      const row = document.createElement("section");
+      row.setAttribute("aria-label", `Account ${index}`);
+      row.innerHTML = `<label for="value-${index}">Value ${index}</label>`
+        + `<input id="value-${index}" value="entry-${index}">`
+        + `<button data-testid="save-${index}" aria-label="Save account ${index}">Save</button>`;
+      fragment.append(row);
+    }
+    app.append(fragment);
+    setTimeout(() => {
+      app.dataset.ready = "true";
+      window.__benchmarkReady = true;
+    }, 20);
+  });
+</script>
