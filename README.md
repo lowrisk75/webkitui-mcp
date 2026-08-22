@@ -10,15 +10,20 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 
 - Native `WKWebView` runtime with an isolated ephemeral WebKit data store per MCP session; authentication remains available for that session without crossing project boundaries.
 - MCP 2026-07-28 stdio server with legacy initialization compatibility.
-- Six bounded tools: `browser_session`, `browser_navigate`, `browser_observe`, `browser_capture`, `browser_act`, and `browser_transaction`.
+- Eight bounded tools: `browser_session`, `browser_authorization`, `browser_navigate`, `browser_observe`, `browser_capture`, `browser_act`, `browser_fill_siliconpass`, and `browser_transaction`.
 - Observation-scoped element symbols backed by semantic locator recipes and fresh action-time resolution.
 - Five separate addressing counters: `address_resolution_failed`, `address_now_ambiguous`, `logical_target_changed`, `node_replaced_but_semantic_locator_recovered`, and `coordinate_invalidated_by_layout_change`.
 - Provenance attached to every serialized page string.
 - Checkpoint-plus-delta observation history and Minimal Failure Set coverage metrics.
 - Optional local Ollama ranker with `think: false`, strict budgets, and deterministic fallback.
 - Transaction ledger with preconditions, exact post-conditions, idempotency keys, indeterminate outcomes, receipts, and reconciliation without replay.
-- Human confirmation through MCP multi-round tool results before every exposed
-  click and open-world navigation.
+- Strict-by-default human confirmation through MCP multi-round tool results
+  before every exposed click and open-world navigation.
+- Optional trusted-session authorization for repeated navigation to one exact
+  HTTPS origin after a single human confirmation. Every grant is isolated to
+  one session, memory-only, quota-bound, expires within one hour, and is
+  revocable. It never covers clicks, fills, submits, credentials, OAuth,
+  passkeys, file transfer, permissions, or handoff transitions.
 - Legacy MCP clients receive the same exact-action authority boundary through a
   server-owned native macOS confirmation dialog; the model cannot supply or
   forge the approval value.
@@ -80,11 +85,20 @@ for a running conversation and are not retroactively replaced.
 ## MCP flow
 
 1. `browser_session { operation: "open" }`
-2. `browser_navigate` returns `input_required`; approve the exact destination.
-3. `browser_observe`
-4. Use the fresh `observationID` and `elementID` once.
-5. `browser_act` returns `input_required`; approve the exact bound action.
-6. Read or reconcile the receipt with `browser_transaction`.
+2. Optional: call `browser_authorization { operation: "grant", origin:
+   "https://example.com", actions: ["navigate"], ... }` and approve once to
+   avoid repeated navigation prompts for that exact origin in this session.
+3. `browser_navigate` returns `input_required` in strict mode; approve the exact destination.
+4. `browser_observe`
+5. Use the fresh `observationID` and `elementID` once.
+6. `browser_act` returns `input_required`; approve the exact bound action.
+7. Read or reconcile the receipt with `browser_transaction`.
+
+Use `browser_authorization { operation: "status", ... }` to inspect active
+grants and `operation: "revoke"` with an exact origin—or without one for the
+whole session—to remove them. Closing the session or restarting the MCP server
+also revokes them. HTTP origins, wildcard/subdomain matching, paths, persistent
+project policies, and global accept-all are deliberately unsupported.
 
 With a legacy MCP client, navigation and actuation block on an exact native
 macOS confirmation and return a normal terminal tool result. Human handoff is

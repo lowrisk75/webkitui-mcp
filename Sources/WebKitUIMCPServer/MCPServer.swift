@@ -18,7 +18,7 @@ private enum MCPServerError: Error {
 
 @MainActor
 public final class WebKitMCPServer {
-  public static let version = "0.3.1"
+  public static let version = "0.4.0"
   public static let protocolVersion = "2026-07-28"
   public static let legacyProtocolVersion = "2025-11-25"
 
@@ -27,11 +27,13 @@ public final class WebKitMCPServer {
   private let credentialBroker: any CredentialBrokerFilling
   private let confirmationPresenter: any BrowserConfirmationPresenting
   private let capabilityAuthority = CapabilityAuthority()
+  private let sessionAuthorizations = SessionAuthorizationStore()
   private var observations: [WebKitSessionHandle: WebKitPageObservation] = [:]
   private var coordinators: [WebKitSessionHandle: WebKitTransactionCoordinator] = [:]
   private var pendingActuations: [String: PendingActuation] = [:]
   private var pendingHandoffs: [String: PendingHandoff] = [:]
   private var pendingNavigations: [String: PendingNavigation] = [:]
+  private var pendingAuthorizations: [String: PendingAuthorization] = [:]
 
   private enum ActPostcondition {
     case urlEquals(String)
@@ -113,6 +115,16 @@ public final class WebKitMCPServer {
     let timeoutMilliseconds: Int64
     let quietWindowMilliseconds: Int64
     let expiresAt: Date
+  }
+
+  private struct PendingAuthorization {
+    let arguments: [String: JSONValue]
+    let session: WebKitSessionHandle
+    let origin: SecurityOrigin
+    let actions: Set<SessionAuthorizationAction>
+    let expiresAt: Date
+    let maximumUses: Int
+    let confirmationExpiresAt: Date
   }
 
   public init(maximumSessions: Int = 1, enforceHostExclusiveSession: Bool = false) throws {
@@ -257,6 +269,8 @@ public final class WebKitMCPServer {
         return try await sessionTool(params: params, arguments: arguments, modern: modern)
       case "browser_navigate":
         return try await navigateTool(params: params, arguments: arguments, modern: modern)
+      case "browser_authorization":
+        return try await authorizationTool(params: params, arguments: arguments, modern: modern)
       case "browser_observe":
         let handle = try sessionHandle(arguments)
         let runtime = try registry.runtime(for: handle)
@@ -356,6 +370,8 @@ public final class WebKitMCPServer {
       pendingActuations = pendingActuations.filter { $0.value.session != handle }
       pendingHandoffs = pendingHandoffs.filter { $0.value.session != handle }
       pendingNavigations = pendingNavigations.filter { $0.value.session != handle }
+      pendingAuthorizations = pendingAuthorizations.filter { $0.value.session != handle }
+      sessionAuthorizations.revoke(session: handle)
       return try toolResult(structured: .object(["closed": .bool(true)]), modern: modern)
     case "handoff":
       return try await handoffTool(params: params, arguments: arguments, modern: modern)
@@ -367,9 +383,6 @@ public final class WebKitMCPServer {
   private func navigateTool(
     params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
-    if modern {
-      try requireFormElicitationCapability(params)
-    }
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
     let url = try safeNavigationURL(try requireString(arguments["url"], named: "url"))
@@ -406,6 +419,26 @@ public final class WebKitMCPServer {
       quietWindowMilliseconds: quiet,
       expiresAt: Date().addingTimeInterval(60)
     )
+    let destinationOrigin = try securityOrigin(for: url)
+    if case .allowed(let remainingUses) = sessionAuthorizations.consume(
+      session: handle,
+      origin: destinationOrigin,
+      action: .navigate
+    ) {
+      return try await executeNavigation(
+        pending,
+        runtime: runtime,
+        modern: modern,
+        authorization: .object([
+          "mode": .string("trusted_session"),
+          "origin": .string(SessionAuthorizationStore.originString(destinationOrigin)),
+          "remaining_uses": .int(Int64(remainingUses)),
+        ])
+      )
+    }
+    if modern {
+      try requireFormElicitationCapability(params)
+    }
     if !modern {
       let currentURL = runtime.webView.url?.absoluteString ?? "no current page"
       guard
@@ -448,6 +481,140 @@ public final class WebKitMCPServer {
         ])
       ]),
     ])
+  }
+
+  private func authorizationTool(
+    params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
+  ) async throws -> JSONValue {
+    let operation = try requireString(arguments["operation"], named: "operation")
+    let handle = try sessionHandle(arguments)
+    switch operation {
+    case "status":
+      guard params["requestState"] == nil, params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams("authorization status is not multi-round")
+      }
+      guard Set(arguments.keys) == Set(["operation", "session_id"]) else {
+        throw MCPServerError.invalidParams(
+          "authorization status accepts only operation and session_id")
+      }
+      let grants = sessionAuthorizations.activeGrants(session: handle).map { grant in
+        JSONValue.object([
+          "origin": .string(SessionAuthorizationStore.originString(grant.origin)),
+          "actions": .array(
+            grant.actions.sorted { $0.rawValue < $1.rawValue }.map {
+              .string($0.rawValue)
+            }),
+          "expires_at": .string(ISO8601DateFormatter().string(from: grant.expiresAt)),
+          "remaining_uses": .int(Int64(grant.remainingUses)),
+        ])
+      }
+      return try toolResult(
+        structured: .object([
+          "mode": .string(grants.isEmpty ? "strict" : "trusted_session"),
+          "grants": .array(grants),
+        ]),
+        modern: modern)
+    case "revoke":
+      guard params["requestState"] == nil, params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams("authorization revoke is not multi-round")
+      }
+      let allowedKeys = Set(["operation", "session_id", "origin"])
+      guard Set(arguments.keys).isSubset(of: allowedKeys) else {
+        throw MCPServerError.invalidParams("authorization revoke has unsupported fields")
+      }
+      let origin = try arguments["origin"].map {
+        try authorizationOrigin(try requireString($0, named: "origin"))
+      }
+      sessionAuthorizations.revoke(session: handle, origin: origin)
+      return try toolResult(
+        structured: .object([
+          "revoked": .bool(true),
+          "scope": .string(origin == nil ? "session" : "origin"),
+        ]), modern: modern)
+    case "grant":
+      let allowedKeys = Set([
+        "operation", "session_id", "origin", "actions", "ttl_seconds", "maximum_uses",
+      ])
+      guard Set(arguments.keys).isSubset(of: allowedKeys) else {
+        throw MCPServerError.invalidParams("authorization grant has unsupported fields")
+      }
+      let origin = try authorizationOrigin(try requireString(arguments["origin"], named: "origin"))
+      let actions = try authorizationActions(arguments["actions"])
+      let ttl = try boundedInteger(
+        arguments["ttl_seconds"], defaultValue: 900, range: 60...3_600, name: "ttl_seconds")
+      let maximumUses = try boundedInteger(
+        arguments["maximum_uses"], defaultValue: 20, range: 1...100, name: "maximum_uses")
+
+      if modern, let requestState = params["requestState"]?.stringValue {
+        guard let pending = pendingAuthorizations.removeValue(forKey: requestState) else {
+          throw MCPServerError.invalidParams("requestState is unknown or already used")
+        }
+        guard pending.confirmationExpiresAt > Date(), pending.arguments == arguments else {
+          throw MCPServerError.invalidParams(
+            "authorization confirmation expired or arguments changed")
+        }
+        guard acceptedConfirmation(params["inputResponses"]) else {
+          return try toolError("The user did not approve this session authorization", modern: true)
+        }
+        return try installAuthorization(pending, modern: true)
+      }
+      guard params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams("inputResponses requires requestState")
+      }
+      let pending = PendingAuthorization(
+        arguments: arguments,
+        session: handle,
+        origin: origin,
+        actions: actions,
+        expiresAt: Date().addingTimeInterval(TimeInterval(ttl)),
+        maximumUses: maximumUses,
+        confirmationExpiresAt: Date().addingTimeInterval(60)
+      )
+      let message = authorizationConfirmationMessage(pending)
+      if !modern {
+        guard
+          confirmationPresenter.confirm(
+            title: "Authorize Trusted Session Origin",
+            message: message,
+            approveLabel: "Trust Temporarily"
+          )
+        else {
+          return try toolError("The user did not approve this session authorization", modern: false)
+        }
+        return try installAuthorization(pending, modern: false)
+      }
+      try requireFormElicitationCapability(params)
+      pendingAuthorizations = pendingAuthorizations.filter {
+        $0.value.confirmationExpiresAt > Date() && $0.value.session != handle
+      }
+      let requestState = UUID().uuidString
+      pendingAuthorizations[requestState] = pending
+      return .object([
+        "resultType": .string("input_required"),
+        "requestState": .string(requestState),
+        "inputRequests": .object([
+          "confirmation": .object([
+            "method": .string("elicitation/create"),
+            "params": .object([
+              "mode": .string("form"),
+              "message": .string(message),
+              "requestedSchema": .object([
+                "type": .string("object"),
+                "properties": .object([
+                  "confirm": .object([
+                    "type": .string("boolean"),
+                    "title": .string("Trust this exact origin for this session"),
+                  ])
+                ]),
+                "required": .array([.string("confirm")]),
+              ]),
+            ]),
+          ])
+        ]),
+      ])
+    default:
+      throw MCPServerError.invalidParams("authorization operation must be grant, status, or revoke")
+    }
   }
 
   private func credentialFillTool(
@@ -819,15 +986,112 @@ public final class WebKitMCPServer {
       + "A GET can still change state on a non-conforming site."
   }
 
+  private func authorizationConfirmationMessage(_ pending: PendingAuthorization) -> String {
+    let actions = pending.actions.map(\.rawValue).sorted().joined(separator: ", ")
+    return
+      "Trust exact origin \(jsonQuoted(SessionAuthorizationStore.originString(pending.origin))) "
+      + "for this browser session only? Allowed actions: \(jsonQuoted(actions)). "
+      + "Maximum uses: \(pending.maximumUses). The grant expires at "
+      + "\(jsonQuoted(ISO8601DateFormatter().string(from: pending.expiresAt))). "
+      + "It is held only in memory, is not shared with other sessions or clients, and can be revoked. "
+      + "Clicks, form fills/submits, credentials, OAuth, passkeys, downloads, uploads, permissions, and human-control transitions remain separately protected."
+  }
+
+  private func installAuthorization(
+    _ pending: PendingAuthorization, modern: Bool
+  ) throws -> JSONValue {
+    do {
+      try sessionAuthorizations.grant(
+        session: pending.session,
+        origin: pending.origin,
+        actions: pending.actions,
+        expiresAt: pending.expiresAt,
+        maximumUses: pending.maximumUses
+      )
+    } catch SessionAuthorizationError.tooManyGrants {
+      throw MCPServerError.invalidParams("session has reached the active authorization limit")
+    } catch {
+      throw MCPServerError.invalidParams("session authorization is invalid or expired")
+    }
+    return try toolResult(
+      structured: .object([
+        "authorized": .bool(true),
+        "mode": .string("trusted_session"),
+        "origin": .string(SessionAuthorizationStore.originString(pending.origin)),
+        "actions": .array(
+          pending.actions.sorted { $0.rawValue < $1.rawValue }.map {
+            .string($0.rawValue)
+          }),
+        "expires_at": .string(ISO8601DateFormatter().string(from: pending.expiresAt)),
+        "remaining_uses": .int(Int64(pending.maximumUses)),
+      ]), modern: modern)
+  }
+
+  private func authorizationActions(_ value: JSONValue?) throws -> Set<SessionAuthorizationAction> {
+    guard case .array(let rawActions) = value, !rawActions.isEmpty else {
+      throw MCPServerError.invalidParams("actions must be a non-empty array")
+    }
+    var actions: Set<SessionAuthorizationAction> = []
+    for rawAction in rawActions {
+      guard
+        let name = rawAction.stringValue,
+        let action = SessionAuthorizationAction(rawValue: name),
+        actions.insert(action).inserted
+      else {
+        throw MCPServerError.invalidParams("actions supports unique navigate entries only")
+      }
+    }
+    return actions
+  }
+
+  private func authorizationOrigin(_ rawValue: String) throws -> SecurityOrigin {
+    guard
+      rawValue.utf8.count <= 2_048,
+      rawValue.unicodeScalars.allSatisfy(\.isASCII),
+      let components = URLComponents(string: rawValue)
+    else {
+      throw MCPServerError.invalidParams("origin is invalid")
+    }
+    guard
+      components.scheme?.lowercased() == "https",
+      components.user == nil,
+      components.password == nil,
+      components.query == nil,
+      components.fragment == nil,
+      components.percentEncodedPath.isEmpty || components.percentEncodedPath == "/",
+      let rawHost = components.host
+    else {
+      throw MCPServerError.invalidParams(
+        "origin must be an exact HTTPS origin without path or credentials")
+    }
+    let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    guard !host.isEmpty, host == rawHost.lowercased() else {
+      throw MCPServerError.invalidParams("origin host must be canonical")
+    }
+    let url = try safeNavigationURL(rawValue)
+    guard url.host != nil else { throw MCPServerError.invalidParams("origin has no host") }
+    let port = components.port == 443 ? nil : components.port
+    return SecurityOrigin(scheme: "https", host: host, port: port)
+  }
+
+  private func securityOrigin(for url: URL) throws -> SecurityOrigin {
+    guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else {
+      throw MCPServerError.invalidParams("navigation URL has no security origin")
+    }
+    let defaultPort = scheme == "https" ? 443 : (scheme == "http" ? 80 : nil)
+    return SecurityOrigin(
+      scheme: scheme,
+      host: host.trimmingCharacters(in: CharacterSet(charactersIn: ".")),
+      port: url.port == defaultPort ? nil : url.port)
+  }
+
   private func executeNavigation(
     _ pending: PendingNavigation,
     runtime: WebKitRuntime,
-    modern: Bool
+    modern: Bool,
+    authorization: JSONValue? = nil
   ) async throws -> JSONValue {
-    guard let scheme = pending.url.scheme, let host = pending.url.host else {
-      throw MCPServerError.invalidParams("navigation URL has no security origin")
-    }
-    let origin = SecurityOrigin(scheme: scheme, host: host, port: pending.url.port)
+    let origin = try securityOrigin(for: pending.url)
     let capability = await capabilityAuthority.issue(
       CapabilityScope(
         actions: [.navigate], origins: [origin],
@@ -852,7 +1116,9 @@ public final class WebKitMCPServer {
       )
       await capabilityAuthority.revoke(capability)
       observations.removeValue(forKey: pending.session)
-      return try toolResult(structured: .encoded(result), modern: modern)
+      var structured = try JSONValue.encoded(result).objectValue ?? [:]
+      if let authorization { structured["authorization"] = authorization }
+      return try toolResult(structured: .object(structured), modern: modern)
     } catch {
       await capabilityAuthority.revoke(capability)
       throw error
@@ -1200,6 +1466,31 @@ public final class WebKitMCPServer {
 
   private static let toolDefinitions: [JSONValue] = [
     tool(
+      name: "browser_authorization",
+      description:
+        "Create, inspect, or revoke a bounded in-memory trusted-session grant. Grant requires one exact human confirmation and currently permits only repeated navigation to one exact HTTPS origin. Grants are isolated by session, expire within one hour, have a use quota, disappear on close/restart, and never authorize clicks, fills, submits, credentials, OAuth, passkeys, file transfer, permissions, or handoff transitions.",
+      properties: sessionSchemaProperties.merging([
+        "operation": .object([
+          "type": .string("string"),
+          "enum": .array([.string("grant"), .string("status"), .string("revoke")]),
+        ]),
+        "origin": .object([
+          "type": .string("string"), "format": .string("uri"), "maxLength": .int(2_048),
+          "description": .string("Exact canonical HTTPS origin; no path, query, or credentials."),
+        ]),
+        "actions": .object([
+          "type": .string("array"),
+          "items": .object(["type": .string("string"), "const": .string("navigate")]),
+          "minItems": .int(1), "maxItems": .int(1), "uniqueItems": .bool(true),
+        ]),
+        "ttl_seconds": integerSchema(minimum: 60, maximum: 3_600, defaultValue: 900),
+        "maximum_uses": integerSchema(minimum: 1, maximum: 100, defaultValue: 20),
+      ]) { _, new in new },
+      required: ["operation", "session_id"],
+      readOnly: false,
+      destructive: false
+    ),
+    tool(
       name: "browser_act",
       description:
         "Prepare one transactionally verified click, native form-submit click, or non-sensitive input fill. Every operation requires a fresh observation, idempotency key, and exact human confirmation through MCP multi-round results or the server-owned native legacy fallback. Click/submit require an exact URL or newly appearing semantic-text postcondition; fill verifies the freshly resolved target's exact value. UI state does not prove backend commit.",
@@ -1273,7 +1564,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_navigate",
       description:
-        "Prepare one exact open-world HTTP(S) navigation for human confirmation through MCP multi-round results or the server-owned native legacy fallback, then wait for document completion plus mutation quiescence, never network-idle or rAF. URL credentials, local names, and IP literals are blocked.",
+        "Navigate to one exact open-world HTTP(S) URL. Strict mode requires exact human confirmation through MCP multi-round results or the native legacy fallback. A previously human-approved browser_authorization grant may skip repeated confirmation only for its exact HTTPS origin, bounded session, expiry, and quota. URL credentials, local names, and IP literals are blocked.",
       properties: sessionSchemaProperties.merging([
         "url": .object([
           "type": .string("string"), "format": .string("uri"),

@@ -136,6 +136,7 @@ struct MCPServerTests {
     }
     #expect(
       names == [
+        "browser_authorization",
         "browser_act",
         "browser_capture",
         "browser_fill_siliconpass",
@@ -239,13 +240,19 @@ struct MCPServerTests {
   @Test("Multi-round tools require the elicitation capability")
   func modernElicitationCapabilityRequired() async throws {
     let server = try WebKitMCPServer()
+    let opened = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("open")])
+    let sessionID = try string(
+      try object(try object(opened["result"])["structuredContent"])["session_id"])
     let response = try await rawCall(
       server,
-      id: 1,
+      id: 2,
       method: "tools/call",
       params: .object([
         "name": .string("browser_navigate"),
-        "arguments": .object([:]),
+        "arguments": .object([
+          "session_id": .string(sessionID), "url": .string("https://example.test"),
+        ]),
         "_meta": .object([
           "io.modelcontextprotocol/protocolVersion": .string("2026-07-28"),
           "io.modelcontextprotocol/clientCapabilities": .object([:]),
