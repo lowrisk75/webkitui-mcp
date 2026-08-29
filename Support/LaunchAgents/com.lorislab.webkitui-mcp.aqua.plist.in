@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Legacy migration and advanced private deployment only. New installs use SMAppService.mainApp. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.lorislab.webkitui-mcp.aqua</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__HOME__/.local/bin/webkitui-mcp-aqua-broker</string>
+    <string>__HOME__/Applications/WebKitUI MCP.app/Contents/MacOS/webkitui-mcp-aqua-broker</string>
   </array>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>

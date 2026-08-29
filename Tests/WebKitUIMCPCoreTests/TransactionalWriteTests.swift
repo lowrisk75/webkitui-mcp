@@ -1,7 +1,38 @@
+import CryptoKit
 import Foundation
 import Testing
 
 @testable import WebKitUIMCPCore
+
+private final class InMemoryTransactionLedgerAnchorStore: TransactionLedgerAnchoring,
+  @unchecked Sendable
+{
+  enum Failure: Error {
+    case simulatedCommitFailure
+  }
+
+  private let lock = NSLock()
+  private var state: TransactionLedgerAnchorState?
+  private var failNextCommit = false
+
+  func loadAnchorState() throws -> TransactionLedgerAnchorState? {
+    lock.withLock { state }
+  }
+
+  func saveAnchorState(_ state: TransactionLedgerAnchorState) throws {
+    try lock.withLock {
+      if failNextCommit, state.committed != nil, state.pending == nil {
+        failNextCommit = false
+        throw Failure.simulatedCommitFailure
+      }
+      self.state = state
+    }
+  }
+
+  func failNextCommittedWrite() {
+    lock.withLock { failNextCommit = true }
+  }
+}
 
 @Suite("Transactional writes")
 struct TransactionalWriteTests {
@@ -53,6 +84,23 @@ struct TransactionalWriteTests {
     #expect(
       try ObservationPredicate.anyEntryTextDigest([.text], digest)
         .evaluate(in: partial) == .unknown)
+  }
+
+  @Test("Semantic contains uses bounded rolling selection and SHA confirmation")
+  func semanticTextContainsPredicate() throws {
+    let statusKey = ObservationFieldKey(frameID: "main", elementID: "e9", field: "@text")
+    let observation = TransactionObservation(
+      state: try state(
+        generation: 3,
+        entries: [(statusKey, try text("Your package name is available for registration"))]),
+      completeness: .complete)
+    let parameters = ObservationPredicate.containsParameters(of: "package name is available")
+    let predicate = ObservationPredicate.anyEntryTextContainsDigest(
+      [.text], parameters.digest, parameters.length, parameters.rolling)
+    #expect(try predicate.evaluate(in: observation) == .satisfied)
+    let wrongField = ObservationPredicate.anyEntryTextContainsDigest(
+      [.label], parameters.digest, parameters.length, parameters.rolling)
+    #expect(try wrongField.evaluate(in: observation) == .unsatisfied)
   }
 
   @Test("Prepare checks capability and every precondition")
@@ -359,6 +407,13 @@ struct TransactionalWriteTests {
           .anyEntryTextDigest([], ObservationPredicate.textDigest(of: "Saved"))
         ])
     }
+    let contains = ObservationPredicate.containsParameters(of: "Saved")
+    #expect(throws: TransactionError.emptySemanticTextFields) {
+      try makePlan(
+        postconditions: [
+          .anyEntryTextContainsDigest([], contains.digest, contains.length, contains.rolling)
+        ])
+    }
 
     let context = try await preparedContext(timeout: 2)
     _ = try await context.ledger.beginDispatch(
@@ -377,6 +432,294 @@ struct TransactionalWriteTests {
         monotonicNowNanoseconds: UInt64.max - 1
       )
     }
+  }
+
+  @Test("A crash during dispatch recovers durably as indeterminate without replay")
+  func durableDispatchRecovery() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-ledger-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try FileTransactionLedgerStore(
+      url: directory.appendingPathComponent("transactions.json"),
+      authenticationKey: Data(repeating: 0xA5, count: 32)
+    )
+    let authority = CapabilityAuthority()
+    let handle = await grant(authority: authority)
+    let plan = try makePlan(idempotencyKey: "durable-write")
+    let observation = TransactionObservation(
+      state: try state(generation: 1, entries: []),
+      completeness: .complete
+    )
+    let first = try TransactionalWriteLedger(persistence: store)
+    _ = try await prepare(
+      plan,
+      ledger: first,
+      observation: observation,
+      authority: authority,
+      handle: handle
+    )
+    _ = try await first.beginDispatch(
+      idempotencyKey: plan.idempotencyKey,
+      observation: observation,
+      resolution: resolution(count: 1),
+      capabilityAuthority: authority,
+      capabilityHandle: handle,
+      wallClockNow: wallClock,
+      monotonicNowNanoseconds: 20
+    )
+
+    let recovered = try TransactionalWriteLedger(persistence: store)
+    let receipt = try await recovered.receipt(idempotencyKey: plan.idempotencyKey)
+    #expect(receipt.phase == .indeterminate)
+  }
+
+  @Test("A tampered durable ledger fails authentication")
+  func durableLedgerRejectsTampering() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-ledger-tamper-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("transactions.json")
+    let store = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: Data(repeating: 0x5A, count: 32)
+    )
+    let authority = CapabilityAuthority()
+    let handle = await grant(authority: authority)
+    let observation = TransactionObservation(
+      state: try state(generation: 1, entries: []),
+      completeness: .complete
+    )
+    let ledger = try TransactionalWriteLedger(persistence: store)
+    _ = try await prepare(
+      makePlan(idempotencyKey: "tampered-write"),
+      ledger: ledger,
+      observation: observation,
+      authority: authority,
+      handle: handle
+    )
+    var bytes = try Data(contentsOf: url)
+    bytes[bytes.index(before: bytes.endIndex)] ^= 0x01
+    try bytes.write(to: url, options: [.atomic])
+
+    #expect(throws: (any Error).self) {
+      _ = try TransactionalWriteLedger(persistence: store)
+    }
+  }
+
+  @Test("A deleted anchored ledger fails closed")
+  func durableLedgerRejectsDeletion() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-ledger-deletion-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("transactions.json")
+    let anchor = InMemoryTransactionLedgerAnchorStore()
+    let store = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: Data(repeating: 0x3C, count: 32),
+      anchor: anchor
+    )
+    let ledger = try TransactionalWriteLedger(persistence: store)
+    let authority = CapabilityAuthority()
+    let handle = await grant(authority: authority)
+    _ = try await prepare(
+      makePlan(idempotencyKey: "delete-resistant-write"),
+      ledger: ledger,
+      observation: TransactionObservation(
+        state: try state(generation: 1, entries: []),
+        completeness: .complete
+      ),
+      authority: authority,
+      handle: handle
+    )
+
+    try FileManager.default.removeItem(at: url)
+    let reopened = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: Data(repeating: 0x3C, count: 32),
+      anchor: anchor
+    )
+    #expect(throws: TransactionLedgerPersistenceError.ledgerMissing) {
+      _ = try TransactionalWriteLedger(persistence: reopened)
+    }
+  }
+
+  @Test("An anchored ledger rejects rollback to an older valid envelope")
+  func durableLedgerRejectsRollback() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-ledger-rollback-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("transactions.json")
+    let anchor = InMemoryTransactionLedgerAnchorStore()
+    let store = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: Data(repeating: 0xC3, count: 32),
+      anchor: anchor
+    )
+    let authority = CapabilityAuthority()
+    let handle = await grant(authority: authority)
+    let plan = try makePlan(idempotencyKey: "rollback-resistant-write")
+    let observation = TransactionObservation(
+      state: try state(generation: 1, entries: []),
+      completeness: .complete
+    )
+    let ledger = try TransactionalWriteLedger(persistence: store)
+    _ = try await prepare(
+      plan,
+      ledger: ledger,
+      observation: observation,
+      authority: authority,
+      handle: handle
+    )
+    let olderEnvelope = try Data(contentsOf: url)
+    _ = try await ledger.beginDispatch(
+      idempotencyKey: plan.idempotencyKey,
+      observation: observation,
+      resolution: resolution(count: 1),
+      capabilityAuthority: authority,
+      capabilityHandle: handle,
+      wallClockNow: wallClock,
+      monotonicNowNanoseconds: 20
+    )
+
+    try olderEnvelope.write(to: url, options: [.atomic])
+    let reopened = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: Data(repeating: 0xC3, count: 32),
+      anchor: anchor
+    )
+    #expect(throws: TransactionLedgerPersistenceError.rollbackDetected) {
+      _ = try TransactionalWriteLedger(persistence: reopened)
+    }
+  }
+
+  @Test("A pending anchor heals after the ledger file was atomically written")
+  func durableLedgerHealsInterruptedAnchorCommit() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-ledger-pending-anchor-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("transactions.json")
+    let anchor = InMemoryTransactionLedgerAnchorStore()
+    anchor.failNextCommittedWrite()
+    let interrupted = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: Data(repeating: 0xD4, count: 32),
+      anchor: anchor
+    )
+    #expect(throws: InMemoryTransactionLedgerAnchorStore.Failure.simulatedCommitFailure) {
+      _ = try TransactionalWriteLedger(persistence: interrupted)
+    }
+
+    let reopened = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: Data(repeating: 0xD4, count: 32),
+      anchor: anchor
+    )
+    _ = try TransactionalWriteLedger(persistence: reopened)
+    #expect(try anchor.loadAnchorState()?.pending == nil)
+    #expect(try anchor.loadAnchorState()?.committed?.generation == 2)
+  }
+
+  @Test("A legacy authenticated v1 ledger migrates once to anchored v2")
+  func durableLedgerMigratesLegacyEnvelope() throws {
+    struct LegacyEnvelope: Codable {
+      let version: Int
+      let payload: Data
+      let authenticationCode: Data
+    }
+
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-ledger-v1-migration-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("transactions.json")
+    let key = Data(repeating: 0xE5, count: 32)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let payload = try encoder.encode([PersistedTransactionRecord]())
+    let legacy = LegacyEnvelope(
+      version: 1,
+      payload: payload,
+      authenticationCode: Data(
+        HMAC<SHA256>.authenticationCode(for: payload, using: SymmetricKey(data: key)))
+    )
+    try encoder.encode(legacy).write(to: url, options: [.atomic])
+
+    let anchor = InMemoryTransactionLedgerAnchorStore()
+    let migrating = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: key,
+      anchor: anchor
+    )
+    _ = try TransactionalWriteLedger(persistence: migrating)
+    #expect(try anchor.loadAnchorState()?.committed?.generation == 1)
+
+    let reopened = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: key,
+      anchor: anchor
+    )
+    _ = try TransactionalWriteLedger(persistence: reopened)
+  }
+
+  @Test("A full durable ledger denies new writes without corrupting memory or disk")
+  func durableLedgerCapacityFailsAtomically() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-ledger-capacity-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("transactions.json")
+    let store = try FileTransactionLedgerStore(
+      url: url,
+      authenticationKey: Data(repeating: 0xF6, count: 32),
+      maximumRecordCount: 1
+    )
+    let authority = CapabilityAuthority()
+    let handle = await grant(authority: authority)
+    let observation = TransactionObservation(
+      state: try state(generation: 1, entries: []),
+      completeness: .complete
+    )
+    let ledger = try TransactionalWriteLedger(persistence: store)
+    _ = try await prepare(
+      makePlan(idempotencyKey: "capacity-first"),
+      ledger: ledger,
+      observation: observation,
+      authority: authority,
+      handle: handle
+    )
+    await #expect(throws: TransactionLedgerPersistenceError.capacityExceeded) {
+      _ = try await prepare(
+        makePlan(idempotencyKey: "capacity-denied"),
+        ledger: ledger,
+        observation: observation,
+        authority: authority,
+        handle: handle
+      )
+    }
+    await #expect(throws: TransactionError.unknownTransaction) {
+      _ = try await ledger.receipt(idempotencyKey: "capacity-denied")
+    }
+
+    let reopened = try TransactionalWriteLedger(
+      persistence: FileTransactionLedgerStore(
+        url: url,
+        authenticationKey: Data(repeating: 0xF6, count: 32),
+        maximumRecordCount: 1
+      ))
+    #expect(try await reopened.receipt(idempotencyKey: "capacity-first").phase == .prepared)
   }
 
   private func text(_ value: String) throws -> ProvenancedText {

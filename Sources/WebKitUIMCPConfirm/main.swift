@@ -15,12 +15,18 @@ private struct NativeConfirmationRequest: Decodable {
 
 @main
 private struct WebKitUIMCPConfirm {
+  private static let protocolVersion = "1"
+
   @MainActor
   static func main() {
     guard
-      CommandLine.arguments.count == 1,
-      let data = try? FileHandle.standardInput.readToEnd(),
+      CommandLine.arguments.count == 4,
+      CommandLine.arguments[1] == "--protocol-version",
+      CommandLine.arguments[2] == protocolVersion,
+      CommandLine.arguments[3] == "--request-stdin",
+      let data = try? FileHandle.standardInput.read(upToCount: 24_001),
       !data.isEmpty,
+      data.count <= 24_000,
       let request = try? JSONDecoder().decode(NativeConfirmationRequest.self, from: data),
       request.validate()
     else {

@@ -12,9 +12,10 @@ public struct WebKitSessionHandle: Codable, Hashable, Sendable {
 
 public struct WebKitSessionStatus: Codable, Equatable, Sendable {
   public let sessionID: UUID
-  public let persistentProfileID: UUID?
   public let currentURL: String?
   public let isLoading: Bool
+  public let profileID: String
+  public let controlState: InteractionControlState
 }
 
 public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
@@ -29,13 +30,21 @@ public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
 private final class HostControllerLease {
   private let descriptor: Int32
 
-  init() throws {
+  init(lockFileURL: URL? = nil) throws {
     let fileManager = FileManager.default
-    guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
-      throw WebKitSessionRegistryError.hostControllerLockUnavailable
+    let directory: URL
+    let path: String
+    if let lockFileURL {
+      directory = lockFileURL.deletingLastPathComponent()
+      path = lockFileURL.path
+    } else {
+      guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+        throw WebKitSessionRegistryError.hostControllerLockUnavailable
+      }
+      directory = caches.appendingPathComponent(
+        "com.lorislab.webkitui-mcp", isDirectory: true)
+      path = directory.appendingPathComponent("controller.lock").path
     }
-    let directory = caches.appendingPathComponent(
-      "com.lorislab.webkitui-mcp", isDirectory: true)
     do {
       try fileManager.createDirectory(
         at: directory,
@@ -47,7 +56,6 @@ private final class HostControllerLease {
     guard chmod(directory.path, S_IRWXU) == 0 else {
       throw WebKitSessionRegistryError.hostControllerLockUnavailable
     }
-    let path = directory.appendingPathComponent("controller.lock").path
     let opened = Darwin.open(path, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
     guard opened >= 0 else {
       throw WebKitSessionRegistryError.hostControllerLockUnavailable
@@ -74,37 +82,40 @@ private final class HostControllerLease {
 
 @MainActor
 public final class WebKitSessionRegistry {
-  private struct SessionEntry {
-    let runtime: WebKitRuntime
-    let persistentProfileID: UUID?
-  }
-
   public let maximumSessions: Int
   private let enforceHostExclusiveSession: Bool
-  private var sessions: [WebKitSessionHandle: SessionEntry] = [:]
+  private let hostControllerLockURL: URL?
+  private var sessions: [WebKitSessionHandle: WebKitRuntime] = [:]
   private var hostControllerLease: HostControllerLease?
 
-  public init(maximumSessions: Int = 1, enforceHostExclusiveSession: Bool = false) throws {
+  public init(
+    maximumSessions: Int = 1,
+    enforceHostExclusiveSession: Bool = false,
+    hostControllerLockURL: URL? = nil
+  ) throws {
     guard maximumSessions > 0 else { throw WebKitSessionRegistryError.invalidMaximumSessions }
     self.maximumSessions = maximumSessions
     self.enforceHostExclusiveSession = enforceHostExclusiveSession
+    self.hostControllerLockURL = hostControllerLockURL
   }
 
   public var count: Int { sessions.count }
 
-  public func open(persistentProfileID: UUID? = nil) throws -> WebKitSessionHandle {
+  public var existingHandle: WebKitSessionHandle? {
+    sessions.keys.first
+  }
+
+  public func open(profileIdentifier: UUID? = nil) throws -> WebKitSessionHandle {
     guard sessions.count < maximumSessions else {
       throw WebKitSessionRegistryError.capacityReached
     }
-    let lease = try enforceHostExclusiveSession ? HostControllerLease() : nil
+    let lease =
+      try enforceHostExclusiveSession
+      ? HostControllerLease(lockFileURL: hostControllerLockURL) : nil
     let handle = WebKitSessionHandle(rawValue: UUID())
     do {
-      let dataStore =
-        persistentProfileID.map(WKWebsiteDataStore.init(forIdentifier:))
-        ?? .nonPersistent()
-      sessions[handle] = SessionEntry(
-        runtime: try WebKitRuntime(protectedWebsiteDataStore: dataStore),
-        persistentProfileID: persistentProfileID)
+      let dataStore = profileIdentifier.map(WKWebsiteDataStore.init(forIdentifier:)) ?? .default()
+      sessions[handle] = try WebKitRuntime(protectedWebsiteDataStore: dataStore)
       hostControllerLease = lease
     } catch {
       throw WebKitSessionRegistryError.networkBoundaryUnavailable
@@ -112,35 +123,52 @@ public final class WebKitSessionRegistry {
     return handle
   }
 
+  /// Reuses the host-owned browser when a durable broker reconnects. The
+  /// session handle remains process-private and no observation or action
+  /// authority is carried by this operation.
+  public func openOrReuse(
+    profileIdentifier: UUID? = nil
+  ) throws -> (handle: WebKitSessionHandle, reused: Bool) {
+    if let existingHandle {
+      let currentIdentifier = try runtime(for: existingHandle).webView.configuration
+        .websiteDataStore.identifier
+      guard currentIdentifier == profileIdentifier else {
+        throw WebKitSessionRegistryError.capacityReached
+      }
+      return (existingHandle, true)
+    }
+    return (try open(profileIdentifier: profileIdentifier), false)
+  }
+
+  public func availableProfileIDs() async -> [String] {
+    // macOS 27 (26A5416b) crashes inside
+    // WebsiteDataStore::fetchAllDataStoreIdentifiers. Keep the only profile
+    // whose persistence is proven and whose identity is stable for this host.
+    ["default"]
+  }
+
   public func close(_ handle: WebKitSessionHandle) throws {
-    guard let entry = sessions.removeValue(forKey: handle) else {
+    guard sessions.removeValue(forKey: handle) != nil else {
       throw WebKitSessionRegistryError.unknownSession
     }
-    entry.runtime.invalidate()
     if sessions.isEmpty { hostControllerLease = nil }
   }
 
   public func runtime(for handle: WebKitSessionHandle) throws -> WebKitRuntime {
-    guard let runtime = sessions[handle]?.runtime else {
+    guard let runtime = sessions[handle] else {
       throw WebKitSessionRegistryError.unknownSession
     }
     return runtime
   }
 
   public func status(_ handle: WebKitSessionHandle) throws -> WebKitSessionStatus {
-    guard let entry = sessions[handle] else {
-      throw WebKitSessionRegistryError.unknownSession
-    }
-    let runtime = entry.runtime
+    let runtime = try runtime(for: handle)
     return WebKitSessionStatus(
       sessionID: handle.rawValue,
-      persistentProfileID: entry.persistentProfileID,
-      currentURL: runtime.webView.url?.absoluteString,
-      isLoading: runtime.webView.isLoading
+      currentURL: runtime.agentSafeCurrentURL(),
+      isLoading: runtime.webView.isLoading,
+      profileID: runtime.webView.configuration.websiteDataStore.identifier?.uuidString ?? "default",
+      controlState: runtime.interactionControlState()
     )
-  }
-
-  public func hasActiveSession(persistentProfileID: UUID) -> Bool {
-    sessions.values.contains { $0.persistentProfileID == persistentProfileID }
   }
 }

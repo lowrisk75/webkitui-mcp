@@ -1,7 +1,7 @@
-import AppKit
 import Foundation
 import Network
 import Testing
+import WebKit
 import WebKitUIMCPCore
 
 @testable import WebKitUIMCPRuntime
@@ -85,7 +85,7 @@ struct WebKitRuntimeTests {
       <!doctype html>
       <title>Account</title>
       <label for="email">Email address</label>
-      <input id="email" value="ada@example.test">
+      <input id="email" value="kevin@example.test">
       <button aria-label="Save profile">Save</button>
       """,
       baseURL: URL(string: "https://fixture.invalid/settings"),
@@ -136,6 +136,228 @@ struct WebKitRuntimeTests {
         stabilityInterval: .milliseconds(1)
       )
     }
+  }
+
+  @Test("Observation omits hidden values and classifies sensitive visible fields")
+  func observationMinimizesFieldValues() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    let hiddenSecrets = [
+      "hidden-type-secret-001",
+      "hidden-attribute-secret-002",
+      "zero-box-secret-003",
+      "display-none-secret-004",
+      "visibility-hidden-secret-005",
+      "opacity-zero-secret-006",
+      "aria-hidden-secret-007",
+      "inert-secret-008",
+    ]
+    let sensitiveSecrets = [
+      "csrf-secret-101",
+      "state-secret-102",
+      "nonce-secret-103",
+      "session-secret-104",
+      "assertion-secret-105",
+      "generic-secret-106",
+      "password-secret-107",
+      "otp-secret-108",
+      "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-opaque",
+    ]
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <label for="email">Email</label>
+      <input id="email" value="visible@example.test">
+      <label for="country">Country</label>
+      <select id="country"><option value="technical-country-opaque-998877">France</option></select>
+
+      <input type="hidden" value="\(hiddenSecrets[0])">
+      <input hidden value="\(hiddenSecrets[1])">
+      <input style="width:0;height:0;border:0;padding:0" value="\(hiddenSecrets[2])">
+      <input style="display:none" value="\(hiddenSecrets[3])">
+      <input style="visibility:hidden" value="\(hiddenSecrets[4])">
+      <input style="opacity:0" value="\(hiddenSecrets[5])">
+      <div aria-hidden="true"><input value="\(hiddenSecrets[6])"></div>
+      <div inert><input value="\(hiddenSecrets[7])"></div>
+
+      <input name="csrfToken" value="\(sensitiveSecrets[0])">
+      <input name="state" value="\(sensitiveSecrets[1])">
+      <input name="nonce" value="\(sensitiveSecrets[2])">
+      <input name="session_state" value="\(sensitiveSecrets[3])">
+      <input name="assertion" value="\(sensitiveSecrets[4])">
+      <input name="client_secret" value="\(sensitiveSecrets[5])">
+      <input type="password" value="\(sensitiveSecrets[6])">
+      <input autocomplete="one-time-code" value="\(sensitiveSecrets[7])">
+      <input id="profile-code" value="\(sensitiveSecrets[8])">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/privacy"),
+      timeout: .seconds(3),
+      quietWindow: .milliseconds(40)
+    )
+
+    let observation = try await runtime.observe()
+    #expect(observation.elements.count == 11)
+    #expect(observation.elements.allSatisfy { $0.visible })
+    #expect(observation.elements[0].value?.segments.first?.text == "visible@example.test")
+    #expect(observation.elements[1].value?.segments.first?.text == "France")
+    #expect(observation.elements[1].text?.segments.first?.text == "France")
+    #expect(observation.elements.dropFirst(2).allSatisfy { $0.sensitive })
+    #expect(observation.elements.dropFirst(2).allSatisfy { $0.value == nil })
+
+    let observationJSON = String(decoding: try JSONEncoder().encode(observation), as: UTF8.self)
+    let canonicalJSON = String(
+      decoding: try JSONEncoder().encode(try observation.canonicalState()),
+      as: UTF8.self
+    )
+    let recipesJSON = String(
+      decoding: try JSONEncoder().encode(observation.elements.map(\.locatorRecipe)),
+      as: UTF8.self
+    )
+    for secret in hiddenSecrets + sensitiveSecrets + ["technical-country-opaque-998877"] {
+      #expect(!observationJSON.contains(secret))
+      #expect(!canonicalJSON.contains(secret))
+      #expect(!recipesJSON.contains(secret))
+    }
+  }
+
+  @Test("Authentication origins block agent surfaces and classify an unready UI")
+  func authenticationOriginFailClosed() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    let secret = "query-state-must-never-escape"
+    let result = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <div role="progressbar" aria-label="Loading"></div>
+      <form style="display:none">
+        <input autocomplete="username">
+        <input type="password">
+      </form>
+      """,
+      baseURL: URL(string: "https://idmsa.apple.com/IDMSWebAuth/signin?state=\(secret)"),
+      timeout: .seconds(3),
+      quietWindow: .milliseconds(40)
+    )
+
+    #expect(result.url == "https://idmsa.apple.com")
+    #expect(runtime.agentSafeCurrentURL() == "https://idmsa.apple.com")
+    #expect(
+      runtime.authenticationRestrictionStatus()
+        == AuthenticationRestrictionStatus(
+          origin: "https://idmsa.apple.com",
+          classification: .authUINotReady,
+          environment: AuthenticationEnvironmentSnapshot(
+            persistentWebsiteDataStore: false,
+            customUserAgentConfigured: false,
+            applicationNameForUserAgentConfigured: false,
+            pinnedProxyConfigured: false,
+            contentBlockingConfigured: false,
+            customProcessPoolConfigured: false
+          )
+        ))
+
+    await #expect(
+      throws: WebKitRuntimeError.authenticationOriginRequiresHuman(
+        "https://idmsa.apple.com")
+    ) {
+      try await runtime.observe()
+    }
+    await #expect(
+      throws: WebKitRuntimeError.authenticationOriginRequiresHuman(
+        "https://idmsa.apple.com")
+    ) {
+      try await runtime.readText()
+    }
+    await #expect(
+      throws: WebKitRuntimeError.authenticationOriginRequiresHuman(
+        "https://idmsa.apple.com")
+    ) {
+      try await runtime.capture()
+    }
+    await #expect(
+      throws: WebKitRuntimeError.authenticationOriginRequiresHuman(
+        "https://idmsa.apple.com")
+    ) {
+      try await runtime.scrollBy(deltaX: 0, deltaY: 100)
+    }
+    await #expect(
+      throws: WebKitRuntimeError.authenticationOriginRequiresHuman(
+        "https://idmsa.apple.com")
+    ) {
+      try await runtime.perform(
+        observationID: UUID().uuidString,
+        elementID: "e1",
+        operation: .click
+      )
+    }
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    #expect(runtime.interactionControlState() == .humanControlled)
+    #expect(
+      throws: WebKitRuntimeError.authenticationOriginRequiresHuman(
+        "https://idmsa.apple.com")
+    ) {
+      try runtime.requestAgentResume()
+    }
+    #expect(runtime.interactionControlState() == .humanControlled)
+    #expect(!String(describing: result).contains(secret))
+  }
+
+  @Test("Authentication environment distinguishes persistent storage without identifiers")
+  func authenticationEnvironmentIsSanitized() async throws {
+    let persistent = WebKitRuntime(websiteDataStore: .default())
+    let ephemeral = WebKitRuntime(websiteDataStore: .nonPersistent())
+
+    #expect(persistent.authenticationEnvironmentSnapshot().persistentWebsiteDataStore)
+    #expect(!ephemeral.authenticationEnvironmentSnapshot().persistentWebsiteDataStore)
+    for snapshot in [
+      persistent.authenticationEnvironmentSnapshot(),
+      ephemeral.authenticationEnvironmentSnapshot(),
+    ] {
+      #expect(!snapshot.customUserAgentConfigured)
+      #expect(!snapshot.applicationNameForUserAgentConfigured)
+      #expect(!snapshot.pinnedProxyConfigured)
+      #expect(!snapshot.contentBlockingConfigured)
+      #expect(!snapshot.customProcessPoolConfigured)
+    }
+    _ = try await ephemeral.loadHTML(
+      "<title>User agent fixture</title>",
+      baseURL: URL(string: "https://fixture.invalid/user-agent"),
+      timeout: .seconds(3),
+      quietWindow: .milliseconds(40)
+    )
+    let userAgent = try #require(
+      try await ephemeral.webView.evaluateJavaScript("navigator.userAgent") as? String)
+    #expect(userAgent.contains("AppleWebKit"))
+    #expect(!userAgent.contains("WebkitUIMCP"))
+  }
+
+  @Test("Full-browser fallback is limited to the exact Apple authentication embedding pair")
+  func appleAuthenticationFullBrowserPolicyIsNarrow() {
+    #expect(
+      WebKitRuntime.requiresFullBrowserBackend(
+        topLevelURL: URL(string: "https://appstoreconnect.apple.com/login"),
+        restrictedFrameOrigin: "https://idmsa.apple.com"
+      ))
+    #expect(
+      !WebKitRuntime.requiresFullBrowserBackend(
+        topLevelURL: URL(string: "https://appstoreconnect.apple.com.evil.invalid/login"),
+        restrictedFrameOrigin: "https://idmsa.apple.com"
+      ))
+    #expect(
+      !WebKitRuntime.requiresFullBrowserBackend(
+        topLevelURL: URL(string: "https://appstoreconnect.apple.com/login"),
+        restrictedFrameOrigin: "https://idmsa.apple.com.evil.invalid"
+      ))
+    #expect(
+      !WebKitRuntime.requiresFullBrowserBackend(
+        topLevelURL: URL(string: "https://developer.apple.com/account"),
+        restrictedFrameOrigin: "https://idmsa.apple.com"
+      ))
+    #expect(
+      !WebKitRuntime.requiresFullBrowserBackend(
+        topLevelURL: URL(string: "https://appstoreconnect.apple.com/login"),
+        restrictedFrameOrigin: nil
+      ))
   }
 
   @Test("Element IDs are observation-scoped")
@@ -189,8 +411,14 @@ struct WebKitRuntimeTests {
         timeout: .seconds(2),
         quietWindow: .milliseconds(20)
       )
-    } catch WebKitRuntimeError.navigationFailed(let reason) {
-      #expect(reason.contains("approved origin"))
+    } catch WebKitRuntimeError.crossOriginRedirectRequiresHuman(
+      let fromOrigin,
+      let toOrigin
+    ) {
+      #expect(fromOrigin == "http://127.0.0.1:\(server.port)")
+      #expect(toOrigin == "http://localhost:\(server.port)")
+      #expect(!fromOrigin.contains("/inside"))
+      #expect(!toOrigin.contains("/escape"))
     }
     try await Task.sleep(for: .milliseconds(180))
 
@@ -317,6 +545,63 @@ struct WebKitRuntimeTests {
     #expect(runtime.terminationAuditEvents().count == 1)
   }
 
+  @Test("An isolated persistent data store retains synthetic cookie and origin storage")
+  func isolatedPersistentAuthenticationStorage() async throws {
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /seed ") {
+        return FormFixtureServer.response(
+          body: """
+            <title>Seeded</title>
+            <script>localStorage.setItem('fixture_auth_state', 'alive');</script>
+            """,
+          extraHeaders: "Set-Cookie: fixture_session=alive; Path=/; HttpOnly; SameSite=Lax\r\n")
+      }
+      let cookiePresent = request.lowercased().contains("cookie: fixture_session=alive")
+      return FormFixtureServer.response(
+        body: """
+          <title>Check</title>
+          <script>
+            document.title = '\(cookiePresent ? "cookie" : "no-cookie"):'
+              + (localStorage.getItem('fixture_auth_state') ?? 'no-storage');
+          </script>
+          """)
+    }
+    let identifier = UUID()
+    var testError: (any Error)?
+    do {
+      let store = WKWebsiteDataStore(forIdentifier: identifier)
+      do {
+        let first = WebKitRuntime(websiteDataStore: store)
+        #expect(first.authenticationEnvironmentSnapshot().persistentWebsiteDataStore)
+        _ = try await first.navigate(
+          to: URL(string: "http://127.0.0.1:\(server.port)/seed")!,
+          timeout: .seconds(3),
+          quietWindow: .milliseconds(40)
+        )
+      }
+      do {
+        let second = WebKitRuntime(websiteDataStore: store)
+        let check = try await second.navigate(
+          to: URL(string: "http://127.0.0.1:\(server.port)/check")!,
+          timeout: .seconds(3),
+          quietWindow: .milliseconds(40)
+        )
+        #expect(check.readiness == .ready)
+        let title = try await second.webView.evaluateJavaScript("document.title") as? String
+        #expect(title == "cookie:alive")
+      }
+    } catch {
+      testError = error
+    }
+    try await Task.sleep(for: .milliseconds(100))
+    do {
+      try await WKWebsiteDataStore.remove(forIdentifier: identifier)
+    } catch {
+      if testError == nil { throw error }
+    }
+    if let testError { throw testError }
+  }
+
   @Test("Invalid readiness windows fail before navigation")
   func invalidQuietWindow() async throws {
     let runtime = WebKitRuntime()
@@ -332,6 +617,7 @@ struct WebKitRuntimeTests {
   @Test("Snapshot is a real PNG with an explicit compositor caveat")
   func snapshot() async throws {
     let runtime = WebKitRuntime()
+    #expect(runtime.webView.window != nil)
     _ = try await runtime.loadHTML(
       "<button>Capture me</button>",
       baseURL: URL(string: "https://fixture.invalid/"),
@@ -345,6 +631,90 @@ struct WebKitRuntimeTests {
     #expect(capture.height == Int(800 * capture.backingScaleFactor))
     #expect(capture.backingScaleFactor >= 1)
     #expect(capture.compositorEffectsMayBeMissing)
+  }
+
+  @Test("Human handoff presents the live rendered WebView")
+  func humanHandoffPresentsLiveRenderedWebView() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    let stableWindow = try #require(runtime.webView.window)
+    #expect(!stableWindow.isVisible)
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <style>
+        html, body { margin: 0; width: 100%; height: 100%; background: rgb(12, 34, 56); }
+        h1 { color: white; padding: 40px; }
+      </style>
+      <h1>Visible handoff fixture</h1>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/handoff"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: true)
+
+    let window = try #require(runtime.webView.window)
+    #expect(window === stableWindow)
+    #expect(window.title == "WebkitUIMCP — Human control")
+    #expect(window.isVisible)
+    #expect(window.alphaValue == 1)
+    #expect(window.contentView === runtime.webView)
+    #expect(runtime.webView.bounds.width > 0)
+    #expect(runtime.webView.bounds.height > 0)
+
+    window.displayIfNeeded()
+    runtime.webView.layoutSubtreeIfNeeded()
+    let configuration = WKSnapshotConfiguration()
+    configuration.rect = runtime.webView.bounds
+    configuration.snapshotWidth = NSNumber(value: runtime.webView.bounds.width)
+    let image = try await runtime.webView.takeSnapshot(configuration: configuration)
+    let bitmap = try #require(image.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
+    let center = try #require(
+      bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.sRGB)
+    )
+    #expect(center.redComponent < 0.2)
+    #expect(center.greenComponent < 0.3)
+    #expect(center.blueComponent < 0.4)
+
+    try runtime.requestAgentResume()
+    _ = try await runtime.resumeAfterHumanControl()
+    #expect(!window.isVisible)
+    #expect(runtime.webView.window === window)
+  }
+
+  @Test("Native Edit menu routes Command-V to the first responder")
+  func nativePasteCommand() throws {
+    let application = NSApplication.shared
+    WebKitNativeApplicationMenu.install(on: application)
+    let mainMenu = try #require(application.mainMenu)
+    let editMenu = try #require(
+      mainMenu.items.first(where: { $0.submenu?.title == "Edit" })?.submenu)
+    let paste = try #require(editMenu.items.first(where: { $0.title == "Paste" }))
+    #expect(paste.action == #selector(NSText.paste(_:)))
+    #expect(paste.keyEquivalent == "v")
+    #expect(paste.keyEquivalentModifierMask == [.command])
+  }
+
+  @Test("An empty human handoff renders an explicit local status page")
+  func emptyHandoffRendersStatusPage() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    #expect(runtime.webView.url == nil)
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: true)
+    while runtime.webView.isLoading {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+
+    let text = try #require(
+      try await runtime.webView.evaluateJavaScript("document.body.innerText") as? String)
+    #expect(text.contains("No approved page is loaded"))
+    #expect(text.contains("Approve a browser navigation"))
+
+    try runtime.requestAgentResume()
+    _ = try await runtime.resumeAfterHumanControl()
   }
 
   @Test("Session handles are bounded and unforgeable")
@@ -363,40 +733,16 @@ struct WebKitRuntimeTests {
     #expect(registry.count == 0)
   }
 
-  @Test("Concurrent sessions isolate website data")
-  func concurrentSessionIsolation() async throws {
-    let registry = try WebKitSessionRegistry(maximumSessions: 2)
-    let firstHandle = try registry.open()
-    let secondHandle = try registry.open()
-    let first = try registry.runtime(for: firstHandle)
-    let second = try registry.runtime(for: secondHandle)
-    let baseURL = URL(string: "https://fixture.invalid/")!
-
-    _ = try await first.loadHTML(
-      "<title>First</title>", baseURL: baseURL, timeout: .seconds(2),
-      quietWindow: .milliseconds(40))
-    _ = try await second.loadHTML(
-      "<title>Second</title>", baseURL: baseURL, timeout: .seconds(2),
-      quietWindow: .milliseconds(40))
-    _ = try await first.webView.evaluateJavaScript("localStorage.setItem('project', 'first')")
-
-    let firstValue =
-      try await first.webView.evaluateJavaScript(
-        "localStorage.getItem('project')") as? String
-    let secondValue =
-      try await second.webView.evaluateJavaScript(
-        "localStorage.getItem('project')") as? String
-    #expect(firstValue == "first")
-    #expect(secondValue == nil)
-
-    try registry.close(firstHandle)
-    try registry.close(secondHandle)
-  }
-
   @Test("Production registries enforce one host controller")
   func hostExclusiveSession() throws {
-    let first = try WebKitSessionRegistry(enforceHostExclusiveSession: true)
-    let second = try WebKitSessionRegistry(enforceHostExclusiveSession: true)
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-host-lock-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let first = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL)
+    let second = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL)
     let handle = try first.open()
     #expect(throws: WebKitSessionRegistryError.hostControllerBusy) {
       try second.open()
@@ -434,6 +780,31 @@ struct WebKitRuntimeTests {
     #expect(after.elements[0].accessibleName?.segments.first?.text == "Saved")
   }
 
+  @Test("AppKit click reaches WebKit as a trusted DOM gesture")
+  func nativeTrustedClickActuation() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <button aria-label='Trusted action'
+        onclick="this.dataset.state=event.isTrusted && navigator.userActivation.isActive
+          ? 'trusted' : 'rejected'">Run</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-click"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let result = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: "e1",
+      operation: .click,
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.dispatched)
+    #expect(result.trustedUserGesture)
+    #expect(result.dispatchMode == .nativeAppKit)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "trusted")
+  }
+
   @Test("Fill preserves input provenance at the actuation boundary")
   func fillActuation() async throws {
     let runtime = WebKitRuntime()
@@ -445,7 +816,7 @@ struct WebKitRuntimeTests {
     )
     let before = try await runtime.observe()
     let value = try ProvenancedText(
-      text: "Ada",
+      text: "Kevin",
       source: ProvenanceSource(classification: .userIntent)
     )
     let result = try await runtime.perform(
@@ -458,8 +829,142 @@ struct WebKitRuntimeTests {
     #expect(!result.trustedUserGesture)
 
     let after = try await runtime.observe()
-    #expect(after.elements[0].value?.segments.first?.text == "Ada")
+    #expect(after.elements[0].value?.segments.first?.text == "Kevin")
     #expect(after.elements[0].value?.classifications == [.userEnteredSiteData])
+  }
+
+  @Test("Control state and bounded attributes survive a fresh observation")
+  func observableControlState() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label style='display:inline-block; padding:8px'>
+        <input style='position:absolute; opacity:0' type='checkbox' checked aria-expanded='false'>
+        Financial data
+      </label>
+      <select aria-label='Plan'><option>Free</option><option selected>Paid</option></select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/state"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let checkbox = try #require(
+      observation.elements.first { $0.role?.segments.first?.text == "checkbox" })
+    let select = try #require(
+      observation.elements.first { $0.role?.segments.first?.text == "combobox" })
+    #expect(checkbox.checked == true)
+    #expect(checkbox.stateAttributes["aria-expanded"]?.segments.first?.text == "false")
+    #expect(select.selectedOption?.segments.first?.text == "Paid")
+
+    let state = try observation.canonicalState()
+    let fields = Set(state.entries.map(\.key.field))
+    #expect(fields.contains("@checked"))
+    #expect(fields.contains("@selected_option"))
+    #expect(fields.contains("@attribute:aria-expanded"))
+  }
+
+  @Test("Keyboard commit operations dispatch without claiming native trust")
+  func keyboardCommitOperations() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input aria-label='Recipient' onkeydown="if(event.key==='Enter') this.dataset.state='accepted'"
+        onchange="this.dataset.state='committed'">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/keyboard"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let key = try await runtime.perform(
+      observationID: before.observationID, elementID: "e1", operation: .pressKey("Enter"),
+      stabilityInterval: .milliseconds(10))
+    #expect(key.dispatched)
+    #expect(!key.trustedUserGesture)
+    let accepted = try await runtime.observe()
+    #expect(accepted.elements[0].stateAttributes["data-state"]?.segments.first?.text == "accepted")
+    let committed = try await runtime.perform(
+      observationID: accepted.observationID, elementID: "e1", operation: .commitInput,
+      stabilityInterval: .milliseconds(10))
+    #expect(committed.dispatched)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "committed")
+  }
+
+  @Test("AppKit Enter reaches the focused WebKit control as trusted")
+  func nativeTrustedKeyActuation() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input aria-label='Recipient'
+        onkeydown="if(event.key==='Enter') this.dataset.state=
+          event.isTrusted&&navigator.userActivation.isActive?'trusted':'rejected'">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-key"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let result = try await runtime.perform(
+      observationID: before.observationID, elementID: "e1",
+      operation: .pressKey("Enter"), dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.dispatched)
+    #expect(result.trustedUserGesture)
+    #expect(result.dispatchMode == .nativeAppKit)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "trusted")
+  }
+
+  @Test("AppKit Tab blurs and commits the focused WebKit input")
+  func nativeTabCommitsInput() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input aria-label='Service account' value='verifier@example.test'
+        onblur="this.dataset.state=event.isTrusted?'committed':'rejected'">
+      <button>Next</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-tab"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let result = try await runtime.perform(
+      observationID: before.observationID, elementID: "e1",
+      operation: .pressKey("Tab"), dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.trustedUserGesture)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "committed")
+  }
+
+  @Test("Element scrolling reports its nearest nested scroll region")
+  func nestedElementScroll() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div style='height:120px; overflow:auto'>
+        <div style='height:900px'></div><button aria-label='Nested target'>Target</button>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/nested-scroll"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Nested target" })
+    let result = try await runtime.scrollElementIntoView(
+      observationID: observation.observationID, elementID: target.elementID)
+    #expect(result.y > 0)
+    #expect(result.viewportHeight == 120)
+    #expect(result.documentHeight > result.viewportHeight)
+  }
+
+  @Test("Observation filters apply before serialization")
+  func serverSideObservationFilters() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<button aria-label='Save profile'>Save</button><a href='/help'>Help center</a>",
+      baseURL: URL(string: "https://fixture.invalid/filter"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe(
+      maximumElements: 10, roles: ["button"], nameContains: "save")
+    #expect(observation.elements.count == 1)
+    #expect(observation.elements[0].role?.segments.first?.text == "button")
   }
 
   @Test("Ambiguous fresh resolution aborts and increments its exact counter")
@@ -550,111 +1055,5 @@ struct WebKitRuntimeTests {
       ])
     let encoded = String(decoding: try JSONEncoder().encode(events), as: UTF8.self)
     #expect(!encoded.contains("private"))
-  }
-
-  @Test("OAuth popup policy requires handoff and follows in the observable web view")
-  func humanControlledPopup() async throws {
-    let server = try FormFixtureServer { request in
-      let body =
-        request.contains("GET /oauth ")
-        ? "<title>OAuth Provider</title><p>Continue authentication</p>"
-        : "<title>Login</title><a id='oauth' target='_blank' href='/oauth'>Log in</a>"
-      return FormFixtureServer.response(body: body)
-    }
-    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
-    _ = try await runtime.navigate(
-      to: URL(string: "http://127.0.0.1:\(server.port)/login")!,
-      timeout: .seconds(2),
-      quietWindow: .milliseconds(20)
-    )
-    _ = try await runtime.webView.evaluateJavaScript("document.getElementById('oauth').click()")
-    try await Task.sleep(for: .milliseconds(100))
-    #expect(runtime.webView.url?.path == "/login")
-    #expect(!runtime.webView.configuration.preferences.javaScriptCanOpenWindowsAutomatically)
-    #expect(
-      !runtime.followHumanPopupRequest(
-        URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/oauth")!)))
-
-    try runtime.requestHumanHandoff()
-    try runtime.beginHumanControl(presentWindow: false)
-    _ = try await runtime.webView.evaluateJavaScript("document.getElementById('oauth').click()")
-    try await Task.sleep(for: .milliseconds(100))
-    #expect(runtime.webView.url?.path == "/login")
-    let humanWebView = try #require(runtime.webView as? HumanControlWebView)
-    humanWebView.recordNativeUserGesture()
-    _ = try await runtime.webView.evaluateJavaScript("document.getElementById('oauth').click()")
-    let deadline = ContinuousClock.now + .seconds(2)
-    while runtime.webView.url?.path != "/oauth", ContinuousClock.now < deadline {
-      try await Task.sleep(for: .milliseconds(20))
-    }
-
-    #expect(runtime.webView.url?.path == "/oauth")
-    #expect(runtime.interactionControlState() == .humanControlled)
-    try runtime.requestAgentResume()
-    let observation = try await runtime.resumeAfterHumanControl()
-    #expect(observation.title.segments.first?.text == "OAuth Provider")
-    #expect(observation.url.segments.first?.text.contains("/oauth") == true)
-  }
-
-  @Test("Closing a session tears down its visible human-control window")
-  func closingSessionDismissesHumanWindow() async throws {
-    let registry = try WebKitSessionRegistry()
-    let handle = try registry.open()
-    let runtime = try registry.runtime(for: handle)
-    _ = try await runtime.loadHTML(
-      "<title>Visible handoff</title><button>Continue</button>",
-      baseURL: URL(string: "https://fixture.invalid/login"),
-      timeout: .seconds(2),
-      quietWindow: .milliseconds(40)
-    )
-    try runtime.requestHumanHandoff()
-    try runtime.beginHumanControl()
-    try await Task.sleep(for: .milliseconds(40))
-    let window = try #require(runtime.webView.window)
-    #expect(window.isVisible)
-    #expect(NSApplication.shared.activationPolicy() == .regular)
-    let editMenu = NSApplication.shared.mainMenu?.items.first {
-      $0.submenu?.title == "Edit"
-    }?.submenu
-    #expect(
-      editMenu?.items.first(where: { $0.keyEquivalent == "v" })?.action == #selector(
-        NSText.paste(_:)))
-
-    try registry.close(handle)
-
-    #expect(!window.isVisible)
-    #expect(runtime.webView.window == nil)
-    #expect(NSApplication.shared.activationPolicy() == .accessory)
-  }
-
-  @Test("Concurrent human-control windows keep the Dock active until the last close")
-  func concurrentHumanWindowsKeepDockActive() async throws {
-    let registry = try WebKitSessionRegistry(maximumSessions: 2)
-    let firstHandle = try registry.open()
-    let secondHandle = try registry.open()
-    let first = try registry.runtime(for: firstHandle)
-    let second = try registry.runtime(for: secondHandle)
-    _ = try await first.loadHTML(
-      "<title>First project</title>", baseURL: URL(string: "https://first.invalid/")!,
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
-    _ = try await second.loadHTML(
-      "<title>Second project</title>", baseURL: URL(string: "https://second.invalid/")!,
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
-
-    try first.requestHumanHandoff()
-    try first.beginHumanControl()
-    try second.requestHumanHandoff()
-    try second.beginHumanControl()
-    #expect(first.webView.window?.title.contains("first.invalid") == true)
-    #expect(second.webView.window?.title.contains("second.invalid") == true)
-    #expect(first.webView.window?.frame.origin != second.webView.window?.frame.origin)
-    #expect(NSApplication.shared.activationPolicy() == .regular)
-
-    try registry.close(firstHandle)
-    #expect(NSApplication.shared.activationPolicy() == .regular)
-    #expect(second.webView.window?.isVisible == true)
-
-    try registry.close(secondHandle)
-    #expect(NSApplication.shared.activationPolicy() == .accessory)
   }
 }

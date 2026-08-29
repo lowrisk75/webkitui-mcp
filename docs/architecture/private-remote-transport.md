@@ -6,10 +6,11 @@ cookies, passwords, or a general shell.
 
 ## Provider-neutral target
 
-Run WebKit in the logged-in Aqua session through a per-user `LaunchAgent`.
-The agent owns a mode `0600` Unix socket and starts
-`webkitui-mcp-aqua-broker` with launchd socket activation. SSH only carries
-stdio to `webkitui-mcp-relay`; it never launches WebKit itself.
+Run WebKit in the logged-in graphical session through the signed `WebKitUI MCP`
+app. The app registers itself at login through `SMAppService.mainApp`, owns a
+mode `0600` Unix socket, and starts the native broker. It does not write a
+mutable plist into `~/Library/LaunchAgents`. SSH only carries stdio to
+`webkitui-mcp-relay`; it never launches WebKit itself.
 
 Use a dedicated key whose `authorized_keys` entry is restricted to the relay:
 
@@ -37,8 +38,10 @@ Host webkitui-mac
 
 The remote MCP command is then `ssh -T` with the pinned options above. Verify
 the host-key fingerprint from the Mac itself before accepting it;
-`ssh-keyscan` alone does not establish trust. The checked-in LaunchAgent
-template is in `Support/LaunchAgents/` and deliberately contains placeholders.
+`ssh-keyscan` alone does not establish trust. The standalone relay artifact is
+intended for this forced-command path; the app also embeds the same relay for
+local MCP registration. The checked-in LaunchAgent template is retained only
+for legacy migration and advanced private deployment, not new installation.
 
 Tailscale SSH is not assumed here: its SSH server is unavailable in the normal
 macOS GUI variant. Ordinary OpenSSH over a private routed address remains
@@ -46,21 +49,31 @@ encrypted, but its reachability policy is independent of the tailnet ACL.
 
 ## Host ownership
 
-The broker creates one MCP server per socket connection. The production runtime
-takes a non-blocking advisory lock before opening WebKit, so only one connection
-can control a browser session for the macOS account.
-A second process remains discoverable but its session-open call fails closed.
-The OS releases the lease if the owner exits or crashes.
+The broker owns one MCP server and one live WebKit session across sequential
+socket connections. It accepts multiple same-UID clients, but gives every
+connection an isolated server authority surface. Clients share only the
+host-owned browser registry: observations, pending confirmations, transaction
+coordinators, and capability grants never cross connections. Each client must
+call `browser_session(operation: "open")` and observe the live page itself;
+any later observation invalidates older runtime addresses fail-closed.
 
-This is intentionally a control lock, not session migration. A handle belongs
-to the server process that created it and cannot be resumed in another process.
+In durable-host mode, `browser_session(operation: "close")` detaches authority
+without destroying the `WKWebView`, its `sessionStorage`, or session cookies.
+Quitting the app or losing the host process remains a real browser-page
+restart. The production runtime also keeps the non-blocking account-wide
+controller lock, so a second WebKit host fails closed.
+
+The local stdio relay is request-framed and remains alive if the native broker is
+restarted. A request that has not been dispatched is sent after reconnection. A
+disconnect after dispatch returns an explicit unknown-outcome transport error
+for that request and never replays it; later requests reconnect normally.
 
 ## Measured deployment state
 
 The private path was exercised end to end on 2026-08-22:
 
 1. Remote `open → status → close` succeeded through SSH, relay, Unix socket,
-   Aqua broker, and `WKWebView` on the Mac.
+   native broker, and `WKWebView` on the Mac.
 2. The handoff window was captured on screen with a title, nonblank placeholder,
    regular activation policy, and application icon; accepted resume hid it.
 3. Host-key pinning, forced command, source-IP restriction, no PTY, and no
@@ -72,9 +85,11 @@ The private path was exercised end to end on 2026-08-22:
    include SSH startup on a busy development machine and are not steady-state
    action latency.
 
-Still open: disconnect during an indeterminate real website write, authenticated
-task success, and steady-state observe/action latency. Existing Codex or Claude
-conversations must be restarted to load a newly installed MCP catalog.
+The 2026-08-22 measurements above predate durable-host reuse and remain evidence
+for the transport only. Still open: disconnect during an indeterminate real
+website write, authenticated task success across a fresh Codex conversation,
+and steady-state observe/action latency. Existing Codex or Claude conversations
+must be restarted to load a newly installed MCP catalog.
 
 OpenAI Secure MCP Tunnel is a separate optional transport for supported OpenAI
 products. It is outbound-only, but requires external Platform configuration and

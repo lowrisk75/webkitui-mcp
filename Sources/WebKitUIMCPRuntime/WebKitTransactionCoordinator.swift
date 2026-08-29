@@ -19,6 +19,7 @@ public final class WebKitTransactionCoordinator {
   public func execute(
     plan: TransactionalWritePlan,
     operation: WebKitActionOperation,
+    dispatchMode: WebKitActionDispatchMode = .javascript,
     observation: WebKitPageObservation,
     capabilityAuthority: CapabilityAuthority,
     capabilityHandle: CapabilityHandle,
@@ -62,7 +63,8 @@ public final class WebKitTransactionCoordinator {
       action = try await runtime.perform(
         observationID: observation.observationID,
         elementID: plan.target.elementID,
-        operation: operation
+        operation: operation,
+        dispatchMode: dispatchMode
       )
       dispatchedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
       _ = try await ledger.recordDispatchOutcome(

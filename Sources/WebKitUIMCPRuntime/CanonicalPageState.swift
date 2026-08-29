@@ -45,7 +45,16 @@ extension WebKitPageObservation {
       if let value = element.text {
         entries.append(.init(key: elementKey(element, "@text"), value: value))
       }
-      if let value = element.value {
+      let role = element.role?.segments.map(\.text).joined().lowercased()
+      if role == "dialog" || role == "alertdialog",
+        let dialogName = element.accessibleName ?? element.label ?? element.text
+      {
+        entries.append(.init(key: elementKey(element, "@dialog_name"), value: dialogName))
+      }
+      if element.visible, !element.sensitive,
+        element.boundingBox.width > 0, element.boundingBox.height > 0,
+        let value = element.value
+      {
         entries.append(.init(key: elementKey(element, "@value"), value: value))
         if semanticIdentityCounts[element.locatorRecipe.semanticIdentity] == 1 {
           entries.append(
@@ -65,6 +74,52 @@ extension WebKitPageObservation {
           value: try ProvenancedText(text: String(element.disabled), source: toolSource)
         )
       )
+      if let checked = element.checked {
+        entries.append(
+          .init(
+            key: elementKey(element, "@checked"),
+            value: try ProvenancedText(text: String(checked), source: toolSource)
+          ))
+      }
+      if let selected = element.selected {
+        entries.append(
+          .init(
+            key: elementKey(element, "@selected"),
+            value: try ProvenancedText(text: String(selected), source: toolSource)
+          ))
+      }
+      if let selectedOption = element.selectedOption {
+        entries.append(.init(key: elementKey(element, "@selected_option"), value: selectedOption))
+      }
+      for (name, value) in element.stateAttributes.sorted(by: { $0.key < $1.key }) {
+        entries.append(.init(key: elementKey(element, "@attribute:\(name)"), value: value))
+      }
+      if semanticIdentityCounts[element.locatorRecipe.semanticIdentity] == 1 {
+        let semanticID = element.locatorRecipe.semanticIdentity
+        func appendSemantic(_ field: String, _ value: ProvenancedText) {
+          entries.append(
+            .init(
+              key: ObservationFieldKey(frameID: "main", elementID: semanticID, field: field),
+              value: value
+            ))
+        }
+        if let checked = element.checked {
+          appendSemantic(
+            "@checked", try ProvenancedText(text: String(checked), source: toolSource))
+        }
+        if let selected = element.selected {
+          appendSemantic(
+            "@selected", try ProvenancedText(text: String(selected), source: toolSource))
+        }
+        if let selectedOption = element.selectedOption {
+          appendSemantic("@selected_option", selectedOption)
+        }
+        appendSemantic(
+          "@enabled", try ProvenancedText(text: String(!element.disabled), source: toolSource))
+        for (name, value) in element.stateAttributes.sorted(by: { $0.key < $1.key }) {
+          appendSemantic("@attribute:\(name)", value)
+        }
+      }
       entries.append(
         .init(
           key: elementKey(element, "@visible"),
