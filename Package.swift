@@ -11,7 +11,9 @@ let package = Package(
     .library(name: "WebKitUIMCPCore", targets: ["WebKitUIMCPCore"]),
     .library(name: "WebKitUIMCPRuntime", targets: ["WebKitUIMCPRuntime"]),
     .library(name: "WebKitUIMCPServer", targets: ["WebKitUIMCPServer"]),
+    .library(name: "WebKitUIMCPLicensing", targets: ["WebKitUIMCPLicensing"]),
     .executable(name: "webkitui-mcp", targets: ["WebKitUIMCPCLI"]),
+    .executable(name: "webkitui-mcp-confirm", targets: ["WebKitUIMCPConfirm"]),
     .executable(name: "webkitui-mcp-aqua-broker", targets: ["WebKitUIMCPAquaBroker"]),
     .executable(name: "webkitui-mcp-relay", targets: ["WebKitUIMCPRelay"]),
     .executable(name: "wkjs-handle-probe", targets: ["WKJSHandleProbe"]),
@@ -25,6 +27,10 @@ let package = Package(
     .systemLibrary(name: "CLaunchShim"),
     .target(name: "WebKitUIMCPCore"),
     .target(
+      name: "WebKitUIMCPLicensing",
+      resources: [.process("Resources")]
+    ),
+    .target(
       name: "WebKitUIMCPRuntime",
       dependencies: ["WebKitUIMCPCore"]
     ),
@@ -34,11 +40,14 @@ let package = Package(
     ),
     .executableTarget(
       name: "WebKitUIMCPCLI",
-      dependencies: ["WebKitUIMCPServer"]
+      dependencies: ["WebKitUIMCPLicensing", "WebKitUIMCPRuntime", "WebKitUIMCPServer"]
     ),
+    .executableTarget(name: "WebKitUIMCPConfirm"),
     .executableTarget(
       name: "WebKitUIMCPAquaBroker",
-      dependencies: ["CLaunchShim", "WebKitUIMCPServer"]
+      dependencies: [
+        "CLaunchShim", "WebKitUIMCPLicensing", "WebKitUIMCPRuntime", "WebKitUIMCPServer",
+      ]
     ),
     .executableTarget(name: "WebKitUIMCPRelay"),
     .executableTarget(name: "WKJSHandleProbe"),
@@ -48,11 +57,15 @@ let package = Package(
     ),
     .executableTarget(
       name: "CredentialBrokerPhysicalValidation",
-      dependencies: ["WebKitUIMCPRuntime"]
+      dependencies: ["WebKitUIMCPRuntime", "WebKitUIMCPServer"]
     ),
     .testTarget(
       name: "WebKitUIMCPCoreTests",
       dependencies: ["WebKitUIMCPCore"]
+    ),
+    .testTarget(
+      name: "WebKitUIMCPLicensingTests",
+      dependencies: ["WebKitUIMCPLicensing"]
     ),
     .testTarget(
       name: "WebKitUIMCPRuntimeTests",

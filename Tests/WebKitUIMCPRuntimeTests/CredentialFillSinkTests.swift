@@ -40,6 +40,38 @@ struct CredentialFillSinkTests {
     return (runtime, try await runtime.observe())
   }
 
+  private func rotationFixture() async throws -> (WebKitRuntime, WebKitPageObservation) {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <form id="rotation">
+        <input id="current" type="password" autocomplete="current-password">
+        <input id="next" type="password" autocomplete="new-password">
+        <input id="confirmation" type="password" autocomplete="new-password">
+        <button type="submit">Change</button>
+      </form>
+      <script>
+        globalThis.submitCount = 0;
+        globalThis.eventCount = 0;
+        const form = document.querySelector('form');
+        form.addEventListener('submit', event => {
+          globalThis.submitCount += 1;
+          event.preventDefault();
+        });
+        for (const input of document.querySelectorAll('input')) {
+          input.addEventListener('input', () => { globalThis.eventCount += 1; form.requestSubmit(); });
+          input.addEventListener('change', () => { globalThis.eventCount += 1; form.requestSubmit(); });
+        }
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/settings/password"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+    return (runtime, try await runtime.observe())
+  }
+
   @Test("Synthetic values reach exact fields without submission or receipt leakage")
   func fillsExactFields() async throws {
     let (runtime, observation) = try await fixture()
@@ -68,6 +100,35 @@ struct CredentialFillSinkTests {
     let receiptJSON = String(decoding: try JSONEncoder().encode(receipt), as: UTF8.self)
     #expect(!receiptJSON.contains(usernameCanary))
     #expect(!receiptJSON.contains(passwordCanary))
+  }
+
+  @Test("Rotation fills three exact fields without events or submission")
+  func rotationFillsExactFieldsWithoutCommit() async throws {
+    let (runtime, observation) = try await rotationFixture()
+    let binding = try runtime.credentialRotationBinding(
+      observationID: observation.observationID,
+      currentPasswordElementID: "e1",
+      newPasswordElementID: "e2",
+      confirmationElementID: "e3"
+    )
+    let current = CredentialSecretBuffer(copying: Array("old-synthetic".utf8))
+    let next = CredentialSecretBuffer(copying: Array("new-synthetic".utf8))
+
+    let receipt = try await runtime.performCredentialRotationFill(
+      binding: binding,
+      currentPassword: current,
+      newPassword: next
+    )
+
+    #expect(receipt.status == .filled)
+    #expect(current.isWiped)
+    #expect(next.isWiped)
+    let values = try #require(
+      await runtime.webView.evaluateJavaScript(
+        "JSON.stringify([current.value, next.value, confirmation.value, globalThis.eventCount, globalThis.submitCount])"
+      ) as? String
+    )
+    #expect(values == "[\"old-synthetic\",\"new-synthetic\",\"new-synthetic\",0,0]")
   }
 
   @Test("An identical DOM replacement is stale and fills neither field")

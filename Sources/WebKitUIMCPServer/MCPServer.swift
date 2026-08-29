@@ -24,36 +24,78 @@ public final class WebKitMCPServer {
   private let registry: WebKitSessionRegistry
   private let presentHumanWindows: Bool
   private let credentialBroker: any CredentialBrokerFilling
+  private let confirmationPresenter: any BrowserConfirmationPresenting
+  private let preserveBrowserOnClose: Bool
+  private let transactionLedgerFactory: WebKitTransactionLedgerFactory
   private let capabilityAuthority = CapabilityAuthority()
   private var observations: [WebKitSessionHandle: WebKitPageObservation] = [:]
   private var coordinators: [WebKitSessionHandle: WebKitTransactionCoordinator] = [:]
+  private var sessionBackends: [WebKitSessionHandle: String] = [:]
   private var pendingActuations: [String: PendingActuation] = [:]
   private var pendingHandoffs: [String: PendingHandoff] = [:]
+  private var asynchronousHandoffs: [String: AsynchronousHandoff] = [:]
   private var pendingNavigations: [String: PendingNavigation] = [:]
 
   private enum ActPostcondition {
     case urlEquals(String)
     case semanticTextAppears(String)
+    case semanticTextContains(String)
+    case checkedEquals(Bool)
+    case selectedEquals(Bool)
+    case enabledEquals(Bool)
+    case valueEquals(String)
+    case attributeEquals(name: String, value: String)
+    case dialogAppears(String)
+    case optionSelected(String)
 
     var confirmationDescription: String {
       switch self {
       case .urlEquals(let value): "URL equals \(value)"
       case .semanticTextAppears(let value): "new semantic text appears: \(value)"
+      case .semanticTextContains(let value): "new semantic text contains: \(value)"
+      case .checkedEquals(let value): "target checked equals \(value)"
+      case .selectedEquals(let value): "target selected equals \(value)"
+      case .enabledEquals(let value): "target enabled equals \(value)"
+      case .valueEquals(let value): "target value equals \(value)"
+      case .attributeEquals(let name, let value): "target \(name) equals \(value)"
+      case .dialogAppears(let value): "dialog appears with accessible name \(value)"
+      case .optionSelected(let value): "target selected option equals \(value)"
       }
     }
 
-    var predicate: ObservationPredicate {
+    func predicate(for target: WebKitObservedElement) -> ObservationPredicate {
+      let semanticID = target.locatorRecipe.semanticIdentity
+      func targetField(_ field: String, _ value: String) -> ObservationPredicate {
+        .entryTextDigest(
+          .init(frameID: "main", elementID: semanticID, field: field),
+          ObservationPredicate.textDigest(of: value)
+        )
+      }
       switch self {
       case .urlEquals(let value):
-        .entryTextDigest(
+        return .entryTextDigest(
           .init(frameID: "main", elementID: "@page", field: "url"),
           ObservationPredicate.textDigest(of: value)
         )
       case .semanticTextAppears(let value):
-        .anyEntryTextDigest(
+        return .anyEntryTextDigest(
           [.accessibleName, .label, .text, .value],
           ObservationPredicate.textDigest(of: value)
         )
+      case .semanticTextContains(let value):
+        let parameters = ObservationPredicate.containsParameters(of: value)
+        return .anyEntryTextContainsDigest(
+          [.accessibleName, .label, .text, .value, .dialogName],
+          parameters.digest, parameters.length, parameters.rolling)
+      case .checkedEquals(let value): return targetField("@checked", String(value))
+      case .selectedEquals(let value): return targetField("@selected", String(value))
+      case .enabledEquals(let value): return targetField("@enabled", String(value))
+      case .valueEquals(let value): return targetField("@value", value)
+      case .attributeEquals(let name, let value):
+        return targetField("@attribute:\(name)", value)
+      case .dialogAppears(let value):
+        return .anyEntryTextDigest([.dialogName], ObservationPredicate.textDigest(of: value))
+      case .optionSelected(let value): return targetField("@selected_option", value)
       }
     }
   }
@@ -62,12 +104,18 @@ public final class WebKitMCPServer {
     case click
     case submit
     case fill(String)
+    case pressKey(String)
+    case blur
+    case commitInput
 
     var name: String {
       switch self {
       case .click: "click"
       case .submit: "submit"
       case .fill: "fill"
+      case .pressKey: "press_key"
+      case .blur: "blur"
+      case .commitInput: "commit_input"
       }
     }
 
@@ -76,13 +124,14 @@ public final class WebKitMCPServer {
       case .click: .activateElement
       case .submit: .submitForm
       case .fill: .fillForm
+      case .pressKey, .blur, .commitInput: .fillForm
       }
     }
 
     var inputProvenance: Set<ProvenanceClass> {
       switch self {
       case .fill: [.modelGenerated]
-      case .click, .submit: []
+      case .click, .submit, .pressKey, .blur, .commitInput: []
       }
     }
   }
@@ -95,11 +144,18 @@ public final class WebKitMCPServer {
     let operation: ActOperation
     let idempotencyKey: String
     let postcondition: ActPostcondition?
+    let approvalMode: String
+    let dispatchMode: WebKitActionDispatchMode
     let expiresAt: Date
   }
 
   private struct PendingHandoff {
     let arguments: [String: JSONValue]
+    let session: WebKitSessionHandle
+    let expiresAt: Date
+  }
+
+  private struct AsynchronousHandoff {
     let session: WebKitSessionHandle
     let expiresAt: Date
   }
@@ -113,22 +169,66 @@ public final class WebKitMCPServer {
     let expiresAt: Date
   }
 
-  public init(maximumSessions: Int = 1, enforceHostExclusiveSession: Bool = false) throws {
+  public init(
+    maximumSessions: Int = 1,
+    enforceHostExclusiveSession: Bool = false,
+    preserveBrowserOnClose: Bool = false,
+    transactionLedgerFactory: WebKitTransactionLedgerFactory = .inMemory
+  ) throws {
     self.registry = try WebKitSessionRegistry(
       maximumSessions: maximumSessions,
       enforceHostExclusiveSession: enforceHostExclusiveSession)
     self.presentHumanWindows = true
     self.credentialBroker = SyntheticCredentialBrokerXPCClient()
+    self.confirmationPresenter = NativeBrowserConfirmationPresenter()
+    self.preserveBrowserOnClose = preserveBrowserOnClose
+    self.transactionLedgerFactory = transactionLedgerFactory
+  }
+
+  /// Creates one client-scoped authority surface over a host-owned durable
+  /// browser registry. Multiple transports may discover tools concurrently,
+  /// while the shared runtime keeps browser control serialized and stale
+  /// observations fail closed.
+  public init(
+    durableRegistry registry: WebKitSessionRegistry,
+    transactionLedgerFactory: WebKitTransactionLedgerFactory = .inMemory
+  ) {
+    self.registry = registry
+    self.presentHumanWindows = true
+    self.credentialBroker = SyntheticCredentialBrokerXPCClient()
+    self.confirmationPresenter = NativeBrowserConfirmationPresenter()
+    self.preserveBrowserOnClose = true
+    self.transactionLedgerFactory = transactionLedgerFactory
   }
 
   init(
     registry: WebKitSessionRegistry,
     presentHumanWindows: Bool = false,
-    credentialBroker: any CredentialBrokerFilling = SyntheticCredentialBrokerXPCClient()
+    credentialBroker: any CredentialBrokerFilling = SyntheticCredentialBrokerXPCClient(),
+    confirmationPresenter: any BrowserConfirmationPresenting =
+      NativeBrowserConfirmationPresenter(),
+    preserveBrowserOnClose: Bool = false,
+    transactionLedgerFactory: WebKitTransactionLedgerFactory = .inMemory
   ) {
     self.registry = registry
     self.presentHumanWindows = presentHumanWindows
     self.credentialBroker = credentialBroker
+    self.confirmationPresenter = confirmationPresenter
+    self.preserveBrowserOnClose = preserveBrowserOnClose
+    self.transactionLedgerFactory = transactionLedgerFactory
+  }
+
+  /// Drops every client-scoped proof while retaining only the host-owned
+  /// browser in durable-broker mode. A reconnect must observe the live page
+  /// again before it can request a fill or action.
+  public func prepareForClientReconnect() async {
+    observations.removeAll(keepingCapacity: false)
+    coordinators.removeAll(keepingCapacity: false)
+    sessionBackends.removeAll(keepingCapacity: false)
+    pendingActuations.removeAll(keepingCapacity: false)
+    pendingHandoffs.removeAll(keepingCapacity: false)
+    pendingNavigations.removeAll(keepingCapacity: false)
+    await capabilityAuthority.revokeAll()
   }
 
   public func handle(_ input: Data) async -> Data? {
@@ -245,6 +345,18 @@ public final class WebKitMCPServer {
     let name = try requireString(params["name"], named: "name")
     let arguments = params["arguments"]?.objectValue ?? [:]
 
+    if Self.authenticationRestrictedTools.contains(name) {
+      let runtime = try registry.runtime(for: sessionHandle(arguments))
+      if let restriction = runtime.authenticationRestrictionStatus() {
+        observations.removeValue(forKey: try sessionHandle(arguments))
+        return try authenticationRestrictionResult(
+          restriction,
+          runtime: runtime,
+          modern: modern
+        )
+      }
+    }
+
     do {
       switch name {
       case "browser_session":
@@ -256,13 +368,81 @@ public final class WebKitMCPServer {
         let runtime = try registry.runtime(for: handle)
         let maximum = try boundedInteger(
           arguments["maximum_elements"],
-          defaultValue: 500,
+          defaultValue: 150,
           range: 1...2_000,
           name: "maximum_elements"
         )
-        let observation = try await runtime.observe(maximumElements: maximum)
+        let elementOffset = try boundedInteger(
+          arguments["element_offset"], defaultValue: 0, range: 0...100_000,
+          name: "element_offset")
+        let maximumFieldCharacters = try boundedInteger(
+          arguments["maximum_field_characters"], defaultValue: 512, range: 64...4_096,
+          name: "maximum_field_characters")
+        let roles: [String]
+        if case .array(let values) = arguments["roles"] {
+          roles = try values.map {
+            guard let value = $0.stringValue, !value.isEmpty, value.count <= 64 else {
+              throw MCPServerError.invalidParams("roles must contain bounded non-empty strings")
+            }
+            return value
+          }
+          guard roles.count <= 16 else {
+            throw MCPServerError.invalidParams("roles accepts at most 16 values")
+          }
+        } else if arguments["roles"] == nil {
+          roles = []
+        } else {
+          throw MCPServerError.invalidParams("roles must be an array")
+        }
+        let nameContains = arguments["name_contains"]?.stringValue
+        if let nameContains, nameContains.count > 128 {
+          throw MCPServerError.invalidParams("name_contains must contain at most 128 characters")
+        }
+        let observation = try await runtime.observe(
+          maximumElements: maximum,
+          elementOffset: elementOffset,
+          maximumFieldCharacters: maximumFieldCharacters,
+          roles: roles,
+          nameContains: nameContains)
         observations[handle] = observation
         return try toolResult(structured: .encoded(observation), modern: modern)
+      case "browser_scroll":
+        let handle = try sessionHandle(arguments)
+        let runtime = try registry.runtime(for: handle)
+        let deltaX = try boundedDouble(
+          arguments["delta_x"], defaultValue: 0, range: -2_000...2_000, name: "delta_x")
+        let deltaY = try boundedDouble(
+          arguments["delta_y"], defaultValue: 0, range: -2_000...2_000, name: "delta_y")
+        let result = try await runtime.scrollBy(deltaX: deltaX, deltaY: deltaY)
+        observations.removeValue(forKey: handle)
+        return try toolResult(structured: .encoded(result), modern: modern)
+      case "element_scroll_into_view":
+        let handle = try sessionHandle(arguments)
+        guard let observation = observations[handle] else {
+          throw MCPServerError.invalidParams("Call browser_observe first")
+        }
+        let observationID = try requireString(
+          arguments["observation_id"], named: "observation_id")
+        guard observation.observationID == observationID else {
+          throw MCPServerError.invalidParams("observation_id is stale")
+        }
+        let elementID = try requireString(arguments["element_id"], named: "element_id")
+        let runtime = try registry.runtime(for: handle)
+        let result = try await runtime.scrollElementIntoView(
+          observationID: observationID, elementID: elementID)
+        observations.removeValue(forKey: handle)
+        return try toolResult(structured: .encoded(result), modern: modern)
+      case "browser_read_text":
+        let runtime = try registry.runtime(for: sessionHandle(arguments))
+        let maximum = try boundedInteger(
+          arguments["maximum_characters"],
+          defaultValue: 20_000,
+          range: 1...100_000,
+          name: "maximum_characters"
+        )
+        return try toolResult(
+          structured: .encoded(try await runtime.readText(maximumCharacters: Int(maximum))),
+          modern: modern)
       case "browser_act":
         return try await actTool(
           params: params,
@@ -293,6 +473,8 @@ public final class WebKitMCPServer {
         return .object(result)
       case "browser_fill_siliconpass":
         return try await credentialFillTool(arguments: arguments, modern: modern)
+      case "browser_rotate_siliconpass_password":
+        return try await credentialRotationTool(arguments: arguments, modern: modern)
       case "browser_transaction":
         let handle = try sessionHandle(arguments)
         guard let coordinator = coordinators[handle] else {
@@ -305,21 +487,99 @@ public final class WebKitMCPServer {
           return try toolResult(
             structured: .encoded(try await coordinator.receipt(idempotencyKey: key)),
             modern: modern)
-        case "reconcile":
+        case "export":
+          let receipt = try await coordinator.receipt(idempotencyKey: key)
+          let exported = TransactionReceiptExportV1(
+            receipt: receipt,
+            exportedAt: ISO8601DateFormatter().string(from: Date())
+          )
+          let canonical = try exported.canonicalJSONData()
+          let digest = try exported.canonicalJSONSHA256()
           return try toolResult(
-            structured: .encoded(try await coordinator.reconcile(idempotencyKey: key)),
+            structured: .object([
+              "format": .string("ReceiptV1"),
+              "media_type": .string("application/vnd.lorislab.webkitui-receipt+json"),
+              "sha256": .string(digest),
+              "canonical_json_base64": .string(canonical.base64EncodedString()),
+              "markdown": .string(exported.markdown()),
+              "receipt": try .encoded(exported),
+              "action_replayed": .bool(false),
+            ]),
+            modern: modern)
+        case "reconcile":
+          let verification = try await coordinator.reconcile(idempotencyKey: key)
+          let state: String
+          let nextStep: String
+          switch verification {
+          case .verified:
+            state = "verified_by_postcondition"
+            nextStep = "none"
+          case .indeterminate:
+            state = "real_world_state_unknown"
+            nextStep =
+              "Inspect an independent backend or provider status before any retry; reconciliation never replays."
+          case .pending:
+            state = "verification_pending"
+            nextStep = "Wait, then reconcile again without replaying the action."
+          }
+          return try toolResult(
+            structured: .object([
+              "verification": try .encoded(verification),
+              "reconcile_state": .string(state),
+              "safe_next_step": .string(nextStep),
+              "action_replayed": .bool(false),
+            ]),
             modern: modern)
         default:
-          throw MCPServerError.invalidParams("operation must be receipt or reconcile")
+          throw MCPServerError.invalidParams("operation must be receipt, export, or reconcile")
         }
       default:
         return try toolError("Unknown tool: \(name)", modern: modern)
       }
     } catch let error as MCPServerError {
       throw error
+    } catch WebKitRuntimeError.targetNotActionable {
+      return try toolError(
+        "target_not_actionable: scroll/re-observe first; if the site requires a trusted human gesture, use browser_session operation=handoff",
+        modern: modern)
     } catch {
       return try toolError(String(describing: error), modern: modern)
     }
+  }
+
+  private func authenticationRestrictionResult(
+    _ restriction: AuthenticationRestrictionStatus,
+    runtime: WebKitRuntime,
+    modern: Bool
+  ) throws -> JSONValue {
+    let fullBrowserRequired = restriction.classification == .fullBrowserRequired
+    if !fullBrowserRequired,
+      runtime.interactionControlState() == .agentControlled
+        || runtime.interactionControlState() == .freshlyReobserved
+    {
+      try runtime.requestHumanHandoff()
+      try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+    }
+    return try structuredToolError(
+      structured: .object([
+        "status": .string(
+          fullBrowserRequired
+            ? AuthenticationUIClassification.fullBrowserRequired.rawValue
+            : "authentication_origin_requires_human_handoff"),
+        "origin": .string(restriction.origin),
+        "auth_ui_state": .string(restriction.classification.rawValue),
+        "environment": try .encoded(restriction.environment),
+        "control_state": .string(runtime.interactionControlState().rawValue),
+        "selected_backend": .string("native_webkit"),
+        "required_internal_backend": .string(
+          fullBrowserRequired ? "safari_compatibility" : "native_handoff"),
+        "backend_transition": .string(
+          fullBrowserRequired ? "internal_backend_required" : "human_handoff_required"),
+        "session_transfer_supported": .bool(false),
+        "credential_transfer_supported": .bool(false),
+      ]),
+      modern: modern
+    )
   }
 
   private func sessionTool(
@@ -328,44 +588,139 @@ public final class WebKitMCPServer {
     let operation = try requireString(arguments["operation"], named: "operation")
     switch operation {
     case "open":
-      guard arguments.keys.allSatisfy({ $0 == "operation" }) else {
-        throw MCPServerError.invalidParams("open accepts only operation")
+      guard
+        arguments.keys.allSatisfy({
+          $0 == "operation" || $0 == "profile_id" || $0 == "execution_policy"
+        })
+      else {
+        throw MCPServerError.invalidParams(
+          "open accepts only operation, profile_id, and execution_policy")
       }
-      let handle = try registry.open()
+      let requestedProfile = arguments["profile_id"]?.stringValue ?? "default"
+      let executionPolicy = arguments["execution_policy"]?.stringValue ?? "auto"
+      guard
+        ["auto", "trusted_local", "compatibility", "isolated_read_only"].contains(
+          executionPolicy)
+      else {
+        throw MCPServerError.invalidParams(
+          "execution_policy must be auto, trusted_local, compatibility, or isolated_read_only")
+      }
+      guard executionPolicy == "auto" || executionPolicy == "trusted_local" else {
+        return try structuredToolError(
+          structured: .object([
+            "status": .string("backend_unavailable"),
+            "execution_policy": .string(executionPolicy),
+            "available_internal_backends": .array([.string("native_webkit")]),
+            "session_transfer_supported": .bool(false),
+            "credential_transfer_supported": .bool(false),
+          ]),
+          modern: modern
+        )
+      }
+      let profileIdentifier: UUID?
+      if requestedProfile == "default" {
+        profileIdentifier = nil
+      } else if let identifier = UUID(uuidString: requestedProfile) {
+        guard await registry.availableProfileIDs().contains(identifier.uuidString) else {
+          throw MCPServerError.invalidParams("profile_id is not an existing persistent profile")
+        }
+        profileIdentifier = identifier
+      } else {
+        throw MCPServerError.invalidParams("profile_id must be default or a listed UUID")
+      }
+      let opened =
+        preserveBrowserOnClose
+        ? try registry.openOrReuse(profileIdentifier: profileIdentifier)
+        : (handle: try registry.open(profileIdentifier: profileIdentifier), reused: false)
+      let handle = opened.handle
+      sessionBackends[handle] = "native_webkit"
       coordinators[handle] = WebKitTransactionCoordinator(
-        runtime: try registry.runtime(for: handle))
+        runtime: try registry.runtime(for: handle),
+        ledger: try transactionLedgerFactory.make(scope: requestedProfile)
+      )
       return try toolResult(
         structured: .object([
           "session_id": .string(handle.rawValue.uuidString),
           "maximum_sessions": .int(Int64(registry.maximumSessions)),
+          "reused": .bool(opened.reused),
+          "profile_id": .string(requestedProfile),
+          "execution_policy": .string(executionPolicy),
+          "selected_backend": .string("native_webkit"),
+          "capabilities": .array([
+            .string("authenticated_read"),
+            .string("trusted_local_write"),
+            .string("human_handoff"),
+          ]),
         ]), modern: modern)
-    case "status":
+    case "profiles":
+      guard arguments.keys.allSatisfy({ $0 == "operation" }) else {
+        throw MCPServerError.invalidParams("profiles accepts only operation")
+      }
       return try toolResult(
-        structured: .encoded(try registry.status(sessionHandle(arguments))), modern: modern)
+        structured: .object([
+          "profiles": .array(
+            await registry.availableProfileIDs().map { .string($0) }),
+          "contains_credentials": .bool(false),
+          "available_execution_policies": .array([
+            .string("auto"), .string("trusted_local"), .string("compatibility"),
+            .string("isolated_read_only"),
+          ]),
+        ]),
+        modern: modern)
+    case "status":
+      let handle = try sessionHandle(arguments)
+      purgeExpiredAsynchronousHandoffs()
+      let status = try registry.status(handle)
+      var statusObject = try requireObject(.encoded(status), named: "session status")
+      statusObject["control_state"] = .string(status.controlState.rawValue)
+      statusObject["selected_backend"] = .string(sessionBackends[handle] ?? "native_webkit")
+      statusObject["handoff_active"] = .bool(
+        asynchronousHandoffs.values.contains { $0.session == handle })
+      return try toolResult(
+        structured: .object(statusObject), modern: modern)
     case "close":
       let handle = try sessionHandle(arguments)
-      try registry.close(handle)
       observations.removeValue(forKey: handle)
       coordinators.removeValue(forKey: handle)
+      sessionBackends.removeValue(forKey: handle)
       pendingActuations = pendingActuations.filter { $0.value.session != handle }
       pendingHandoffs = pendingHandoffs.filter { $0.value.session != handle }
+      asynchronousHandoffs = asynchronousHandoffs.filter { $0.value.session != handle }
       pendingNavigations = pendingNavigations.filter { $0.value.session != handle }
-      return try toolResult(structured: .object(["closed": .bool(true)]), modern: modern)
+      if !preserveBrowserOnClose {
+        try registry.close(handle)
+      }
+      return try toolResult(
+        structured: .object([
+          "closed": .bool(true),
+          "browser_preserved": .bool(preserveBrowserOnClose),
+        ]),
+        modern: modern)
     case "handoff":
       return try await handoffTool(params: params, arguments: arguments, modern: modern)
+    case "handoff_start":
+      return try asynchronousHandoffStart(arguments: arguments, modern: modern)
+    case "handoff_status":
+      return try asynchronousHandoffStatus(arguments: arguments, modern: modern)
+    case "handoff_resume":
+      return try await asynchronousHandoffResume(arguments: arguments, modern: modern)
     default:
-      throw MCPServerError.invalidParams("operation must be open, status, close, or handoff")
+      throw MCPServerError.invalidParams(
+        "operation must be open, profiles, status, close, handoff, handoff_start, handoff_status, or handoff_resume"
+      )
     }
   }
 
   private func navigateTool(
     params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
-    guard modern else {
-      return try toolError(
-        "browser_navigate requires MCP 2026-07-28 multi-round tool results", modern: false)
+    let approvalMode = arguments["approval_mode"]?.stringValue ?? "native"
+    guard ["native", "mcp"].contains(approvalMode) else {
+      throw MCPServerError.invalidParams("approval_mode must be native or mcp")
     }
-    try requireFormElicitationCapability(params)
+    if modern, approvalMode == "mcp" {
+      try requireFormElicitationCapability(params)
+    }
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
     let url = try safeNavigationURL(try requireString(arguments["url"], named: "url"))
@@ -375,7 +730,7 @@ public final class WebKitMCPServer {
       arguments["quiet_window_ms"], defaultValue: 300, range: 20...5_000,
       name: "quiet_window_ms")
 
-    if let requestState = params["requestState"]?.stringValue {
+    if modern, approvalMode == "mcp", let requestState = params["requestState"]?.stringValue {
       guard let pending = pendingNavigations.removeValue(forKey: requestState) else {
         throw MCPServerError.invalidParams("requestState is unknown or already used")
       }
@@ -385,50 +740,16 @@ public final class WebKitMCPServer {
       guard acceptedConfirmation(params["inputResponses"]) else {
         return try toolError("The user did not approve this navigation", modern: true)
       }
-      guard
-        let scheme = pending.url.scheme,
-        let host = pending.url.host
-      else { throw MCPServerError.invalidParams("navigation URL has no security origin") }
-      let origin = SecurityOrigin(scheme: scheme, host: host, port: pending.url.port)
-      let capability = await capabilityAuthority.issue(
-        CapabilityScope(
-          actions: [.navigate], origins: [origin],
-          acceptedInputProvenance: [.modelGenerated],
-          expiresAt: Date().addingTimeInterval(15)))
-      let decision = await capabilityAuthority.evaluate(
-        CapabilityRequest(
-          action: .navigate, liveOrigin: origin, inputProvenance: [.modelGenerated]),
-        using: capability,
-        now: Date()
-      )
-      guard decision == .allowed else {
-        await capabilityAuthority.revoke(capability)
-        return try toolError("Private navigation capability was denied", modern: true)
-      }
-      do {
-        let result = try await runtime.navigate(
-          to: pending.url,
-          timeout: .milliseconds(pending.timeoutMilliseconds),
-          quietWindow: .milliseconds(pending.quietWindowMilliseconds),
-          constrainToInitialOrigin: true
-        )
-        await capabilityAuthority.revoke(capability)
-        observations.removeValue(forKey: handle)
-        return try toolResult(structured: .encoded(result), modern: modern)
-      } catch {
-        await capabilityAuthority.revoke(capability)
-        throw error
-      }
+      return try await executeNavigation(pending, runtime: runtime, modern: true)
     }
 
     guard params["inputResponses"] == nil else {
       throw MCPServerError.invalidParams("inputResponses requires requestState")
     }
-    pendingNavigations = pendingNavigations.filter {
-      $0.value.expiresAt > Date() && $0.value.session != handle
+    guard params["requestState"] == nil else {
+      throw MCPServerError.invalidParams("requestState is unavailable without MCP 2026-07-28")
     }
-    let requestState = UUID().uuidString
-    pendingNavigations[requestState] = PendingNavigation(
+    let pending = PendingNavigation(
       arguments: arguments,
       session: handle,
       url: url,
@@ -436,7 +757,25 @@ public final class WebKitMCPServer {
       quietWindowMilliseconds: quiet,
       expiresAt: Date().addingTimeInterval(60)
     )
-    let currentURL = runtime.webView.url?.absoluteString ?? "no current page"
+    if !modern || approvalMode == "native" {
+      let currentURL = runtime.agentSafeCurrentURL() ?? "no current page"
+      guard
+        confirmationPresenter.confirm(
+          title: "Approve Web Navigation",
+          message: navigationConfirmationMessage(currentURL: currentURL, url: url),
+          approveLabel: "Navigate"
+        )
+      else {
+        return try toolError("The user did not approve this navigation", modern: modern)
+      }
+      return try await executeNavigation(pending, runtime: runtime, modern: modern)
+    }
+    pendingNavigations = pendingNavigations.filter {
+      $0.value.expiresAt > Date() && $0.value.session != handle
+    }
+    let requestState = UUID().uuidString
+    pendingNavigations[requestState] = pending
+    let currentURL = runtime.agentSafeCurrentURL() ?? "no current page"
     return .object([
       "resultType": .string("input_required"),
       "requestState": .string(requestState),
@@ -445,11 +784,7 @@ public final class WebKitMCPServer {
           "method": .string("elicitation/create"),
           "params": .object([
             "mode": .string("form"),
-            "message": .string(
-              "Approve one exact open-world navigation? Current page: "
-                + "\(jsonQuoted(currentURL)). Destination: \(jsonQuoted(url.absoluteString)). "
-                + "A GET can still change state on a non-conforming site."
-            ),
+            "message": .string(navigationConfirmationMessage(currentURL: currentURL, url: url)),
             "requestedSchema": .object([
               "type": .string("object"),
               "properties": .object([
@@ -470,12 +805,6 @@ public final class WebKitMCPServer {
     arguments: [String: JSONValue],
     modern: Bool
   ) async throws -> JSONValue {
-    guard modern else {
-      return try toolError(
-        "SiliconPass credential fill requires MCP 2026-07-28",
-        modern: false
-      )
-    }
     let allowedKeys = Set([
       "session_id", "observation_id", "username_element_id", "password_element_id",
     ])
@@ -504,13 +833,111 @@ public final class WebKitMCPServer {
     } catch {
       status = .failed
     }
+    if status == .credentialNotFound {
+      let origin =
+        "\(binding.origin.scheme)://\(binding.origin.asciiHost):\(binding.origin.effectivePort)"
+      let accepted = confirmationPresenter.confirm(
+        title: "No Saved SiliconPass Credential",
+        message:
+          "No credential is saved for \(origin). Continue in the visible browser to sign in manually, then add or update this credential in SiliconPass? No password will be sent through MCP.",
+        approveLabel: "Continue Securely"
+      )
+      if accepted {
+        try runtime.requestHumanHandoff()
+        try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+      }
+      return try toolResult(
+        structured: .object([
+          "status": .string(status.rawValue),
+          "add_offered": .bool(true),
+          "human_handoff_started": .bool(accepted),
+          "control_state": .string(runtime.interactionControlState().rawValue),
+        ]),
+        modern: modern
+      )
+    }
+    if status == .userPresenceUnavailable {
+      return try toolResult(
+        structured: .object([
+          "status": .string(status.rawValue),
+          "requires_user_presence": .bool(true),
+          "retryable": .bool(true),
+          "automatic_retry": .bool(false),
+          "secret_released": .bool(false),
+          "authentication_policy": .string("device_owner_authentication"),
+          "accepted_methods": .array([
+            .string("system_device_owner_authentication")
+          ]),
+          "recovery": .string(
+            "Unlock this Mac and retry from an interactive session using the authentication method offered by macOS. Closed-lid availability is device-specific and is not inferred."
+          ),
+          "control_state": .string(runtime.interactionControlState().rawValue),
+        ]),
+        modern: modern
+      )
+    }
     return try toolResult(
-      structured: .object(["status": .string(status.rawValue)]),
-      modern: true
+      structured: .object([
+        "status": .string(status.rawValue),
+        "requires_human_handoff": .bool(false),
+      ]),
+      modern: modern
+    )
+  }
+
+  private func credentialRotationTool(
+    arguments: [String: JSONValue],
+    modern: Bool
+  ) async throws -> JSONValue {
+    let allowedKeys = Set([
+      "session_id", "observation_id", "current_password_element_id",
+      "new_password_element_id", "confirmation_element_id",
+    ])
+    guard Set(arguments.keys).isSubset(of: allowedKeys) else {
+      throw MCPServerError.invalidParams(
+        "browser_rotate_siliconpass_password accepts only secretless target identifiers"
+      )
+    }
+    let handle = try sessionHandle(arguments)
+    let observationID = try requireString(
+      arguments["observation_id"], named: "observation_id")
+    guard observations[handle]?.observationID == observationID else {
+      throw MCPServerError.invalidParams("Call browser_observe and use its fresh observation_id")
+    }
+    let runtime = try registry.runtime(for: handle)
+    let binding = try runtime.credentialRotationBinding(
+      observationID: observationID,
+      currentPasswordElementID: try requireString(
+        arguments["current_password_element_id"], named: "current_password_element_id"),
+      newPasswordElementID: try requireString(
+        arguments["new_password_element_id"], named: "new_password_element_id"),
+      confirmationElementID: try requireString(
+        arguments["confirmation_element_id"], named: "confirmation_element_id")
+    )
+    let status: CredentialBrokerWireStatus
+    do {
+      status = try await credentialBroker.rotatePassword(
+        binding: binding,
+        runtime: runtime
+      ).status
+    } catch {
+      status = .failed
+    }
+    return try toolResult(
+      structured: .object([
+        "status": .string(status.rawValue),
+        "secret_released_to_mcp": .bool(false),
+        "submitted": .bool(false),
+        "requires_native_confirmation": .bool(status != .changed),
+      ]),
+      modern: modern
     )
   }
 
   private func safeNavigationURL(_ rawValue: String) throws -> URL {
+    guard rawValue.utf8.count <= 8_192 else {
+      throw MCPServerError.invalidParams("url must contain at most 8192 UTF-8 bytes")
+    }
     guard
       let components = URLComponents(string: rawValue),
       let scheme = components.scheme?.lowercased(),
@@ -542,13 +969,55 @@ public final class WebKitMCPServer {
   private func handoffTool(
     params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
-    guard modern else {
-      return try toolError(
-        "Human handoff requires MCP 2026-07-28 multi-round tool results", modern: false)
+    if modern {
+      try requireFormElicitationCapability(params)
     }
-    try requireFormElicitationCapability(params)
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
+    if !modern {
+      guard params["requestState"] == nil, params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams(
+          "multi-round handoff fields require MCP 2026-07-28")
+      }
+      switch runtime.interactionControlState() {
+      case .agentControlled, .freshlyReobserved:
+        try runtime.requestHumanHandoff()
+        try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+        return try toolResult(
+          structured: .object([
+            "control_state": .string(runtime.interactionControlState().rawValue),
+            "instructions": .string(
+              "Complete login, MFA, CAPTCHA, or sensitive input in the local WebKit window, then call browser_session operation=handoff again to request agent resume."
+            ),
+          ]),
+          modern: false
+        )
+      case .humanControlled:
+        guard
+          confirmationPresenter.confirm(
+            title: "Return Browser Control",
+            message:
+              "Return control of the visible WebKit session to the requesting agent? A fresh observation will be required.",
+            approveLabel: "Return Control"
+          )
+        else {
+          return try toolError(
+            "Human control remains active until an explicit resume confirmation", modern: false)
+        }
+        try runtime.requestAgentResume()
+        let observation = try await runtime.resumeAfterHumanControl()
+        observations[handle] = observation
+        return try toolResult(
+          structured: .object([
+            "control_state": .string(runtime.interactionControlState().rawValue),
+            "observation": try .encoded(observation),
+          ]),
+          modern: false
+        )
+      default:
+        throw MCPServerError.invalidParams("handoff transition is already in progress")
+      }
+    }
     if let requestState = params["requestState"]?.stringValue {
       guard let pending = pendingHandoffs.removeValue(forKey: requestState) else {
         throw MCPServerError.invalidParams("requestState is unknown or already used")
@@ -617,16 +1086,137 @@ public final class WebKitMCPServer {
     ])
   }
 
+  private func purgeExpiredAsynchronousHandoffs(now: Date = Date()) {
+    asynchronousHandoffs = asynchronousHandoffs.filter { $0.value.expiresAt > now }
+  }
+
+  private func asynchronousHandoffStart(
+    arguments: [String: JSONValue], modern: Bool
+  ) throws -> JSONValue {
+    guard arguments.keys.allSatisfy({ $0 == "operation" || $0 == "session_id" }) else {
+      throw MCPServerError.invalidParams("handoff_start accepts only operation and session_id")
+    }
+    let handle = try sessionHandle(arguments)
+    let runtime = try registry.runtime(for: handle)
+    switch runtime.interactionControlState() {
+    case .agentControlled, .freshlyReobserved:
+      try runtime.requestHumanHandoff()
+      try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+    case .humanControlled:
+      break
+    default:
+      throw MCPServerError.invalidParams("handoff transition is already in progress")
+    }
+    purgeExpiredAsynchronousHandoffs()
+    asynchronousHandoffs = asynchronousHandoffs.filter { $0.value.session != handle }
+    let token = UUID().uuidString
+    let expiresAt = Date().addingTimeInterval(3_600)
+    asynchronousHandoffs[token] = AsynchronousHandoff(session: handle, expiresAt: expiresAt)
+    return try toolResult(
+      structured: .object([
+        "control_state": .string(runtime.interactionControlState().rawValue),
+        "resume_token": .string(token),
+        "resume_token_state": .string("active"),
+        "expires_at": .string(ISO8601DateFormatter().string(from: expiresAt)),
+        "blocking": .bool(false),
+        "instructions": .string(
+          "Complete the sensitive step in the live WebKit window. Poll handoff_status, then call handoff_resume with this single-session token; resume still requires local confirmation."
+        ),
+      ]), modern: modern)
+  }
+
+  private func asynchronousHandoffStatus(
+    arguments: [String: JSONValue], modern: Bool
+  ) throws -> JSONValue {
+    guard
+      arguments.keys.allSatisfy({
+        $0 == "operation" || $0 == "session_id" || $0 == "resume_token"
+      })
+    else {
+      throw MCPServerError.invalidParams(
+        "handoff_status accepts only operation, session_id, and resume_token")
+    }
+    let handle = try sessionHandle(arguments)
+    let token = try requireString(arguments["resume_token"], named: "resume_token")
+    purgeExpiredAsynchronousHandoffs()
+    let tokenState: String
+    if let pending = asynchronousHandoffs[token], pending.session == handle {
+      tokenState = "active"
+    } else {
+      tokenState = "unknown_or_expired"
+    }
+    let runtime = try registry.runtime(for: handle)
+    return try toolResult(
+      structured: .object([
+        "control_state": .string(runtime.interactionControlState().rawValue),
+        "resume_token_state": .string(tokenState),
+        "blocking": .bool(false),
+        "ready_for_resume_request": .bool(
+          tokenState == "active" && runtime.interactionControlState() == .humanControlled),
+      ]), modern: modern)
+  }
+
+  private func asynchronousHandoffResume(
+    arguments: [String: JSONValue], modern: Bool
+  ) async throws -> JSONValue {
+    guard
+      arguments.keys.allSatisfy({
+        $0 == "operation" || $0 == "session_id" || $0 == "resume_token"
+      })
+    else {
+      throw MCPServerError.invalidParams(
+        "handoff_resume accepts only operation, session_id, and resume_token")
+    }
+    let handle = try sessionHandle(arguments)
+    let token = try requireString(arguments["resume_token"], named: "resume_token")
+    purgeExpiredAsynchronousHandoffs()
+    guard let pending = asynchronousHandoffs[token], pending.session == handle else {
+      throw MCPServerError.invalidParams("resume_token is unknown, expired, or session-mismatched")
+    }
+    let runtime = try registry.runtime(for: handle)
+    guard runtime.interactionControlState() == .humanControlled else {
+      throw MCPServerError.invalidParams("session is not under human control")
+    }
+    guard
+      confirmationPresenter.confirm(
+        title: "Return Browser Control",
+        message:
+          "Return control of this exact live WebKit session to the requesting agent? The resume token will be consumed and a fresh observation will be required.",
+        approveLabel: "Return Control"
+      )
+    else {
+      return try toolResult(
+        structured: .object([
+          "control_state": .string(runtime.interactionControlState().rawValue),
+          "resume_token_state": .string("active"),
+          "resumed": .bool(false),
+        ]), modern: modern)
+    }
+    asynchronousHandoffs.removeValue(forKey: token)
+    try runtime.requestAgentResume()
+    let observation = try await runtime.resumeAfterHumanControl()
+    observations[handle] = observation
+    return try toolResult(
+      structured: .object([
+        "control_state": .string(runtime.interactionControlState().rawValue),
+        "resume_token_state": .string("consumed"),
+        "resumed": .bool(true),
+        "observation": try .encoded(observation),
+      ]), modern: modern)
+  }
+
   private func actTool(
     params: [String: JSONValue],
     arguments: [String: JSONValue],
     modern: Bool
   ) async throws -> JSONValue {
-    guard modern else {
-      return try toolError(
-        "browser_act requires MCP 2026-07-28 multi-round tool results", modern: false)
+    let approvalMode = arguments["approval_mode"]?.stringValue ?? (modern ? "mcp" : "native")
+    guard ["native", "mcp"].contains(approvalMode) else {
+      throw MCPServerError.invalidParams("approval_mode must be native or mcp")
     }
-    try requireFormElicitationCapability(params)
+    if modern, approvalMode == "mcp" {
+      try requireFormElicitationCapability(params)
+    }
     let handle = try sessionHandle(arguments)
     guard let observation = observations[handle] else {
       throw MCPServerError.invalidParams("Call browser_observe before browser_act")
@@ -686,13 +1276,31 @@ public final class WebKitMCPServer {
       }
       operation = .fill(value)
       postcondition = nil
+    case "press_key":
+      guard arguments["value"] == nil else {
+        throw MCPServerError.invalidParams("press_key uses key, not value")
+      }
+      let key = try requireString(arguments["key"], named: "key")
+      let normalized = ["enter": "Enter", "tab": "Tab", "escape": "Escape"][key.lowercased()]
+      guard let normalized else {
+        throw MCPServerError.invalidParams("press_key key must be Enter, Tab, or Escape")
+      }
+      operation = .pressKey(normalized)
+      postcondition = try parseActPostcondition(arguments["postcondition"])
+    case "blur", "commit_input":
+      guard arguments["value"] == nil, arguments["key"] == nil else {
+        throw MCPServerError.invalidParams("blur and commit_input accept neither value nor key")
+      }
+      operation = operationName == "blur" ? .blur : .commitInput
+      postcondition = try parseActPostcondition(arguments["postcondition"])
     default:
-      throw MCPServerError.invalidParams("operation must be click, fill, or submit")
+      throw MCPServerError.invalidParams(
+        "operation must be click, fill, submit, press_key, blur, or commit_input")
     }
     let idempotencyKey = try requireString(
       arguments["idempotency_key"], named: "idempotency_key")
 
-    if let requestState = params["requestState"]?.stringValue {
+    if modern, approvalMode == "mcp", let requestState = params["requestState"]?.stringValue {
       guard let pending = pendingActuations.removeValue(forKey: requestState) else {
         throw MCPServerError.invalidParams("requestState is unknown or already used")
       }
@@ -711,14 +1319,10 @@ public final class WebKitMCPServer {
     guard params["inputResponses"] == nil else {
       throw MCPServerError.invalidParams("inputResponses requires requestState")
     }
-    pendingActuations = pendingActuations.filter {
-      $0.value.expiresAt > Date() && $0.value.session != handle
+    guard params["requestState"] == nil else {
+      throw MCPServerError.invalidParams("requestState is unavailable without MCP 2026-07-28")
     }
-    let requestState = UUID().uuidString
-    let untrustedLabel = target.accessibleName ?? target.label ?? target.text
-    let label = String((untrustedLabel?.segments.map(\.text).joined() ?? "").prefix(120))
-    let currentURL = observation.url.segments.first?.text ?? "unknown"
-    pendingActuations[requestState] = PendingActuation(
+    let pending = PendingActuation(
       arguments: arguments,
       session: handle,
       observation: observation,
@@ -726,8 +1330,37 @@ public final class WebKitMCPServer {
       operation: operation,
       idempotencyKey: idempotencyKey,
       postcondition: postcondition,
+      approvalMode: approvalMode,
+      dispatchMode: approvalMode == "native"
+        && (operationName == "click" || operationName == "submit" || operationName == "press_key")
+        ? .nativeAppKit : .javascript,
       expiresAt: Date().addingTimeInterval(60)
     )
+    let confirmationMessage = actuationConfirmationMessage(
+      operation: operation,
+      currentURL: observation.url.segments.first?.text ?? "unknown",
+      elementID: elementID,
+      label: String(
+        ((target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text).joined() ?? "")
+          .prefix(120)),
+      postcondition: postcondition,
+      dispatchMode: pending.dispatchMode
+    )
+    if !modern || approvalMode == "native" {
+      guard
+        confirmationPresenter.confirm(
+          title: "Approve Browser Action",
+          message: confirmationMessage,
+          approveLabel: "Approve Once"
+        )
+      else { return try toolError("The user did not approve this action", modern: modern) }
+      return try await executeActuation(pending, modern: modern)
+    }
+    pendingActuations = pendingActuations.filter {
+      $0.value.expiresAt > Date() && $0.value.session != handle
+    }
+    let requestState = UUID().uuidString
+    pendingActuations[requestState] = pending
     return .object([
       "resultType": .string("input_required"),
       "requestState": .string(requestState),
@@ -737,13 +1370,7 @@ public final class WebKitMCPServer {
           "params": .object([
             "mode": .string("form"),
             "message": .string(
-              actuationConfirmationMessage(
-                operation: operation,
-                currentURL: currentURL,
-                elementID: elementID,
-                label: label,
-                postcondition: postcondition
-              )),
+              confirmationMessage),
             "requestedSchema": .object([
               "type": .string("object"),
               "properties": .object([
@@ -772,8 +1399,118 @@ public final class WebKitMCPServer {
   }
 
   private func jsonQuoted(_ value: String) -> String {
-    guard let data = try? JSONEncoder().encode(value) else { return "\"unavailable\"" }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .withoutEscapingSlashes
+    guard let data = try? encoder.encode(Self.safeConfirmationText(value)) else {
+      return "\"unavailable\""
+    }
     return String(decoding: data, as: UTF8.self)
+  }
+
+  static func safeConfirmationText(_ value: String) -> String {
+    let bidiControls: Set<UInt32> = [
+      0x061C, 0x200E, 0x200F,
+      0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+      0x2066, 0x2067, 0x2068, 0x2069,
+    ]
+    let rejected = CharacterSet.controlCharacters.union(.illegalCharacters)
+    var output = ""
+    for scalar in value.precomposedStringWithCompatibilityMapping.unicodeScalars
+    where !rejected.contains(scalar) && !bidiControls.contains(scalar.value) {
+      output.unicodeScalars.append(scalar)
+    }
+    return output
+  }
+
+  private func navigationConfirmationMessage(currentURL: String, url: URL) -> String {
+    "Approve one exact open-world navigation? Current page: \(jsonQuoted(currentURL)). "
+      + "Destination: \(jsonQuoted(WebKitRuntime.agentSafeURL(url))). "
+      + "A GET can still change state on a non-conforming site."
+  }
+
+  private func executeNavigation(
+    _ pending: PendingNavigation,
+    runtime: WebKitRuntime,
+    modern: Bool
+  ) async throws -> JSONValue {
+    guard let scheme = pending.url.scheme, let host = pending.url.host else {
+      throw MCPServerError.invalidParams("navigation URL has no security origin")
+    }
+    let origin = SecurityOrigin(scheme: scheme, host: host, port: pending.url.port)
+    let capability = await capabilityAuthority.issue(
+      CapabilityScope(
+        actions: [.navigate], origins: [origin],
+        acceptedInputProvenance: [.modelGenerated],
+        expiresAt: Date().addingTimeInterval(15)))
+    let decision = await capabilityAuthority.evaluate(
+      CapabilityRequest(
+        action: .navigate, liveOrigin: origin, inputProvenance: [.modelGenerated]),
+      using: capability,
+      now: Date()
+    )
+    guard decision == .allowed else {
+      await capabilityAuthority.revoke(capability)
+      return try toolError("Private navigation capability was denied", modern: modern)
+    }
+    do {
+      let result = try await runtime.navigate(
+        to: pending.url,
+        timeout: .milliseconds(pending.timeoutMilliseconds),
+        quietWindow: .milliseconds(pending.quietWindowMilliseconds),
+        constrainToInitialOrigin: true
+      )
+      await capabilityAuthority.revoke(capability)
+      observations.removeValue(forKey: pending.session)
+      if let restriction = runtime.authenticationRestrictionStatus() {
+        if runtime.interactionControlState() == .agentControlled
+          || runtime.interactionControlState() == .freshlyReobserved
+        {
+          try runtime.requestHumanHandoff()
+          try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+        }
+        return try toolResult(
+          structured: .object([
+            "status": .string("authentication_origin_requires_human_handoff"),
+            "origin": .string(restriction.origin),
+            "auth_ui_state": .string(restriction.classification.rawValue),
+            "environment": try .encoded(restriction.environment),
+            "control_state": .string(runtime.interactionControlState().rawValue),
+            "navigation": try .encoded(result),
+          ]),
+          modern: modern
+        )
+      }
+      return try toolResult(structured: .encoded(result), modern: modern)
+    } catch WebKitRuntimeError.crossOriginRedirectRequiresHuman(
+      let fromOrigin,
+      let toOrigin
+    ) {
+      await capabilityAuthority.revoke(capability)
+      observations.removeValue(forKey: pending.session)
+      return try redirectApprovalResult(
+        fromOrigin: fromOrigin,
+        toOrigin: toOrigin,
+        modern: modern
+      )
+    } catch {
+      await capabilityAuthority.revoke(capability)
+      throw error
+    }
+  }
+
+  func redirectApprovalResult(
+    fromOrigin: String,
+    toOrigin: String,
+    modern: Bool
+  ) throws -> JSONValue {
+    try structuredToolError(
+      structured: .object([
+        "status": .string("redirect_requires_human_approval"),
+        "from_origin": .string(fromOrigin),
+        "to_origin": .string(toOrigin),
+      ]),
+      modern: modern
+    )
   }
 
   private func actuationConfirmationMessage(
@@ -781,17 +1518,32 @@ public final class WebKitMCPServer {
     currentURL: String,
     elementID: String,
     label: String,
-    postcondition: ActPostcondition?
+    postcondition: ActPostcondition?,
+    dispatchMode: WebKitActionDispatchMode
   ) -> String {
     let action: String
     switch operation {
     case .click:
-      action = "untrusted JavaScript click"
+      action =
+        dispatchMode == .nativeAppKit
+        ? "AppKit click with a measured WebKit trust receipt" : "untrusted JavaScript click"
     case .submit:
-      action = "form submission click"
+      action =
+        dispatchMode == .nativeAppKit
+        ? "AppKit form submission click with a measured WebKit trust receipt"
+        : "untrusted JavaScript form submission click"
     case .fill(let value):
       action =
         "fill with exact value \(jsonQuoted(value)); site input/change handlers may autosave or cause server effects"
+    case .pressKey(let key):
+      action =
+        dispatchMode == .nativeAppKit
+        ? "AppKit key \(jsonQuoted(key)) with a measured WebKit trust receipt"
+        : "untrusted JavaScript key \(jsonQuoted(key))"
+    case .blur:
+      action = "explicitly blur the target"
+    case .commitInput:
+      action = "dispatch change and blur to commit the target input"
     }
     let verification =
       postcondition.map {
@@ -803,12 +1555,18 @@ public final class WebKitMCPServer {
   }
 
   private func parseActPostcondition(_ value: JSONValue?) throws -> ActPostcondition {
-    let object = try requireObject(value, named: "postcondition")
-    guard object.count == 2 else {
-      throw MCPServerError.invalidParams("postcondition accepts only type and value")
+    guard value != nil else {
+      throw MCPServerError.invalidParams(
+        "postcondition is required for click and submit; it must be omitted for fill")
     }
+    let object = try requireObject(value, named: "postcondition")
     let type = try requireString(object["type"], named: "postcondition.type")
     let expected = try requireString(object["value"], named: "postcondition.value")
+    let ordinaryKeys: Set<String> = ["type", "value"]
+    let attributeKeys: Set<String> = ["type", "attribute", "value"]
+    guard Set(object.keys) == (type == "attribute_equals" ? attributeKeys : ordinaryKeys) else {
+      throw MCPServerError.invalidParams("postcondition contains unsupported fields")
+    }
     switch type {
     case "url_equals":
       guard let parsed = URL(string: expected), parsed.scheme != nil, parsed.host != nil else {
@@ -820,6 +1578,46 @@ public final class WebKitMCPServer {
         throw MCPServerError.invalidParams("semantic text must contain at most 512 characters")
       }
       return .semanticTextAppears(expected)
+    case "semantic_text_contains":
+      guard !expected.isEmpty, expected.count <= 512 else {
+        throw MCPServerError.invalidParams(
+          "semantic_text_contains must contain 1 to 512 characters")
+      }
+      return .semanticTextContains(expected)
+    case "checked_equals", "selected_equals", "enabled_equals":
+      guard let boolean = ["true": true, "false": false][expected.lowercased()] else {
+        throw MCPServerError.invalidParams("boolean state postconditions require true or false")
+      }
+      if type == "checked_equals" { return .checkedEquals(boolean) }
+      if type == "selected_equals" { return .selectedEquals(boolean) }
+      return .enabledEquals(boolean)
+    case "value_equals":
+      guard expected.count <= 1_024 else {
+        throw MCPServerError.invalidParams("value_equals must contain at most 1024 characters")
+      }
+      return .valueEquals(expected)
+    case "attribute_equals":
+      let name = try requireString(object["attribute"], named: "postcondition.attribute")
+        .lowercased()
+      let allowed = Set([
+        "aria-checked", "aria-selected", "aria-disabled", "aria-expanded", "data-state", "open",
+      ])
+      guard allowed.contains(name) else {
+        throw MCPServerError.invalidParams(
+          "attribute_equals attribute is not an observable state attribute")
+      }
+      return .attributeEquals(name: name, value: expected)
+    case "dialog_appears":
+      guard !expected.isEmpty, expected.count <= 512 else {
+        throw MCPServerError.invalidParams("dialog_appears requires a bounded accessible name")
+      }
+      return .dialogAppears(expected)
+    case "option_selected":
+      guard !expected.isEmpty, expected.count <= 512 else {
+        throw MCPServerError.invalidParams(
+          "option_selected requires a bounded visible option label")
+      }
+      return .optionSelected(expected)
     default:
       throw MCPServerError.invalidParams("unsupported postcondition type")
     }
@@ -856,15 +1654,22 @@ public final class WebKitMCPServer {
     let preconditions: [ObservationPredicate]
     let postconditions: [ObservationPredicate]
     switch pending.operation {
-    case .click, .submit:
+    case .click, .submit, .pressKey, .blur, .commitInput:
       guard let postcondition = pending.postcondition else {
         throw MCPServerError.invalidParams("postcondition is required")
       }
-      runtimeOperation = .click
+      switch pending.operation {
+      case .click, .submit: runtimeOperation = .click
+      case .pressKey(let key): runtimeOperation = .pressKey(key)
+      case .blur: runtimeOperation = .blur
+      case .commitInput: runtimeOperation = .commitInput
+      case .fill:
+        throw MCPServerError.invalidParams("internal operation mismatch")
+      }
       preconditions = [
         .entryPresent(.init(frameID: "main", elementID: pending.elementID, field: "@tag"))
       ]
-      postconditions = [postcondition.predicate]
+      postconditions = [postcondition.predicate(for: target)]
     case .fill(let value):
       runtimeOperation = .fill(
         try ProvenancedText(
@@ -891,6 +1696,7 @@ public final class WebKitMCPServer {
     let result = try await coordinator.execute(
       plan: plan,
       operation: runtimeOperation,
+      dispatchMode: pending.dispatchMode,
       observation: pending.observation,
       capabilityAuthority: capabilityAuthority,
       capabilityHandle: capability
@@ -899,6 +1705,14 @@ public final class WebKitMCPServer {
       structured: .object([
         "action": try .encoded(result.action),
         "verification": try .encoded(result.verification),
+        "confirmation_mode": .string(pending.approvalMode),
+        "dispatch_mode": .string(result.action.dispatchMode.rawValue),
+        "confirmation_and_dispatch_are_distinct": .bool(true),
+        "trusted_gesture_state": .string(
+          result.action.trustedUserGesture ? "trusted" : "untrusted_javascript"),
+        "requires_trusted_human_gesture": .string(
+          result.action.trustedUserGesture ? "no" : "unknown_site_requirement"),
+        "trusted_human_gesture_handoff_available": .bool(!result.action.trustedUserGesture),
       ]), modern: modern)
   }
 
@@ -949,6 +1763,17 @@ public final class WebKitMCPServer {
     var result: [String: JSONValue] = [
       "content": .array([.object(["type": .string("text"), "text": .string(text)])]),
       "structuredContent": structured,
+    ]
+    if modern { result["resultType"] = .string("complete") }
+    return .object(result)
+  }
+
+  private func structuredToolError(structured: JSONValue, modern: Bool) throws -> JSONValue {
+    let text = String(decoding: try JSONEncoder().encode(structured), as: UTF8.self)
+    var result: [String: JSONValue] = [
+      "content": .array([.object(["type": .string("text"), "text": .string(text)])]),
+      "structuredContent": structured,
+      "isError": .bool(true),
     ]
     if modern { result["resultType"] = .string("complete") }
     return .object(result)
@@ -1012,6 +1837,29 @@ public final class WebKitMCPServer {
       throw MCPServerError.invalidParams("\(name) is out of range")
     }
     return converted
+  }
+
+  private func boundedDouble(
+    _ value: JSONValue?,
+    defaultValue: Double,
+    range: ClosedRange<Double>,
+    name: String
+  ) throws -> Double {
+    let number: Double
+    switch value {
+    case .int(let integer):
+      number = Double(integer)
+    case .double(let double):
+      number = double
+    case nil:
+      number = defaultValue
+    default:
+      throw MCPServerError.invalidParams("\(name) must be a number")
+    }
+    guard number.isFinite, range.contains(number) else {
+      throw MCPServerError.invalidParams("\(name) is out of range")
+    }
+    return number
   }
 
   private func isModern(_ request: RPCRequest) throws(MCPServerError) -> Bool {
@@ -1100,7 +1948,7 @@ public final class WebKitMCPServer {
   }
 
   private func serverInfo() -> JSONValue {
-    .object(["name": .string("webkitui-mcp"), "version": .string("0.1.0")])
+    .object(["name": .string("webkitui-mcp"), "version": .string("0.6.0")])
   }
 
   private func encode(_ value: JSONValue) -> Data? {
@@ -1115,25 +1963,55 @@ public final class WebKitMCPServer {
     ])
   ]
 
+  private static let authenticationRestrictedTools: Set<String> = [
+    "browser_observe",
+    "browser_read_text",
+    "browser_capture",
+    "browser_scroll",
+    "element_scroll_into_view",
+    "browser_act",
+    "browser_fill_siliconpass",
+    "browser_rotate_siliconpass_password",
+  ]
+
   private static let toolDefinitions: [JSONValue] = [
     tool(
       name: "browser_act",
       description:
-        "Prepare one transactionally verified click, native form-submit click, or non-sensitive input fill. Every operation requires a fresh observation, idempotency key, and exact human confirmation. Click/submit require an exact URL or newly appearing semantic-text postcondition; fill verifies the freshly resolved target's exact value. UI state does not prove backend commit.",
+        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, bounded key, blur, or input commit. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and exact human confirmation. approval_mode=native uses server-owned confirmation and AppKit dispatch for click/submit, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. UI state does not prove backend commit.",
       properties: sessionSchemaProperties.merging([
         "observation_id": .object(["type": .string("string")]),
         "element_id": .object(["type": .string("string")]),
         "operation": .object([
           "type": .string("string"),
-          "enum": .array([.string("click"), .string("fill"), .string("submit")]),
+          "enum": .array([
+            .string("click"), .string("fill"), .string("submit"),
+            .string("press_key"), .string("blur"), .string("commit_input"),
+          ]),
         ]),
         "value": .object([
           "type": .string("string"), "maxLength": .int(512),
           "description": .string("Required only for fill; empty string clears the control."),
         ]),
+        "key": .object([
+          "type": .string("string"),
+          "enum": .array([.string("Enter"), .string("Tab"), .string("Escape")]),
+          "description": .string("Required only for press_key."),
+        ]),
         "idempotency_key": .object(["type": .string("string"), "minLength": .int(1)]),
+        "approval_mode": .object([
+          "type": .string("string"),
+          "enum": .array([.string("native"), .string("mcp")]),
+          "default": .string("mcp"),
+          "description": .string(
+            "native separates exact local confirmation from measured AppKit dispatch; mcp uses multi-round elicitation and JavaScript dispatch."
+          ),
+        ]),
         "postcondition": .object([
           "type": .string("object"),
+          "description": .string(
+            "Required for click and submit; forbidden for fill, whose exact value is verified automatically."
+          ),
           "oneOf": .array([
             .object([
               "type": .string("object"),
@@ -1155,11 +2033,115 @@ public final class WebKitMCPServer {
               "required": .array([.string("type"), .string("value")]),
               "additionalProperties": .bool(false),
             ]),
+            .object([
+              "type": .string("object"),
+              "properties": .object([
+                "type": .object(["const": .string("semantic_text_contains")]),
+                "value": .object([
+                  "type": .string("string"), "minLength": .int(1), "maxLength": .int(512),
+                ]),
+              ]),
+              "required": .array([.string("type"), .string("value")]),
+              "additionalProperties": .bool(false),
+            ]),
+            .object([
+              "type": .string("object"),
+              "properties": .object([
+                "type": .object([
+                  "enum": .array([
+                    .string("checked_equals"), .string("selected_equals"),
+                    .string("enabled_equals"),
+                  ])
+                ]),
+                "value": .object([
+                  "type": .string("string"),
+                  "enum": .array([.string("true"), .string("false")]),
+                ]),
+              ]),
+              "required": .array([.string("type"), .string("value")]),
+              "additionalProperties": .bool(false),
+            ]),
+            .object([
+              "type": .string("object"),
+              "properties": .object([
+                "type": .object([
+                  "enum": .array([
+                    .string("value_equals"), .string("dialog_appears"),
+                    .string("option_selected"),
+                  ])
+                ]),
+                "value": .object([
+                  "type": .string("string"), "minLength": .int(1), "maxLength": .int(1_024),
+                ]),
+              ]),
+              "required": .array([.string("type"), .string("value")]),
+              "additionalProperties": .bool(false),
+            ]),
+            .object([
+              "type": .string("object"),
+              "properties": .object([
+                "type": .object(["const": .string("attribute_equals")]),
+                "attribute": .object([
+                  "type": .string("string"),
+                  "enum": .array([
+                    .string("aria-checked"), .string("aria-selected"),
+                    .string("aria-disabled"), .string("aria-expanded"),
+                    .string("data-state"), .string("open"),
+                  ]),
+                ]),
+                "value": .object([
+                  "type": .string("string"), "maxLength": .int(1_024),
+                ]),
+              ]),
+              "required": .array([
+                .string("type"), .string("attribute"), .string("value"),
+              ]),
+              "additionalProperties": .bool(false),
+            ]),
           ]),
         ]),
       ]) { _, new in new },
       required: [
         "session_id", "observation_id", "element_id", "operation", "idempotency_key",
+      ],
+      schemaExtras: [
+        "allOf": .array([
+          .object([
+            "if": .object([
+              "properties": .object([
+                "operation": .object([
+                  "enum": .array([
+                    .string("click"), .string("submit"), .string("press_key"),
+                    .string("blur"), .string("commit_input"),
+                  ])
+                ])
+              ]),
+              "required": .array([.string("operation")]),
+            ]),
+            "then": .object(["required": .array([.string("postcondition")])]),
+          ]),
+          .object([
+            "if": .object([
+              "properties": .object([
+                "operation": .object(["const": .string("fill")])
+              ]),
+              "required": .array([.string("operation")]),
+            ]),
+            "then": .object([
+              "required": .array([.string("value")]),
+              "not": .object(["required": .array([.string("postcondition")])]),
+            ]),
+          ]),
+          .object([
+            "if": .object([
+              "properties": .object([
+                "operation": .object(["const": .string("press_key")])
+              ]),
+              "required": .array([.string("operation")]),
+            ]),
+            "then": .object(["required": .array([.string("key")])]),
+          ]),
+        ])
       ],
       readOnly: false,
       destructive: true
@@ -1175,7 +2157,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_fill_siliconpass",
       description:
-        "Request one native-confirmed synthetic SiliconPass credential fill into one fresh HTTPS main-frame username/password pair. The tool accepts no credential value, account, provider, submit action, or reusable authorization and returns only a terminal status.",
+        "Request one native-confirmed SiliconPass credential fill into one fresh HTTPS main-frame username/password pair. If no credential exists, SiliconPass can offer its native create-and-save flow without exposing values to MCP. If the Mac cannot present user authentication, user_presence_unavailable asks the MCP client to unlock the Mac and retry. The tool accepts no credential value, account, provider, submit action, or reusable authorization and returns only a terminal status.",
       properties: sessionSchemaProperties.merging([
         "observation_id": .object(["type": .string("string")]),
         "username_element_id": .object(["type": .string("string")]),
@@ -1188,13 +2170,41 @@ public final class WebKitMCPServer {
       destructive: true
     ),
     tool(
+      name: "browser_rotate_siliconpass_password",
+      description:
+        "Prepare one SiliconPass password rotation in three freshly observed HTTPS password fields. SiliconPass selects the account, generates and durably seals the replacement, fills current/new/confirmation without DOM events or submit, then promotes only after native human confirmation of remote success. MCP receives no credential value.",
+      properties: sessionSchemaProperties.merging([
+        "observation_id": .object(["type": .string("string")]),
+        "current_password_element_id": .object(["type": .string("string")]),
+        "new_password_element_id": .object(["type": .string("string")]),
+        "confirmation_element_id": .object(["type": .string("string")]),
+      ]) { _, new in new },
+      required: [
+        "session_id", "observation_id", "current_password_element_id",
+        "new_password_element_id", "confirmation_element_id",
+      ],
+      readOnly: false,
+      destructive: true
+    ),
+    tool(
       name: "browser_navigate",
       description:
-        "Prepare one exact open-world HTTP(S) navigation for human confirmation, then wait for document completion plus mutation quiescence, never network-idle or rAF. URL credentials, local names, and IP literals are blocked.",
+        "Prepare one exact open-world HTTP(S) navigation for human confirmation. Native local confirmation is the reliable default; MCP multi-round elicitation remains opt-in. Cross-origin redirects return redirect_requires_human_approval with origin-only data. Restricted authentication origins immediately require local human handoff. Then wait for document completion plus mutation quiescence, never network-idle or rAF. URL credentials, local names, and IP literals are blocked.",
       properties: sessionSchemaProperties.merging([
-        "url": .object(["type": .string("string"), "format": .string("uri")]),
+        "url": .object([
+          "type": .string("string"), "format": .string("uri"),
+          "maxLength": .int(8_192),
+        ]),
         "timeout_ms": integerSchema(minimum: 100, maximum: 120_000, defaultValue: 30_000),
         "quiet_window_ms": integerSchema(minimum: 20, maximum: 5_000, defaultValue: 300),
+        "approval_mode": .object([
+          "type": .string("string"),
+          "enum": .array([.string("native"), .string("mcp")]),
+          "default": .string("native"),
+          "description": .string(
+            "native shows a local exact-destination confirmation and is the reliable default; mcp uses a multi-round client elicitation."
+          ),
+        ]),
       ]) { _, new in new },
       required: ["session_id", "url"],
       readOnly: false,
@@ -1203,24 +2213,96 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_observe",
       description:
-        "Return full-page interactive semantics with provenance and fresh observation-scoped element IDs. Never reuse an element ID after another observation.",
+        "Return rendered, actionable full-page semantics with provenance and fresh observation-scoped element IDs. Hidden, zero-size, aria-hidden, inert, transparent, and sensitive field values are omitted before serialization. Selects expose only the visible selected label. Restricted authentication origins require local human handoff and return no page semantics. Never reuse an element ID after another observation.",
       properties: sessionSchemaProperties.merging([
-        "maximum_elements": integerSchema(minimum: 1, maximum: 2_000, defaultValue: 500)
+        "maximum_elements": integerSchema(minimum: 1, maximum: 2_000, defaultValue: 150),
+        "element_offset": integerSchema(minimum: 0, maximum: 100_000, defaultValue: 0),
+        "maximum_field_characters": integerSchema(
+          minimum: 64, maximum: 4_096, defaultValue: 512),
+        "roles": .object([
+          "type": .string("array"), "maxItems": .int(16),
+          "items": .object([
+            "type": .string("string"), "minLength": .int(1), "maxLength": .int(64),
+          ]),
+          "description": .string("Optional server-side exact semantic-role filter."),
+        ]),
+        "name_contains": .object([
+          "type": .string("string"), "maxLength": .int(128),
+          "description": .string(
+            "Optional case-insensitive server-side accessible-name substring filter."),
+        ]),
       ]) { _, new in new },
       required: ["session_id"],
       readOnly: true
     ),
     tool(
+      name: "browser_read_text",
+      description:
+        "Read bounded visible body text plus rendered log, terminal, preformatted, aria-live, and scrollable text regions. This exposes currently rendered virtualized console lines; scroll and repeat to read other rendered ranges.",
+      properties: sessionSchemaProperties.merging([
+        "maximum_characters": integerSchema(
+          minimum: 1, maximum: 100_000, defaultValue: 20_000)
+      ]) { _, new in new },
+      required: ["session_id"],
+      readOnly: true
+    ),
+    tool(
+      name: "browser_scroll",
+      description:
+        "Scroll the top-level page by bounded CSS-pixel deltas and return viewport/document bounds. Scrolling invalidates the prior observation, so call browser_observe again.",
+      properties: sessionSchemaProperties.merging([
+        "delta_x": numberSchema(minimum: -2_000, maximum: 2_000, defaultValue: 0),
+        "delta_y": numberSchema(minimum: -2_000, maximum: 2_000, defaultValue: 0),
+      ]) { _, new in new },
+      required: ["session_id"],
+      readOnly: false
+    ),
+    tool(
+      name: "element_scroll_into_view",
+      description:
+        "Resolve one element from a fresh observation, scroll it to the viewport center, and invalidate that observation. Call browser_observe again before acting.",
+      properties: sessionSchemaProperties.merging([
+        "observation_id": .object(["type": .string("string")]),
+        "element_id": .object(["type": .string("string")]),
+      ]) { _, new in new },
+      required: ["session_id", "observation_id", "element_id"],
+      readOnly: false
+    ),
+    tool(
       name: "browser_session",
       description:
-        "Open, inspect, or close one bounded native WebKit session. Open uses the default persistent WebKit data store.",
+        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. Native WebKit is the current trusted-write backend; compatibility and isolated read-only policies fail closed until their internal backends are available. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
           "enum": .array([
-            .string("open"), .string("status"), .string("close"), .string("handoff"),
+            .string("open"), .string("profiles"), .string("status"), .string("close"),
+            .string("handoff"), .string("handoff_start"), .string("handoff_status"),
+            .string("handoff_resume"),
           ]),
-        ])
+        ]),
+        "profile_id": .object([
+          "type": .string("string"),
+          "description": .string(
+            "For open only: default or an exact UUID returned by operation=profiles."
+          ),
+        ]),
+        "execution_policy": .object([
+          "type": .string("string"),
+          "enum": .array([
+            .string("auto"), .string("trusted_local"), .string("compatibility"),
+            .string("isolated_read_only"),
+          ]),
+          "default": .string("auto"),
+          "description": .string(
+            "For open only. Selects an internal backend policy without exposing a second MCP or transferring credentials between backends."
+          ),
+        ]),
+        "resume_token": .object([
+          "type": .string("string"), "minLength": .int(1), "maxLength": .int(128),
+          "description": .string(
+            "Required for handoff_status and handoff_resume; returned only by handoff_start."),
+        ]),
       ]) { _, new in new },
       required: ["operation"],
       readOnly: false,
@@ -1229,11 +2311,11 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_transaction",
       description:
-        "Read a transaction receipt or reconcile an indeterminate write against a fresh observation. Reconciliation never retries the action.",
+        "Read or export a versioned transaction receipt, or reconcile an indeterminate write against a fresh observation. ReceiptV1 is canonical JSON evidence and never authorizes replay. Reconciliation never retries the action.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
-          "enum": .array([.string("receipt"), .string("reconcile")]),
+          "enum": .array([.string("receipt"), .string("export"), .string("reconcile")]),
           "default": .string("receipt"),
         ]),
         "idempotency_key": .object(["type": .string("string"), "minLength": .int(1)]),
@@ -1248,18 +2330,21 @@ public final class WebKitMCPServer {
     description: String,
     properties: [String: JSONValue],
     required: [String],
+    schemaExtras: [String: JSONValue] = [:],
     readOnly: Bool,
     destructive: Bool = false
   ) -> JSONValue {
-    .object([
+    var inputSchema: [String: JSONValue] = [
+      "type": .string("object"),
+      "properties": .object(properties),
+      "required": .array(required.map(JSONValue.string)),
+      "additionalProperties": .bool(false),
+    ]
+    for (key, value) in schemaExtras { inputSchema[key] = value }
+    return .object([
       "name": .string(name),
       "description": .string(description),
-      "inputSchema": .object([
-        "type": .string("object"),
-        "properties": .object(properties),
-        "required": .array(required.map(JSONValue.string)),
-        "additionalProperties": .bool(false),
-      ]),
+      "inputSchema": .object(inputSchema),
       "annotations": .object([
         "readOnlyHint": .bool(readOnly),
         "destructiveHint": .bool(destructive),
@@ -1279,6 +2364,19 @@ public final class WebKitMCPServer {
       "minimum": .int(minimum),
       "maximum": .int(maximum),
       "default": .int(defaultValue),
+    ])
+  }
+
+  private static func numberSchema(
+    minimum: Double,
+    maximum: Double,
+    defaultValue: Double
+  ) -> JSONValue {
+    .object([
+      "type": .string("number"),
+      "minimum": .double(minimum),
+      "maximum": .double(maximum),
+      "default": .double(defaultValue),
     ])
   }
 }

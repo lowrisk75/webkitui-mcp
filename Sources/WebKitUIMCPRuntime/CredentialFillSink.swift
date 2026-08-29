@@ -103,6 +103,34 @@ public struct CredentialSinkFormBinding: Codable, Hashable, Sendable {
   }
 }
 
+public struct CredentialSinkRotationBinding: Codable, Hashable, Sendable {
+  public let origin: CredentialSinkOrigin
+  public let documentID: String
+  public let observationID: String
+  public let observationGeneration: UInt64
+  public let currentPasswordTarget: CredentialSinkElementBinding
+  public let newPasswordTarget: CredentialSinkElementBinding
+  public let confirmationTarget: CredentialSinkElementBinding
+
+  public init(
+    origin: CredentialSinkOrigin,
+    documentID: String,
+    observationID: String,
+    observationGeneration: UInt64,
+    currentPasswordTarget: CredentialSinkElementBinding,
+    newPasswordTarget: CredentialSinkElementBinding,
+    confirmationTarget: CredentialSinkElementBinding
+  ) {
+    self.origin = origin
+    self.documentID = documentID
+    self.observationID = observationID
+    self.observationGeneration = observationGeneration
+    self.currentPasswordTarget = currentPasswordTarget
+    self.newPasswordTarget = newPasswordTarget
+    self.confirmationTarget = confirmationTarget
+  }
+}
+
 public enum CredentialSinkStatus: String, Codable, Equatable, Sendable {
   case filled
 }

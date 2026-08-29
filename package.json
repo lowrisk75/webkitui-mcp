@@ -1,17 +1,11 @@
 {
-  "name": "webkitui-mcp",
-  "version": "0.2.0",
-  "description": "Local MCP server that drives a real Chrome (Playwright/CDP) — multi-tab navigation/interaction, service-worker console capture, and unpacked MV3 extension loading, as a reliable replacement for the Claude in Chrome extension for extension-development testing.",
-  "license": "MIT",
+  "name": "webkitui-mcp-legacy-playwright-fixtures",
+  "version": "0.6.0",
+  "private": true,
+  "description": "Retained TypeScript/Playwright prior-art fixtures. The supported WebKitUI MCP product is the native Swift/WKWebView implementation built with Swift Package Manager.",
+  "license": "BUSL-1.1",
   "author": "LorisLabs",
   "type": "module",
-  "bin": {
-    "webkitui-mcp": "dist/index.js"
-  },
-  "files": [
-    "dist",
-    "README.md"
-  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

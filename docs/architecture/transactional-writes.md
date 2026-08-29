@@ -31,7 +31,14 @@ website into a transactional database.
 
 ## Known boundary
 
-The current ledger is in-memory. It survives a WebContent-process replacement
-only while the native host remains alive. Durable atomic persistence and the
-server-side application proof remain required before claiming host-crash
-recovery or backend commit. Semantic UI text proves browser-visible state only.
+Production profiles use an HMAC-authenticated, atomically replaced local ledger
+with mode `0600`; interrupted `dispatching` and `dispatched` records recover as
+`indeterminate`, never as permission to replay. In-memory storage remains
+available only for isolated tests. The durable ledger protects integrity, not
+confidentiality independently of the macOS account, and callers must use opaque
+idempotency keys. Its retention rules are defined in
+[`../privacy-retention.md`](../privacy-retention.md).
+
+Durability still cannot prove a server-side application commit. Semantic UI
+state proves browser-visible state only; independent provider evidence remains
+required for a real-world success claim.

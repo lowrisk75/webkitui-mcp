@@ -2,6 +2,9 @@ import Foundation
 
 public enum CredentialBrokerWireStatus: String, Codable, Equatable, Sendable {
   case filled
+  case changed
+  case credentialNotFound = "credential_not_found"
+  case userPresenceUnavailable = "user_presence_unavailable"
   case denied
   case cancelled
   case stale
@@ -27,6 +30,22 @@ public protocol CredentialBrokerFilling: Sendable {
     binding: CredentialSinkFormBinding,
     runtime: WebKitRuntime
   ) async throws -> CredentialBrokerWireReceipt
+
+  func rotatePassword(
+    binding: CredentialSinkRotationBinding,
+    runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt
+}
+
+extension CredentialBrokerFilling {
+  public func rotatePassword(
+    binding: CredentialSinkRotationBinding,
+    runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt {
+    _ = binding
+    _ = runtime
+    throw CredentialBrokerClientError.unavailable
+  }
 }
 
 private enum CredentialBrokerXPCConstants {
@@ -35,6 +54,23 @@ private enum CredentialBrokerXPCConstants {
 
   static func requirement(bundleIdentifier: String) -> String {
     "anchor apple generic and certificate leaf[subject.OU] = \"\(teamIdentifier)\" and identifier \"\(bundleIdentifier)\" and entitlement[\"com.apple.security.get-task-allow\"] absent"
+  }
+}
+
+struct CredentialBrokerXPCPeerRequirements: Equatable, Sendable {
+  let controlService: String
+  let secretProvider: String
+
+  init(
+    brokerBundleIdentifier: String = "com.lorislab.siliconpass.credential-broker-service",
+    secretProviderBundleIdentifier: String = "com.lorislab.siliconpass"
+  ) {
+    controlService = CredentialBrokerXPCConstants.requirement(
+      bundleIdentifier: brokerBundleIdentifier
+    )
+    secretProvider = CredentialBrokerXPCConstants.requirement(
+      bundleIdentifier: secretProviderBundleIdentifier
+    )
   }
 }
 
@@ -52,6 +88,18 @@ private protocol CredentialBrokerRemoteXPCProtocol {
     withReply reply: @escaping @Sendable (Data?, String?) -> Void
   )
 
+  func requestPasswordRotation(
+    _ bindingData: Data,
+    sinkEndpoint: NSXPCListenerEndpoint,
+    withReply reply: @escaping @Sendable (Data?, String?) -> Void
+  )
+
+  func deliverPasswordRotation(
+    _ requestData: Data,
+    liveBindingData: Data,
+    withReply reply: @escaping @Sendable (Data?, String?) -> Void
+  )
+
   func invalidateAll(withReply reply: @escaping @Sendable () -> Void)
 }
 
@@ -61,6 +109,13 @@ private protocol CredentialSinkExportedXPCProtocol {
     _ bindingData: Data,
     username: Data,
     password: Data,
+    withReply reply: @escaping @Sendable (String?) -> Void
+  )
+
+  func fillPasswordRotation(
+    _ bindingData: Data,
+    currentPassword: Data,
+    newPassword: Data,
     withReply reply: @escaping @Sendable (String?) -> Void
   )
 }
@@ -86,11 +141,19 @@ private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCPro
   @unchecked Sendable
 {
   private let runtime: WebKitRuntime
-  private let expectedBinding: CredentialSinkFormBinding
+  private let expectedBinding: CredentialSinkFormBinding?
+  private let expectedRotationBinding: CredentialSinkRotationBinding?
 
   init(runtime: WebKitRuntime, expectedBinding: CredentialSinkFormBinding) {
     self.runtime = runtime
     self.expectedBinding = expectedBinding
+    expectedRotationBinding = nil
+  }
+
+  init(runtime: WebKitRuntime, expectedRotationBinding: CredentialSinkRotationBinding) {
+    self.runtime = runtime
+    expectedBinding = nil
+    self.expectedRotationBinding = expectedRotationBinding
   }
 
   func fillSyntheticCredential(
@@ -102,7 +165,7 @@ private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCPro
     Task { @MainActor [runtime, expectedBinding] in
       do {
         let binding = try JSONDecoder().decode(CredentialSinkFormBinding.self, from: bindingData)
-        guard binding == expectedBinding else {
+        guard let expectedBinding, binding == expectedBinding else {
           reply("stale")
           return
         }
@@ -125,24 +188,58 @@ private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCPro
       }
     }
   }
+
+  func fillPasswordRotation(
+    _ bindingData: Data,
+    currentPassword: Data,
+    newPassword: Data,
+    withReply reply: @escaping @Sendable (String?) -> Void
+  ) {
+    Task { @MainActor [runtime, expectedRotationBinding] in
+      do {
+        let binding = try JSONDecoder().decode(
+          CredentialSinkRotationBinding.self,
+          from: bindingData
+        )
+        guard let expectedRotationBinding, binding == expectedRotationBinding else {
+          reply("stale")
+          return
+        }
+        var currentCopy = currentPassword
+        var newCopy = newPassword
+        defer {
+          currentCopy.resetBytes(in: currentCopy.indices)
+          newCopy.resetBytes(in: newCopy.indices)
+        }
+        _ = try await runtime.performCredentialRotationFill(
+          binding: binding,
+          currentPassword: CredentialSecretBuffer(copying: currentCopy),
+          newPassword: CredentialSecretBuffer(copying: newCopy)
+        )
+        reply(nil)
+      } catch {
+        reply("stale")
+      }
+    }
+  }
 }
 
 private final class CredentialSinkListenerDelegate: NSObject, NSXPCListenerDelegate,
   @unchecked Sendable
 {
   private let exportedObject: CredentialSinkExport
-  private let brokerRequirement: String
+  private let secretProviderRequirement: String
 
-  init(exportedObject: CredentialSinkExport, brokerRequirement: String) {
+  init(exportedObject: CredentialSinkExport, secretProviderRequirement: String) {
     self.exportedObject = exportedObject
-    self.brokerRequirement = brokerRequirement
+    self.secretProviderRequirement = secretProviderRequirement
   }
 
   func listener(
     _ listener: NSXPCListener,
     shouldAcceptNewConnection connection: NSXPCConnection
   ) -> Bool {
-    connection.setCodeSigningRequirement(brokerRequirement)
+    connection.setCodeSigningRequirement(secretProviderRequirement)
     connection.exportedInterface = NSXPCInterface(with: CredentialSinkExportedXPCProtocol.self)
     connection.exportedObject = exportedObject
     connection.resume()
@@ -163,13 +260,15 @@ private final class CredentialSinkEndpointBox: @unchecked Sendable {
 /// broker-initiated, mutually authenticated callback connection.
 @MainActor
 public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
-  private let brokerRequirement: String
+  private let peerRequirements: CredentialBrokerXPCPeerRequirements
 
   public init(
-    brokerBundleIdentifier: String = "com.lorislab.siliconpass.credential-broker-service"
+    brokerBundleIdentifier: String = "com.lorislab.siliconpass.credential-broker-service",
+    secretProviderBundleIdentifier: String = "com.lorislab.siliconpass"
   ) {
-    brokerRequirement = CredentialBrokerXPCConstants.requirement(
-      bundleIdentifier: brokerBundleIdentifier
+    peerRequirements = CredentialBrokerXPCPeerRequirements(
+      brokerBundleIdentifier: brokerBundleIdentifier,
+      secretProviderBundleIdentifier: secretProviderBundleIdentifier
     )
   }
 
@@ -184,7 +283,7 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     let sinkExport = CredentialSinkExport(runtime: runtime, expectedBinding: binding)
     let sinkDelegate = CredentialSinkListenerDelegate(
       exportedObject: sinkExport,
-      brokerRequirement: brokerRequirement
+      secretProviderRequirement: peerRequirements.secretProvider
     )
     let sinkListener = NSXPCListener.anonymous()
     sinkListener.delegate = sinkDelegate
@@ -197,7 +296,7 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
       options: []
     )
     connection.remoteObjectInterface = NSXPCInterface(with: CredentialBrokerRemoteXPCProtocol.self)
-    connection.setCodeSigningRequirement(brokerRequirement)
+    connection.setCodeSigningRequirement(peerRequirements.controlService)
     connection.resume()
     defer { connection.invalidate() }
 
@@ -231,6 +330,64 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     return receipt
   }
 
+  public func rotatePassword(
+    binding: CredentialSinkRotationBinding,
+    runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let bindingData = try encoder.encode(binding)
+    let sinkExport = CredentialSinkExport(
+      runtime: runtime,
+      expectedRotationBinding: binding
+    )
+    let sinkDelegate = CredentialSinkListenerDelegate(
+      exportedObject: sinkExport,
+      secretProviderRequirement: peerRequirements.secretProvider
+    )
+    let sinkListener = NSXPCListener.anonymous()
+    sinkListener.delegate = sinkDelegate
+    sinkListener.resume()
+    defer { sinkListener.suspend() }
+    let sinkEndpoint = CredentialSinkEndpointBox(sinkListener.endpoint)
+
+    let connection = NSXPCConnection(
+      machServiceName: CredentialBrokerXPCConstants.machServiceName,
+      options: []
+    )
+    connection.remoteObjectInterface = NSXPCInterface(
+      with: CredentialBrokerRemoteXPCProtocol.self
+    )
+    connection.setCodeSigningRequirement(peerRequirements.controlService)
+    connection.resume()
+    defer { connection.invalidate() }
+
+    let requestReply = await call(connection: connection) { broker, reply in
+      broker.requestPasswordRotation(
+        bindingData,
+        sinkEndpoint: sinkEndpoint.endpoint,
+        withReply: reply
+      )
+    }
+    guard requestReply.1 == nil, let requestData = requestReply.0 else {
+      throw CredentialBrokerClientError.unavailable
+    }
+    let deliveryReply = await call(connection: connection) { broker, reply in
+      broker.deliverPasswordRotation(
+        requestData,
+        liveBindingData: bindingData,
+        withReply: reply
+      )
+    }
+    guard deliveryReply.1 == nil, let receiptData = deliveryReply.0,
+      let receipt = try? JSONDecoder().decode(
+        CredentialBrokerWireReceipt.self,
+        from: receiptData
+      )
+    else { throw CredentialBrokerClientError.invalidReply }
+    return receipt
+  }
+
   private nonisolated func call(
     connection: NSXPCConnection,
     operation:
@@ -241,6 +398,10 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
   ) async -> (Data?, String?) {
     await withCheckedContinuation { (continuation: CheckedContinuation<(Data?, String?), Never>) in
       let gate = DataReplyGate { result in continuation.resume(returning: result) }
+      Task {
+        try? await Task.sleep(for: .seconds(15))
+        gate.finish(data: nil, error: "timeout")
+      }
       let proxy = connection.remoteObjectProxyWithErrorHandler { _ in
         gate.finish(data: nil, error: "unavailable")
       }

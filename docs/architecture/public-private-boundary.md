@@ -20,18 +20,18 @@ private keys, or deployment backups.
 
 ## Private operations repository
 
-The private repository contains the minimum non-secret operational metadata
-needed to reproduce and audit the current installation:
+The private repository contains only identifier-free operational policy and
+evidence:
 
-- inventory identifiers and private network topology;
-- installed component versions and configuration destinations;
-- sanitized runbooks, validation results, and recovery steps;
-- references to secret locations, never secret values.
+- generic architecture invariants;
+- sanitized validation results and recovery steps;
+- no live inventory, topology, account, host, VM, network, or installation
+  identifiers.
 
 Private Git still must not contain key material, passwords, session state,
 cookies, tokens, raw browser captures, or complete environment dumps. Those stay
-in the OS keychain, root-owned files on the relevant host, or another dedicated
-secret store.
+in an approved non-Git secret or operations store. Their locations are also not
+recorded in Git.
 
 ## Publication gate
 

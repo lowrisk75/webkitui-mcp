@@ -15,7 +15,10 @@ blob-report/
 **/storage-state.json
 **/.auth/
 *.pem
+!Sources/WebKitUIMCPLicensing/Resources/lorislabs-license-public.pem
 *.p12
 *.mobileprovision
 *.key
 known_hosts*
+.tmp-design/
+audit-output/
