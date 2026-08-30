@@ -1473,6 +1473,51 @@ struct MCPServerTests {
     #expect(presenter.requests.count == 2)
   }
 
+  @Test("Authentication keeps the asynchronous handoff token active until the human leaves")
+  func authenticationHandoffDoesNotConsumeResumeToken() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Apple ID</title><form><input autocomplete='username'></form>",
+      baseURL: URL(string: "https://idmsa.apple.com/IDMSWebAuth/signin?state=private")!,
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false, confirmationPresenter: presenter)
+    let sessionID = handle.rawValue.uuidString
+
+    let started = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff_start"), "session_id": .string(sessionID)])
+    let token = try string(
+      try object(try object(started["result"])["structuredContent"])["resume_token"])
+
+    let blocked = try await toolCall(
+      server, id: 2, name: "browser_session",
+      arguments: [
+        "operation": .string("handoff_resume"), "session_id": .string(sessionID),
+        "resume_token": .string(token),
+      ])
+    let blockedState = try object(try object(blocked["result"])["structuredContent"])
+    #expect(blockedState["status"] == .string("authentication_origin_requires_human_handoff"))
+    #expect(blockedState["origin"] == .string("https://idmsa.apple.com"))
+    #expect(blockedState["resumed"] == .bool(false))
+    #expect(blockedState["resume_token_state"] == .string("active"))
+    #expect(runtime.interactionControlState() == .humanControlled)
+    #expect(presenter.requests.isEmpty)
+
+    let polled = try await toolCall(
+      server, id: 3, name: "browser_session",
+      arguments: [
+        "operation": .string("handoff_status"), "session_id": .string(sessionID),
+        "resume_token": .string(token),
+      ])
+    #expect(
+      try object(try object(polled["result"])["structuredContent"])["resume_token_state"]
+        == .string("active"))
+  }
+
   @Test("The SiliconPass MCP shim is secretless and never submits")
   func siliconPassShim() async throws {
     let registry = try WebKitSessionRegistry()

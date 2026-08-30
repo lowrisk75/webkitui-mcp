@@ -52,6 +52,11 @@ final class FormFixtureServer: @unchecked Sendable {
     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\(extraHeaders)"
       + "Content-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
   }
+
+  static func redirect(to url: URL) -> String {
+    "HTTP/1.1 302 Found\r\nLocation: \(url.absoluteString)\r\n"
+      + "Content-Length: 0\r\nConnection: close\r\n\r\n"
+  }
 }
 
 @Suite("Native WebKit runtime", .serialized)
@@ -423,6 +428,73 @@ struct WebKitRuntimeTests {
     try await Task.sleep(for: .milliseconds(180))
 
     #expect(runtime.webView.url?.host == "127.0.0.1")
+  }
+
+  @Test("An approved cross-origin redirect retains its exact private request for handoff")
+  func approvedCrossOriginRedirectContinuesExactRequest() async throws {
+    let privateState = "private-redirect-state-must-stay-inside-webkit"
+    let authenticationServer = try FormFixtureServer { request in
+      let receivedExactRequest = request.contains("GET /authenticate?state=\(privateState) ")
+      return FormFixtureServer.response(
+        body: receivedExactRequest
+          ? """
+          <!doctype html><title>Human authentication</title>
+          <style>html,body{margin:0;width:100%;height:100%;background:rgb(18,52,86)}</style>
+          <form><label>Account <input autocomplete="username"></label></form>
+          """
+          : "<title>Missing private redirect state</title>")
+    }
+    let authenticationURL = URL(
+      string: "http://localhost:\(authenticationServer.port)/authenticate?state=\(privateState)"
+    )!
+    let entryServer = try FormFixtureServer { _ in
+      FormFixtureServer.redirect(to: authenticationURL)
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+
+    await #expect(
+      throws: WebKitRuntimeError.crossOriginRedirectRequiresHuman(
+        fromOrigin: "http://127.0.0.1:\(entryServer.port)",
+        toOrigin: "http://localhost:\(authenticationServer.port)"
+      )
+    ) {
+      try await runtime.navigate(
+        to: URL(string: "http://127.0.0.1:\(entryServer.port)/developer-portal")!,
+        timeout: .seconds(3),
+        quietWindow: .milliseconds(20),
+        constrainToInitialOrigin: true
+      )
+    }
+
+    let continued = try await runtime.continueApprovedCrossOriginNavigation(
+      timeout: .seconds(3), quietWindow: .milliseconds(20))
+    #expect(continued.readiness == .ready)
+    #expect(runtime.webView.url == authenticationURL)
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.title") as? String
+        == "Human authentication")
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: true)
+    let window = try #require(runtime.webView.window)
+    #expect(window.isVisible)
+    let snapshot = try await runtime.webView.takeSnapshot(configuration: nil)
+    let bitmap = try #require(snapshot.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
+    let center = try #require(
+      bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.sRGB)
+    )
+    #expect(center.blueComponent > center.redComponent)
+
+    runtime.webView.loadHTMLString(
+      "<title>Developer Portal</title><main>Connected</main>",
+      baseURL: URL(string: "https://developer.apple.com/account/")!)
+    while runtime.webView.isLoading {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    try runtime.requestAgentResume()
+    let resumed = try await runtime.resumeAfterHumanControl()
+    #expect(resumed.title.segments.first?.text == "Developer Portal")
+    #expect(!String(describing: resumed).contains(privateState))
   }
 
   @Test("macOS 27 willSubmitForm does not cover programmatic requestSubmit")

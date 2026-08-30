@@ -1177,6 +1177,21 @@ public final class WebKitMCPServer {
     guard runtime.interactionControlState() == .humanControlled else {
       throw MCPServerError.invalidParams("session is not under human control")
     }
+    if let restriction = runtime.authenticationRestrictionStatus() {
+      return try toolResult(
+        structured: .object([
+          "status": .string("authentication_origin_requires_human_handoff"),
+          "origin": .string(restriction.origin),
+          "auth_ui_state": .string(restriction.classification.rawValue),
+          "control_state": .string(runtime.interactionControlState().rawValue),
+          "resume_token_state": .string("active"),
+          "resumed": .bool(false),
+          "credentials_exposed_to_mcp": .bool(false),
+          "instructions": .string(
+            "Complete authentication in the visible WebKit window. The resume token remains active until the browser leaves the authentication origin."
+          ),
+        ]), modern: modern)
+    }
     guard
       confirmationPresenter.confirm(
         title: "Return Browser Control",
@@ -1192,10 +1207,10 @@ public final class WebKitMCPServer {
           "resumed": .bool(false),
         ]), modern: modern)
     }
-    asynchronousHandoffs.removeValue(forKey: token)
     try runtime.requestAgentResume()
     let observation = try await runtime.resumeAfterHumanControl()
     observations[handle] = observation
+    asynchronousHandoffs.removeValue(forKey: token)
     return try toolResult(
       structured: .object([
         "control_state": .string(runtime.interactionControlState().rawValue),
@@ -1485,13 +1500,53 @@ public final class WebKitMCPServer {
       let fromOrigin,
       let toOrigin
     ) {
-      await capabilityAuthority.revoke(capability)
       observations.removeValue(forKey: pending.session)
-      return try redirectApprovalResult(
-        fromOrigin: fromOrigin,
-        toOrigin: toOrigin,
-        modern: modern
-      )
+      guard
+        confirmationPresenter.confirm(
+          title: "Approve Cross-Origin Redirect",
+          message:
+            "Allow this exact redirect from \(fromOrigin) to \(toOrigin)? Its private path and query stay inside WebKitUI and are never exposed through MCP.",
+          approveLabel: "Continue"
+        )
+      else {
+        runtime.discardPendingCrossOriginNavigation()
+        await capabilityAuthority.revoke(capability)
+        return try redirectApprovalResult(
+          fromOrigin: fromOrigin,
+          toOrigin: toOrigin,
+          modern: modern
+        )
+      }
+      do {
+        let result = try await runtime.continueApprovedCrossOriginNavigation(
+          timeout: .milliseconds(pending.timeoutMilliseconds),
+          quietWindow: .milliseconds(pending.quietWindowMilliseconds)
+        )
+        await capabilityAuthority.revoke(capability)
+        if let restriction = runtime.authenticationRestrictionStatus() {
+          if runtime.interactionControlState() == .agentControlled
+            || runtime.interactionControlState() == .freshlyReobserved
+          {
+            try runtime.requestHumanHandoff()
+            try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+          }
+          return try toolResult(
+            structured: .object([
+              "status": .string("authentication_origin_requires_human_handoff"),
+              "origin": .string(restriction.origin),
+              "auth_ui_state": .string(restriction.classification.rawValue),
+              "environment": try .encoded(restriction.environment),
+              "control_state": .string(runtime.interactionControlState().rawValue),
+              "navigation": try .encoded(result),
+              "redirect_request_exposed_to_mcp": .bool(false),
+            ]),
+            modern: modern)
+        }
+        return try toolResult(structured: .encoded(result), modern: modern)
+      } catch {
+        await capabilityAuthority.revoke(capability)
+        throw error
+      }
     } catch {
       await capabilityAuthority.revoke(capability)
       throw error

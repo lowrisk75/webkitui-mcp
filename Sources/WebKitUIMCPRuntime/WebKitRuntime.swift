@@ -25,6 +25,7 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case invalidCredentialSecret
   case humanControlActive
   case authenticationOriginRequiresHuman(String)
+  case noPendingCrossOriginNavigation
   case invalidControlTransition
   case nativeGestureReceiptUnavailable
 }
@@ -233,6 +234,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   private var lastCommittedHTTPURL: URL?
   private var authenticationUIClassification: AuthenticationUIClassification?
   private var restrictedAuthenticationFrameOrigin: String?
+  private var pendingCrossOriginNavigationRequest: URLRequest?
   private let egressProxy: PinnedSOCKSProxy?
   private var armedNativeGestureTokens: Set<String> = []
   private var nativeGestureReceipts: [String: NativeGestureReceipt] = [:]
@@ -288,6 +290,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     constrainToInitialOrigin: Bool = false
   ) async throws -> WebKitNavigationResult {
     try requireAgentControl()
+    pendingCrossOriginNavigationRequest = nil
     guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
       throw WebKitRuntimeError.unsupportedURLScheme
     }
@@ -310,6 +313,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       timeout: timeout,
       quietWindow: quietWindow
     )
+  }
+
+  /// Continues the exact GET/HEAD redirect request retained inside WebKitUI
+  /// after a separately approved cross-origin transition. The request URL,
+  /// path, query, headers, and cookies are never returned through MCP.
+  public func continueApprovedCrossOriginNavigation(
+    timeout: Duration = .seconds(30),
+    quietWindow: Duration = .milliseconds(300)
+  ) async throws -> WebKitNavigationResult {
+    try requireAgentControl()
+    guard
+      let request = pendingCrossOriginNavigationRequest,
+      let url = request.url,
+      let origin = navigationOrigin(for: url)
+    else { throw WebKitRuntimeError.noPendingCrossOriginNavigation }
+    pendingCrossOriginNavigationRequest = nil
+    topLevelOriginLock = origin
+    return try await load(request: request, timeout: timeout, quietWindow: quietWindow)
+  }
+
+  public func discardPendingCrossOriginNavigation() {
+    pendingCrossOriginNavigationRequest = nil
   }
 
   /// Useful for deterministic fixtures and local benchmarks. A non-nil base
@@ -957,30 +982,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
     topLevelOriginLock = nil
-    if presentWindow {
-      let application = NSApplication.shared
-      WebKitNativeApplicationMenu.install(on: application)
-      application.finishLaunching()
-      application.setActivationPolicy(.regular)
-      application.applicationIconImage = Self.humanControlApplicationIcon()
-      let window = browserWindow ?? makeBrowserWindow()
-      if webView.url == nil {
-        webView.loadHTMLString(Self.emptyHandoffDocument, baseURL: nil)
-      }
-      window.title = "WebkitUIMCP — Human control"
-      window.ignoresMouseEvents = false
-      window.collectionBehavior.remove(.stationary)
-      window.collectionBehavior.remove(.ignoresCycle)
-      window.collectionBehavior.insert(.moveToActiveSpace)
-      webView.isHidden = false
-      webView.alphaValue = 1
-      attachWebView(to: window)
-      window.makeKeyAndOrderFront(nil)
-      window.orderFrontRegardless()
-      application.activate(ignoringOtherApps: true)
-      window.makeFirstResponder(webView)
-      window.displayIfNeeded()
-    }
+    if presentWindow { presentHumanControlWindow() }
     transition(to: .humanControlled, observationID: nil)
   }
 
@@ -1018,6 +1020,31 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     window.orderOut(nil)
     browserWindow = window
     return window
+  }
+
+  private func presentHumanControlWindow() {
+    let application = NSApplication.shared
+    WebKitNativeApplicationMenu.install(on: application)
+    application.finishLaunching()
+    application.setActivationPolicy(.regular)
+    application.applicationIconImage = Self.humanControlApplicationIcon()
+    let window = browserWindow ?? makeBrowserWindow()
+    if webView.url == nil, lastCommittedHTTPURL == nil, !webView.isLoading {
+      webView.loadHTMLString(Self.emptyHandoffDocument, baseURL: nil)
+    }
+    window.title = "WebkitUIMCP — Human control"
+    window.ignoresMouseEvents = false
+    window.collectionBehavior.remove(.stationary)
+    window.collectionBehavior.remove(.ignoresCycle)
+    window.collectionBehavior.insert(.moveToActiveSpace)
+    webView.isHidden = false
+    webView.alphaValue = 1
+    attachWebView(to: window)
+    window.makeKeyAndOrderFront(nil)
+    window.orderFrontRegardless()
+    application.activate(ignoringOtherApps: true)
+    window.makeFirstResponder(webView)
+    window.displayIfNeeded()
   }
 
   private static let emptyHandoffDocument = """
@@ -1067,19 +1094,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     guard controlState == .resumeRequested else {
       throw WebKitRuntimeError.invalidControlTransition
     }
-    if processTerminated {
-      guard
-        let url = lastCommittedHTTPURL,
-        let scheme = url.scheme?.lowercased(),
-        ["http", "https"].contains(scheme)
-      else { throw WebKitRuntimeError.webContentProcessTerminated }
-      _ = try await load(
-        request: URLRequest(url: url),
-        timeout: .seconds(30),
-        quietWindow: .milliseconds(300)
-      )
+    do {
+      if processTerminated {
+        guard
+          let url = lastCommittedHTTPURL,
+          let scheme = url.scheme?.lowercased(),
+          ["http", "https"].contains(scheme)
+        else { throw WebKitRuntimeError.webContentProcessTerminated }
+        _ = try await load(
+          request: URLRequest(url: url),
+          timeout: .seconds(30),
+          quietWindow: .milliseconds(300)
+        )
+      }
+      return try await observe(maximumElements: maximumElements)
+    } catch {
+      if controlState == .resumeRequested {
+        presentHumanControlWindow()
+        transition(to: .humanControlled, observationID: nil)
+      }
+      throw error
     }
-    return try await observe(maximumElements: maximumElements)
   }
 
   public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -1172,6 +1207,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       navigationOrigin(for: targetURL) == lockedOrigin
     else {
       let targetOrigin = navigationAction.request.url.flatMap(navigationOrigin(for:))
+      let method = navigationAction.request.httpMethod?.uppercased() ?? "GET"
+      pendingCrossOriginNavigationRequest =
+        ["GET", "HEAD"].contains(method)
+        ? navigationAction.request : nil
       navigationFailure = .crossOriginRedirectRequiresHuman(
         fromOrigin: Self.sanitizedOrigin(lockedOrigin),
         toOrigin: targetOrigin.map(Self.sanitizedOrigin) ?? "unavailable"
@@ -1538,6 +1577,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     processTerminated = false
     authenticationUIClassification = nil
     restrictedAuthenticationFrameOrigin = nil
+    pendingCrossOriginNavigationRequest = nil
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
   }
