@@ -473,6 +473,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
             physicalIdentity: rawElement.physicalIdentity,
             boundingBox: rawElement.boundingBox,
             sensitive: rawElement.sensitive,
+            disabled: rawElement.disabled,
             observedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
           )
         )
@@ -520,14 +521,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   ) async throws -> WebKitScrollResult {
     try requireAgentControl()
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    let criteria = locatorCriteria(recipe, expectedEnabled: !target.disabled)
     let resolution = try await resolveTarget(
-      criteria: locatorCriteria(recipe), scrollIntoView: true)
+      criteria: criteria, scrollIntoView: true)
     guard resolution.count == 1 else {
       throw WebKitRuntimeError.targetNotUnique(resolution.count)
     }
     return try await performScroll(
       source: Self.nearestScrollStateSource,
-      arguments: ["criteria": locatorCriteria(recipe)]
+      arguments: ["criteria": criteria]
     )
   }
 
@@ -785,8 +788,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     elementID: String
   ) async throws -> LocatorResolution {
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
     let resolution = try await resolveTarget(
-      criteria: locatorCriteria(recipe), scrollIntoView: false)
+      criteria: locatorCriteria(recipe, expectedEnabled: !target.disabled), scrollIntoView: false)
     return LocatorResolution(
       recipeElementID: elementID,
       evaluations: (0..<resolution.count).map {
@@ -812,7 +816,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
 
-    let criteria = locatorCriteria(target.recipe)
+    let criteria = locatorCriteria(target.recipe, expectedEnabled: !target.disabled)
     let first = try await resolveTarget(criteria: criteria, scrollIntoView: true)
     try recordCardinality(first.count, target: target)
     guard let firstCandidate = first.candidate else {
@@ -1271,8 +1275,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     )
   }
 
-  private func locatorCriteria(_ recipe: LocatorRecipe) -> [[String: String]] {
-    recipe.clauses.map { clause in
+  private func locatorCriteria(
+    _ recipe: LocatorRecipe,
+    expectedEnabled: Bool? = nil
+  ) -> [[String: String]] {
+    var criteria = recipe.clauses.map { clause in
       let fact: String
       let argument: String
       switch clause.fact {
@@ -1309,6 +1316,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         "comparison": clause.comparison.rawValue,
       ]
     }
+    if let expectedEnabled {
+      criteria.append([
+        "fact": "enabled",
+        "argument": "",
+        "expected": String(expectedEnabled),
+        "strength": "required",
+        "comparison": "exact",
+      ])
+    }
+    return criteria
   }
 
   private func resolveTarget(
@@ -2125,6 +2142,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         case 'stableAttribute': return criterion.argument === 'tag'
           ? element.localName : element.getAttribute(criterion.argument);
         case 'contextAnchor': return collapse(element.closest(criterion.argument)?.innerText) || null;
+        case 'enabled': return String(
+          !(element.disabled || element.getAttribute('aria-disabled') === 'true'));
         default: return null;
       }
     };
@@ -2555,6 +2574,7 @@ private struct ObservedTargetRecord {
   let physicalIdentity: String
   let boundingBox: ObservedBoundingBox
   let sensitive: Bool
+  let disabled: Bool
   let observedAtMonotonicNanoseconds: UInt64
 }
 

@@ -1061,6 +1061,30 @@ struct WebKitRuntimeTests {
     #expect(runtime.addressingCounterSnapshot().addressNowAmbiguous == 1)
   }
 
+  @Test("Enabled state disambiguates otherwise identical controls")
+  func enabledStateDisambiguatesControls() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<button onclick='this.dataset.state=\"clicked\"'>Configure</button>"
+        + "<button disabled>Configure</button>",
+      baseURL: URL(string: "https://fixture.invalid/"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+    let observation = try await runtime.observe()
+
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: "e1",
+      operation: .click,
+      stabilityInterval: .milliseconds(10)
+    )
+
+    #expect(result.dispatched)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "clicked")
+  }
+
   @Test("An element symbol expires after the next observation")
   func staleObservationRejected() async throws {
     let runtime = WebKitRuntime()
