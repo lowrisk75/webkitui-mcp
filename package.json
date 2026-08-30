@@ -1,0 +1,29 @@
+{
+  "name": "webkitui-mcp-legacy-playwright-fixtures",
+  "version": "0.6.0",
+  "private": true,
+  "description": "Retained TypeScript/Playwright prior-art fixtures. The supported WebKitUI MCP product is the native Swift/WKWebView implementation built with Swift Package Manager.",
+  "license": "BUSL-1.1",
+  "author": "LorisLabs",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "prepare": "tsc",
+    "smoke-test": "node scripts/smoke-test.mjs",
+    "test": "node scripts/goat-test-full.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "playwright": "^1.49.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

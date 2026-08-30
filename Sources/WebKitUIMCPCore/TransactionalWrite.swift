@@ -27,6 +27,7 @@ public enum ObservationTextField: String, Codable, CaseIterable, Sendable {
   case label = "@label"
   case text = "@text"
   case value = "@value"
+  case dialogName = "@dialog_name"
 }
 
 public enum ObservationPredicate: Codable, Equatable, Sendable {
@@ -42,6 +43,9 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
   /// on an ephemeral element ID. Transaction preparation rejects a match that
   /// was already present before dispatch.
   case anyEntryTextDigest([ObservationTextField], String)
+  /// Matches an exact UTF-8 substring without storing that caller-supplied text.
+  /// A rolling hash selects candidates in linear time; SHA-256 confirms the match.
+  case anyEntryTextContainsDigest([ObservationTextField], String, Int, UInt64)
 
   public static func digest(of value: ProvenancedText) throws -> String {
     SHA256.hash(data: try value.canonicalJSONData())
@@ -53,6 +57,19 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
     SHA256.hash(data: Data(text.utf8))
       .map { String(format: "%02x", $0) }
       .joined()
+  }
+
+  public static func containsParameters(of text: String) -> (
+    digest: String, length: Int, rolling: UInt64
+  ) {
+    let bytes = Array(text.utf8)
+    return (textDigest(of: text), bytes.count, rollingHash(bytes))
+  }
+
+  private static func rollingHash(_ bytes: [UInt8]) -> UInt64 {
+    bytes.reduce(0) { partial, byte in
+      partial &* 257 &+ UInt64(byte) &+ 1
+    }
   }
 
   public func evaluate(in observation: TransactionObservation) throws -> PredicateResult {
@@ -87,6 +104,30 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
         return Self.textDigest(of: text) == expectedDigest
       }
       if found { return .satisfied }
+      return observation.completeness == .complete ? .unsatisfied : .unknown
+    case .anyEntryTextContainsDigest(
+      let fields, let expectedDigest, let expectedLength, let expectedRolling):
+      let allowedFields = Set(fields.map(\.rawValue))
+      for entry in observation.state.entries where allowedFields.contains(entry.key.field) {
+        let bytes = Array(entry.value.segments.map(\.text).joined().utf8)
+        guard bytes.count >= expectedLength else { continue }
+        var power: UInt64 = 1
+        if expectedLength > 1 {
+          for _ in 1..<expectedLength { power = power &* 257 }
+        }
+        var rolling = Self.rollingHash(Array(bytes[0..<expectedLength]))
+        for offset in 0...(bytes.count - expectedLength) {
+          if rolling == expectedRolling {
+            let candidate = String(
+              decoding: bytes[offset..<(offset + expectedLength)], as: UTF8.self)
+            if Self.textDigest(of: candidate) == expectedDigest { return .satisfied }
+          }
+          guard offset < bytes.count - expectedLength else { break }
+          rolling =
+            (rolling &- (UInt64(bytes[offset]) &+ 1) &* power) &* 257
+            &+ UInt64(bytes[offset + expectedLength]) &+ 1
+        }
+      }
       return observation.completeness == .complete ? .unsatisfied : .unknown
     }
   }
@@ -131,7 +172,7 @@ public struct TransactionalWritePlan: Codable, Sendable {
       let digest: String?
       switch predicate {
       case .entryValueDigest(_, let value), .entryTextDigest(_, let value),
-        .anyEntryTextDigest(_, let value):
+        .anyEntryTextDigest(_, let value), .anyEntryTextContainsDigest(_, let value, _, _):
         digest = value
       default: digest = nil
       }
@@ -142,6 +183,12 @@ public struct TransactionalWritePlan: Codable, Sendable {
       }
       if case .anyEntryTextDigest(let fields, _) = predicate, fields.isEmpty {
         throw TransactionError.emptySemanticTextFields
+      }
+      if case .anyEntryTextContainsDigest(let fields, _, let length, _) = predicate {
+        guard !fields.isEmpty else { throw TransactionError.emptySemanticTextFields }
+        guard (1...2_048).contains(length) else {
+          throw TransactionError.invalidExpectedDigest
+        }
       }
     }
 
@@ -278,7 +325,7 @@ public actor TransactionalWriteLedger {
     let plan: TransactionalWritePlan
     let planDigest: String
     let baseObservationDigest: String
-    let preparedAtNanoseconds: UInt64
+    var preparedAtNanoseconds: UInt64
     var phase: TransactionPhase
     var dispatchedAtNanoseconds: UInt64?
     var deadlineNanoseconds: UInt64?
@@ -289,8 +336,51 @@ public actor TransactionalWriteLedger {
   }
 
   private var records: [String: Record] = [:]
+  private let persistence: (any TransactionLedgerPersisting)?
 
-  public init() {}
+  public init() {
+    self.persistence = nil
+  }
+
+  public init(persistence: any TransactionLedgerPersisting) throws {
+    self.persistence = persistence
+    for persisted in try persistence.load() {
+      let key = persisted.plan.idempotencyKey
+      guard records[key] == nil else {
+        throw TransactionLedgerPersistenceError.duplicateIdempotencyKey
+      }
+      let recoveredPhase: TransactionPhase
+      switch persisted.phase {
+      case .dispatching, .dispatched: recoveredPhase = .indeterminate
+      case .prepared, .verified, .indeterminate: recoveredPhase = persisted.phase
+      }
+      records[key] = Record(
+        plan: persisted.plan,
+        planDigest: persisted.planDigest,
+        baseObservationDigest: persisted.baseObservationDigest,
+        preparedAtNanoseconds: 0,
+        phase: recoveredPhase,
+        dispatchedAtNanoseconds: nil,
+        deadlineNanoseconds: nil,
+        resultObservationDigest: persisted.resultObservationDigest,
+        observedAtNanoseconds: nil,
+        evidence: persisted.evidence,
+        recoveredByReconciliation: persisted.recoveredByReconciliation
+      )
+    }
+    try persistence.save(
+      records.values.map {
+        PersistedTransactionRecord(
+          plan: $0.plan,
+          planDigest: $0.planDigest,
+          baseObservationDigest: $0.baseObservationDigest,
+          phase: $0.phase,
+          resultObservationDigest: $0.resultObservationDigest,
+          evidence: $0.evidence,
+          recoveredByReconciliation: $0.recoveredByReconciliation
+        )
+      })
+  }
 
   public func prepare(
     _ plan: TransactionalWritePlan,
@@ -342,7 +432,7 @@ public actor TransactionalWriteLedger {
       evidence: [],
       recoveredByReconciliation: false
     )
-    records[plan.idempotencyKey] = record
+    try commit(record, for: plan.idempotencyKey)
     return .prepared(receipt(for: record))
   }
 
@@ -390,7 +480,7 @@ public actor TransactionalWriteLedger {
     try requireSatisfied(record.plan.preconditions, in: observation)
 
     record.phase = .dispatching
-    records[idempotencyKey] = record
+    try commit(record, for: idempotencyKey)
     return receipt(for: record)
   }
 
@@ -425,7 +515,7 @@ public actor TransactionalWriteLedger {
       record.deadlineNanoseconds = deadline
     }
 
-    records[idempotencyKey] = record
+    try commit(record, for: idempotencyKey)
     return receipt(for: record)
   }
 
@@ -446,7 +536,7 @@ public actor TransactionalWriteLedger {
     }
     record.phase = .indeterminate
     record.observedAtNanoseconds = monotonicNowNanoseconds
-    records[idempotencyKey] = record
+    try commit(record, for: idempotencyKey)
     return receipt(for: record)
   }
 
@@ -474,16 +564,16 @@ public actor TransactionalWriteLedger {
 
     if evidence.allSatisfy({ $0.result == .satisfied }) {
       record.phase = .verified
-      records[idempotencyKey] = record
+      try commit(record, for: idempotencyKey)
       return .verified(receipt(for: record))
     }
     if let deadline = record.deadlineNanoseconds, monotonicNowNanoseconds >= deadline {
       record.phase = .indeterminate
-      records[idempotencyKey] = record
+      try commit(record, for: idempotencyKey)
       return .indeterminate(receipt(for: record))
     }
 
-    records[idempotencyKey] = record
+    try commit(record, for: idempotencyKey)
     return .pending(receipt(for: record))
   }
 
@@ -510,11 +600,11 @@ public actor TransactionalWriteLedger {
     if record.evidence.allSatisfy({ $0.result == .satisfied }) {
       record.phase = .verified
       record.recoveredByReconciliation = true
-      records[idempotencyKey] = record
+      try commit(record, for: idempotencyKey)
       return .verified(receipt(for: record))
     }
 
-    records[idempotencyKey] = record
+    try commit(record, for: idempotencyKey)
     return .indeterminate(receipt(for: record))
   }
 
@@ -576,5 +666,34 @@ public actor TransactionalWriteLedger {
       postconditionEvidence: record.evidence,
       recoveredByReconciliation: record.recoveredByReconciliation
     )
+  }
+
+  private func persist() throws {
+    try persistence?.save(
+      records.values.map {
+        PersistedTransactionRecord(
+          plan: $0.plan,
+          planDigest: $0.planDigest,
+          baseObservationDigest: $0.baseObservationDigest,
+          phase: $0.phase,
+          resultObservationDigest: $0.resultObservationDigest,
+          evidence: $0.evidence,
+          recoveredByReconciliation: $0.recoveredByReconciliation
+        )
+      })
+  }
+
+  private func commit(_ record: Record, for idempotencyKey: String) throws {
+    let previous = records.updateValue(record, forKey: idempotencyKey)
+    do {
+      try persist()
+    } catch {
+      if let previous {
+        records[idempotencyKey] = previous
+      } else {
+        records.removeValue(forKey: idempotencyKey)
+      }
+      throw error
+    }
   }
 }

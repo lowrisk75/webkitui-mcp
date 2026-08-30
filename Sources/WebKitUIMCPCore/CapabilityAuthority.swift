@@ -83,6 +83,10 @@ public actor CapabilityAuthority {
     grants.removeValue(forKey: handle)
   }
 
+  public func revokeAll() {
+    grants.removeAll(keepingCapacity: false)
+  }
+
   /// The caller supplies the current live origin after re-resolution.
   /// Decisions are intentionally not cached across action boundaries.
   public func evaluate(

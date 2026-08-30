@@ -80,6 +80,8 @@ struct PinnedSOCKSProxyTests {
   func webKitRouting() async throws {
     let destination = try FormFixtureServer()
     let runtime = try WebKitRuntime(protectedWebsiteDataStore: .nonPersistent())
+    #expect(runtime.authenticationEnvironmentSnapshot().pinnedProxyConfigured)
+    #expect(!runtime.authenticationEnvironmentSnapshot().persistentWebsiteDataStore)
     await #expect(throws: WebKitRuntimeError.networkBoundaryDenied) {
       try await runtime.navigate(
         to: URL(string: "http://127.0.0.1:\(destination.port)/")!,

@@ -4,96 +4,10 @@ import Foundation
 import WebKit
 import WebKitUIMCPCore
 
-@MainActor
-final class HumanControlWebView: WKWebView {
-  private var nativeGestureNanoseconds: UInt64?
-
-  override func mouseDown(with event: NSEvent) {
-    recordNativeUserGesture()
-    super.mouseDown(with: event)
-  }
-
-  override func keyDown(with event: NSEvent) {
-    if [36, 49, 76].contains(event.keyCode) {
-      recordNativeUserGesture()
-    }
-    super.keyDown(with: event)
-  }
-
-  func recordNativeUserGesture() {
-    nativeGestureNanoseconds = DispatchTime.now().uptimeNanoseconds
-  }
-
-  func consumeRecentNativeUserGesture() -> Bool {
-    guard let recorded = nativeGestureNanoseconds else { return false }
-    nativeGestureNanoseconds = nil
-    let now = DispatchTime.now().uptimeNanoseconds
-    return now >= recorded && now - recorded <= 1_000_000_000
-  }
-}
-
-@MainActor
-private enum HumanControlPresentationCoordinator {
-  private static var visibleRuntimeSlots: [ObjectIdentifier: Int] = [:]
-
-  static func present(runtime: WebKitRuntime) -> Int {
-    let identifier = ObjectIdentifier(runtime)
-    let slot = visibleRuntimeSlots[identifier] ?? firstAvailableSlot()
-    visibleRuntimeSlots[identifier] = slot
-    let application = NSApplication.shared
-    application.finishLaunching()
-    installStandardEditMenu(in: application)
-    application.setActivationPolicy(.regular)
-    application.applicationIconImage = WebKitRuntime.humanControlApplicationIcon()
-    application.dockTile.display()
-    application.unhide(nil)
-    application.activate(ignoringOtherApps: true)
-    return slot
-  }
-
-  static func dismiss(runtime: WebKitRuntime) {
-    visibleRuntimeSlots.removeValue(forKey: ObjectIdentifier(runtime))
-    if visibleRuntimeSlots.isEmpty {
-      NSApplication.shared.setActivationPolicy(.accessory)
-    }
-  }
-
-  private static func firstAvailableSlot() -> Int {
-    let occupied = Set(visibleRuntimeSlots.values)
-    return (0..<8).first(where: { !occupied.contains($0) }) ?? 0
-  }
-
-  private static func installStandardEditMenu(in application: NSApplication) {
-    let mainMenu = application.mainMenu ?? NSMenu(title: "Main Menu")
-    guard mainMenu.items.first(where: { $0.submenu?.title == "Edit" }) == nil else {
-      return
-    }
-
-    let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
-    let editMenu = NSMenu(title: "Edit")
-    editMenu.addItem(
-      withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
-    let redo = editMenu.addItem(
-      withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
-    redo.keyEquivalentModifierMask = [.command, .shift]
-    editMenu.addItem(.separator())
-    editMenu.addItem(
-      withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-    editMenu.addItem(
-      withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-    editMenu.addItem(
-      withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-    editMenu.addItem(
-      withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-    editItem.submenu = editMenu
-    mainMenu.addItem(editItem)
-    application.mainMenu = mainMenu
-  }
-}
-
 public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case unsupportedURLScheme
   case navigationFailed(String)
+  case crossOriginRedirectRequiresHuman(fromOrigin: String, toOrigin: String)
   case navigationTimedOut
   case webContentProcessTerminated
   case networkBoundaryDenied
@@ -110,7 +24,31 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case invalidCredentialBinding
   case invalidCredentialSecret
   case humanControlActive
+  case authenticationOriginRequiresHuman(String)
+  case noPendingCrossOriginNavigation
   case invalidControlTransition
+  case nativeGestureReceiptUnavailable
+}
+
+public enum AuthenticationUIClassification: String, Codable, Equatable, Sendable {
+  case humanHandoffRequired = "authentication_origin_requires_human_handoff"
+  case authUINotReady = "auth_ui_not_ready"
+  case fullBrowserRequired = "full_browser_required"
+}
+
+public struct AuthenticationRestrictionStatus: Codable, Equatable, Sendable {
+  public let origin: String
+  public let classification: AuthenticationUIClassification
+  public let environment: AuthenticationEnvironmentSnapshot
+}
+
+public struct AuthenticationEnvironmentSnapshot: Codable, Equatable, Sendable {
+  public let persistentWebsiteDataStore: Bool
+  public let customUserAgentConfigured: Bool
+  public let applicationNameForUserAgentConfigured: Bool
+  public let pinnedProxyConfigured: Bool
+  public let contentBlockingConfigured: Bool
+  public let customProcessPoolConfigured: Bool
 }
 
 public enum InteractionControlState: String, Codable, Equatable, Sendable {
@@ -161,6 +99,10 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let sensitive: Bool
   public let submitsForm: Bool
   public let disabled: Bool
+  public let checked: Bool?
+  public let selected: Bool?
+  public let selectedOption: ProvenancedText?
+  public let stateAttributes: [String: ProvenancedText]
   public let visible: Bool
   public let boundingBox: ObservedBoundingBox
   public let locatorRecipe: LocatorRecipe
@@ -175,6 +117,10 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let readyState: String
   public let mutationCount: UInt64
   public let elements: [WebKitObservedElement]
+  public let totalElementCount: Int
+  public let elementOffset: Int
+  public let nextElementOffset: Int?
+  public let semanticTextTruncated: Bool
   public let crossOriginFramesOpaque: Bool
   public let capturedAtMonotonicNanoseconds: UInt64
 }
@@ -187,9 +133,44 @@ public struct WebKitCapture: Sendable {
   public let compositorEffectsMayBeMissing: Bool
 }
 
+public struct WebKitScrollResult: Codable, Equatable, Sendable {
+  public let x: Double
+  public let y: Double
+  public let viewportWidth: Double
+  public let viewportHeight: Double
+  public let documentWidth: Double
+  public let documentHeight: Double
+  public let reachedTop: Bool
+  public let reachedBottom: Bool
+  public let observationInvalidated: Bool
+}
+
+public struct WebKitTextRegion: Codable, Equatable, Sendable {
+  public let kind: String
+  public let label: String?
+  public let text: String
+  public let scrollTop: Double
+  public let scrollHeight: Double
+  public let clientHeight: Double
+}
+
+public struct WebKitTextSnapshot: Codable, Equatable, Sendable {
+  public let bodyText: String
+  public let regions: [WebKitTextRegion]
+  public let truncated: Bool
+}
+
 public enum WebKitActionOperation: Sendable {
   case click
   case fill(ProvenancedText)
+  case pressKey(String)
+  case blur
+  case commitInput
+}
+
+public enum WebKitActionDispatchMode: String, Codable, Equatable, Sendable {
+  case javascript
+  case nativeAppKit = "native_appkit"
 }
 
 public struct WebKitActionResult: Codable, Equatable, Sendable {
@@ -197,6 +178,7 @@ public struct WebKitActionResult: Codable, Equatable, Sendable {
   public let addressingOutcome: AddressingOutcome
   public let dispatched: Bool
   public let trustedUserGesture: Bool
+  public let dispatchMode: WebKitActionDispatchMode
   public let actionMonotonicNanoseconds: UInt64
 }
 
@@ -215,27 +197,47 @@ public struct WebContentTerminationEvent: Codable, Equatable, Sendable {
   public let monotonicNanoseconds: UInt64
 }
 
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+  weak var target: (any WKScriptMessageHandler)?
+
+  init(target: any WKScriptMessageHandler) {
+    self.target = target
+  }
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    target?.userContentController(userContentController, didReceive: message)
+  }
+}
+
 @MainActor
-public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
+public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
   public let webView: WKWebView
 
   private let instrumentationWorld: WKContentWorld
   private var documentID = UUID().uuidString
   private var observationGeneration: UInt64 = 0
-  private var navigationFailure: String?
+  private var navigationFailure: WebKitRuntimeError?
   private var processTerminated = false
   private var latestObservationID: String?
   private var latestTargets: [String: ObservedTargetRecord] = [:]
   private var addressingCounters = AddressingCounterSnapshot()
   private var controlState: InteractionControlState = .agentControlled
   private var handoffEvents: [HandoffAuditEvent] = []
-  private var humanControlWindow: NSWindow?
+  private var browserWindow: NSWindow?
   private var topLevelOriginLock: SecurityOrigin?
   private let formAuditKey = SymmetricKey(size: .bits256)
   private var formSubmissionEvents: [FormSubmissionAuditEvent] = []
   private var webContentTerminationEvents: [WebContentTerminationEvent] = []
   private var lastCommittedHTTPURL: URL?
+  private var authenticationUIClassification: AuthenticationUIClassification?
+  private var restrictedAuthenticationFrameOrigin: String?
+  private var pendingCrossOriginNavigationRequest: URLRequest?
   private let egressProxy: PinnedSOCKSProxy?
+  private var armedNativeGestureTokens: Set<String> = []
+  private var nativeGestureReceipts: [String: NativeGestureReceipt] = [:]
 
   public override convenience init() {
     self.init(websiteDataStore: .default())
@@ -266,16 +268,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     )
     configuration.userContentController = contentController
     configuration.websiteDataStore = websiteDataStore
-    configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
     self.instrumentationWorld = world
-    self.webView = HumanControlWebView(
+    self.webView = WKWebView(
       frame: .init(x: 0, y: 0, width: 1280, height: 800),
       configuration: configuration
     )
     super.init()
+    contentController.add(
+      WeakScriptMessageHandler(target: self),
+      contentWorld: world,
+      name: Self.nativeGestureMessageHandlerName)
     webView.navigationDelegate = self
-    webView.uiDelegate = self
+    _ = makeBrowserWindow()
   }
 
   public func navigate(
@@ -285,6 +290,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     constrainToInitialOrigin: Bool = false
   ) async throws -> WebKitNavigationResult {
     try requireAgentControl()
+    pendingCrossOriginNavigationRequest = nil
     guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
       throw WebKitRuntimeError.unsupportedURLScheme
     }
@@ -309,6 +315,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     )
   }
 
+  /// Continues the exact GET/HEAD redirect request retained inside WebKitUI
+  /// after a separately approved cross-origin transition. The request URL,
+  /// path, query, headers, and cookies are never returned through MCP.
+  public func continueApprovedCrossOriginNavigation(
+    timeout: Duration = .seconds(30),
+    quietWindow: Duration = .milliseconds(300)
+  ) async throws -> WebKitNavigationResult {
+    try requireAgentControl()
+    guard
+      let request = pendingCrossOriginNavigationRequest,
+      let url = request.url,
+      let origin = navigationOrigin(for: url)
+    else { throw WebKitRuntimeError.noPendingCrossOriginNavigation }
+    pendingCrossOriginNavigationRequest = nil
+    topLevelOriginLock = origin
+    return try await load(request: request, timeout: timeout, quietWindow: quietWindow)
+  }
+
+  public func discardPendingCrossOriginNavigation() {
+    pendingCrossOriginNavigationRequest = nil
+  }
+
   /// Useful for deterministic fixtures and local benchmarks. A non-nil base
   /// URL determines the page's security origin.
   public func loadHTML(
@@ -324,20 +352,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     webView.loadHTMLString(html, baseURL: baseURL)
     let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
     let state = try await instrumentationState()
+    await refreshAuthenticationUIClassification()
+    let loadedURL = webView.url ?? baseURL
     return WebKitNavigationResult(
       documentID: documentID,
-      url: webView.url?.absoluteString ?? baseURL?.absoluteString ?? "about:blank",
+      url: agentSafeURLString(loadedURL) ?? "about:blank",
       readiness: readiness,
       elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
       mutationCount: state.mutationCount
     )
   }
 
-  public func observe(maximumElements: Int = 500) async throws -> WebKitPageObservation {
-    guard controlState != .handoffRequested, controlState != .humanControlled else {
-      throw WebKitRuntimeError.humanControlActive
+  public func observe(
+    maximumElements: Int = 200,
+    elementOffset: Int = 0,
+    maximumFieldCharacters: Int = 512,
+    roles: [String] = [],
+    nameContains: String? = nil
+  ) async throws -> WebKitPageObservation {
+    try requireObservationControl()
+    guard maximumElements > 0, elementOffset >= 0, maximumFieldCharacters > 0 else {
+      throw WebKitRuntimeError.malformedInstrumentationResult
     }
-    guard maximumElements > 0 else { throw WebKitRuntimeError.malformedInstrumentationResult }
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
 
     let script = Self.observationSource.replacingOccurrences(
@@ -347,7 +383,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     guard
       let json = try await webView.callAsyncJavaScript(
         script,
-        arguments: [:],
+        arguments: [
+          "roleFilters": roles.map { $0.lowercased() },
+          "nameFilter": nameContains?.lowercased() ?? "",
+          "elementOffset": elementOffset,
+          "maximumFieldCharacters": maximumFieldCharacters,
+        ],
         in: nil,
         contentWorld: instrumentationWorld
       ) as? String,
@@ -404,6 +445,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
         sensitive: element.sensitive,
         submitsForm: element.submitsForm,
         disabled: element.disabled,
+        checked: element.checked,
+        selected: element.selected,
+        selectedOption: try element.selectedOption.map {
+          try ProvenancedText(text: $0, source: pageSource)
+        },
+        stateAttributes: try element.stateAttributes.mapValues {
+          try ProvenancedText(text: $0, source: pageSource)
+        },
         visible: element.visible,
         boundingBox: element.boundingBox,
         locatorRecipe: try locatorRecipe(
@@ -424,6 +473,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
             physicalIdentity: rawElement.physicalIdentity,
             boundingBox: rawElement.boundingBox,
             sensitive: rawElement.sensitive,
+            disabled: rawElement.disabled,
             observedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
           )
         )
@@ -439,6 +489,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       readyState: raw.readyState,
       mutationCount: raw.mutationCount,
       elements: elements,
+      totalElementCount: raw.totalElementCount,
+      elementOffset: elementOffset,
+      nextElementOffset: elementOffset + elements.count < raw.totalElementCount
+        ? elementOffset + elements.count : nil,
+      semanticTextTruncated: raw.semanticTextTruncated,
       crossOriginFramesOpaque: raw.crossOriginFrameCount > 0,
       capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
     )
@@ -449,10 +504,62 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     return observation
   }
 
+  public func scrollBy(deltaX: Double, deltaY: Double) async throws -> WebKitScrollResult {
+    try requireAgentControl()
+    guard deltaX.isFinite, deltaY.isFinite else {
+      throw WebKitRuntimeError.malformedInstrumentationResult
+    }
+    return try await performScroll(
+      source: Self.pageScrollSource,
+      arguments: ["deltaX": deltaX, "deltaY": deltaY]
+    )
+  }
+
+  public func scrollElementIntoView(
+    observationID: String,
+    elementID: String
+  ) async throws -> WebKitScrollResult {
+    try requireAgentControl()
+    let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    let criteria = locatorCriteria(recipe, expectedEnabled: !target.disabled)
+    let resolution = try await resolveTarget(
+      criteria: criteria, scrollIntoView: true)
+    guard resolution.count == 1 else {
+      throw WebKitRuntimeError.targetNotUnique(resolution.count)
+    }
+    return try await performScroll(
+      source: Self.nearestScrollStateSource,
+      arguments: ["criteria": criteria]
+    )
+  }
+
+  public func readText(maximumCharacters: Int = 20_000) async throws -> WebKitTextSnapshot {
+    try requireAgentControl()
+    guard maximumCharacters > 0 else {
+      throw WebKitRuntimeError.malformedInstrumentationResult
+    }
+    guard
+      let json = try await webView.callAsyncJavaScript(
+        Self.textSnapshotSource,
+        arguments: ["maximumCharacters": maximumCharacters],
+        in: nil,
+        contentWorld: instrumentationWorld
+      ) as? String,
+      let data = json.data(using: .utf8),
+      let snapshot = try? JSONDecoder().decode(WebKitTextSnapshot.self, from: data)
+    else { throw WebKitRuntimeError.malformedInstrumentationResult }
+    return snapshot
+  }
+
   public func capture() async throws -> WebKitCapture {
     try requireAgentControl()
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
-    let image = try await webView.takeSnapshot(configuration: nil)
+    webView.layoutSubtreeIfNeeded()
+    let configuration = WKSnapshotConfiguration()
+    configuration.rect = webView.bounds
+    configuration.snapshotWidth = NSNumber(value: webView.bounds.width)
+    let image = try await webView.takeSnapshot(configuration: configuration)
     guard
       let tiff = image.tiffRepresentation,
       let bitmap = NSBitmapImageRep(data: tiff),
@@ -521,6 +628,48 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     )
   }
 
+  /// Captures exactly three password fields for an assisted rotation. This is
+  /// private runtime state and is never exposed as a secret-bearing API.
+  public func credentialRotationBinding(
+    observationID: String,
+    currentPasswordElementID: String,
+    newPasswordElementID: String,
+    confirmationElementID: String
+  ) throws -> CredentialSinkRotationBinding {
+    try requireAgentControl()
+    let ids = [currentPasswordElementID, newPasswordElementID, confirmationElementID]
+    guard !processTerminated,
+      observationID == latestObservationID,
+      Set(ids).count == ids.count,
+      let current = latestTargets[currentPasswordElementID],
+      let new = latestTargets[newPasswordElementID],
+      let confirmation = latestTargets[confirmationElementID],
+      current.sensitive, new.sensitive, confirmation.sensitive,
+      current.recipe.observationGeneration == new.recipe.observationGeneration,
+      new.recipe.observationGeneration == confirmation.recipe.observationGeneration,
+      let url = webView.url
+    else { throw WebKitRuntimeError.invalidCredentialBinding }
+    let origin = try CredentialSinkOrigin(url: url)
+    return CredentialSinkRotationBinding(
+      origin: origin,
+      documentID: documentID,
+      observationID: observationID,
+      observationGeneration: current.recipe.observationGeneration,
+      currentPasswordTarget: .init(
+        elementID: currentPasswordElementID,
+        physicalElementIdentity: current.physicalIdentity
+      ),
+      newPasswordTarget: .init(
+        elementID: newPasswordElementID,
+        physicalElementIdentity: new.physicalIdentity
+      ),
+      confirmationTarget: .init(
+        elementID: confirmationElementID,
+        physicalElementIdentity: confirmation.physicalIdentity
+      )
+    )
+  }
+
   /// Private native sink. It resolves only the two physical nodes captured in
   /// `credentialFormBinding`; semantic fallback and form submission are absent.
   public func performCredentialFill(
@@ -574,13 +723,74 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     return CredentialSinkReceipt(status: .filled)
   }
 
+  public func performCredentialRotationFill(
+    binding: CredentialSinkRotationBinding,
+    currentPassword: CredentialSecretBuffer,
+    newPassword: CredentialSecretBuffer
+  ) async throws -> CredentialSinkReceipt {
+    defer {
+      currentPassword.wipe()
+      newPassword.wipe()
+    }
+    try requireAgentControl()
+    let targetBindings = [
+      binding.currentPasswordTarget,
+      binding.newPasswordTarget,
+      binding.confirmationTarget,
+    ]
+    guard !processTerminated,
+      binding.documentID == documentID,
+      binding.observationID == latestObservationID,
+      Set(targetBindings.map(\.elementID)).count == 3,
+      let liveURL = webView.url,
+      let liveOrigin = try? CredentialSinkOrigin(url: liveURL),
+      liveOrigin == binding.origin,
+      let current = latestTargets[binding.currentPasswordTarget.elementID],
+      let new = latestTargets[binding.newPasswordTarget.elementID],
+      let confirmation = latestTargets[binding.confirmationTarget.elementID],
+      current.recipe.observationGeneration == binding.observationGeneration,
+      new.recipe.observationGeneration == binding.observationGeneration,
+      confirmation.recipe.observationGeneration == binding.observationGeneration,
+      current.physicalIdentity == binding.currentPasswordTarget.physicalElementIdentity,
+      new.physicalIdentity == binding.newPasswordTarget.physicalElementIdentity,
+      confirmation.physicalIdentity == binding.confirmationTarget.physicalElementIdentity,
+      current.sensitive, new.sensitive, confirmation.sensitive
+    else { throw WebKitRuntimeError.invalidCredentialBinding }
+
+    let currentString = try currentPassword.asciiString(maximumBytes: 1_024)
+    let newString = try newPassword.asciiString(maximumBytes: 1_024)
+    let arguments: [String: Any] = [
+      "currentIdentity": binding.currentPasswordTarget.physicalElementIdentity,
+      "newIdentity": binding.newPasswordTarget.physicalElementIdentity,
+      "confirmationIdentity": binding.confirmationTarget.physicalElementIdentity,
+      "currentBox": Self.boxDictionary(current.boundingBox),
+      "newBox": Self.boxDictionary(new.boundingBox),
+      "confirmationBox": Self.boxDictionary(confirmation.boundingBox),
+      "currentPassword": currentString,
+      "newPassword": newString,
+    ]
+    guard
+      let json = try await webView.callAsyncJavaScript(
+        Self.credentialRotationFillSource,
+        arguments: arguments,
+        in: nil,
+        contentWorld: instrumentationWorld
+      ) as? String,
+      let data = json.data(using: .utf8),
+      let result = try? JSONDecoder().decode(RawCredentialFillResult.self, from: data),
+      result.filled
+    else { throw WebKitRuntimeError.invalidCredentialBinding }
+    return CredentialSinkReceipt(status: .filled)
+  }
+
   public func preflightResolution(
     observationID: String,
     elementID: String
   ) async throws -> LocatorResolution {
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
     let resolution = try await resolveTarget(
-      criteria: locatorCriteria(recipe), scrollIntoView: false)
+      criteria: locatorCriteria(recipe, expectedEnabled: !target.disabled), scrollIntoView: false)
     return LocatorResolution(
       recipeElementID: elementID,
       evaluations: (0..<resolution.count).map {
@@ -598,6 +808,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     observationID: String,
     elementID: String,
     operation: WebKitActionOperation,
+    dispatchMode: WebKitActionDispatchMode = .javascript,
     stabilityInterval: Duration = .milliseconds(50)
   ) async throws -> WebKitActionResult {
     try requireAgentControl()
@@ -605,7 +816,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
 
-    let criteria = locatorCriteria(target.recipe)
+    let criteria = locatorCriteria(target.recipe, expectedEnabled: !target.disabled)
     let first = try await resolveTarget(criteria: criteria, scrollIntoView: true)
     try recordCardinality(first.count, target: target)
     guard let firstCandidate = first.candidate else {
@@ -623,14 +834,32 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       guard !target.sensitive else { throw WebKitRuntimeError.sensitiveInputRequiresHuman }
       operationName = "fill"
       value = provenancedValue.segments.map(\.text).joined()
+    case .pressKey(let key):
+      operationName = "press_key"
+      value = key
+    case .blur:
+      operationName = "blur"
+      value = nil
+    case .commitInput:
+      operationName = "commit_input"
+      value = nil
     }
 
-    let second = try await resolveAndPerform(
-      criteria: criteria,
-      expectedBoundingBox: firstCandidate.boundingBox,
-      operation: operationName,
-      value: value
-    )
+    let second: RawActionResolution
+    if dispatchMode == .nativeAppKit, operationName == "click" {
+      second = try await resolveAndPerformNativeClick(
+        criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox)
+    } else if dispatchMode == .nativeAppKit, operationName == "press_key", let value {
+      second = try await resolveAndPerformNativeKey(
+        criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox, key: value)
+    } else {
+      second = try await resolveAndPerform(
+        criteria: criteria,
+        expectedBoundingBox: firstCandidate.boundingBox,
+        operation: operationName,
+        value: value
+      )
+    }
     try recordCardinality(second.count, target: target)
     guard let candidate = second.candidate else {
       throw WebKitRuntimeError.targetNotUnique(second.count)
@@ -664,6 +893,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       addressingOutcome: outcome,
       dispatched: true,
       trustedUserGesture: candidate.trustedUserGesture,
+      dispatchMode: dispatchMode == .nativeAppKit
+        && (operationName == "click" || operationName == "press_key")
+        ? .nativeAppKit : .javascript,
       actionMonotonicNanoseconds: actionTime
     )
     if controlState == .freshlyReobserved {
@@ -673,6 +905,56 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
   }
 
   public func interactionControlState() -> InteractionControlState { controlState }
+
+  public func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    guard message.name == Self.nativeGestureMessageHandlerName,
+      let body = message.body as? [String: Any],
+      let token = body["token"] as? String,
+      armedNativeGestureTokens.contains(token),
+      let physicalIdentity = body["physicalIdentity"] as? String,
+      let eventType = body["eventType"] as? String,
+      let trusted = body["trusted"] as? Bool
+    else { return }
+    nativeGestureReceipts[token] = NativeGestureReceipt(
+      physicalIdentity: physicalIdentity, eventType: eventType, trusted: trusted)
+  }
+
+  public func authenticationRestrictionStatus() -> AuthenticationRestrictionStatus? {
+    guard let origin = restrictedAuthenticationOrigin() else { return nil }
+    return AuthenticationRestrictionStatus(
+      origin: origin,
+      classification: authenticationUIClassification ?? .humanHandoffRequired,
+      environment: authenticationEnvironmentSnapshot()
+    )
+  }
+
+  public func authenticationEnvironmentSnapshot() -> AuthenticationEnvironmentSnapshot {
+    AuthenticationEnvironmentSnapshot(
+      persistentWebsiteDataStore: webView.configuration.websiteDataStore.isPersistent,
+      customUserAgentConfigured: !(webView.customUserAgent?.isEmpty ?? true),
+      applicationNameForUserAgentConfigured:
+        !(webView.configuration.applicationNameForUserAgent?.isEmpty ?? true),
+      pinnedProxyConfigured: egressProxy != nil,
+      contentBlockingConfigured: false,
+      customProcessPoolConfigured: false
+    )
+  }
+
+  public func agentSafeCurrentURL() -> String? {
+    agentSafeURLString(webView.url ?? lastCommittedHTTPURL)
+  }
+
+  public static func agentSafeURL(_ url: URL) -> String {
+    guard
+      let host = url.host?.lowercased().trimmingCharacters(
+        in: CharacterSet(charactersIn: ".")),
+      restrictedAuthenticationHosts.contains(host)
+    else { return url.absoluteString }
+    return sanitizedOrigin(for: url) ?? "unavailable"
+  }
 
   public func handoffAuditEvents() -> [HandoffAuditEvent] { handoffEvents }
 
@@ -704,33 +986,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
     topLevelOriginLock = nil
-    if presentWindow {
-      let presentationSlot = HumanControlPresentationCoordinator.present(runtime: self)
-      let window =
-        humanControlWindow
-        ?? NSWindow(
-          contentRect: .init(x: 0, y: 0, width: 1280, height: 800),
-          styleMask: [.titled, .closable, .miniaturizable, .resizable],
-          backing: .buffered,
-          defer: false
-        )
-      let site = webView.url?.host ?? "No page"
-      window.title = "WebkitUIMCP — Human control — \(site)"
-      window.isReleasedWhenClosed = false
-      window.collectionBehavior.insert(.moveToActiveSpace)
-      window.contentView = humanControlContentView()
-      window.center()
-      let cascadeOffset = CGFloat(presentationSlot * 28)
-      window.setFrameOrigin(
-        .init(
-          x: window.frame.origin.x + cascadeOffset,
-          y: window.frame.origin.y - cascadeOffset
-        ))
-      window.makeKeyAndOrderFront(nil)
-      window.orderFrontRegardless()
-      NSApplication.shared.activate(ignoringOtherApps: true)
-      humanControlWindow = window
-    }
+    if presentWindow { presentHumanControlWindow() }
     transition(to: .humanControlled, observationID: nil)
   }
 
@@ -738,90 +994,101 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     guard controlState == .humanControlled else {
       throw WebKitRuntimeError.invalidControlTransition
     }
-    humanControlWindow?.orderOut(nil)
-    HumanControlPresentationCoordinator.dismiss(runtime: self)
+    if let origin = restrictedAuthenticationOrigin() {
+      throw WebKitRuntimeError.authenticationOriginRequiresHuman(origin)
+    }
+    if let window = browserWindow {
+      window.orderOut(nil)
+      window.ignoresMouseEvents = true
+      window.collectionBehavior.remove(.moveToActiveSpace)
+      window.collectionBehavior.insert(.stationary)
+      window.collectionBehavior.insert(.ignoresCycle)
+    }
+    NSApplication.shared.setActivationPolicy(.accessory)
     topLevelOriginLock = (webView.url ?? lastCommittedHTTPURL).flatMap {
       navigationOrigin(for: $0)
     }
     transition(to: .resumeRequested, observationID: nil)
   }
 
-  func invalidate() {
-    humanControlWindow?.orderOut(nil)
-    humanControlWindow?.contentView = nil
-    humanControlWindow?.close()
-    humanControlWindow = nil
-    webView.stopLoading()
-    HumanControlPresentationCoordinator.dismiss(runtime: self)
-  }
-
-  private func humanControlContentView() -> NSView {
-    guard webView.url == nil || webView.url?.absoluteString == "about:blank" else {
-      let container = NSView()
-      webView.translatesAutoresizingMaskIntoConstraints = false
-      container.addSubview(webView)
-      NSLayoutConstraint.activate([
-        webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-        webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-        webView.topAnchor.constraint(equalTo: container.topAnchor),
-        webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-      ])
-      return container
-    }
-    let title = NSTextField(labelWithString: "No page is loaded")
-    title.font = .systemFont(ofSize: 28, weight: .semibold)
-    title.alignment = .center
-    let detail = NSTextField(
-      wrappingLabelWithString:
-        "Return control to the agent, navigate to the approved page, then request human control again."
+  private func makeBrowserWindow() -> NSWindow {
+    let window = NSWindow(
+      contentRect: .init(x: 0, y: 0, width: 1280, height: 800),
+      styleMask: [.titled, .closable, .miniaturizable, .resizable],
+      backing: .buffered,
+      defer: false
     )
-    detail.font = .systemFont(ofSize: 16)
-    detail.textColor = .secondaryLabelColor
-    detail.alignment = .center
-    detail.maximumNumberOfLines = 0
-    let stack = NSStackView(views: [title, detail])
-    stack.orientation = .vertical
-    stack.spacing = 14
-    stack.alignment = .centerX
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    let container = NSView()
-    container.addSubview(stack)
-    NSLayoutConstraint.activate([
-      stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-      stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-      stack.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 48),
-      stack.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -48),
-      detail.widthAnchor.constraint(lessThanOrEqualToConstant: 620),
-    ])
-    return container
+    window.isReleasedWhenClosed = false
+    window.center()
+    attachWebView(to: window)
+    window.orderOut(nil)
+    browserWindow = window
+    return window
   }
 
-  fileprivate static func humanControlApplicationIcon() -> NSImage? {
-    let size = NSSize(width: 512, height: 512)
-    let image = NSImage(size: size, flipped: false) { bounds in
-      NSColor.systemBlue.setFill()
-      NSBezierPath(roundedRect: bounds.insetBy(dx: 28, dy: 28), xRadius: 112, yRadius: 112)
-        .fill()
-
-      NSColor.white.setStroke()
-      let globe = NSBezierPath(ovalIn: bounds.insetBy(dx: 104, dy: 104))
-      globe.lineWidth = 26
-      globe.stroke()
-      let meridian = NSBezierPath(ovalIn: NSRect(x: 188, y: 104, width: 136, height: 304))
-      meridian.lineWidth = 22
-      meridian.stroke()
-      for y in [196.0, 316.0] {
-        let latitude = NSBezierPath()
-        latitude.move(to: .init(x: 124, y: y))
-        latitude.line(to: .init(x: 388, y: y))
-        latitude.lineWidth = 20
-        latitude.stroke()
-      }
-      return true
+  private func presentHumanControlWindow() {
+    let application = NSApplication.shared
+    WebKitNativeApplicationMenu.install(on: application)
+    application.finishLaunching()
+    application.setActivationPolicy(.regular)
+    application.applicationIconImage = Self.humanControlApplicationIcon()
+    let window = browserWindow ?? makeBrowserWindow()
+    if webView.url == nil, lastCommittedHTTPURL == nil, !webView.isLoading {
+      webView.loadHTMLString(Self.emptyHandoffDocument, baseURL: nil)
     }
-    image.isTemplate = false
-    image.accessibilityDescription = "WebkitUIMCP"
-    return image
+    window.title = "WebkitUIMCP — Human control"
+    window.ignoresMouseEvents = false
+    window.collectionBehavior.remove(.stationary)
+    window.collectionBehavior.remove(.ignoresCycle)
+    window.collectionBehavior.insert(.moveToActiveSpace)
+    webView.isHidden = false
+    webView.alphaValue = 1
+    attachWebView(to: window)
+    window.makeKeyAndOrderFront(nil)
+    window.orderFrontRegardless()
+    application.activate(ignoringOtherApps: true)
+    window.makeFirstResponder(webView)
+    window.displayIfNeeded()
+  }
+
+  private static let emptyHandoffDocument = """
+    <!doctype html>
+    <html lang="en">
+    <meta charset="utf-8">
+    <meta name="color-scheme" content="light dark">
+    <title>No approved page loaded</title>
+    <style>
+      :root { font: -apple-system-body; color-scheme: light dark; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+             background: Canvas; color: CanvasText; }
+      main { max-width: 34rem; padding: 2rem; text-align: center; }
+      h1 { font: -apple-system-title1; margin-bottom: .6rem; }
+      p { font: -apple-system-body; opacity: .75; line-height: 1.45; }
+    </style>
+    <main role="status">
+      <h1>No approved page is loaded</h1>
+      <p>Approve a browser navigation, then request human control again.</p>
+    </main>
+    </html>
+    """
+
+  private func attachWebView(to window: NSWindow) {
+    webView.removeFromSuperview()
+    window.contentViewController = nil
+    window.contentView = webView
+    webView.frame = window.contentView?.bounds ?? .zero
+    webView.autoresizingMask = [.width, .height]
+    webView.translatesAutoresizingMaskIntoConstraints = true
+    webView.needsLayout = true
+    webView.needsDisplay = true
+    webView.layoutSubtreeIfNeeded()
+  }
+
+  private static func humanControlApplicationIcon() -> NSImage? {
+    NSImage(
+      systemSymbolName: "globe.americas.fill",
+      accessibilityDescription: "WebkitUIMCP")?
+      .withSymbolConfiguration(.init(pointSize: 128, weight: .medium))
   }
 
   /// The returned observation is the only address space valid after handoff.
@@ -831,29 +1098,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     guard controlState == .resumeRequested else {
       throw WebKitRuntimeError.invalidControlTransition
     }
-    if !processTerminated,
-      let url = webView.url,
-      let scheme = url.scheme?.lowercased(),
-      ["http", "https"].contains(scheme)
-    {
-      _ = try await awaitReadiness(
-        timeout: .seconds(30),
-        quietWindow: .milliseconds(300)
-      )
+    do {
+      if processTerminated {
+        guard
+          let url = lastCommittedHTTPURL,
+          let scheme = url.scheme?.lowercased(),
+          ["http", "https"].contains(scheme)
+        else { throw WebKitRuntimeError.webContentProcessTerminated }
+        _ = try await load(
+          request: URLRequest(url: url),
+          timeout: .seconds(30),
+          quietWindow: .milliseconds(300)
+        )
+      }
+      return try await observe(maximumElements: maximumElements)
+    } catch {
+      if controlState == .resumeRequested {
+        presentHumanControlWindow()
+        transition(to: .humanControlled, observationID: nil)
+      }
+      throw error
     }
-    if processTerminated {
-      guard
-        let url = lastCommittedHTTPURL,
-        let scheme = url.scheme?.lowercased(),
-        ["http", "https"].contains(scheme)
-      else { throw WebKitRuntimeError.webContentProcessTerminated }
-      _ = try await load(
-        request: URLRequest(url: url),
-        timeout: .seconds(30),
-        quietWindow: .milliseconds(300)
-      )
-    }
-    return try await observe(maximumElements: maximumElements)
   }
 
   public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -925,6 +1190,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     _ webView: WKWebView,
     decidePolicyFor navigationAction: WKNavigationAction
   ) async -> WKNavigationActionPolicy {
+    if navigationAction.targetFrame?.isMainFrame == false,
+      let targetURL = navigationAction.request.url,
+      Self.isRestrictedAuthenticationHost(targetURL.host)
+    {
+      restrictedAuthenticationFrameOrigin = Self.sanitizedOrigin(for: targetURL)
+      if Self.requiresFullBrowserBackend(
+        topLevelURL: webView.url ?? lastCommittedHTTPURL,
+        restrictedFrameOrigin: restrictedAuthenticationFrameOrigin
+      ) {
+        authenticationUIClassification = .fullBrowserRequired
+      }
+    }
     guard let lockedOrigin = topLevelOriginLock else { return .allow }
     guard navigationAction.targetFrame?.isMainFrame == true else {
       return navigationAction.targetFrame == nil ? .cancel : .allow
@@ -933,47 +1210,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       let targetURL = navigationAction.request.url,
       navigationOrigin(for: targetURL) == lockedOrigin
     else {
-      navigationFailure = "top-level navigation escaped the approved origin"
+      let targetOrigin = navigationAction.request.url.flatMap(navigationOrigin(for:))
+      let method = navigationAction.request.httpMethod?.uppercased() ?? "GET"
+      pendingCrossOriginNavigationRequest =
+        ["GET", "HEAD"].contains(method)
+        ? navigationAction.request : nil
+      navigationFailure = .crossOriginRedirectRequiresHuman(
+        fromOrigin: Self.sanitizedOrigin(lockedOrigin),
+        toOrigin: targetOrigin.map(Self.sanitizedOrigin) ?? "unavailable"
+      )
       return .cancel
     }
     return .allow
-  }
-
-  public func webView(
-    _ webView: WKWebView,
-    createWebViewWith configuration: WKWebViewConfiguration,
-    for navigationAction: WKNavigationAction,
-    windowFeatures: WKWindowFeatures
-  ) -> WKWebView? {
-    guard
-      navigationAction.targetFrame == nil,
-      (webView as? HumanControlWebView)?.consumeRecentNativeUserGesture() == true
-    else {
-      return nil
-    }
-    _ = followHumanPopupRequest(navigationAction.request)
-    return nil
-  }
-
-  @discardableResult
-  func followHumanPopupRequest(_ request: URLRequest) -> Bool {
-    guard
-      controlState == .humanControlled,
-      let url = request.url,
-      let scheme = url.scheme?.lowercased(),
-      ["http", "https"].contains(scheme)
-    else { return false }
-    if egressProxy != nil {
-      guard let host = url.host else { return false }
-      do {
-        try PublicNetworkAddressPolicy().validateNavigationHost(host)
-      } catch {
-        return false
-      }
-    }
-    topLevelOriginLock = nil
-    webView.load(request)
-    return true
   }
 
   public func webView(
@@ -988,7 +1236,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     didFail navigation: WKNavigation!,
     withError error: any Error
   ) {
-    navigationFailure = String(describing: error)
+    if navigationFailure == nil {
+      navigationFailure = Self.sanitizedNavigationFailure(error)
+    }
   }
 
   public func webView(
@@ -996,7 +1246,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     didFailProvisionalNavigation navigation: WKNavigation!,
     withError error: any Error
   ) {
-    navigationFailure = String(describing: error)
+    if navigationFailure == nil {
+      navigationFailure = Self.sanitizedNavigationFailure(error)
+    }
   }
 
   private func load(
@@ -1010,19 +1262,24 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     webView.load(request)
     let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
     let state = try await instrumentationState()
+    await refreshAuthenticationUIClassification()
     rememberRecoverableURL(webView.url ?? request.url)
     processTerminated = false
+    let loadedURL = webView.url ?? request.url
     return WebKitNavigationResult(
       documentID: documentID,
-      url: webView.url?.absoluteString ?? request.url?.absoluteString ?? "about:blank",
+      url: agentSafeURLString(loadedURL) ?? "about:blank",
       readiness: readiness,
       elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
       mutationCount: state.mutationCount
     )
   }
 
-  private func locatorCriteria(_ recipe: LocatorRecipe) -> [[String: String]] {
-    recipe.clauses.map { clause in
+  private func locatorCriteria(
+    _ recipe: LocatorRecipe,
+    expectedEnabled: Bool? = nil
+  ) -> [[String: String]] {
+    var criteria = recipe.clauses.map { clause in
       let fact: String
       let argument: String
       switch clause.fact {
@@ -1059,6 +1316,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
         "comparison": clause.comparison.rawValue,
       ]
     }
+    if let expectedEnabled {
+      criteria.append([
+        "fact": "enabled",
+        "argument": "",
+        "expected": String(expectedEnabled),
+        "strength": "required",
+        "comparison": "exact",
+      ])
+    }
+    return criteria
   }
 
   private func resolveTarget(
@@ -1091,6 +1358,145 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     return try await actionScript(source: Self.performSource, arguments: arguments)
   }
 
+  private func resolveAndPerformNativeClick(
+    criteria: [[String: String]],
+    expectedBoundingBox: ObservedBoundingBox
+  ) async throws -> RawActionResolution {
+    let token = UUID().uuidString
+    armedNativeGestureTokens.insert(token)
+    defer {
+      armedNativeGestureTokens.remove(token)
+      nativeGestureReceipts.removeValue(forKey: token)
+    }
+    let armed = try await actionScript(
+      source: Self.armNativeClickSource,
+      arguments: [
+        "criteria": criteria,
+        "expectedBox": Self.boxDictionary(expectedBoundingBox),
+        "token": token,
+      ])
+    guard armed.count == 1, let candidate = armed.candidate else { return armed }
+    guard candidate.geometryStable, candidate.actionable else { return armed }
+
+    try dispatchNativeMouseClick(at: candidate.boundingBox)
+    let deadline = ContinuousClock.now + .seconds(1)
+    while ContinuousClock.now < deadline {
+      if let receipt = nativeGestureReceipts[token],
+        receipt.physicalIdentity == candidate.physicalIdentity,
+        receipt.eventType == "click"
+      {
+        return RawActionResolution(
+          count: armed.count,
+          candidate: RawActionCandidate(
+            physicalIdentity: candidate.physicalIdentity,
+            boundingBox: candidate.boundingBox,
+            geometryStable: candidate.geometryStable,
+            actionable: candidate.actionable,
+            dispatched: true,
+            trustedUserGesture: receipt.trusted
+          ))
+      }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw WebKitRuntimeError.nativeGestureReceiptUnavailable
+  }
+
+  private func dispatchNativeMouseClick(at box: ObservedBoundingBox) throws {
+    guard let window = webView.window else { throw WebKitRuntimeError.targetNotActionable }
+    let localPoint = NSPoint(
+      x: box.x + box.width / 2,
+      y: webView.isFlipped
+        ? box.y + box.height / 2
+        : webView.bounds.height - (box.y + box.height / 2)
+    )
+    let windowPoint = webView.convert(localPoint, to: nil)
+    let timestamp = ProcessInfo.processInfo.systemUptime
+    guard
+      let down = NSEvent.mouseEvent(
+        with: .leftMouseDown, location: windowPoint, modifierFlags: [],
+        timestamp: timestamp, windowNumber: window.windowNumber, context: nil,
+        eventNumber: 0, clickCount: 1, pressure: 1),
+      let up = NSEvent.mouseEvent(
+        with: .leftMouseUp, location: windowPoint, modifierFlags: [],
+        timestamp: timestamp + 0.001, windowNumber: window.windowNumber, context: nil,
+        eventNumber: 0, clickCount: 1, pressure: 0)
+    else { throw WebKitRuntimeError.targetNotActionable }
+    webView.mouseDown(with: down)
+    webView.mouseUp(with: up)
+  }
+
+  private func resolveAndPerformNativeKey(
+    criteria: [[String: String]],
+    expectedBoundingBox: ObservedBoundingBox,
+    key: String
+  ) async throws -> RawActionResolution {
+    guard let window = webView.window, window.makeFirstResponder(webView) else {
+      throw WebKitRuntimeError.targetNotActionable
+    }
+    let token = UUID().uuidString
+    armedNativeGestureTokens.insert(token)
+    defer {
+      armedNativeGestureTokens.remove(token)
+      nativeGestureReceipts.removeValue(forKey: token)
+    }
+    let armed = try await actionScript(
+      source: Self.armNativeKeySource,
+      arguments: [
+        "criteria": criteria,
+        "expectedBox": Self.boxDictionary(expectedBoundingBox),
+        "token": token,
+        "expectedKey": key,
+      ])
+    guard armed.count == 1, let candidate = armed.candidate else { return armed }
+    guard candidate.geometryStable, candidate.actionable else { return armed }
+    try dispatchNativeKey(key)
+    let expectedReceiptEvent = key == "Tab" ? "blur" : "keydown"
+    let deadline = ContinuousClock.now + .seconds(1)
+    while ContinuousClock.now < deadline {
+      if let receipt = nativeGestureReceipts[token],
+        receipt.physicalIdentity == candidate.physicalIdentity,
+        receipt.eventType == expectedReceiptEvent
+      {
+        return RawActionResolution(
+          count: armed.count,
+          candidate: RawActionCandidate(
+            physicalIdentity: candidate.physicalIdentity,
+            boundingBox: candidate.boundingBox,
+            geometryStable: candidate.geometryStable,
+            actionable: candidate.actionable,
+            dispatched: true,
+            trustedUserGesture: receipt.trusted
+          ))
+      }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw WebKitRuntimeError.nativeGestureReceiptUnavailable
+  }
+
+  private func dispatchNativeKey(_ key: String) throws {
+    guard let window = webView.window else { throw WebKitRuntimeError.targetNotActionable }
+    let mapping: (characters: String, keyCode: UInt16)
+    switch key {
+    case "Enter": mapping = ("\r", 36)
+    case "Tab": mapping = ("\t", 48)
+    case "Escape": mapping = ("\u{1B}", 53)
+    default: throw WebKitRuntimeError.targetNotActionable
+    }
+    let timestamp = ProcessInfo.processInfo.systemUptime
+    guard
+      let down = NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [], timestamp: timestamp,
+        windowNumber: window.windowNumber, context: nil, characters: mapping.characters,
+        charactersIgnoringModifiers: mapping.characters, isARepeat: false, keyCode: mapping.keyCode),
+      let up = NSEvent.keyEvent(
+        with: .keyUp, location: .zero, modifierFlags: [], timestamp: timestamp + 0.001,
+        windowNumber: window.windowNumber, context: nil, characters: mapping.characters,
+        charactersIgnoringModifiers: mapping.characters, isARepeat: false, keyCode: mapping.keyCode)
+    else { throw WebKitRuntimeError.targetNotActionable }
+    window.sendEvent(down)
+    window.sendEvent(up)
+  }
+
   private func actionScript(
     source: String,
     arguments: [String: Any]
@@ -1107,6 +1513,25 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     else {
       throw WebKitRuntimeError.malformedInstrumentationResult
     }
+    return result
+  }
+
+  private func performScroll(
+    source: String,
+    arguments: [String: Any]
+  ) async throws -> WebKitScrollResult {
+    guard
+      let json = try await webView.callAsyncJavaScript(
+        source,
+        arguments: arguments,
+        in: nil,
+        contentWorld: instrumentationWorld
+      ) as? String,
+      let data = json.data(using: .utf8),
+      let result = try? JSONDecoder().decode(WebKitScrollResult.self, from: data)
+    else { throw WebKitRuntimeError.malformedInstrumentationResult }
+    latestObservationID = nil
+    latestTargets.removeAll(keepingCapacity: true)
     return result
   }
 
@@ -1133,6 +1558,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     guard controlState == .agentControlled || controlState == .freshlyReobserved else {
       throw WebKitRuntimeError.humanControlActive
     }
+    try requireNonAuthenticationOrigin()
+  }
+
+  private func requireObservationControl() throws {
+    guard controlState != .handoffRequested, controlState != .humanControlled else {
+      throw WebKitRuntimeError.humanControlActive
+    }
+    try requireNonAuthenticationOrigin()
+  }
+
+  private func requireNonAuthenticationOrigin() throws {
+    if let origin = restrictedAuthenticationOrigin() {
+      throw WebKitRuntimeError.authenticationOriginRequiresHuman(origin)
+    }
   }
 
   private func transition(to next: InteractionControlState, observationID: String?) {
@@ -1153,6 +1592,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     observationGeneration = 0
     navigationFailure = nil
     processTerminated = false
+    authenticationUIClassification = nil
+    restrictedAuthenticationFrameOrigin = nil
+    pendingCrossOriginNavigationRequest = nil
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
   }
@@ -1165,6 +1607,101 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     else { return nil }
     let effectivePort = url.port ?? (scheme == "https" ? 443 : 80)
     return SecurityOrigin(scheme: scheme, host: host, port: effectivePort)
+  }
+
+  private func restrictedAuthenticationOrigin() -> String? {
+    if let url = webView.url ?? lastCommittedHTTPURL,
+      let host = url.host?.lowercased().trimmingCharacters(
+        in: CharacterSet(charactersIn: ".")),
+      Self.restrictedAuthenticationHosts.contains(host)
+    {
+      return Self.sanitizedOrigin(for: url)
+    }
+    return restrictedAuthenticationFrameOrigin
+  }
+
+  private func agentSafeURLString(_ url: URL?) -> String? {
+    guard let url else { return nil }
+    return Self.agentSafeURL(url)
+  }
+
+  private static func sanitizedOrigin(for url: URL) -> String? {
+    guard
+      let scheme = url.scheme?.lowercased(),
+      ["http", "https"].contains(scheme),
+      let host = url.host?.lowercased().trimmingCharacters(
+        in: CharacterSet(charactersIn: "."))
+    else { return nil }
+    let defaultPort = scheme == "https" ? 443 : 80
+    let portSuffix = url.port.map { $0 == defaultPort ? "" : ":\($0)" } ?? ""
+    return "\(scheme)://\(host)\(portSuffix)"
+  }
+
+  private static func sanitizedOrigin(_ origin: SecurityOrigin) -> String {
+    let defaultPort = origin.scheme == "https" ? 443 : 80
+    let portSuffix = origin.port.map { $0 == defaultPort ? "" : ":\($0)" } ?? ""
+    return "\(origin.scheme)://\(origin.host)\(portSuffix)"
+  }
+
+  private static func sanitizedNavigationFailure(_ error: any Error) -> WebKitRuntimeError {
+    let cocoaError = error as NSError
+    return .navigationFailed("\(cocoaError.domain) code=\(cocoaError.code)")
+  }
+
+  private func refreshAuthenticationUIClassification() async {
+    guard restrictedAuthenticationOrigin() != nil else {
+      authenticationUIClassification = nil
+      return
+    }
+    guard
+      let json = try? await webView.callAsyncJavaScript(
+        Self.authenticationUIStateSource,
+        arguments: [:],
+        in: nil,
+        contentWorld: instrumentationWorld
+      ) as? String,
+      let data = json.data(using: .utf8),
+      let state = try? JSONDecoder().decode(RawAuthenticationUIState.self, from: data)
+    else {
+      authenticationUIClassification = .humanHandoffRequired
+      return
+    }
+    if Self.requiresFullBrowserBackend(
+      topLevelURL: webView.url ?? lastCommittedHTTPURL,
+      restrictedFrameOrigin: restrictedAuthenticationFrameOrigin
+    ) {
+      authenticationUIClassification = .fullBrowserRequired
+    } else {
+      authenticationUIClassification =
+        state.readyState == "complete" && state.hasProgressIndicator
+          && state.hasInvisibleAuthenticationControl && !state.hasVisibleAuthenticationControl
+        ? .authUINotReady : .humanHandoffRequired
+    }
+  }
+
+  private static let restrictedAuthenticationHosts: Set<String> = ["idmsa.apple.com"]
+  private static let fullBrowserAuthenticationParents: [String: Set<String>] = [
+    "appstoreconnect.apple.com": ["idmsa.apple.com"]
+  ]
+
+  private static func isRestrictedAuthenticationHost(_ rawHost: String?) -> Bool {
+    guard
+      let host = rawHost?.lowercased().trimmingCharacters(
+        in: CharacterSet(charactersIn: "."))
+    else { return false }
+    return restrictedAuthenticationHosts.contains(host)
+  }
+
+  static func requiresFullBrowserBackend(
+    topLevelURL: URL?, restrictedFrameOrigin: String?
+  ) -> Bool {
+    guard
+      let parentHost = topLevelURL?.host?.lowercased().trimmingCharacters(
+        in: CharacterSet(charactersIn: ".")),
+      let restrictedFrameOrigin,
+      let childHost = URL(string: restrictedFrameOrigin)?.host?.lowercased()
+    else { return false }
+    return fullBrowserAuthenticationParents[parentHost]?.contains(childHost) == true
   }
 
   private func rememberRecoverableURL(_ url: URL?) {
@@ -1191,7 +1728,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     while clock.now < deadline {
       if processTerminated { return .processTerminated }
-      if let navigationFailure { throw WebKitRuntimeError.navigationFailed(navigationFailure) }
+      if let navigationFailure { throw navigationFailure }
 
       if !webView.isLoading, let state = try? await instrumentationState() {
         if lastMutationCount != state.mutationCount {
@@ -1263,7 +1800,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
         )
       )
     }
-    if let text = element.text, !text.isEmpty {
+    if !element.sensitive, element.visible,
+      element.boundingBox.width > 0, element.boundingBox.height > 0,
+      let text = element.text, !text.isEmpty
+    {
       clauses.append(
         .init(
           fact: .value,
@@ -1314,8 +1854,95 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     })();
     """
 
+  private static let authenticationUIStateSource = """
+    const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    const isRendered = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
+        return false;
+      }
+      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+        if (cursor.hidden || cursor.inert
+            || collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
+          return false;
+        }
+        const style = getComputedStyle(cursor);
+        if (style.display === 'none' || style.visibility === 'hidden'
+            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+          return false;
+        }
+      }
+      return true;
+    };
+    const authenticationSelector = [
+      'input[type="password"]',
+      'input[autocomplete="username"]',
+      'input[autocomplete="current-password"]',
+      'input[autocomplete="new-password"]',
+      'input[autocomplete="one-time-code"]'
+    ].join(',');
+    const authenticationControls = Array.from(document.querySelectorAll(authenticationSelector));
+    const forms = Array.from(document.querySelectorAll('form'));
+    const formHasOnlyInvisibleControls = forms.some(form => {
+      const controls = Array.from(form.querySelectorAll('input, select, textarea, button'));
+      return controls.length > 0 && !controls.some(isRendered);
+    });
+    return JSON.stringify({
+      readyState: document.readyState,
+      hasProgressIndicator: Boolean(
+        document.querySelector('[role="progressbar"], progress, [aria-busy="true"]')),
+      hasVisibleAuthenticationControl: authenticationControls.some(isRendered),
+      hasInvisibleAuthenticationControl:
+        authenticationControls.some(element => !isRendered(element)) || formHasOnlyInvisibleControls
+    });
+    """
+
   private static let observationSource = """
     const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    let semanticTextTruncated = false;
+    const bounded = value => {
+      if (value === null || value === undefined) return null;
+      const text = collapse(value);
+      if (text.length <= maximumFieldCharacters) return text;
+      semanticTextTruncated = true;
+      return text.slice(0, maximumFieldCharacters);
+    };
+    const isRendered = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
+        return false;
+      }
+      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+        if (cursor.hidden || cursor.inert
+            || collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
+          return false;
+        }
+        const style = getComputedStyle(cursor);
+        if (style.display === 'none' || style.visibility === 'hidden'
+            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+          return false;
+        }
+      }
+      return true;
+    };
+    const sensitiveIdentifierTerm = /(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time)/i;
+    const sensitiveLabelTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time)(?:$|[^a-z0-9])/i;
+    const sensitiveAutocomplete = new Set([
+      'current-password', 'new-password', 'one-time-code', 'webauthn'
+    ]);
+    const styledControlSurface = element => {
+      if (!(element instanceof HTMLInputElement)
+          || !['checkbox', 'radio'].includes(element.type)) return null;
+      const labels = element.labels ? Array.from(element.labels) : [];
+      return labels.find(isRendered) || null;
+    };
+    const looksOpaque = value => {
+      const text = String(value ?? '');
+      if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(text)) return true;
+      if (text.length < 32 || /\\s/.test(text)
+          || !/^[A-Za-z0-9._~+/=-]+$/.test(text)) return false;
+      return new Set(text).size >= 12;
+    };
     const roleOf = element => {
       const explicit = collapse(element.getAttribute('role'));
       if (explicit) return explicit;
@@ -1351,11 +1978,63 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
       '[role]', '[contenteditable="true"]', '[tabindex]'
     ].join(',');
-    const elements = Array.from(document.querySelectorAll(selector))
-      .slice(0, __MAXIMUM_ELEMENTS__)
+    const allowedRoles = new Set(Array.isArray(roleFilters) ? roleFilters : []);
+    const wantedName = collapse(nameFilter).toLowerCase();
+    const matchingElements = Array.from(document.querySelectorAll(selector))
+      .filter(element => {
+        if (!isRendered(element) && !styledControlSurface(element)) return false;
+        const role = collapse(roleOf(element)).toLowerCase();
+        if (allowedRoles.size > 0 && !allowedRoles.has(role)) return false;
+        const name = collapse(nameOf(element)).toLowerCase();
+        return !wantedName || name.includes(wantedName);
+      });
+    const elements = matchingElements
+      .slice(elementOffset, elementOffset + __MAXIMUM_ELEMENTS__)
       .map(element => {
-        const box = element.getBoundingClientRect();
-        const style = getComputedStyle(element);
+        const surface = isRendered(element) ? element : styledControlSurface(element);
+        const box = surface.getBoundingClientRect();
+        const rawValue = typeof element.value === 'string' ? element.value : null;
+        const autocomplete = collapse(element.getAttribute('autocomplete')).toLowerCase();
+        const autocompleteTokens = autocomplete.split(/\\s+/).filter(Boolean);
+        const identifierMetadata = [
+          element.getAttribute('name'), element.id, element.getAttribute('type'), autocomplete
+        ].map(collapse).join(' ');
+        const labelMetadata = [element.getAttribute('aria-label'), labelOf(element)]
+          .map(collapse).join(' ');
+        const sensitive = (element instanceof HTMLInputElement && element.type === 'password')
+          || autocompleteTokens.some(token => sensitiveAutocomplete.has(token))
+          || sensitiveIdentifierTerm.test(identifierMetadata)
+          || sensitiveLabelTerm.test(labelMetadata)
+          || (!(element instanceof HTMLSelectElement) && looksOpaque(rawValue));
+        const editable = !element.disabled && !element.readOnly;
+        let observableValue = null;
+        if (!sensitive && editable && element instanceof HTMLSelectElement) {
+          observableValue = collapse(
+            Array.from(element.selectedOptions).map(option => option.textContent).join(' ')) || null;
+        } else if (!sensitive && editable && element instanceof HTMLTextAreaElement) {
+          observableValue = rawValue !== null && rawValue.length <= 1024 ? rawValue : null;
+        } else if (!sensitive && editable && element instanceof HTMLInputElement
+                   && ['text', 'search', 'email', 'tel', 'url', 'number'].includes(element.type)) {
+          observableValue = rawValue !== null && rawValue.length <= 1024 ? rawValue : null;
+        }
+        const selectedLabel = element instanceof HTMLSelectElement
+          ? collapse(Array.from(element.selectedOptions).map(option => option.textContent).join(' '))
+          : null;
+        const checked = (element instanceof HTMLInputElement
+          && ['checkbox', 'radio'].includes(element.type))
+          ? Boolean(element.checked)
+          : (element.hasAttribute('aria-checked')
+            ? collapse(element.getAttribute('aria-checked')).toLowerCase() === 'true' : null);
+        const selected = element instanceof HTMLOptionElement
+          ? Boolean(element.selected)
+          : (element.hasAttribute('aria-selected')
+            ? collapse(element.getAttribute('aria-selected')).toLowerCase() === 'true' : null);
+        const stateAttributes = {};
+        for (const name of [
+          'aria-checked', 'aria-selected', 'aria-disabled', 'aria-expanded', 'data-state', 'open'
+        ]) {
+          if (element.hasAttribute(name)) stateAttributes[name] = element.getAttribute(name) ?? '';
+        }
         let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
         if (!physicalIdentity) {
           physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
@@ -1365,12 +2044,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
           physicalIdentity,
           tag: element.localName,
           role: roleOf(element),
-          accessibleName: nameOf(element),
-          label: labelOf(element),
-          text: collapse(element.innerText) || null,
-          value: element.localName === 'input' && element.type === 'password'
-            ? null : (typeof element.value === 'string' ? element.value : null),
-          sensitive: element instanceof HTMLInputElement && element.type === 'password',
+          accessibleName: bounded(nameOf(element)),
+          label: bounded(labelOf(element)),
+          text: sensitive ? null : bounded(selectedLabel || collapse(element.innerText) || null),
+          value: bounded(observableValue),
+          sensitive,
           submitsForm: Boolean(
             (element instanceof HTMLButtonElement
               && (element.type || 'submit').toLowerCase() === 'submit' && element.form)
@@ -1378,8 +2056,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
               && ['submit', 'image'].includes(element.type) && element.form)
           ),
           disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
-          visible: box.width > 0 && box.height > 0 && style.visibility !== 'hidden'
-            && style.display !== 'none' && Number(style.opacity) !== 0,
+          checked,
+          selected,
+          selectedOption: bounded(selectedLabel || null),
+          stateAttributes: Object.fromEntries(
+            Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
+          visible: true,
           boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height }
         };
       });
@@ -1394,6 +2076,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       readyState: document.readyState,
       mutationCount: globalThis.__webkituiState?.mutationCount ?? 0,
       crossOriginFrameCount,
+      totalElementCount: matchingElements.length,
+      semanticTextTruncated,
       elements
     });
     """
@@ -1431,6 +2115,24 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
       || collapse(element.innerText) || null;
+    const isRendered = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
+      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+        const style = getComputedStyle(cursor);
+        if (cursor.hidden || cursor.inert || style.display === 'none'
+            || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+      }
+      return true;
+    };
+    const surfaceOf = element => {
+      if (isRendered(element)) return element;
+      if (element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)) {
+        const labels = element.labels ? Array.from(element.labels) : [];
+        return labels.find(isRendered) || element;
+      }
+      return element;
+    };
     const factValue = (element, criterion) => {
       switch (criterion.fact) {
         case 'role': return roleOf(element);
@@ -1440,6 +2142,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
         case 'stableAttribute': return criterion.argument === 'tag'
           ? element.localName : element.getAttribute(criterion.argument);
         case 'contextAnchor': return collapse(element.closest(criterion.argument)?.innerText) || null;
+        case 'enabled': return String(
+          !(element.disabled || element.getAttribute('aria-disabled') === 'true'));
         default: return null;
       }
     };
@@ -1459,7 +2163,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       criteria.every(criterion => matchesCriterion(element, criterion))
     );
     const describe = element => {
-      const box = element.getBoundingClientRect();
+      const box = surfaceOf(element).getBoundingClientRect();
       let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
       if (!physicalIdentity) {
         physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
@@ -1479,16 +2183,116 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
   private static let resolveSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (element && scrollIntoView) element.scrollIntoView({ block: 'center', inline: 'center' });
+      if (element && scrollIntoView) surfaceOf(element).scrollIntoView({ block: 'center', inline: 'center' });
       return JSON.stringify({ count: matches.length, candidate: element ? describe(element) : null });
       """
+
+  private static let scrollStateSource = """
+    const root = document.scrollingElement || document.documentElement;
+    const maximumY = Math.max(0, root.scrollHeight - innerHeight);
+    return JSON.stringify({
+      x: scrollX,
+      y: scrollY,
+      viewportWidth: innerWidth,
+      viewportHeight: innerHeight,
+      documentWidth: root.scrollWidth,
+      documentHeight: root.scrollHeight,
+      reachedTop: scrollY <= 0,
+      reachedBottom: scrollY >= maximumY - 1,
+      observationInvalidated: true
+    });
+    """
+
+  private static let nearestScrollStateSource =
+    actionHelpers + """
+      const element = matches.length === 1 ? matches[0] : null;
+      if (!element) return JSON.stringify({
+        x: scrollX, y: scrollY, viewportWidth: innerWidth, viewportHeight: innerHeight,
+        documentWidth: document.documentElement.scrollWidth,
+        documentHeight: document.documentElement.scrollHeight,
+        reachedTop: scrollY <= 0, reachedBottom: false, observationInvalidated: true
+      });
+      const canScroll = candidate => {
+        const style = getComputedStyle(candidate);
+        const scrollableY = ['auto', 'scroll', 'overlay'].includes(style.overflowY)
+          && candidate.scrollHeight > candidate.clientHeight + 1;
+        const scrollableX = ['auto', 'scroll', 'overlay'].includes(style.overflowX)
+          && candidate.scrollWidth > candidate.clientWidth + 1;
+        return scrollableY || scrollableX;
+      };
+      let region = element.parentElement;
+      while (region && !canScroll(region)) region = region.parentElement;
+      if (!region) region = document.scrollingElement || document.documentElement;
+      element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      const isRoot = region === document.scrollingElement || region === document.documentElement
+        || region === document.body;
+      const x = isRoot ? scrollX : region.scrollLeft;
+      const y = isRoot ? scrollY : region.scrollTop;
+      const viewportWidth = isRoot ? innerWidth : region.clientWidth;
+      const viewportHeight = isRoot ? innerHeight : region.clientHeight;
+      const documentWidth = region.scrollWidth;
+      const documentHeight = region.scrollHeight;
+      return JSON.stringify({
+        x, y, viewportWidth, viewportHeight, documentWidth, documentHeight,
+        reachedTop: y <= 0,
+        reachedBottom: y >= Math.max(0, documentHeight - viewportHeight) - 1,
+        observationInvalidated: true
+      });
+      """
+
+  private static let pageScrollSource = """
+    scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' });
+    """ + scrollStateSource
+
+  private static let textSnapshotSource = """
+    const collapseLines = value => String(value ?? '')
+      .split(/\\n/).map(line => line.replace(/[\\t ]+/g, ' ').trimEnd()).join('\\n').trim();
+    const limit = Math.max(1, Number(maximumCharacters));
+    let remaining = limit;
+    let truncated = false;
+    const take = value => {
+      const text = collapseLines(value);
+      if (text.length <= remaining) { remaining -= text.length; return text; }
+      truncated = true;
+      const result = text.slice(0, remaining);
+      remaining = 0;
+      return result;
+    };
+    const candidates = Array.from(document.querySelectorAll(
+      '[role="log"], [role="terminal"], pre, code, [aria-live], [data-testid*="log" i], [class*="log" i]'
+    ));
+    for (const element of document.querySelectorAll('div, section, article')) {
+      if (element.scrollHeight > element.clientHeight + 8 && collapseLines(element.innerText)) {
+        candidates.push(element);
+      }
+    }
+    const seen = new Set();
+    const regions = [];
+    for (const element of candidates) {
+      if (remaining <= 0 || seen.has(element)) continue;
+      seen.add(element);
+      const text = take(element.innerText || element.textContent);
+      if (!text) continue;
+      regions.push({
+        kind: element.getAttribute('role') || element.localName,
+        label: element.getAttribute('aria-label') || element.getAttribute('data-testid') || null,
+        text,
+        scrollTop: element.scrollTop,
+        scrollHeight: element.scrollHeight,
+        clientHeight: element.clientHeight
+      });
+    }
+    const bodyText = remaining > 0 ? take(document.body?.innerText || '') : '';
+    return JSON.stringify({ bodyText, regions, truncated });
+    """
 
   private static let performSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
       if (!element) return JSON.stringify({ count: matches.length, candidate: null });
       const candidate = describe(element);
-      const box = element.getBoundingClientRect();
+      const surface = surfaceOf(element);
+      const box = surface.getBoundingClientRect();
       const tolerance = 0.5;
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
@@ -1501,7 +2305,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
       const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
       const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
       const hit = document.elementFromPoint(centerX, centerY);
-      const receivesEvents = Boolean(hit && (hit === element || element.contains(hit)));
+      const receivesEvents = Boolean(hit && (
+        hit === element || element.contains(hit) || hit === surface || surface.contains(hit)
+      ));
       const editable = operation !== 'fill' || (
         (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
           || element.isContentEditable) && !element.readOnly
@@ -1512,8 +2318,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
         let trusted = false;
         const listener = event => { trusted = event.isTrusted; };
         element.addEventListener('click', listener, { capture: true, once: true });
-        element.click();
+        surface.click();
         candidate.trustedUserGesture = trusted;
+        candidate.dispatched = true;
+      } else if (candidate.actionable && operation === 'press_key') {
+        const options = { key: value, bubbles: true, cancelable: true };
+        element.focus({ preventScroll: true });
+        element.dispatchEvent(new KeyboardEvent('keydown', options));
+        element.dispatchEvent(new KeyboardEvent('keyup', options));
+        candidate.trustedUserGesture = false;
+        candidate.dispatched = true;
+      } else if (candidate.actionable && operation === 'blur') {
+        element.focus({ preventScroll: true });
+        element.blur();
+        candidate.trustedUserGesture = false;
+        candidate.dispatched = true;
+      } else if (candidate.actionable && operation === 'commit_input') {
+        element.focus({ preventScroll: true });
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        element.blur();
+        candidate.trustedUserGesture = false;
         candidate.dispatched = true;
       } else if (candidate.actionable && operation === 'fill') {
         let trusted = false;
@@ -1531,6 +2355,82 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
         element.dispatchEvent(new Event('change', { bubbles: true }));
         candidate.trustedUserGesture = trusted;
         candidate.dispatched = true;
+      }
+      return JSON.stringify({ count: matches.length, candidate });
+      """
+
+  private static let nativeGestureMessageHandlerName = "webkituiNativeGesture"
+
+  private static let armNativeClickSource =
+    actionHelpers + """
+      const element = matches.length === 1 ? matches[0] : null;
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      const candidate = describe(element);
+      const surface = surfaceOf(element);
+      const box = surface.getBoundingClientRect();
+      const tolerance = 0.5;
+      candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
+        Math.abs(box[key] - expectedBox[key]) <= tolerance
+      );
+      const style = getComputedStyle(surface);
+      const visible = box.width > 0 && box.height > 0 && style.visibility !== 'hidden'
+        && style.display !== 'none' && Number(style.opacity) !== 0;
+      const enabled = !element.matches(':disabled')
+        && element.getAttribute('aria-disabled') !== 'true';
+      const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      const hit = document.elementFromPoint(centerX, centerY);
+      const receivesEvents = Boolean(hit && (
+        hit === element || element.contains(hit) || hit === surface || surface.contains(hit)
+      ));
+      candidate.actionable = visible && enabled && receivesEvents
+        && candidate.geometryStable && element.isConnected && surface.isConnected;
+      if (candidate.actionable) {
+        const physicalIdentity = candidate.physicalIdentity;
+        const report = event => {
+          globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
+            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+          });
+        };
+        element.addEventListener('click', report, { capture: true, once: true });
+        if (surface !== element) {
+          surface.addEventListener('click', report, { capture: true, once: true });
+        }
+      }
+      return JSON.stringify({ count: matches.length, candidate });
+      """
+
+  private static let armNativeKeySource =
+    actionHelpers + """
+      const element = matches.length === 1 ? matches[0] : null;
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      const candidate = describe(element);
+      const surface = surfaceOf(element);
+      const box = surface.getBoundingClientRect();
+      const tolerance = 0.5;
+      candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
+        Math.abs(box[key] - expectedBox[key]) <= tolerance
+      );
+      const enabled = !element.matches(':disabled')
+        && element.getAttribute('aria-disabled') !== 'true';
+      candidate.actionable = enabled && candidate.geometryStable
+        && element.isConnected && typeof element.focus === 'function';
+      if (candidate.actionable) {
+        element.focus({ preventScroll: true });
+        const physicalIdentity = candidate.physicalIdentity;
+        element.addEventListener('keydown', event => {
+          if (event.key !== expectedKey) return;
+          globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
+            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+          });
+        }, { capture: true, once: true });
+        if (expectedKey === 'Tab') {
+          element.addEventListener('blur', event => {
+            globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
+              token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+            });
+          }, { capture: true, once: true });
+        }
       }
       return JSON.stringify({ count: matches.length, candidate });
       """
@@ -1580,6 +2480,47 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKUIDelegate {
     setValue(passwordElement, password);
     return JSON.stringify({ filled: true });
     """
+
+  private static let credentialRotationFillSource = """
+    const nodeFor = identity => {
+      for (const element of document.querySelectorAll('input')) {
+        if (globalThis.__webkituiState?.nodeIDs?.get(element) === identity) return element;
+      }
+      return null;
+    };
+    const current = nodeFor(currentIdentity);
+    const next = nodeFor(newIdentity);
+    const confirmation = nodeFor(confirmationIdentity);
+    const stable = (element, expectedBox) => {
+      if (!(element instanceof HTMLInputElement) || !element.isConnected
+          || element.type !== 'password' || element.disabled || element.readOnly
+          || element.getAttribute('aria-disabled') === 'true') return false;
+      const box = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      if (!(box.width > 0 && box.height > 0) || style.visibility === 'hidden'
+          || style.display === 'none' || Number(style.opacity) === 0) return false;
+      const tolerance = 0.5;
+      if (!['x', 'y', 'width', 'height'].every(key =>
+          Math.abs(box[key] - expectedBox[key]) <= tolerance)) return false;
+      const x = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const y = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      const hit = document.elementFromPoint(x, y);
+      return Boolean(hit && (hit === element || element.contains(hit)));
+    };
+    if (!stable(current, currentBox) || !stable(next, newBox)
+        || !stable(confirmation, confirmationBox)) {
+      return JSON.stringify({ filled: false });
+    }
+    const setValue = (element, value) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(element, value); else element.value = value;
+    };
+    // No input/change event and no submit: the human remains the commit point.
+    setValue(current, currentPassword);
+    setValue(next, newPassword);
+    setValue(confirmation, newPassword);
+    return JSON.stringify({ filled: true });
+    """
 }
 
 private struct RawInstrumentationState: Decodable {
@@ -1597,7 +2538,16 @@ private struct RawObservation: Decodable {
   let readyState: String
   let mutationCount: UInt64
   let crossOriginFrameCount: Int
+  let totalElementCount: Int
+  let semanticTextTruncated: Bool
   let elements: [RawElement]
+}
+
+private struct RawAuthenticationUIState: Decodable {
+  let readyState: String
+  let hasProgressIndicator: Bool
+  let hasVisibleAuthenticationControl: Bool
+  let hasInvisibleAuthenticationControl: Bool
 }
 
 private struct RawElement: Decodable {
@@ -1611,6 +2561,10 @@ private struct RawElement: Decodable {
   let sensitive: Bool
   let submitsForm: Bool
   let disabled: Bool
+  let checked: Bool?
+  let selected: Bool?
+  let selectedOption: String?
+  let stateAttributes: [String: String]
   let visible: Bool
   let boundingBox: ObservedBoundingBox
 }
@@ -1620,6 +2574,7 @@ private struct ObservedTargetRecord {
   let physicalIdentity: String
   let boundingBox: ObservedBoundingBox
   let sensitive: Bool
+  let disabled: Bool
   let observedAtMonotonicNanoseconds: UInt64
 }
 
@@ -1635,4 +2590,10 @@ private struct RawActionCandidate: Decodable {
   let actionable: Bool
   let dispatched: Bool
   let trustedUserGesture: Bool
+}
+
+private struct NativeGestureReceipt {
+  let physicalIdentity: String
+  let eventType: String
+  let trusted: Bool
 }

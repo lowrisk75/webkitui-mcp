@@ -4,7 +4,8 @@ dist/
 .chrome-profile/
 *.log
 .DS_Store
-.env*
+.env
+.env.*
 !.env.example
 *.har
 *.trace.zip
@@ -13,10 +14,11 @@ test-results/
 blob-report/
 **/storage-state.json
 **/.auth/
-*.key
 *.pem
+!Sources/WebKitUIMCPLicensing/Resources/lorislabs-license-public.pem
 *.p12
 *.mobileprovision
+*.key
 known_hosts*
-.internal/
-docs/private/
+.tmp-design/
+audit-output/
