@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Network
 import Testing
@@ -5,6 +6,27 @@ import WebKit
 import WebKitUIMCPCore
 
 @testable import WebKitUIMCPRuntime
+
+@MainActor
+private func descendant<T: NSView>(
+  of type: T.Type,
+  accessibilityIdentifier: String,
+  in root: NSView
+) -> T? {
+  if let match = root as? T,
+    match.accessibilityIdentifier() == accessibilityIdentifier
+  {
+    return match
+  }
+  for child in root.subviews {
+    if let match = descendant(
+      of: type, accessibilityIdentifier: accessibilityIdentifier, in: child)
+    {
+      return match
+    }
+  }
+  return nil
+}
 
 final class FormFixtureServer: @unchecked Sendable {
   private let listener: NWListener
@@ -62,6 +84,17 @@ final class FormFixtureServer: @unchecked Sendable {
 @Suite("Native WebKit runtime", .serialized)
 @MainActor
 struct WebKitRuntimeTests {
+  private func makeWindowHandoffRuntime() -> WebKitRuntime {
+    // Swift Testing runs in a command-line host. Repeatedly transforming that
+    // host between regular and accessory activation policies can terminate the
+    // process before it reports the rest of this suite. The installed-app gate
+    // exercises the real activation-policy transition end to end.
+    WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+  }
+
   @Test("Document readiness uses mutation quiescence and no rAF")
   func readiness() async throws {
     let runtime = WebKitRuntime()
@@ -112,6 +145,201 @@ struct WebKitRuntimeTests {
     #expect(page.elements[1].locatorRecipe.observationID == page.observationID)
   }
 
+  @Test("Observation reports live validation and long-field character counts")
+  func validationAndCharacterCountObservation() async throws {
+    let runtime = WebKitRuntime()
+    let longValue = String(repeating: "a", count: 1_500)
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <label for="required">Required</label>
+      <input id="required" required value="">
+      <label for="accepted">Accepted</label>
+      <input id="accepted" required value="ready">
+      <label for="rejected">Rejected</label>
+      <textarea id="rejected" aria-invalid="true">\(longValue)</textarea>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/form"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40))
+
+    let page = try await runtime.observe(maximumFieldCharacters: 4_096)
+    let required = try #require(
+      page.elements.first { $0.accessibleName?.segments.first?.text == "Required" })
+    let accepted = try #require(
+      page.elements.first { $0.accessibleName?.segments.first?.text == "Accepted" })
+    let rejected = try #require(
+      page.elements.first { $0.accessibleName?.segments.first?.text == "Rejected" })
+
+    #expect(required.validationState == .invalid)
+    #expect(required.characterCount == 0)
+    #expect(accepted.validationState == .valid)
+    #expect(accepted.characterCount == 5)
+    #expect(rejected.validationState == .invalid)
+    #expect(rejected.characterCount == 1_500)
+    #expect(rejected.value?.segments.first?.text.count == 1_500)
+
+    let canonical = try page.canonicalState()
+    let semanticID = rejected.locatorRecipe.semanticIdentity
+    let fields = Dictionary(uniqueKeysWithValues: canonical.entries.map { ($0.key, $0.value) })
+    #expect(
+      fields[.init(frameID: "main", elementID: semanticID, field: "@validation_accepted")]?
+        .segments.first?.text == "false")
+    #expect(
+      fields[.init(frameID: "main", elementID: semanticID, field: "@character_count")]?
+        .segments.first?.text == "1500")
+  }
+
+  @Test("A macOS file input receives a bounded native selection and emits a pathless receipt")
+  func nativeFileUploadPanelReceipt() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("store-icon-512.png")
+    let bytes = Data("fixture-image".utf8)
+    try bytes.write(to: file, options: .atomic)
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      uploadSelectionProvider: { allowsMultiple, allowsDirectories in
+        #expect(!allowsMultiple)
+        #expect(!allowsDirectories)
+        return [file]
+      })
+    _ = try await runtime.loadHTML(
+      "<label for='asset'>App icon</label><input id='asset' type='file'>",
+      baseURL: URL(string: "https://fixture.invalid/upload"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let input = try #require(before.elements.first)
+    _ = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: input.elementID,
+      operation: .click,
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+
+    for _ in 0..<50 where runtime.latestFileUploadReceipt() == nil {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    let receipt = try #require(runtime.latestFileUploadReceipt())
+    #expect(receipt.filenames == ["store-icon-512.png"])
+    #expect(receipt.byteCounts == [UInt64(bytes.count)])
+    #expect(receipt.sha256.count == 1)
+    #expect(receipt.sha256[0].count == 64)
+    #expect(!receipt.selectedByHuman)
+    #expect(!receipt.localPathsExposed)
+    let selectedName =
+      try await runtime.webView.evaluateJavaScript(
+        "document.getElementById('asset').files[0].name") as? String
+    #expect(selectedName == "store-icon-512.png")
+  }
+
+  @Test("Native file upload rejects a selection above its hard file-count bound")
+  func nativeFileUploadCountBound() async throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-upload-count-\(UUID().uuidString).txt")
+    try Data("bounded".utf8).write(to: file, options: .atomic)
+    defer { try? FileManager.default.removeItem(at: file) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      uploadSelectionProvider: { _, _ in Array(repeating: file, count: 11) })
+    _ = try await runtime.loadHTML(
+      "<input aria-label='Assets' type='file' multiple>",
+      baseURL: URL(string: "https://fixture.invalid/upload"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let input = try #require(observation.elements.first)
+    _ = try await runtime.perform(
+      observationID: observation.observationID, elementID: input.elementID,
+      operation: .click, stabilityInterval: .milliseconds(1))
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(runtime.latestFileUploadReceipt() == nil)
+    let count =
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('input').files.length") as? Int
+    #expect(count == 0)
+  }
+
+  @Test("Main-frame navigation audit distinguishes agent actions from web content")
+  func navigationActorAttribution() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<a href='/agent-next'>Next</a>",
+      baseURL: URL(string: "https://fixture.invalid/start"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    #expect(runtime.latestNavigationAuditEvent()?.actor == .agentNavigation)
+    #expect(runtime.latestNavigationAuditEvent()?.toOrigin == "https://fixture.invalid")
+
+    let observation = try await runtime.observe()
+    let link = try #require(observation.elements.first)
+    _ = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: link.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    for _ in 0..<50 where runtime.latestNavigationAuditEvent()?.actor != .agentAction {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(runtime.latestNavigationAuditEvent()?.actor == .agentAction)
+    #expect(runtime.latestNavigationAuditEvent()?.navigationType == "link_activated")
+
+    let scripted = WebKitRuntime()
+    _ = try await scripted.loadHTML(
+      "<p>Start</p>", baseURL: URL(string: "https://fixture.invalid/start"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    _ = try await scripted.webView.evaluateJavaScript("location.href='/automatic'")
+    for _ in 0..<50 where scripted.latestNavigationAuditEvent()?.actor != .webContent {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(scripted.latestNavigationAuditEvent()?.actor == .webContent)
+    #expect(scripted.latestNavigationAuditEvent()?.navigationType == "other")
+  }
+
+  @Test("Open shadow DOM controls remain observable and actionable")
+  func openShadowDOMControls() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Shadow form</title>
+      <div id="composer"></div>
+      <script>
+        const root = document.getElementById('composer').attachShadow({ mode: 'open' });
+        root.innerHTML = '<label for="title">Title</label>'
+          + '<input id="title" name="title" placeholder="Title">';
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/submit"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+
+    let before = try await runtime.observe()
+    let title = try #require(
+      before.elements.first { $0.accessibleName?.segments.first?.text == "Title" })
+    #expect(title.role?.segments.first?.text == "textbox")
+    #expect(title.stableAttributes["name"]?.segments.first?.text == "title")
+
+    let value = try ProvenancedText(
+      text: "Native browser authority",
+      source: ProvenanceSource(classification: .modelGenerated))
+    let result = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: title.elementID,
+      operation: .fill(value),
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    #expect(result.addressingOutcome == .stable)
+
+    let after = try await runtime.observe()
+    let updated = try #require(
+      after.elements.first { $0.accessibleName?.segments.first?.text == "Title" })
+    #expect(updated.value?.segments.first?.text == "Native browser authority")
+  }
+
   @Test("Password values never cross the observation boundary")
   func passwordOmitted() async throws {
     let runtime = WebKitRuntime()
@@ -141,6 +369,60 @@ struct WebKitRuntimeTests {
         stabilityInterval: .milliseconds(1)
       )
     }
+  }
+
+  @Test("Observation emits safe context, stable hrefs, and locator quality before actuation")
+  func contextualLocatorQuality() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <button></button><button></button>
+      <section aria-label="API Tokens">
+        <h2>API Tokens</h2>
+        <a id="api-link" href="/dashboard/tokens?team=private-team-value">
+          <span aria-hidden="true">→</span>
+        </a>
+      </section>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/settings"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let link = try #require(
+      observation.elements.first { element in
+        element.role?.segments.first?.text == "link"
+      })
+    #expect(
+      link.contextAnchors.contains {
+        $0.kind == .labelledRegion && $0.text.segments.first?.text == "API Tokens"
+      })
+    #expect(
+      link.contextAnchors.contains {
+        $0.kind == .nearestHeading && $0.text.segments.first?.text == "API Tokens"
+      })
+    #expect(
+      link.stableAttributes["href"]?.segments.first?.text
+        == "https://fixture.invalid/dashboard/tokens?team=<redacted>")
+    #expect(link.stableAttributes["id"]?.segments.first?.text == "api-link")
+    #expect(link.locatorQuality.status == .unique)
+    #expect(link.locatorQuality.candidateCount == 1)
+    #expect(link.locatorQuality.facts.contains("stable_attribute:href"))
+
+    let buttons = observation.elements.filter {
+      $0.role?.segments.first?.text == "button"
+    }
+    #expect(buttons.count == 2)
+    #expect(buttons.allSatisfy { $0.locatorQuality.status == .insufficient })
+    #expect(buttons.allSatisfy { $0.locatorQuality.candidateCount == 2 })
+    #expect(
+      buttons.allSatisfy {
+        $0.locatorQuality.recommendedAction == "contextual_reobserve_or_handoff"
+      })
+
+    let encoded = String(decoding: try JSONEncoder().encode(observation), as: UTF8.self)
+    #expect(!encoded.contains("private-team-value"))
   }
 
   @Test("Observation omits hidden values and classifies sensitive visible fields")
@@ -224,6 +506,37 @@ struct WebKitRuntimeTests {
     }
   }
 
+  @Test("A labelled reverse-DNS Bundle ID remains public while opaque tokens stay sensitive")
+  func bundleIdentifierIsNotSensitive() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      """
+      <label for="bundle-id">Bundle ID</label>
+      <input id="bundle-id" name="bundleIdentifier"
+        value="com.lorislab.lumenforfrigate.background-agent">
+      <label for="token">Profile code</label>
+      <input id="token" value="AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-opaque">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/identifiers"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let bundle = try #require(
+      observation.elements.first { element in
+        element.label?.segments.first?.text == "Bundle ID"
+      })
+    #expect(!bundle.sensitive)
+    #expect(
+      bundle.value?.segments.first?.text
+        == "com.lorislab.lumenforfrigate.background-agent")
+    let token = try #require(
+      observation.elements.first { element in
+        element.label?.segments.first?.text == "Profile code"
+      })
+    #expect(token.sensitive)
+    #expect(token.value == nil)
+  }
+
   @Test("Authentication origins block agent surfaces and classify an unready UI")
   func authenticationOriginFailClosed() async throws {
     let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
@@ -255,7 +568,8 @@ struct WebKitRuntimeTests {
             applicationNameForUserAgentConfigured: false,
             pinnedProxyConfigured: false,
             contentBlockingConfigured: false,
-            customProcessPoolConfigured: false
+            customProcessPoolConfigured: false,
+            webAuthnAnyRelyingPartyEntitlementConfigured: false
           )
         ))
 
@@ -323,6 +637,7 @@ struct WebKitRuntimeTests {
       #expect(!snapshot.pinnedProxyConfigured)
       #expect(!snapshot.contentBlockingConfigured)
       #expect(!snapshot.customProcessPoolConfigured)
+      #expect(!snapshot.webAuthnAnyRelyingPartyEntitlementConfigured)
     }
     _ = try await ephemeral.loadHTML(
       "<title>User agent fixture</title>",
@@ -334,6 +649,42 @@ struct WebKitRuntimeTests {
       try await ephemeral.webView.evaluateJavaScript("navigator.userAgent") as? String)
     #expect(userAgent.contains("AppleWebKit"))
     #expect(!userAgent.contains("WebkitUIMCP"))
+  }
+
+  @Test("Visible WebAuthn security-key control requires a full browser without entitlement")
+  func webAuthnSecurityKeyRequiresFullBrowserWithoutEntitlement() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      "<div>Verify with a security key</div>",
+      baseURL: URL(string: "https://dash.cloudflare.com/two-factor"),
+      timeout: .seconds(3),
+      quietWindow: .milliseconds(40)
+    )
+
+    let status = try #require(runtime.authenticationRestrictionStatus())
+    #expect(status.origin == "https://dash.cloudflare.com")
+    #expect(status.classification == .fullBrowserRequired)
+    #expect(!status.environment.webAuthnAnyRelyingPartyEntitlementConfigured)
+    await #expect(
+      throws: WebKitRuntimeError.authenticationOriginRequiresHuman(
+        "https://dash.cloudflare.com")
+    ) {
+      try await runtime.observe()
+    }
+  }
+
+  @Test("Cloudflare two-factor route requires a full browser even with closed component text")
+  func cloudflareTwoFactorRouteRequiresFullBrowser() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      "<div>Authentication challenge</div>",
+      baseURL: URL(string: "https://dash.cloudflare.com/two-factor"),
+      timeout: .seconds(3),
+      quietWindow: .milliseconds(40)
+    )
+    let status = try #require(runtime.authenticationRestrictionStatus())
+    #expect(status.origin == "https://dash.cloudflare.com")
+    #expect(status.classification == .fullBrowserRequired)
   }
 
   @Test("Full-browser fallback is limited to the exact Apple authentication embedding pair")
@@ -450,7 +801,7 @@ struct WebKitRuntimeTests {
     let entryServer = try FormFixtureServer { _ in
       FormFixtureServer.redirect(to: authenticationURL)
     }
-    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    let runtime = makeWindowHandoffRuntime()
 
     await #expect(
       throws: WebKitRuntimeError.crossOriginRedirectRequiresHuman(
@@ -491,6 +842,9 @@ struct WebKitRuntimeTests {
     while runtime.webView.isLoading {
       try await Task.sleep(for: .milliseconds(10))
     }
+    try runtime.markHumanStepCompleted()
+    #expect(runtime.interactionControlState() == .humanStepCompleted)
+    #expect(runtime.humanStepCompletionMonotonicNanoseconds() != nil)
     try runtime.requestAgentResume()
     let resumed = try await runtime.resumeAfterHumanControl()
     #expect(resumed.title.segments.first?.text == "Developer Portal")
@@ -686,6 +1040,32 @@ struct WebKitRuntimeTests {
     }
   }
 
+  @Test("A timed-out navigation is stopped before the next command")
+  func timedOutNavigationDoesNotReplaceNextDocument() async throws {
+    let slowServer = try FormFixtureServer { _ in
+      Thread.sleep(forTimeInterval: 0.3)
+      return FormFixtureServer.response(body: "<title>Late document</title>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+
+    await #expect(throws: (any Error).self) {
+      try await runtime.navigate(
+        to: URL(string: "http://127.0.0.1:\(slowServer.port)/slow")!,
+        timeout: .milliseconds(40),
+        quietWindow: .milliseconds(20))
+    }
+    let next = try await runtime.loadHTML(
+      "<title>Next command</title>",
+      baseURL: URL(string: "https://fixture.invalid/next"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(20))
+    #expect(next.readiness == .ready)
+
+    try await Task.sleep(for: .milliseconds(400))
+    let title = try await runtime.webView.evaluateJavaScript("document.title") as? String
+    #expect(title == "Next command")
+  }
+
   @Test("Snapshot is a real PNG with an explicit compositor caveat")
   func snapshot() async throws {
     let runtime = WebKitRuntime()
@@ -707,7 +1087,7 @@ struct WebKitRuntimeTests {
 
   @Test("Human handoff presents the live rendered WebView")
   func humanHandoffPresentsLiveRenderedWebView() async throws {
-    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    let runtime = makeWindowHandoffRuntime()
     let stableWindow = try #require(runtime.webView.window)
     #expect(!stableWindow.isVisible)
     _ = try await runtime.loadHTML(
@@ -732,7 +1112,7 @@ struct WebKitRuntimeTests {
     #expect(window.title == "WebkitUIMCP — Human control")
     #expect(window.isVisible)
     #expect(window.alphaValue == 1)
-    #expect(window.contentView === runtime.webView)
+    #expect(runtime.webView.isDescendant(of: try #require(window.contentView)))
     #expect(runtime.webView.bounds.width > 0)
     #expect(runtime.webView.bounds.height > 0)
 
@@ -750,10 +1130,52 @@ struct WebKitRuntimeTests {
     #expect(center.greenComponent < 0.3)
     #expect(center.blueComponent < 0.4)
 
+    let contentView = try #require(window.contentView)
+    let done = try #require(
+      descendant(
+        of: NSButton.self,
+        accessibilityIdentifier: "webkitui.handoff.done",
+        in: contentView))
+    let status = try #require(
+      descendant(
+        of: NSTextField.self,
+        accessibilityIdentifier: "webkitui.handoff.status",
+        in: contentView))
+    done.performClick(nil)
+    #expect(runtime.interactionControlState() == .humanStepCompleted)
+    #expect(!done.isEnabled)
+    #expect(done.title == "Ready — Waiting for Agent")
+    #expect(status.stringValue.contains("Waiting for the requesting agent"))
+
     try runtime.requestAgentResume()
     _ = try await runtime.resumeAfterHumanControl()
     #expect(!window.isVisible)
     #expect(runtime.webView.window === window)
+  }
+
+  @Test("Human handoff button reports an invalid transition instead of swallowing it")
+  func humanHandoffButtonReportsFailure() throws {
+    let runtime = makeWindowHandoffRuntime()
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: true)
+    let contentView = try #require(runtime.webView.window?.contentView)
+    let done = try #require(
+      descendant(
+        of: NSButton.self,
+        accessibilityIdentifier: "webkitui.handoff.done",
+        in: contentView))
+    let status = try #require(
+      descendant(
+        of: NSTextField.self,
+        accessibilityIdentifier: "webkitui.handoff.status",
+        in: contentView))
+
+    try runtime.markHumanStepCompleted()
+    done.performClick(nil)
+
+    #expect(done.isEnabled)
+    #expect(done.title == "Try Again — Return Control")
+    #expect(status.stringValue.contains("could not be returned"))
   }
 
   @Test("Native Edit menu routes Command-V to the first responder")
@@ -771,7 +1193,7 @@ struct WebKitRuntimeTests {
 
   @Test("An empty human handoff renders an explicit local status page")
   func emptyHandoffRendersStatusPage() async throws {
-    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    let runtime = makeWindowHandoffRuntime()
     #expect(runtime.webView.url == nil)
 
     try runtime.requestHumanHandoff()
@@ -875,6 +1297,264 @@ struct WebKitRuntimeTests {
     #expect(result.dispatchMode == .nativeAppKit)
     let after = try await runtime.observe()
     #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "trusted")
+  }
+
+  @Test("AppKit fill survives a controlled-input rerender with an exact trusted receipt")
+  func nativeControlledFillActuation() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for="bundle-id">Bundle ID</label><input id="bundle-id" value="old.value.id">
+      <script>
+      const input = document.getElementById('bundle-id');
+      input.addEventListener('input', event => {
+        document.body.dataset.inputTrust = String(event.isTrusted);
+        const replacement = event.target.cloneNode(true);
+        replacement.value = event.target.value;
+        event.target.replaceWith(replacement);
+      });
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-fill"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let value = try ProvenancedText(
+      text: "com.lorislab.example.background-agent",
+      source: ProvenanceSource(classification: .userIntent))
+    let result = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: "e1",
+      operation: .fill(value),
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.dispatched)
+    #expect(result.trustedUserGesture)
+    #expect(result.dispatchMode == .nativeAppKit)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].value?.segments.first?.text == value.segments.first?.text)
+  }
+
+  @Test("AppKit fill persists in an Apple-style searchable App ID selector")
+  func nativeCustomSelectorFillActuation() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for="app-id">App ID</label>
+      <input id="app-id" role="combobox" aria-controls="options">
+      <div id="options" role="listbox"></div>
+      <script>
+      const input = document.getElementById('app-id');
+      input.addEventListener('input', event => {
+        if (!event.isTrusted) { event.target.value = ''; return; }
+        const value = event.target.value;
+        const replacement = event.target.cloneNode(true);
+        replacement.value = value;
+        event.target.replaceWith(replacement);
+      });
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/profile-selector"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let value = try ProvenancedText(
+      text: "Lumen Background Agent",
+      source: ProvenanceSource(classification: .userIntent))
+    let result = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: "e1",
+      operation: .fill(value),
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.trustedUserGesture)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].value?.segments.first?.text == "Lumen Background Agent")
+  }
+
+  @Test("Same-row labels independently address repeated Configure buttons")
+  func sameRowLabelsDisambiguateControls() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div class="row"><span>App Groups</span><button data-state="idle"
+        onclick="this.dataset.state='opened'">Configure</button></div>
+      <div class="row"><span>iCloud</span><button data-state="idle"
+        onclick="this.dataset.state='opened'">Configure</button></div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/capabilities"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let buttons = observation.elements.filter {
+      $0.accessibleName?.segments.first?.text == "Configure"
+    }
+    #expect(buttons.count == 2)
+    #expect(buttons.allSatisfy { $0.locatorQuality.status == .unique })
+    #expect(buttons[0].contextAnchors.first?.kind == .sameRowLabel)
+    #expect(buttons[0].contextAnchors.first?.text.segments.first?.text == "App Groups")
+    #expect(buttons[1].contextAnchors.first?.text.segments.first?.text == "iCloud")
+
+    let firstResult = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: buttons[0].elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(10))
+    #expect(firstResult.dispatched)
+    let refreshed = try await runtime.observe()
+    let iCloud = try #require(
+      refreshed.elements.first { element in
+        element.contextAnchors.first?.text.segments.first?.text == "iCloud"
+      })
+    let secondResult = try await runtime.perform(
+      observationID: refreshed.observationID,
+      elementID: iCloud.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(10))
+    #expect(secondResult.dispatched)
+  }
+
+  @Test("An authenticated attachment download returns a collision-safe integrity receipt")
+  func authenticatedAttachmentDownload() async throws {
+    let profile = "fixture-provisioning-profile-bytes"
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /profile") {
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+          + "Content-Disposition: attachment; filename=Fixture.provisionprofile\r\n"
+          + "Content-Length: \(profile.utf8.count)\r\nConnection: close\r\n\r\n\(profile)"
+      }
+      return FormFixtureServer.response(
+        body: "<a href='/profile'>Download</a>",
+        extraHeaders: "Set-Cookie: portal_session=private; HttpOnly\r\n")
+    }
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("webkitui-download-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let requested = directory.appendingPathComponent("Fixture.provisionprofile")
+    try Data("existing".utf8).write(to: requested)
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { _ in requested })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/")!,
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let link = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Download"
+      })
+    let receipt = try await runtime.download(
+      observationID: observation.observationID,
+      elementID: link.elementID,
+      timeout: .seconds(5))
+    #expect(receipt.filename == "Fixture 2.provisionprofile")
+    #expect(receipt.suggestedFilename == "Fixture.provisionprofile")
+    #expect(receipt.httpStatus == 200)
+    #expect(receipt.byteCount == UInt64(profile.utf8.count))
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: profile))
+    #expect(receipt.mimeType == "application/octet-stream")
+    #expect(receipt.provisioningProfileUUID == nil)
+    #expect(
+      try String(
+        contentsOf: directory.appendingPathComponent(receipt.filename), encoding: .utf8) == profile)
+  }
+
+  @Test("A same-origin URL fallback preserves cookies and verifies a profile UUID")
+  func authenticatedDirectURLDownload() async throws {
+    let expectedUUID = "12345678-1234-1234-1234-123456789ABC"
+    let profile =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+      + "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">"
+      + "<plist version=\"1.0\"><dict><key>UUID</key><string>\(expectedUUID)</string>"
+      + "</dict></plist>"
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /direct-profile") {
+        guard request.lowercased().contains("cookie: portal_session=private") else {
+          return "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/x-apple-aspen-config\r\n"
+          + "Content-Disposition: attachment; filename=Direct.provisionprofile\r\n"
+          + "Content-Length: \(profile.utf8.count)\r\nConnection: close\r\n\r\n\(profile)"
+      }
+      return FormFixtureServer.response(
+        body: "<p>Authenticated portal</p>",
+        extraHeaders: "Set-Cookie: portal_session=private; HttpOnly\r\n")
+    }
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("webkitui-direct-download-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { suggested in directory.appendingPathComponent(suggested) })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/")!,
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let receipt = try await runtime.download(
+      url: URL(string: "http://127.0.0.1:\(server.port)/direct-profile")!,
+      expectedProvisioningProfileUUID: expectedUUID,
+      timeout: .seconds(5))
+    #expect(receipt.httpStatus == 200)
+    #expect(receipt.suggestedFilename == "Direct.provisionprofile")
+    #expect(receipt.provisioningProfileUUID == expectedUUID)
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: profile))
+    #expect(
+      FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(receipt.filename).path))
+  }
+
+  @Test("The direct URL fallback rejects another origin before starting")
+  func directURLDownloadRejectsCrossOrigin() async throws {
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { _ in nil })
+    _ = try await runtime.loadHTML(
+      "<p>Portal</p>",
+      baseURL: URL(string: "https://portal.example/")!,
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    await #expect(throws: WebKitRuntimeError.networkBoundaryDenied) {
+      try await runtime.download(
+        url: URL(string: "https://download.example/profile")!,
+        timeout: .milliseconds(100))
+    }
+  }
+
+  @Test("A same-origin HTML response is a typed unsupported download")
+  func directURLRejectsNonDownloadResponse() async throws {
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /not-a-download") {
+        return FormFixtureServer.response(body: "<p>Not an attachment</p>")
+      }
+      return FormFixtureServer.response(body: "<p>Portal</p>")
+    }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { _ in nil })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/")!,
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    await #expect(throws: WebKitRuntimeError.unsupportedDownload(httpStatus: 200)) {
+      try await runtime.download(
+        url: URL(string: "http://127.0.0.1:\(server.port)/not-a-download")!,
+        timeout: .seconds(2))
+    }
+  }
+
+  @Test("A CMS-wrapped provisioning profile exposes only its decoded UUID")
+  func cmsProvisioningProfileUUID() throws {
+    let encoded =
+      "MIIBEwYJKoZIhvcNAQcBoIIBBASCAQA8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCI/Pg0KPCFET0NUWVBFIHBsaXN0IFBVQkxJQyAiLS8vQXBwbGUvL0RURCBQTElTVCAxLjAvL0VOIiAiaHR0cDovL3d3dy5hcHBsZS5jb20vRFREcy9Qcm9wZXJ0eUxpc3QtMS4wLmR0ZCI+DQo8cGxpc3QgdmVyc2lvbj0iMS4wIj48ZGljdD48a2V5PlVVSUQ8L2tleT48c3RyaW5nPjg3NjU0MzIxLTQzMjEtNDMyMS00MzIxLUNCQTk4NzY1NDMyMTwvc3RyaW5nPjwvZGljdD48L3BsaXN0Pg0K"
+    let cms = try #require(Data(base64Encoded: encoded))
+    #expect(
+      WebKitRuntime.provisioningProfileUUID(from: cms)
+        == "87654321-4321-4321-4321-CBA987654321")
   }
 
   @Test("Fill preserves input provenance at the actuation boundary")
@@ -1005,6 +1685,32 @@ struct WebKitRuntimeTests {
     #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "committed")
   }
 
+  @Test("Pointer-styled tab groups expose unique roles, names, and selected state")
+  func implicitPointerTabs() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div class='capability-tabs'>
+        <div class='tab active' style='cursor:pointer'>Capabilities</div>
+        <div class='tab' style='cursor:pointer'>App Services</div>
+        <div class='tab' style='cursor:pointer'>Capability Requests</div>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/capabilities"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let tabs = observation.elements.filter {
+      $0.role?.segments.first?.text == "tab"
+    }
+    #expect(
+      tabs.map { $0.accessibleName?.segments.first?.text } == [
+        "Capabilities", "App Services", "Capability Requests",
+      ])
+    #expect(tabs.map(\.selected) == [true, false, false])
+    #expect(tabs.allSatisfy { $0.locatorQuality.status == .unique })
+  }
+
   @Test("Element scrolling reports its nearest nested scroll region")
   func nestedElementScroll() async throws {
     let runtime = WebKitRuntime()
@@ -1061,6 +1767,30 @@ struct WebKitRuntimeTests {
     #expect(runtime.addressingCounterSnapshot().addressNowAmbiguous == 1)
   }
 
+  @Test("Enabled state disambiguates otherwise identical controls")
+  func enabledStateDisambiguatesControls() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<button onclick='this.dataset.state=\"clicked\"'>Configure</button>"
+        + "<button disabled>Configure</button>",
+      baseURL: URL(string: "https://fixture.invalid/"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+    let observation = try await runtime.observe()
+
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: "e1",
+      operation: .click,
+      stabilityInterval: .milliseconds(10)
+    )
+
+    #expect(result.dispatched)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "clicked")
+  }
+
   @Test("An element symbol expires after the next observation")
   func staleObservationRejected() async throws {
     let runtime = WebKitRuntime()
@@ -1080,6 +1810,55 @@ struct WebKitRuntimeTests {
         operation: .click
       )
     }
+  }
+
+  @Test("Handoff resume capabilities are session-bound, expiring, replaceable, and single-use")
+  func handoffResumeCapabilities() throws {
+    let registry = try WebKitSessionRegistry(maximumSessions: 1)
+    let handle = try registry.open()
+    let forgedHandle = WebKitSessionHandle(rawValue: UUID())
+
+    let first = try registry.issueHandoffResumeCapability(for: handle)
+    #expect(registry.handoffResumeCapabilityIsActive(first.token, for: handle))
+    #expect(!registry.handoffResumeCapabilityIsActive(first.token, for: forgedHandle))
+
+    let replacement = try registry.issueHandoffResumeCapability(for: handle)
+    #expect(!registry.handoffResumeCapabilityIsActive(first.token, for: handle))
+    #expect(registry.consumeHandoffResumeCapability(replacement.token, for: handle))
+    #expect(!registry.consumeHandoffResumeCapability(replacement.token, for: handle))
+
+    let expired = try registry.issueHandoffResumeCapability(
+      for: handle, lifetime: -1, now: Date(timeIntervalSince1970: 100))
+    #expect(
+      !registry.handoffResumeCapabilityIsActive(
+        expired.token, for: handle, now: Date(timeIntervalSince1970: 101)))
+  }
+
+  @Test("Implicit tables, rows, cells, and search fields are observed semantically")
+  func implicitTableAndSearchSemantics() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input type="search" placeholder="Search identifiers">
+      <table><tr><th>Name</th><td>Example App ID</td></tr></table>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/identifiers"),
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(40)
+    )
+
+    let observation = try await runtime.observe()
+    let roles = observation.elements.compactMap { $0.role?.segments.first?.text }
+    #expect(roles.contains("searchbox"))
+    #expect(roles.contains("table"))
+    #expect(roles.contains("row"))
+    #expect(roles.contains("columnheader"))
+    #expect(roles.contains("cell"))
+    let search = try #require(
+      observation.elements.first { element in
+        element.role?.segments.first?.text == "searchbox"
+      })
+    #expect(search.accessibleName?.segments.first?.text == "Search identifiers")
   }
 
   @Test("Human handoff blocks the agent and resumes only from a fresh address space")
@@ -1104,6 +1883,9 @@ struct WebKitRuntimeTests {
         observationID: before.observationID, elementID: "e2", operation: .click)
     }
 
+    try runtime.markHumanStepCompleted()
+    #expect(runtime.interactionControlState() == .humanStepCompleted)
+    #expect(runtime.humanStepCompletionMonotonicNanoseconds() != nil)
     try runtime.requestAgentResume()
     let resumed = try await runtime.resumeAfterHumanControl()
     #expect(runtime.interactionControlState() == .freshlyReobserved)
@@ -1122,7 +1904,8 @@ struct WebKitRuntimeTests {
     let events = runtime.handoffAuditEvents()
     #expect(
       events.map(\.to) == [
-        .handoffRequested, .humanControlled, .resumeRequested, .freshlyReobserved,
+        .handoffRequested, .humanControlled, .humanStepCompleted, .resumeRequested,
+        .freshlyReobserved,
         .agentControlled,
       ])
     let encoded = String(decoding: try JSONEncoder().encode(events), as: UTF8.self)

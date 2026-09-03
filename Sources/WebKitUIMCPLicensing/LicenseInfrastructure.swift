@@ -61,15 +61,17 @@ public struct WebKitUIKeychainLicenseStore: WebKitUILicenseStoring {
 }
 
 public struct WebKitUILicenseHTTPAPI: WebKitUILicenseAPI {
+  static let maximumResponseBytes = 64 * 1_024
+
   private let baseURL: URL
   private let session: URLSession
 
   public init(
     baseURL: URL = URL(string: "https://license.lorislab.fr")!,
-    session: URLSession = .shared
+    session: URLSession? = nil
   ) {
     self.baseURL = baseURL
-    self.session = session
+    self.session = session ?? Self.ephemeralSession()
   }
 
   public func activate(
@@ -136,14 +138,25 @@ public struct WebKitUILicenseHTTPAPI: WebKitUILicenseAPI {
   private func post(path: String, body: [String: String]) async throws
     -> (body: [String: Any], status: Int)
   {
+    guard baseURL.scheme?.lowercased() == "https", baseURL.host != nil else {
+      throw WebKitUILicenseError.transport("license endpoint must use HTTPS")
+    }
     var request = URLRequest(url: baseURL.appending(path: path))
     request.httpMethod = "POST"
     request.timeoutInterval = 20
+    request.cachePolicy = .reloadIgnoringLocalCacheData
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
     do {
       let (data, rawResponse) = try await session.data(for: request)
       guard let response = rawResponse as? HTTPURLResponse else {
+        throw WebKitUILicenseError.invalidServerResponse
+      }
+      guard Self.sameHTTPSOrigin(response.url, baseURL),
+        data.count <= Self.maximumResponseBytes,
+        response.mimeType?.lowercased() == "application/json"
+      else {
         throw WebKitUILicenseError.invalidServerResponse
       }
       let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
@@ -164,6 +177,50 @@ public struct WebKitUILicenseHTTPAPI: WebKitUILicenseAPI {
     } catch {
       throw WebKitUILicenseError.transport(error.localizedDescription)
     }
+  }
+
+  private static func ephemeralSession() -> URLSession {
+    URLSession(
+      configuration: ephemeralConfiguration(),
+      delegate: WebKitUILicenseNoRedirectDelegate(),
+      delegateQueue: nil)
+  }
+
+  static func ephemeralConfiguration() -> URLSessionConfiguration {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    configuration.urlCache = nil
+    configuration.httpCookieStorage = nil
+    configuration.httpShouldSetCookies = false
+    configuration.timeoutIntervalForRequest = 20
+    configuration.timeoutIntervalForResource = 20
+    configuration.httpMaximumConnectionsPerHost = 2
+    return configuration
+  }
+
+  static func sameHTTPSOrigin(_ candidate: URL?, _ expected: URL) -> Bool {
+    guard let candidate else { return false }
+    return candidate.scheme?.lowercased() == "https"
+      && candidate.host?.lowercased() == expected.host?.lowercased()
+      && effectivePort(candidate) == effectivePort(expected)
+  }
+
+  private static func effectivePort(_ url: URL) -> Int? {
+    url.port ?? (url.scheme?.lowercased() == "https" ? 443 : nil)
+  }
+}
+
+final class WebKitUILicenseNoRedirectDelegate: NSObject, URLSessionTaskDelegate,
+  @unchecked Sendable
+{
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    completionHandler(nil)
   }
 }
 

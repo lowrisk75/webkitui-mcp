@@ -25,6 +25,82 @@ private final class ResolverProbe: @unchecked Sendable {
 
 @Suite("Pinned SOCKS egress proxy", .serialized)
 struct PinnedSOCKSProxyTests {
+  @Test("Connection admission rejects saturation and recovers after release")
+  func boundedConnectionAdmission() {
+    let admission = BoundedConnectionAdmission(maximum: 2)
+
+    #expect(admission.tryAcquire())
+    #expect(admission.tryAcquire())
+    #expect(!admission.tryAcquire())
+    #expect(admission.activeCount() == 2)
+
+    admission.release()
+    #expect(admission.tryAcquire())
+    #expect(admission.activeCount() == 2)
+    admission.release()
+    admission.release()
+    #expect(admission.activeCount() == 0)
+  }
+
+  @Test("Local socket deadlines are applied to blocking descriptors")
+  func localSocketDeadlines() throws {
+    var descriptors = [Int32](repeating: -1, count: 2)
+    guard socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+      throw POSIXError(.ENOTCONN)
+    }
+    defer {
+      close(descriptors[0])
+      close(descriptors[1])
+    }
+
+    try LocalSocketDeadlinePolicy(receiveIdleSeconds: 17, sendSeconds: 9)
+      .apply(to: descriptors[0])
+
+    #expect(try socketTimeout(SO_RCVTIMEO, descriptor: descriptors[0]).tv_sec == 17)
+    #expect(try socketTimeout(SO_SNDTIMEO, descriptor: descriptors[0]).tv_sec == 9)
+  }
+
+  @Test("Proxy rejects connections above its active connection limit")
+  func activeConnectionLimit() async throws {
+    let resolver = ResolverProbe()
+    let proxy = try PinnedSOCKSProxy(
+      maximumActiveConnections: 1,
+      timeouts: PinnedSOCKSTimeouts(handshake: 2, connect: 2, idle: 2)
+    ) { resolver.resolve($0) }
+    let first = try openProxyConnection(port: proxy.port.rawValue)
+    defer { close(first) }
+    try await Task.sleep(for: .milliseconds(50))
+
+    let second = try openProxyConnection(port: proxy.port.rawValue)
+    defer { close(second) }
+
+    try await waitUntil { proxy.metricsSnapshot().blockedConnections == 1 }
+    #expect(proxy.metricsSnapshot().blockedConnections == 1)
+  }
+
+  @Test("Handshake timeout releases capacity for a later valid request")
+  func handshakeTimeoutRecovery() async throws {
+    let destination = try FormFixtureServer()
+    let resolver = ResolverProbe()
+    let proxy = try PinnedSOCKSProxy(
+      maximumActiveConnections: 1,
+      timeouts: PinnedSOCKSTimeouts(handshake: 0.05, connect: 1, idle: 1)
+    ) { resolver.resolve($0) }
+    let stalled = try openProxyConnection(port: proxy.port.rawValue)
+    defer { close(stalled) }
+
+    try await waitUntil { proxy.metricsSnapshot().timedOutConnections == 1 }
+    let response = try await Task.detached {
+      try socksRequest(
+        proxyPort: proxy.port.rawValue,
+        host: "rebind.test",
+        destinationPort: destination.port)
+    }.value
+
+    #expect(String(decoding: response, as: UTF8.self).contains("200 OK"))
+    #expect(proxy.metricsSnapshot().timedOutConnections == 1)
+  }
+
   @Test("A hostname is resolved once, pinned, and reused across TCP connections")
   func pinReuse() async throws {
     let destination = try FormFixtureServer()
@@ -161,6 +237,101 @@ struct PinnedSOCKSProxyTests {
     #expect(proxy.metricsSnapshot().pinnedHosts == 1)
     #expect(proxy.metricsSnapshot().acceptedConnections >= 1)
   }
+
+  @Test("WKWebView routes an HTTPS TLS attempt through the pinned proxy")
+  @MainActor
+  func webKitHTTPSAttemptRouting() async throws {
+    let destination = try FormFixtureServer()
+    let resolver = ResolverProbe()
+    let proxy = try PinnedSOCKSProxy { resolver.resolve($0) }
+    let store = WKWebsiteDataStore.nonPersistent()
+    store.proxyConfigurations = [proxy.proxyConfiguration()]
+    let runtime = WebKitRuntime(websiteDataStore: store, egressProxy: proxy)
+
+    _ = try await runtime.loadHTML(
+      """
+      <img src="https://rebind.test:\(destination.port)/tls-attempt">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/")!,
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(20)
+    )
+    try await Task.sleep(for: .milliseconds(300))
+
+    #expect(resolver.callCount() == 1)
+    #expect(proxy.metricsSnapshot().pinnedHosts == 1)
+    #expect(proxy.metricsSnapshot().acceptedConnections >= 1)
+  }
+
+  @Test("WKWebView routes a WebSocket handshake attempt through the pinned proxy")
+  @MainActor
+  func webKitWebSocketAttemptRouting() async throws {
+    let destination = try FormFixtureServer()
+    let resolver = ResolverProbe()
+    let proxy = try PinnedSOCKSProxy { resolver.resolve($0) }
+    let store = WKWebsiteDataStore.nonPersistent()
+    store.proxyConfigurations = [proxy.proxyConfiguration()]
+    let runtime = WebKitRuntime(websiteDataStore: store, egressProxy: proxy)
+
+    _ = try await runtime.loadHTML(
+      """
+      <script>
+        const socket = new WebSocket('ws://rebind.test:\(destination.port)/socket-attempt');
+        socket.onerror = () => { document.title = 'websocket-attempted'; };
+      </script>
+      """,
+      baseURL: URL(string: "http://fixture.invalid/")!,
+      timeout: .seconds(2),
+      quietWindow: .milliseconds(20)
+    )
+    try await Task.sleep(for: .milliseconds(300))
+
+    #expect(resolver.callCount() == 1)
+    #expect(proxy.metricsSnapshot().pinnedHosts == 1)
+    #expect(proxy.metricsSnapshot().acceptedConnections >= 1)
+  }
+}
+
+private func waitUntil(
+  timeout: Duration = .seconds(2),
+  condition: @escaping @Sendable () -> Bool
+) async throws {
+  let clock = ContinuousClock()
+  let deadline = clock.now.advanced(by: timeout)
+  while !condition() {
+    guard clock.now < deadline else { throw POSIXError(.ETIMEDOUT) }
+    try await Task.sleep(for: .milliseconds(10))
+  }
+}
+
+private func openProxyConnection(port: UInt16) throws -> Int32 {
+  let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+  guard descriptor >= 0 else { throw POSIXError(.ENOTCONN) }
+  var address = sockaddr_in()
+  address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+  address.sin_family = sa_family_t(AF_INET)
+  address.sin_port = port.bigEndian
+  inet_pton(AF_INET, "127.0.0.1", &address.sin_addr)
+  let connected = withUnsafePointer(to: &address) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+      Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    }
+  }
+  guard connected == 0 else {
+    close(descriptor)
+    throw POSIXError(.ECONNREFUSED)
+  }
+  return descriptor
+}
+
+private func socketTimeout(_ option: Int32, descriptor: Int32) throws -> timeval {
+  var timeout = timeval()
+  var length = socklen_t(MemoryLayout<timeval>.size)
+  let result = withUnsafeMutablePointer(to: &timeout) {
+    getsockopt(descriptor, SOL_SOCKET, option, $0, &length)
+  }
+  guard result == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+  return timeout
 }
 
 private func socksRequest(

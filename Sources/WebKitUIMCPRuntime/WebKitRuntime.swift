@@ -1,6 +1,8 @@
 import AppKit
 import CryptoKit
 import Foundation
+import OSLog
+import Security
 import WebKit
 import WebKitUIMCPCore
 
@@ -20,6 +22,12 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case targetNotActionable
   case targetGeometryChanged
   case sensitiveInputRequiresHuman
+  case downloadInProgress
+  case downloadCancelled
+  case downloadReceiptTimedOut(started: Bool)
+  case unsupportedDownload(httpStatus: Int?)
+  case downloadHTTPFailure(status: Int)
+  case downloadFailed(String)
   case invalidCredentialOrigin
   case invalidCredentialBinding
   case invalidCredentialSecret
@@ -49,12 +57,14 @@ public struct AuthenticationEnvironmentSnapshot: Codable, Equatable, Sendable {
   public let pinnedProxyConfigured: Bool
   public let contentBlockingConfigured: Bool
   public let customProcessPoolConfigured: Bool
+  public let webAuthnAnyRelyingPartyEntitlementConfigured: Bool
 }
 
 public enum InteractionControlState: String, Codable, Equatable, Sendable {
   case agentControlled = "agent_controlled"
   case handoffRequested = "handoff_requested"
   case humanControlled = "human_controlled"
+  case humanStepCompleted = "human_step_completed"
   case resumeRequested = "resume_requested"
   case freshlyReobserved = "freshly_reobserved"
 }
@@ -81,11 +91,55 @@ public struct WebKitNavigationResult: Codable, Equatable, Sendable {
   public let mutationCount: UInt64
 }
 
+public enum WebKitNavigationActor: String, Codable, Equatable, Sendable {
+  case agentNavigation = "agent_navigation"
+  case agentAction = "agent_action"
+  case human
+  case webContent = "web_content"
+  case unattributed
+}
+
+public struct WebKitNavigationAuditEvent: Codable, Equatable, Sendable {
+  public let fromOrigin: String?
+  public let toOrigin: String?
+  public let actor: WebKitNavigationActor
+  public let navigationType: String
+  public let allowed: Bool
+  public let monotonicNanoseconds: UInt64
+}
+
 public struct ObservedBoundingBox: Codable, Equatable, Sendable {
   public let x: Double
   public let y: Double
   public let width: Double
   public let height: Double
+}
+
+public enum ObservedContextAnchorKind: String, Codable, Equatable, Sendable {
+  case fieldsetLegend = "fieldset_legend"
+  case labelledRegion = "labelled_region"
+  case nearestHeading = "nearest_heading"
+  case previousSibling = "previous_sibling"
+  case sameRowLabel = "same_row_label"
+}
+
+public struct ObservedContextAnchor: Codable, Equatable, Sendable {
+  public let kind: ObservedContextAnchorKind
+  public let text: ProvenancedText
+}
+
+public enum LocatorQualityStatus: String, Codable, Equatable, Sendable {
+  case unique
+  case ambiguous
+  case insufficient
+}
+
+public struct LocatorQuality: Codable, Equatable, Sendable {
+  public let status: LocatorQualityStatus
+  public let candidateCount: Int
+  public let candidateCountIsLowerBound: Bool
+  public let facts: [String]
+  public let recommendedAction: String?
 }
 
 public struct WebKitObservedElement: Codable, Equatable, Sendable {
@@ -96,6 +150,8 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let label: ProvenancedText?
   public let text: ProvenancedText?
   public let value: ProvenancedText?
+  public let validationState: ObservedValidationState
+  public let characterCount: Int?
   public let sensitive: Bool
   public let submitsForm: Bool
   public let disabled: Bool
@@ -103,9 +159,18 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let selected: Bool?
   public let selectedOption: ProvenancedText?
   public let stateAttributes: [String: ProvenancedText]
+  public let contextAnchors: [ObservedContextAnchor]
+  public let stableAttributes: [String: ProvenancedText]
   public let visible: Bool
   public let boundingBox: ObservedBoundingBox
   public let locatorRecipe: LocatorRecipe
+  public let locatorQuality: LocatorQuality
+}
+
+public enum ObservedValidationState: String, Codable, Equatable, Sendable {
+  case valid
+  case invalid
+  case notApplicable = "not_applicable"
 }
 
 public struct WebKitPageObservation: Codable, Equatable, Sendable {
@@ -182,6 +247,26 @@ public struct WebKitActionResult: Codable, Equatable, Sendable {
   public let actionMonotonicNanoseconds: UInt64
 }
 
+public struct WebKitDownloadReceipt: Codable, Equatable, Sendable {
+  public let httpStatus: Int?
+  public let suggestedFilename: String
+  public let filename: String
+  public let mimeType: String?
+  public let byteCount: UInt64
+  public let sha256: String
+  public let provisioningProfileUUID: String?
+}
+
+public struct WebKitFileUploadReceipt: Codable, Equatable, Sendable {
+  public let filenames: [String]
+  public let byteCounts: [UInt64]
+  public let sha256: [String]
+  public let fileCount: Int
+  public let selectedByHuman: Bool
+  public let localPathsExposed: Bool
+  public let monotonicNanoseconds: UInt64
+}
+
 public struct FormSubmissionAuditEvent: Codable, Equatable, Sendable {
   public let payloadHMAC: String
   public let httpMethod: String
@@ -213,13 +298,18 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 }
 
 @MainActor
-public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDelegate, WKUIDelegate,
+  WKScriptMessageHandler
+{
   public let webView: WKWebView
 
   private let instrumentationWorld: WKContentWorld
+  private let managesApplicationActivationPolicy: Bool
   private var documentID = UUID().uuidString
   private var observationGeneration: UInt64 = 0
   private var navigationFailure: WebKitRuntimeError?
+  private var armedNavigationActor: (actor: WebKitNavigationActor, expiresAt: UInt64)?
+  private var navigationAuditEvents: [WebKitNavigationAuditEvent] = []
   private var processTerminated = false
   private var latestObservationID: String?
   private var latestTargets: [String: ObservedTargetRecord] = [:]
@@ -227,6 +317,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   private var controlState: InteractionControlState = .agentControlled
   private var handoffEvents: [HandoffAuditEvent] = []
   private var browserWindow: NSWindow?
+  private weak var humanControlInstruction: NSTextField?
+  private weak var humanControlCompletionButton: NSButton?
   private var topLevelOriginLock: SecurityOrigin?
   private let formAuditKey = SymmetricKey(size: .bits256)
   private var formSubmissionEvents: [FormSubmissionAuditEvent] = []
@@ -234,10 +326,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   private var lastCommittedHTTPURL: URL?
   private var authenticationUIClassification: AuthenticationUIClassification?
   private var restrictedAuthenticationFrameOrigin: String?
+  private var restrictedWebAuthnOrigin: String?
   private var pendingCrossOriginNavigationRequest: URLRequest?
   private let egressProxy: PinnedSOCKSProxy?
   private var armedNativeGestureTokens: Set<String> = []
   private var nativeGestureReceipts: [String: NativeGestureReceipt] = [:]
+  private let downloadDestinationProvider: (@MainActor @Sendable (String) async -> URL?)?
+  private let uploadSelectionProvider: (@MainActor @Sendable (Bool, Bool) async -> [URL]?)?
+  private var lastUploadReceipt: WebKitFileUploadReceipt?
+  private var filePickerVisible = false
+  private var downloadContinuation: CheckedContinuation<WebKitDownloadReceipt, any Error>?
+  private var downloadExpectedOrigin: SecurityOrigin?
+  private var downloadDestination: URL?
+  private var downloadMIMEType: String?
+  private var downloadHTTPStatus: Int?
+  private var downloadSuggestedFilename: String?
+  private var downloadExpectedProvisioningProfileUUID: String?
+  private var downloadStarted = false
+  private var downloadActionVerified = false
+  private var completedDownloadReceipt: WebKitDownloadReceipt?
+  private var activeDownload: WKDownload?
+  private var downloadTimeoutTask: Task<Void, Never>?
 
   public override convenience init() {
     self.init(websiteDataStore: .default())
@@ -253,8 +362,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     self.init(websiteDataStore: protectedWebsiteDataStore, egressProxy: proxy)
   }
 
-  init(websiteDataStore: WKWebsiteDataStore, egressProxy: PinnedSOCKSProxy?) {
+  init(
+    websiteDataStore: WKWebsiteDataStore,
+    egressProxy: PinnedSOCKSProxy?,
+    managesApplicationActivationPolicy: Bool = true,
+    downloadDestinationProvider: (@MainActor @Sendable (String) async -> URL?)? = nil,
+    uploadSelectionProvider:
+      (@MainActor @Sendable (Bool, Bool) async -> [URL]?)? = nil
+  ) {
     self.egressProxy = egressProxy
+    self.managesApplicationActivationPolicy = managesApplicationActivationPolicy
+    self.downloadDestinationProvider = downloadDestinationProvider
+    self.uploadSelectionProvider = uploadSelectionProvider
     let configuration = WKWebViewConfiguration()
     let contentController = WKUserContentController()
     let world = WKContentWorld.world(name: "WebKitUIMCP.Instrumentation")
@@ -280,6 +399,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       contentWorld: world,
       name: Self.nativeGestureMessageHandlerName)
     webView.navigationDelegate = self
+    webView.uiDelegate = self
     _ = makeBrowserWindow()
   }
 
@@ -348,9 +468,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     try requireAgentControl()
     try validate(quietWindow: quietWindow)
     resetForNavigation()
+    armNavigationActor(.agentNavigation)
     let started = DispatchTime.now().uptimeNanoseconds
     webView.loadHTMLString(html, baseURL: baseURL)
     let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
+    if readiness == .deadlineReached { webView.stopLoading() }
     let state = try await instrumentationState()
     await refreshAuthenticationUIClassification()
     let loadedURL = webView.url ?? baseURL
@@ -366,7 +488,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   public func observe(
     maximumElements: Int = 200,
     elementOffset: Int = 0,
-    maximumFieldCharacters: Int = 512,
+    maximumFieldCharacters: Int = 4_096,
     roles: [String] = [],
     nameContains: String? = nil
   ) async throws -> WebKitPageObservation {
@@ -380,28 +502,31 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       of: "__MAXIMUM_ELEMENTS__",
       with: String(maximumElements)
     )
-    guard
-      let json = try await webView.callAsyncJavaScript(
-        script,
-        arguments: [
-          "roleFilters": roles.map { $0.lowercased() },
-          "nameFilter": nameContains?.lowercased() ?? "",
-          "elementOffset": elementOffset,
-          "maximumFieldCharacters": maximumFieldCharacters,
-        ],
-        in: nil,
-        contentWorld: instrumentationWorld
-      ) as? String,
-      let data = json.data(using: .utf8)
-    else {
-      throw WebKitRuntimeError.malformedInstrumentationResult
+    let arguments: [String: Any] = [
+      "roleFilters": roles.map { $0.lowercased() },
+      "nameFilter": nameContains?.lowercased() ?? "",
+      "elementOffset": elementOffset,
+      "maximumFieldCharacters": maximumFieldCharacters,
+    ]
+    func captureRawObservation() async throws -> RawObservation {
+      guard
+        let json = try await webView.callAsyncJavaScript(
+          script, arguments: arguments, in: nil, contentWorld: instrumentationWorld) as? String,
+        let data = json.data(using: .utf8),
+        let decoded = try? JSONDecoder().decode(RawObservation.self, from: data)
+      else { throw WebKitRuntimeError.malformedInstrumentationResult }
+      return decoded
     }
 
-    let raw: RawObservation
-    do {
-      raw = try JSONDecoder().decode(RawObservation.self, from: data)
-    } catch {
-      throw WebKitRuntimeError.malformedInstrumentationResult
+    webView.layoutSubtreeIfNeeded()
+    var raw = try await captureRawObservation()
+    if raw.elements.isEmpty, raw.unfilteredCandidateCount > 0 {
+      // A foreground/layout transition can leave WebKit geometry stale for one
+      // turn. Refresh locally instead of requiring a human handoff as a cache bust.
+      webView.needsLayout = true
+      webView.layoutSubtreeIfNeeded()
+      try await Task.sleep(for: .milliseconds(50))
+      raw = try await captureRawObservation()
     }
 
     let (nextGeneration, overflow) = observationGeneration.addingReportingOverflow(1)
@@ -428,8 +553,25 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       securityOrigin: origin
     )
 
+    let recipes = try raw.elements.enumerated().map { index, element in
+      let elementID = "e\(index + 1)"
+      return try locatorRecipe(
+        for: element,
+        peers: raw.elements,
+        elementID: elementID,
+        observationID: observationID,
+        generation: nextGeneration)
+    }
+    let candidates = raw.elements.map(locatorCandidate)
+    let candidateCountIsLowerBound = raw.totalElementCount > raw.elements.count
     let elements = try raw.elements.enumerated().map { index, element in
       let elementID = "e\(index + 1)"
+      let recipe = recipes[index]
+      let resolution = LocatorResolver.resolve(recipe: recipe, candidates: candidates)
+      let quality = locatorQuality(
+        recipe: recipe,
+        candidateCount: resolution.finalCandidateCount,
+        candidateCountIsLowerBound: candidateCountIsLowerBound)
       return try WebKitObservedElement(
         elementID: elementID,
         tag: ProvenancedText(text: element.tag, source: pageSource),
@@ -442,6 +584,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         value: try element.value.map {
           try ProvenancedText(text: $0, source: enteredDataSource)
         },
+        validationState: ObservedValidationState(rawValue: element.validationState)
+          ?? .notApplicable,
+        characterCount: element.characterCount,
         sensitive: element.sensitive,
         submitsForm: element.submitsForm,
         disabled: element.disabled,
@@ -453,14 +598,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         stateAttributes: try element.stateAttributes.mapValues {
           try ProvenancedText(text: $0, source: pageSource)
         },
+        contextAnchors: try element.contextAnchors.compactMap { anchor in
+          guard let kind = ObservedContextAnchorKind(rawValue: anchor.kind) else { return nil }
+          return ObservedContextAnchor(
+            kind: kind,
+            text: try ProvenancedText(text: anchor.text, source: pageSource))
+        },
+        stableAttributes: try element.stableAttributes.mapValues {
+          try ProvenancedText(text: $0, source: pageSource)
+        },
         visible: element.visible,
         boundingBox: element.boundingBox,
-        locatorRecipe: try locatorRecipe(
-          for: element,
-          elementID: elementID,
-          observationID: observationID,
-          generation: nextGeneration
-        )
+        locatorRecipe: recipe,
+        locatorQuality: quality
       )
     }
     latestObservationID = observationID
@@ -473,6 +623,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
             physicalIdentity: rawElement.physicalIdentity,
             boundingBox: rawElement.boundingBox,
             sensitive: rawElement.sensitive,
+            disabled: rawElement.disabled,
             observedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
           )
         )
@@ -520,14 +671,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   ) async throws -> WebKitScrollResult {
     try requireAgentControl()
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    let criteria = locatorCriteria(recipe, expectedEnabled: !target.disabled)
     let resolution = try await resolveTarget(
-      criteria: locatorCriteria(recipe), scrollIntoView: true)
+      criteria: criteria, scrollIntoView: true)
     guard resolution.count == 1 else {
       throw WebKitRuntimeError.targetNotUnique(resolution.count)
     }
     return try await performScroll(
       source: Self.nearestScrollStateSource,
-      arguments: ["criteria": locatorCriteria(recipe)]
+      arguments: ["criteria": criteria]
     )
   }
 
@@ -785,8 +938,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     elementID: String
   ) async throws -> LocatorResolution {
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
     let resolution = try await resolveTarget(
-      criteria: locatorCriteria(recipe), scrollIntoView: false)
+      criteria: locatorCriteria(recipe, expectedEnabled: !target.disabled), scrollIntoView: false)
     return LocatorResolution(
       recipeElementID: elementID,
       evaluations: (0..<resolution.count).map {
@@ -812,7 +966,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
 
-    let criteria = locatorCriteria(target.recipe)
+    let criteria = locatorCriteria(target.recipe, expectedEnabled: !target.disabled)
     let first = try await resolveTarget(criteria: criteria, scrollIntoView: true)
     try recordCardinality(first.count, target: target)
     guard let firstCandidate = first.candidate else {
@@ -841,6 +995,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       value = nil
     }
 
+    armNavigationActor(.agentAction)
     let second: RawActionResolution
     if dispatchMode == .nativeAppKit, operationName == "click" {
       second = try await resolveAndPerformNativeClick(
@@ -848,6 +1003,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     } else if dispatchMode == .nativeAppKit, operationName == "press_key", let value {
       second = try await resolveAndPerformNativeKey(
         criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox, key: value)
+    } else if dispatchMode == .nativeAppKit, operationName == "fill", let value {
+      second = try await resolveAndPerformNativeFill(
+        criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox, value: value)
     } else {
       second = try await resolveAndPerform(
         criteria: criteria,
@@ -890,17 +1048,193 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       dispatched: true,
       trustedUserGesture: candidate.trustedUserGesture,
       dispatchMode: dispatchMode == .nativeAppKit
-        && (operationName == "click" || operationName == "press_key")
+        && (operationName == "click" || operationName == "press_key" || operationName == "fill")
         ? .nativeAppKit : .javascript,
       actionMonotonicNanoseconds: actionTime
     )
     if controlState == .freshlyReobserved {
       transition(to: .agentControlled, observationID: observationID)
     }
+    if armedNavigationActor?.actor == .agentAction {
+      armedNavigationActor = nil
+    }
     return result
   }
 
   public func interactionControlState() -> InteractionControlState { controlState }
+
+  public func latestNavigationAuditEvent() -> WebKitNavigationAuditEvent? {
+    navigationAuditEvents.last
+  }
+
+  public func navigationAuditEventCount() -> Int { navigationAuditEvents.count }
+
+  public func latestFileUploadReceipt() -> WebKitFileUploadReceipt? {
+    lastUploadReceipt
+  }
+
+  public func isFilePickerVisible() -> Bool { filePickerVisible }
+
+  public func webView(
+    _ webView: WKWebView,
+    runOpenPanelWith parameters: WKOpenPanelParameters,
+    initiatedByFrame frame: WKFrameInfo
+  ) async -> [URL]? {
+    filePickerVisible = true
+    defer { filePickerVisible = false }
+    let selectedURLs: [URL]?
+    if let uploadSelectionProvider {
+      selectedURLs = await uploadSelectionProvider(
+        parameters.allowsMultipleSelection, parameters.allowsDirectories)
+    } else {
+      let panel = NSOpenPanel()
+      panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+      panel.canChooseDirectories = false
+      panel.canChooseFiles = true
+      panel.resolvesAliases = true
+      panel.message =
+        "Choose the exact local file. Its name, size, and SHA-256 will be returned to the MCP client; its local path and contents will not."
+      panel.prompt = "Choose"
+      let response: NSApplication.ModalResponse
+      if let window = browserWindow, window.isVisible {
+        response = await withCheckedContinuation { continuation in
+          panel.beginSheetModal(for: window) { continuation.resume(returning: $0) }
+        }
+      } else {
+        NSApp.activate()
+        response = await withCheckedContinuation { continuation in
+          panel.begin { continuation.resume(returning: $0) }
+        }
+      }
+      selectedURLs = response == .OK ? panel.urls : nil
+    }
+    guard let selectedURLs, !selectedURLs.isEmpty, selectedURLs.count <= 10 else {
+      lastUploadReceipt = nil
+      return nil
+    }
+
+    var filenames: [String] = []
+    var byteCounts: [UInt64] = []
+    var digests: [String] = []
+    for url in selectedURLs {
+      guard let filename = Self.safeUploadFilename(url.lastPathComponent) else {
+        lastUploadReceipt = nil
+        return nil
+      }
+      guard url.isFileURL,
+        let values = try? url.resourceValues(forKeys: [
+          .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
+        ]),
+        values.isRegularFile == true, values.isSymbolicLink != true,
+        let size = values.fileSize, (0...52_428_800).contains(size),
+        let data = try? Data(contentsOf: url, options: [.mappedIfSafe])
+      else {
+        lastUploadReceipt = nil
+        return nil
+      }
+      filenames.append(filename)
+      byteCounts.append(UInt64(data.count))
+      digests.append(
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
+    }
+    lastUploadReceipt = WebKitFileUploadReceipt(
+      filenames: filenames,
+      byteCounts: byteCounts,
+      sha256: digests,
+      fileCount: selectedURLs.count,
+      selectedByHuman: uploadSelectionProvider == nil,
+      localPathsExposed: false,
+      monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    return selectedURLs
+  }
+
+  public func download(
+    observationID: String,
+    elementID: String,
+    expectedProvisioningProfileUUID: String? = nil,
+    timeout: Duration = .seconds(120)
+  ) async throws -> WebKitDownloadReceipt {
+    try requireAgentControl()
+    guard downloadContinuation == nil else { throw WebKitRuntimeError.downloadInProgress }
+    guard let currentURL = webView.url, let origin = navigationOrigin(for: currentURL) else {
+      throw WebKitRuntimeError.noDocument
+    }
+    return try await beginDownloadRequest(
+      origin: origin,
+      expectedProvisioningProfileUUID: expectedProvisioningProfileUUID,
+      timeout: timeout
+    ) {
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        do {
+          _ = try await self.perform(
+            observationID: observationID,
+            elementID: elementID,
+            operation: .click,
+            dispatchMode: .nativeAppKit)
+          self.downloadActionVerified = true
+          if let receipt = self.completedDownloadReceipt {
+            self.finishDownload(.success(receipt))
+          }
+        } catch {
+          self.finishDownload(.failure(error))
+        }
+      }
+    }
+  }
+
+  public func download(
+    url: URL,
+    expectedProvisioningProfileUUID: String? = nil,
+    timeout: Duration = .seconds(120)
+  ) async throws -> WebKitDownloadReceipt {
+    try requireAgentControl()
+    guard downloadContinuation == nil else { throw WebKitRuntimeError.downloadInProgress }
+    guard let currentURL = webView.url, let origin = navigationOrigin(for: currentURL) else {
+      throw WebKitRuntimeError.noDocument
+    }
+    guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+      throw WebKitRuntimeError.unsupportedURLScheme
+    }
+    guard navigationOrigin(for: url) == origin else {
+      throw WebKitRuntimeError.networkBoundaryDenied
+    }
+    return try await beginDownloadRequest(
+      origin: origin,
+      expectedProvisioningProfileUUID: expectedProvisioningProfileUUID,
+      timeout: timeout
+    ) {
+      downloadActionVerified = true
+      webView.load(URLRequest(url: url))
+    }
+  }
+
+  private func beginDownloadRequest(
+    origin: SecurityOrigin,
+    expectedProvisioningProfileUUID: String?,
+    timeout: Duration,
+    trigger: () -> Void
+  ) async throws -> WebKitDownloadReceipt {
+    try await withCheckedThrowingContinuation { continuation in
+      downloadContinuation = continuation
+      downloadExpectedOrigin = origin
+      downloadDestination = nil
+      downloadMIMEType = nil
+      downloadHTTPStatus = nil
+      downloadSuggestedFilename = nil
+      downloadExpectedProvisioningProfileUUID = expectedProvisioningProfileUUID
+      downloadStarted = false
+      downloadActionVerified = false
+      completedDownloadReceipt = nil
+      downloadTimeoutTask = Task { @MainActor [weak self] in
+        try? await Task.sleep(for: timeout)
+        guard let self else { return }
+        self.finishDownload(
+          .failure(WebKitRuntimeError.downloadReceiptTimedOut(started: self.downloadStarted)))
+      }
+      trigger()
+    }
+  }
 
   public func userContentController(
     _ userContentController: WKUserContentController,
@@ -927,6 +1261,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     )
   }
 
+  /// Returns the exact private URL only to the in-process compatibility
+  /// presenter. Callers must never serialize, log, or place it in an MCP
+  /// confirmation; paths and queries may contain authentication state.
+  public func privateFullBrowserHandoffURL() throws -> URL {
+    guard
+      authenticationRestrictionStatus()?.classification == .fullBrowserRequired,
+      let url = webView.url ?? lastCommittedHTTPURL,
+      url.scheme?.lowercased() == "https",
+      url.host != nil
+    else { throw WebKitRuntimeError.authenticationOriginRequiresHuman("unavailable") }
+    return url
+  }
+
   public func authenticationEnvironmentSnapshot() -> AuthenticationEnvironmentSnapshot {
     AuthenticationEnvironmentSnapshot(
       persistentWebsiteDataStore: webView.configuration.websiteDataStore.isPersistent,
@@ -935,7 +1282,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         !(webView.configuration.applicationNameForUserAgent?.isEmpty ?? true),
       pinnedProxyConfigured: egressProxy != nil,
       contentBlockingConfigured: false,
-      customProcessPoolConfigured: false
+      customProcessPoolConfigured: false,
+      webAuthnAnyRelyingPartyEntitlementConfigured:
+        Self.webAuthnAnyRelyingPartyEntitlementConfigured()
     )
   }
 
@@ -982,12 +1331,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
     topLevelOriginLock = nil
-    if presentWindow { presentHumanControlWindow() }
     transition(to: .humanControlled, observationID: nil)
+    if presentWindow { presentHumanControlWindow() }
+  }
+
+  public func markHumanStepCompleted() throws {
+    guard controlState == .humanControlled else {
+      throw WebKitRuntimeError.invalidControlTransition
+    }
+    transition(to: .humanStepCompleted, observationID: nil)
+  }
+
+  public func humanStepCompletionMonotonicNanoseconds() -> UInt64? {
+    handoffEvents.last(where: { $0.to == .humanStepCompleted })?.monotonicNanoseconds
   }
 
   public func requestAgentResume() throws {
-    guard controlState == .humanControlled else {
+    guard controlState == .humanControlled || controlState == .humanStepCompleted else {
       throw WebKitRuntimeError.invalidControlTransition
     }
     if let origin = restrictedAuthenticationOrigin() {
@@ -1000,7 +1360,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       window.collectionBehavior.insert(.stationary)
       window.collectionBehavior.insert(.ignoresCycle)
     }
-    NSApplication.shared.setActivationPolicy(.accessory)
+    if managesApplicationActivationPolicy {
+      NSApplication.shared.setActivationPolicy(.accessory)
+    }
     topLevelOriginLock = (webView.url ?? lastCommittedHTTPURL).flatMap {
       navigationOrigin(for: $0)
     }
@@ -1025,24 +1387,29 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   private func presentHumanControlWindow() {
     let application = NSApplication.shared
     WebKitNativeApplicationMenu.install(on: application)
-    application.finishLaunching()
-    application.setActivationPolicy(.regular)
+    if managesApplicationActivationPolicy {
+      application.finishLaunching()
+      application.setActivationPolicy(.regular)
+    }
     application.applicationIconImage = Self.humanControlApplicationIcon()
     let window = browserWindow ?? makeBrowserWindow()
     if webView.url == nil, lastCommittedHTTPURL == nil, !webView.isLoading {
       webView.loadHTMLString(Self.emptyHandoffDocument, baseURL: nil)
     }
-    window.title = "WebkitUIMCP — Human control"
+    window.title = Self.localizedHandoff(
+      "WebkitUIMCP — Human control", fallback: "WebkitUIMCP — Human control")
     window.ignoresMouseEvents = false
     window.collectionBehavior.remove(.stationary)
     window.collectionBehavior.remove(.ignoresCycle)
     window.collectionBehavior.insert(.moveToActiveSpace)
     webView.isHidden = false
     webView.alphaValue = 1
-    attachWebView(to: window)
+    attachHumanControlView(to: window)
     window.makeKeyAndOrderFront(nil)
     window.orderFrontRegardless()
-    application.activate(ignoringOtherApps: true)
+    if managesApplicationActivationPolicy {
+      application.activate(ignoringOtherApps: true)
+    }
     window.makeFirstResponder(webView)
     window.displayIfNeeded()
   }
@@ -1078,6 +1445,108 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     webView.needsLayout = true
     webView.needsDisplay = true
     webView.layoutSubtreeIfNeeded()
+  }
+
+  private func attachHumanControlView(to window: NSWindow) {
+    webView.removeFromSuperview()
+    window.contentViewController = nil
+    let root = NSView()
+    let bar = NSVisualEffectView()
+    bar.material = .headerView
+    bar.blendingMode = .withinWindow
+    bar.state = .active
+    let instruction = NSTextField(
+      labelWithString: Self.localizedHandoff(
+        "Complete the private step, then return control explicitly.",
+        fallback: "Complete the private step, then return control explicitly."))
+    instruction.textColor = .secondaryLabelColor
+    instruction.setAccessibilityIdentifier("webkitui.handoff.status")
+    let done = NSButton(
+      title: Self.localizedHandoff(
+        "Done — Return Control", fallback: "Done — Return Control"),
+      target: self,
+      action: #selector(completeHumanStep))
+    done.bezelStyle = .rounded
+    done.bezelColor = .controlAccentColor
+    done.setAccessibilityIdentifier("webkitui.handoff.done")
+    done.setAccessibilityHelp(
+      Self.localizedHandoff(
+        "Marks the private step complete so the requesting agent can resume this session.",
+        fallback:
+          "Marks the private step complete so the requesting agent can resume this session."))
+    let controls = NSStackView(views: [instruction, done])
+    controls.orientation = .horizontal
+    controls.alignment = .centerY
+    controls.distribution = .fill
+    controls.spacing = 12
+    controls.translatesAutoresizingMaskIntoConstraints = false
+    webView.translatesAutoresizingMaskIntoConstraints = false
+    bar.translatesAutoresizingMaskIntoConstraints = false
+    root.addSubview(webView)
+    root.addSubview(bar)
+    bar.addSubview(controls)
+    window.contentView = root
+    humanControlInstruction = instruction
+    humanControlCompletionButton = done
+    NSLayoutConstraint.activate([
+      webView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+      webView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+      webView.topAnchor.constraint(equalTo: root.topAnchor),
+      webView.bottomAnchor.constraint(equalTo: bar.topAnchor),
+      bar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+      bar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+      bar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+      bar.heightAnchor.constraint(equalToConstant: 54),
+      controls.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 16),
+      controls.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -16),
+      controls.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+    ])
+  }
+
+  @objc private func completeHumanStep() {
+    do {
+      try markHumanStepCompleted()
+      humanControlInstruction?.stringValue =
+        Self.localizedHandoff(
+          "Private step complete. Waiting for the requesting agent to resume.",
+          fallback: "Private step complete. Waiting for the requesting agent to resume.")
+      humanControlInstruction?.textColor = .systemGreen
+      humanControlCompletionButton?.title = Self.localizedHandoff(
+        "Ready — Waiting for Agent", fallback: "Ready — Waiting for Agent")
+      humanControlCompletionButton?.isEnabled = false
+      humanControlCompletionButton?.setAccessibilityLabel(
+        Self.localizedHandoff(
+          "Private step complete; waiting for the requesting agent",
+          fallback: "Private step complete; waiting for the requesting agent"))
+      if let button = humanControlCompletionButton {
+        NSAccessibility.post(element: button, notification: .valueChanged)
+      }
+      Self.handoffLogger.notice("Human handoff completion accepted")
+    } catch {
+      humanControlInstruction?.stringValue =
+        Self.localizedHandoff(
+          "Control could not be returned. Keep this window open and try again.",
+          fallback: "Control could not be returned. Keep this window open and try again.")
+      humanControlInstruction?.textColor = .systemRed
+      humanControlCompletionButton?.title = Self.localizedHandoff(
+        "Try Again — Return Control", fallback: "Try Again — Return Control")
+      humanControlCompletionButton?.isEnabled = true
+      humanControlCompletionButton?.setAccessibilityLabel(
+        Self.localizedHandoff(
+          "Return control failed; try again", fallback: "Return control failed; try again"))
+      if let button = humanControlCompletionButton {
+        NSAccessibility.post(element: button, notification: .valueChanged)
+      }
+      Self.handoffLogger.error(
+        "Human handoff completion rejected: \(String(describing: error), privacy: .public)")
+    }
+  }
+
+  private static let handoffLogger = Logger(
+    subsystem: "com.lorislab.webkitui-mcp", category: "human-handoff")
+
+  private static func localizedHandoff(_ key: String, fallback: String) -> String {
+    Bundle.main.localizedString(forKey: key, value: fallback, table: nil)
   }
 
   private static func humanControlApplicationIcon() -> NSImage? {
@@ -1198,7 +1667,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         authenticationUIClassification = .fullBrowserRequired
       }
     }
-    guard let lockedOrigin = topLevelOriginLock else { return .allow }
+    if let expectedOrigin = downloadExpectedOrigin {
+      guard let targetURL = navigationAction.request.url,
+        navigationOrigin(for: targetURL) == expectedOrigin
+      else {
+        finishDownload(.failure(WebKitRuntimeError.networkBoundaryDenied))
+        return .cancel
+      }
+      if navigationAction.shouldPerformDownload { return .download }
+    }
+    guard let lockedOrigin = topLevelOriginLock else {
+      recordNavigationAudit(navigationAction, allowed: true)
+      return .allow
+    }
     guard navigationAction.targetFrame?.isMainFrame == true else {
       return navigationAction.targetFrame == nil ? .cancel : .allow
     }
@@ -1215,16 +1696,65 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         fromOrigin: Self.sanitizedOrigin(lockedOrigin),
         toOrigin: targetOrigin.map(Self.sanitizedOrigin) ?? "unavailable"
       )
+      recordNavigationAudit(navigationAction, allowed: false)
       return .cancel
     }
+    recordNavigationAudit(navigationAction, allowed: true)
     return .allow
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    decidePolicyFor navigationResponse: WKNavigationResponse
+  ) async -> WKNavigationResponsePolicy {
+    guard downloadContinuation != nil else { return .allow }
+    guard let responseURL = navigationResponse.response.url,
+      let expectedOrigin = downloadExpectedOrigin,
+      navigationOrigin(for: responseURL) == expectedOrigin
+    else {
+      finishDownload(.failure(WebKitRuntimeError.networkBoundaryDenied))
+      return .cancel
+    }
+    let disposition =
+      (navigationResponse.response as? HTTPURLResponse)?
+      .value(forHTTPHeaderField: "Content-Disposition")?.lowercased() ?? ""
+    if let response = navigationResponse.response as? HTTPURLResponse {
+      downloadHTTPStatus = response.statusCode
+      guard (200...299).contains(response.statusCode) else {
+        finishDownload(
+          .failure(WebKitRuntimeError.downloadHTTPFailure(status: response.statusCode)))
+        return .cancel
+      }
+    }
+    if !navigationResponse.canShowMIMEType || disposition.contains("attachment") {
+      return .download
+    }
+    finishDownload(
+      .failure(WebKitRuntimeError.unsupportedDownload(httpStatus: downloadHTTPStatus)))
+    return .cancel
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    navigationAction: WKNavigationAction,
+    didBecome download: WKDownload
+  ) {
+    beginDownload(download)
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    navigationResponse: WKNavigationResponse,
+    didBecome download: WKDownload
+  ) {
+    beginDownload(download)
   }
 
   public func webView(
     _ webView: WKWebView,
     didStartProvisionalNavigation navigation: WKNavigation!
   ) {
-    resetForNavigation()
+    if downloadContinuation == nil { resetForNavigation() }
   }
 
   public func webView(
@@ -1232,7 +1762,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     didFail navigation: WKNavigation!,
     withError error: any Error
   ) {
-    if navigationFailure == nil {
+    if navigationFailure == nil && !(downloadStarted && Self.isDownloadCancellation(error)) {
       navigationFailure = Self.sanitizedNavigationFailure(error)
     }
   }
@@ -1242,9 +1772,210 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     didFailProvisionalNavigation navigation: WKNavigation!,
     withError error: any Error
   ) {
-    if navigationFailure == nil {
+    if navigationFailure == nil && !(downloadStarted && Self.isDownloadCancellation(error)) {
       navigationFailure = Self.sanitizedNavigationFailure(error)
     }
+  }
+
+  public func download(
+    _ download: WKDownload,
+    decideDestinationUsing response: URLResponse,
+    suggestedFilename: String,
+    completionHandler: @escaping @MainActor (URL?) -> Void
+  ) {
+    guard download === activeDownload, downloadContinuation != nil else {
+      completionHandler(nil)
+      return
+    }
+    downloadMIMEType = response.mimeType
+    downloadHTTPStatus = (response as? HTTPURLResponse)?.statusCode ?? downloadHTTPStatus
+    downloadSuggestedFilename = Self.safeSuggestedFilename(suggestedFilename)
+    Task { @MainActor [weak self] in
+      guard let self else {
+        completionHandler(nil)
+        return
+      }
+      let proposed = await self.proposedDownloadDestination(suggestedFilename: suggestedFilename)
+      guard let proposed else {
+        completionHandler(nil)
+        self.finishDownload(.failure(WebKitRuntimeError.downloadCancelled))
+        return
+      }
+      let destination = Self.collisionSafeDestination(for: proposed)
+      self.downloadDestination = destination
+      completionHandler(destination)
+    }
+  }
+
+  public func downloadDidFinish(_ download: WKDownload) {
+    guard download === activeDownload, let destination = downloadDestination else { return }
+    do {
+      let data = try Data(contentsOf: destination, options: .mappedIfSafe)
+      let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+      let profileUUID = Self.provisioningProfileUUID(from: data)
+      if let expected = downloadExpectedProvisioningProfileUUID,
+        profileUUID?.localizedCaseInsensitiveCompare(expected) != .orderedSame
+      {
+        finishDownload(
+          .failure(WebKitRuntimeError.downloadFailed("provisioning_profile_uuid_mismatch")))
+        return
+      }
+      let receipt = WebKitDownloadReceipt(
+        httpStatus: downloadHTTPStatus,
+        suggestedFilename: downloadSuggestedFilename ?? destination.lastPathComponent,
+        filename: destination.lastPathComponent,
+        mimeType: downloadMIMEType,
+        byteCount: UInt64(data.count),
+        sha256: digest,
+        provisioningProfileUUID: profileUUID)
+      if downloadActionVerified {
+        finishDownload(.success(receipt))
+      } else {
+        completedDownloadReceipt = receipt
+      }
+    } catch {
+      finishDownload(.failure(WebKitRuntimeError.downloadFailed("integrity_receipt_unavailable")))
+    }
+  }
+
+  public func download(
+    _ download: WKDownload,
+    didFailWithError error: any Error,
+    resumeData: Data?
+  ) {
+    guard download === activeDownload else { return }
+    if let destination = downloadDestination {
+      try? FileManager.default.removeItem(at: destination)
+    }
+    finishDownload(.failure(WebKitRuntimeError.downloadFailed(Self.sanitizedError(error))))
+  }
+
+  public func download(
+    _ download: WKDownload,
+    decidedPolicyForHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest
+  ) async -> WKDownload.RedirectPolicy {
+    guard download === activeDownload,
+      let expectedOrigin = downloadExpectedOrigin,
+      let url = request.url,
+      navigationOrigin(for: url) == expectedOrigin
+    else { return .cancel }
+    return .allow
+  }
+
+  private func beginDownload(_ download: WKDownload) {
+    guard downloadContinuation != nil else {
+      download.cancel { _ in }
+      return
+    }
+    downloadStarted = true
+    activeDownload = download
+    download.delegate = self
+    navigationFailure = nil
+  }
+
+  private func proposedDownloadDestination(suggestedFilename: String) async -> URL? {
+    let filename = Self.safeSuggestedFilename(suggestedFilename)
+    if let downloadDestinationProvider {
+      return await downloadDestinationProvider(filename)
+    }
+    let panel = NSSavePanel()
+    panel.title = "Save Browser Download"
+    panel.prompt = "Save"
+    panel.canCreateDirectories = true
+    panel.nameFieldStringValue = filename
+    return panel.runModal() == .OK ? panel.url : nil
+  }
+
+  private func finishDownload(_ result: Result<WebKitDownloadReceipt, any Error>) {
+    guard let continuation = downloadContinuation else { return }
+    if case .failure = result, let downloadDestination {
+      try? FileManager.default.removeItem(at: downloadDestination)
+    }
+    downloadTimeoutTask?.cancel()
+    downloadTimeoutTask = nil
+    downloadContinuation = nil
+    downloadExpectedOrigin = nil
+    downloadDestination = nil
+    downloadMIMEType = nil
+    downloadHTTPStatus = nil
+    downloadSuggestedFilename = nil
+    downloadExpectedProvisioningProfileUUID = nil
+    downloadStarted = false
+    downloadActionVerified = false
+    completedDownloadReceipt = nil
+    activeDownload = nil
+    continuation.resume(with: result)
+  }
+
+  private static func safeSuggestedFilename(_ value: String) -> String {
+    let component = URL(fileURLWithPath: value).lastPathComponent
+      .filter { !$0.isNewline && !$0.isASCII || ($0.asciiValue.map { $0 >= 32 } ?? false) }
+    return component.isEmpty || component == "." || component == ".." ? "download" : component
+  }
+
+  private static func safeUploadFilename(_ value: String) -> String? {
+    guard !value.isEmpty, value.count <= 255, value != ".", value != ".." else { return nil }
+    let bidiControls: Set<UInt32> = [
+      0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+      0x2066, 0x2067, 0x2068, 0x2069,
+    ]
+    let rejected = CharacterSet.controlCharacters.union(.illegalCharacters)
+    guard
+      value.unicodeScalars.allSatisfy({
+        !rejected.contains($0) && !bidiControls.contains($0.value)
+      })
+    else { return nil }
+    return value
+  }
+
+  static func provisioningProfileUUID(from data: Data) -> String? {
+    if let value = propertyListUUID(from: data) { return value }
+    guard !data.isEmpty else { return nil }
+    var decoder: CMSDecoder?
+    guard CMSDecoderCreate(&decoder) == errSecSuccess, let decoder else { return nil }
+    let updateStatus = data.withUnsafeBytes { bytes in
+      CMSDecoderUpdateMessage(decoder, bytes.baseAddress!, bytes.count)
+    }
+    guard updateStatus == errSecSuccess,
+      CMSDecoderFinalizeMessage(decoder) == errSecSuccess
+    else { return nil }
+    var content: CFData?
+    guard CMSDecoderCopyContent(decoder, &content) == errSecSuccess, let content else { return nil }
+    return propertyListUUID(from: content as Data)
+  }
+
+  private static func propertyListUUID(from data: Data) -> String? {
+    guard
+      let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+      let dictionary = plist as? [String: Any],
+      let uuid = dictionary["UUID"] as? String,
+      !uuid.isEmpty
+    else { return nil }
+    return uuid
+  }
+
+  private static func collisionSafeDestination(for requested: URL) -> URL {
+    guard FileManager.default.fileExists(atPath: requested.path) else { return requested }
+    let directory = requested.deletingLastPathComponent()
+    let extensionName = requested.pathExtension
+    let stem = requested.deletingPathExtension().lastPathComponent
+    for index in 2...10_000 {
+      let name = extensionName.isEmpty ? "\(stem) \(index)" : "\(stem) \(index).\(extensionName)"
+      let candidate = directory.appendingPathComponent(name, isDirectory: false)
+      if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+    }
+    return directory.appendingPathComponent("\(UUID().uuidString)-\(requested.lastPathComponent)")
+  }
+
+  private static func isDownloadCancellation(_ error: any Error) -> Bool {
+    let error = error as NSError
+    return error.domain == WKError.errorDomain && error.code == 102
+  }
+
+  private static func sanitizedError(_ error: any Error) -> String {
+    let error = error as NSError
+    return "\(error.domain) code=\(error.code)"
   }
 
   private func load(
@@ -1254,9 +1985,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   ) async throws -> WebKitNavigationResult {
     try validate(quietWindow: quietWindow)
     resetForNavigation()
+    armNavigationActor(.agentNavigation)
     let started = DispatchTime.now().uptimeNanoseconds
     webView.load(request)
     let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
+    if readiness == .deadlineReached { webView.stopLoading() }
     let state = try await instrumentationState()
     await refreshAuthenticationUIClassification()
     rememberRecoverableURL(webView.url ?? request.url)
@@ -1271,8 +2004,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     )
   }
 
-  private func locatorCriteria(_ recipe: LocatorRecipe) -> [[String: String]] {
-    recipe.clauses.map { clause in
+  private func locatorCriteria(
+    _ recipe: LocatorRecipe,
+    expectedEnabled: Bool? = nil
+  ) -> [[String: String]] {
+    var criteria = recipe.clauses.map { clause in
       let fact: String
       let argument: String
       switch clause.fact {
@@ -1309,6 +2045,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         "comparison": clause.comparison.rawValue,
       ]
     }
+    if let expectedEnabled {
+      criteria.append([
+        "fact": "enabled",
+        "argument": "",
+        "expected": String(expectedEnabled),
+        "strength": "required",
+        "comparison": "exact",
+      ])
+    }
+    return criteria
   }
 
   private func resolveTarget(
@@ -1456,6 +2202,53 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     throw WebKitRuntimeError.nativeGestureReceiptUnavailable
   }
 
+  private func resolveAndPerformNativeFill(
+    criteria: [[String: String]],
+    expectedBoundingBox: ObservedBoundingBox,
+    value: String
+  ) async throws -> RawActionResolution {
+    guard let window = webView.window, window.makeFirstResponder(webView) else {
+      throw WebKitRuntimeError.targetNotActionable
+    }
+    let token = UUID().uuidString
+    armedNativeGestureTokens.insert(token)
+    defer {
+      armedNativeGestureTokens.remove(token)
+      nativeGestureReceipts.removeValue(forKey: token)
+    }
+    let armed = try await actionScript(
+      source: Self.armNativeFillSource,
+      arguments: [
+        "criteria": criteria,
+        "expectedBox": Self.boxDictionary(expectedBoundingBox),
+        "token": token,
+      ])
+    guard armed.count == 1, let candidate = armed.candidate else { return armed }
+    guard candidate.geometryStable, candidate.actionable else { return armed }
+
+    webView.insertText(value)
+    let deadline = ContinuousClock.now + .seconds(1)
+    while ContinuousClock.now < deadline {
+      if let receipt = nativeGestureReceipts[token],
+        receipt.physicalIdentity == candidate.physicalIdentity,
+        receipt.eventType == "input"
+      {
+        return RawActionResolution(
+          count: armed.count,
+          candidate: RawActionCandidate(
+            physicalIdentity: candidate.physicalIdentity,
+            boundingBox: candidate.boundingBox,
+            geometryStable: candidate.geometryStable,
+            actionable: candidate.actionable,
+            dispatched: true,
+            trustedUserGesture: receipt.trusted
+          ))
+      }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw WebKitRuntimeError.nativeGestureReceiptUnavailable
+  }
+
   private func dispatchNativeKey(_ key: String) throws {
     guard let window = webView.window else { throw WebKitRuntimeError.targetNotActionable }
     let mapping: (characters: String, keyCode: UInt16)
@@ -1545,7 +2338,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   }
 
   private func requireObservationControl() throws {
-    guard controlState != .handoffRequested, controlState != .humanControlled else {
+    guard
+      controlState != .handoffRequested,
+      controlState != .humanControlled,
+      controlState != .humanStepCompleted
+    else {
       throw WebKitRuntimeError.humanControlActive
     }
     try requireNonAuthenticationOrigin()
@@ -1577,9 +2374,56 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     processTerminated = false
     authenticationUIClassification = nil
     restrictedAuthenticationFrameOrigin = nil
+    restrictedWebAuthnOrigin = nil
     pendingCrossOriginNavigationRequest = nil
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
+  }
+
+  private func armNavigationActor(_ actor: WebKitNavigationActor) {
+    let now = DispatchTime.now().uptimeNanoseconds
+    let (expiry, overflow) = now.addingReportingOverflow(2_000_000_000)
+    armedNavigationActor = (actor, overflow ? UInt64.max : expiry)
+  }
+
+  private func recordNavigationAudit(
+    _ action: WKNavigationAction,
+    allowed: Bool
+  ) {
+    guard action.targetFrame?.isMainFrame == true else { return }
+    let now = DispatchTime.now().uptimeNanoseconds
+    let actor: WebKitNavigationActor
+    if controlState == .humanControlled || controlState == .humanStepCompleted {
+      actor = .human
+    } else if let armedNavigationActor, now <= armedNavigationActor.expiresAt {
+      actor = armedNavigationActor.actor
+    } else if action.sourceFrame.isMainFrame {
+      actor = .webContent
+    } else {
+      actor = .unattributed
+    }
+    armedNavigationActor = nil
+    let navigationType: String
+    switch action.navigationType {
+    case .linkActivated: navigationType = "link_activated"
+    case .formSubmitted: navigationType = "form_submitted"
+    case .backForward: navigationType = "back_forward"
+    case .reload: navigationType = "reload"
+    case .formResubmitted: navigationType = "form_resubmitted"
+    case .other: navigationType = "other"
+    @unknown default: navigationType = "unknown"
+    }
+    navigationAuditEvents.append(
+      WebKitNavigationAuditEvent(
+        fromOrigin: webView.url.flatMap(Self.sanitizedOrigin(for:)),
+        toOrigin: action.request.url.flatMap(Self.sanitizedOrigin(for:)),
+        actor: actor,
+        navigationType: navigationType,
+        allowed: allowed,
+        monotonicNanoseconds: now))
+    if navigationAuditEvents.count > 128 {
+      navigationAuditEvents.removeFirst(navigationAuditEvents.count - 128)
+    }
   }
 
   private func navigationOrigin(for url: URL) -> SecurityOrigin? {
@@ -1600,7 +2444,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     {
       return Self.sanitizedOrigin(for: url)
     }
-    return restrictedAuthenticationFrameOrigin
+    return restrictedAuthenticationFrameOrigin ?? restrictedWebAuthnOrigin
   }
 
   private func agentSafeURLString(_ url: URL?) -> String? {
@@ -1632,8 +2476,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   }
 
   private func refreshAuthenticationUIClassification() async {
-    guard restrictedAuthenticationOrigin() != nil else {
-      authenticationUIClassification = nil
+    restrictedWebAuthnOrigin = nil
+    if let url = webView.url ?? lastCommittedHTTPURL,
+      url.scheme?.lowercased() == "https",
+      url.host?.lowercased() == "dash.cloudflare.com",
+      url.path == "/two-factor"
+    {
+      restrictedWebAuthnOrigin = Self.sanitizedOrigin(for: url)
+      authenticationUIClassification = .fullBrowserRequired
       return
     }
     guard
@@ -1646,7 +2496,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       let data = json.data(using: .utf8),
       let state = try? JSONDecoder().decode(RawAuthenticationUIState.self, from: data)
     else {
-      authenticationUIClassification = .humanHandoffRequired
+      authenticationUIClassification =
+        restrictedAuthenticationOrigin() == nil ? nil : .humanHandoffRequired
+      return
+    }
+    if state.hasWebAuthnControl,
+      !Self.webAuthnAnyRelyingPartyEntitlementConfigured(),
+      let url = webView.url ?? lastCommittedHTTPURL
+    {
+      restrictedWebAuthnOrigin = Self.sanitizedOrigin(for: url)
+      authenticationUIClassification = .fullBrowserRequired
+      return
+    }
+    guard restrictedAuthenticationOrigin() != nil else {
+      authenticationUIClassification = nil
       return
     }
     if Self.requiresFullBrowserBackend(
@@ -1685,6 +2548,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       let childHost = URL(string: restrictedFrameOrigin)?.host?.lowercased()
     else { return false }
     return fullBrowserAuthenticationParents[parentHost]?.contains(childHost) == true
+  }
+
+  private static func webAuthnAnyRelyingPartyEntitlementConfigured() -> Bool {
+    guard
+      let task = SecTaskCreateFromSelf(nil),
+      let value = SecTaskCopyValueForEntitlement(
+        task,
+        "com.apple.developer.web-browser.public-key-credential" as CFString,
+        nil
+      )
+    else { return false }
+    return (value as? Bool) == true
   }
 
   private func rememberRecoverableURL(_ url: URL?) {
@@ -1746,6 +2621,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private func locatorRecipe(
     for element: RawElement,
+    peers: [RawElement],
     elementID: String,
     observationID: String,
     generation: UInt64
@@ -1773,6 +2649,45 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           comparison: .whitespaceCollapsed
         )
       )
+    }
+    let basePeerCount = peers.filter {
+      $0.role == element.role
+        && $0.accessibleName == element.accessibleName
+        && $0.label == element.label
+    }.count
+    let uniquelyIdentifyingAnchor = element.contextAnchors.first { anchor in
+      guard basePeerCount > 1 else { return false }
+      guard !anchor.text.isEmpty else { return false }
+      let matchingPeers = peers.filter { peer in
+        peer.role == element.role
+          && peer.accessibleName == element.accessibleName
+          && peer.label == element.label
+          && peer.contextAnchors.contains(where: {
+            $0.kind == anchor.kind && $0.text == anchor.text
+          })
+      }
+      return matchingPeers.count == 1
+    }
+    for anchor in element.contextAnchors where !anchor.text.isEmpty {
+      clauses.append(
+        .init(
+          fact: .contextAnchor(anchor.kind),
+          expectedValue: anchor.text,
+          strength: element.accessibleName == nil && element.label == nil
+            || (anchor.kind == uniquelyIdentifyingAnchor?.kind
+              && anchor.text == uniquelyIdentifyingAnchor?.text)
+            ? .required : .corroborating,
+          comparison: .whitespaceCollapsed))
+    }
+    for name in ["href", "data-testid", "id", "name", "title"] {
+      guard let value = element.stableAttributes[name], !value.isEmpty else { continue }
+      let strongIdentity = ["href", "data-testid", "id"].contains(name)
+      clauses.append(
+        .init(
+          fact: .stableAttribute(name),
+          expectedValue: value,
+          strength: strongIdentity ? .required : .corroborating,
+          comparison: .exact))
     }
     if clauses.isEmpty {
       clauses.append(
@@ -1802,6 +2717,64 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       observationGeneration: generation,
       clauses: clauses
     )
+  }
+
+  private func locatorCandidate(_ element: RawElement) -> LocatorCandidate {
+    var facts: [LocatorFact: String] = [.stableAttribute("tag"): element.tag]
+    if let role = element.role { facts[.role] = role }
+    if let name = element.accessibleName { facts[.accessibleName] = name }
+    if let label = element.label { facts[.label] = label }
+    if let text = element.text { facts[.value] = text }
+    for anchor in element.contextAnchors { facts[.contextAnchor(anchor.kind)] = anchor.text }
+    for (name, value) in element.stableAttributes {
+      facts[.stableAttribute(name)] = value
+    }
+    return LocatorCandidate(candidateID: element.physicalIdentity, facts: facts)
+  }
+
+  private func locatorQuality(
+    recipe: LocatorRecipe,
+    candidateCount: Int,
+    candidateCountIsLowerBound: Bool
+  ) -> LocatorQuality {
+    let required = recipe.clauses.filter { $0.strength == .required }
+    let facts = required.map { clause -> String in
+      switch clause.fact {
+      case .role: "role"
+      case .accessibleName: "accessible_name"
+      case .label: "label"
+      case .contextAnchor(let kind): "context_anchor:\(kind)"
+      case .stableAttribute(let name): "stable_attribute:\(name)"
+      case .framePath: "frame_path"
+      case .value: "value"
+      case .domPath: "dom_path"
+      }
+    }.sorted()
+    let hasStrongIdentity = required.contains { clause in
+      switch clause.fact {
+      case .accessibleName, .label, .contextAnchor: true
+      case .stableAttribute(let name): name != "tag"
+      default: false
+      }
+    }
+    let status: LocatorQualityStatus
+    let recommended: String?
+    if !hasStrongIdentity || candidateCount == 0 || candidateCountIsLowerBound {
+      status = .insufficient
+      recommended = "contextual_reobserve_or_handoff"
+    } else if candidateCount > 1 {
+      status = .ambiguous
+      recommended = "inspect_or_contextual_reobserve"
+    } else {
+      status = .unique
+      recommended = nil
+    }
+    return LocatorQuality(
+      status: status,
+      candidateCount: candidateCount,
+      candidateCountIsLowerBound: candidateCountIsLowerBound,
+      facts: facts,
+      recommendedAction: recommended)
   }
 
   private static func securityOrigin(from url: URL?) -> SecurityOrigin? {
@@ -1839,12 +2812,25 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private static let authenticationUIStateSource = """
     const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+    const deepQueryAll = (root, selector) => {
+      const matches = [];
+      const roots = [root];
+      for (let index = 0; index < roots.length; index += 1) {
+        const current = roots[index];
+        matches.push(...current.querySelectorAll(selector));
+        for (const host of current.querySelectorAll('*')) {
+          if (host.shadowRoot) roots.push(host.shadowRoot);
+        }
+      }
+      return matches;
+    };
     const isRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
         return false;
       }
-      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
         if (cursor.hidden || cursor.inert
             || collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
           return false;
@@ -1864,10 +2850,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       'input[autocomplete="new-password"]',
       'input[autocomplete="one-time-code"]'
     ].join(',');
-    const authenticationControls = Array.from(document.querySelectorAll(authenticationSelector));
-    const forms = Array.from(document.querySelectorAll('form'));
+    const authenticationControls = deepQueryAll(document, authenticationSelector);
+    const webAuthnText = /(?:security key|passkey|yubikey|clé de sécurité|clé d’accès|cle de securite|cle d'acces)/i;
+    const webAuthnControls = deepQueryAll(document,
+      'a, button, h1, h2, h3, [role="button"], [role="heading"], input[autocomplete~="webauthn"]'
+    ).filter(element => {
+      if (element.matches('input[autocomplete~="webauthn"]')) return true;
+      return webAuthnText.test(collapse(
+        element.getAttribute('aria-label') || element.textContent || element.value));
+    });
+    const bodyHasWebAuthnText = webAuthnText.test(collapse(document.body?.innerText));
+    const forms = deepQueryAll(document, 'form');
     const formHasOnlyInvisibleControls = forms.some(form => {
-      const controls = Array.from(form.querySelectorAll('input, select, textarea, button'));
+      const controls = deepQueryAll(form, 'input, select, textarea, button');
       return controls.length > 0 && !controls.some(isRendered);
     });
     return JSON.stringify({
@@ -1876,12 +2871,31 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         document.querySelector('[role="progressbar"], progress, [aria-busy="true"]')),
       hasVisibleAuthenticationControl: authenticationControls.some(isRendered),
       hasInvisibleAuthenticationControl:
-        authenticationControls.some(element => !isRendered(element)) || formHasOnlyInvisibleControls
+        authenticationControls.some(element => !isRendered(element)) || formHasOnlyInvisibleControls,
+      hasWebAuthnControl: webAuthnControls.some(isRendered) || bodyHasWebAuthnText
     });
     """
 
   private static let observationSource = """
     const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+    const deepQueryAll = (root, selector) => {
+      const matches = [];
+      const roots = [root];
+      for (let index = 0; index < roots.length; index += 1) {
+        const current = roots[index];
+        matches.push(...current.querySelectorAll(selector));
+        for (const host of current.querySelectorAll('*')) {
+          if (host.shadowRoot) roots.push(host.shadowRoot);
+        }
+      }
+      return matches;
+    };
+    const labelledNode = (element, id) => {
+      const root = element?.getRootNode?.();
+      return (typeof root?.getElementById === 'function' ? root.getElementById(id) : null)
+        || document.getElementById(id);
+    };
     let semanticTextTruncated = false;
     const bounded = value => {
       if (value === null || value === undefined) return null;
@@ -1895,7 +2909,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
         return false;
       }
-      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
         if (cursor.hidden || cursor.inert
             || collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
           return false;
@@ -1919,6 +2933,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       const labels = element.labels ? Array.from(element.labels) : [];
       return labels.find(isRendered) || null;
     };
+    const classTokens = element => collapse(element?.getAttribute?.('class'));
+    const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
+    const hasSelectedToken = element =>
+      /(^|[\\s_-])(active|current|selected)($|[\\s_-])/i.test(classTokens(element));
+    const isPointerControl = element => {
+      if (!['a', 'div', 'li', 'span'].includes(element.localName) || !isRendered(element)) {
+        return false;
+      }
+      if (getComputedStyle(element).cursor !== 'pointer') return false;
+      const name = collapse(element.getAttribute('aria-label') || element.innerText);
+      if (!name || name.length > maximumFieldCharacters) return false;
+      return !Array.from(element.children).some(child =>
+        isRendered(child) && getComputedStyle(child).cursor === 'pointer'
+        && collapse(child.getAttribute('aria-label') || child.innerText) === name);
+    };
+    const hasImplicitTabSemantics = element => {
+      if (element.hasAttribute('aria-selected')) return true;
+      const parent = composedParent(element);
+      return isPointerControl(element)
+        && (collapse(parent?.getAttribute?.('role')).toLowerCase() === 'tablist'
+          || hasTabToken(element) || hasTabToken(parent));
+    };
     const looksOpaque = value => {
       const text = String(value ?? '');
       if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(text)) return true;
@@ -1929,19 +2965,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     const roleOf = element => {
       const explicit = collapse(element.getAttribute('role'));
       if (explicit) return explicit;
+      if (hasImplicitTabSemantics(element)) return 'tab';
       if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
       if (element.localName === 'button') return 'button';
+      if (/^h[1-6]$/.test(element.localName)) return 'heading';
+      if (element.localName === 'table') return 'table';
+      if (element.localName === 'tr') return 'row';
+      if (element.localName === 'th') return 'columnheader';
+      if (element.localName === 'td') return 'cell';
       if (element.localName === 'select') return 'combobox';
       if (element.localName === 'textarea') return 'textbox';
       if (element.localName === 'summary') return 'button';
       if (element.localName === 'input') {
         const type = collapse(element.type).toLowerCase();
+        if (type === 'search') return 'searchbox';
         if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
         if (type === 'checkbox') return 'checkbox';
         if (type === 'radio') return 'radio';
         if (type === 'range') return 'slider';
         return 'textbox';
       }
+      if (isPointerControl(element)) return 'button';
       return null;
     };
     const labelOf = element => {
@@ -1950,20 +2994,110 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       }
       const labelledBy = collapse(element.getAttribute('aria-labelledby'));
       if (labelledBy) {
-        return collapse(labelledBy.split(/\\s+/).map(id => document.getElementById(id)?.innerText).join(' ')) || null;
+        return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
       }
       return null;
     };
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
+      || collapse(element.getAttribute('placeholder'))
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
       || collapse(element.innerText) || null;
+    const directLabelledText = element => {
+      const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
+      if (!labelledBy) return null;
+      return collapse(labelledBy.split(/\\s+/)
+        .slice(0, 8)
+        .map(id => labelledNode(element, id)?.innerText)
+        .join(' ')) || null;
+    };
+    const safeContextValue = value => {
+      const text = collapse(value);
+      if (!text || looksOpaque(text) || sensitiveLabelTerm.test(text)) return null;
+      return bounded(text);
+    };
+    const sameRowLabelOf = element => {
+      const row = element.closest(
+        'tr, [role="row"], li, [data-row], [class~="row"], [class*="form-row"], [class*="capability"]');
+      if (!row) return null;
+      const labelled = Array.from(row.querySelectorAll(
+        'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
+      const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
+      for (const candidate of candidates) {
+        if (candidate === element || candidate.contains(element) || !isRendered(candidate)) continue;
+        const text = safeContextValue(
+          candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
+        if (text && text !== safeContextValue(nameOf(element))) return text;
+      }
+      return null;
+    };
+    const contextAnchorsOf = element => {
+      const anchors = [];
+      const fieldset = element.closest('fieldset');
+      const legend = fieldset?.querySelector(':scope > legend');
+      const legendText = safeContextValue(legend?.innerText);
+      if (legendText) anchors.push({ kind: 'fieldset_legend', text: legendText });
+
+      const region = element.closest(
+        'section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
+      const regionText = safeContextValue(
+        region?.getAttribute('aria-label') || directLabelledText(region));
+      if (regionText) anchors.push({ kind: 'labelled_region', text: regionText });
+
+      const structural = element.closest('section, article, nav, main, form, fieldset')
+        || document.body;
+      const headings = Array.from(
+        structural.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]'));
+      const heading = headings.filter(candidate =>
+        candidate !== element
+        && Boolean(candidate.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+      ).pop();
+      const headingText = safeContextValue(heading?.innerText || heading?.getAttribute('aria-label'));
+      if (headingText) anchors.push({ kind: 'nearest_heading', text: headingText });
+
+      let sibling = element.previousElementSibling;
+      while (sibling && !isRendered(sibling)) sibling = sibling.previousElementSibling;
+      const siblingText = safeContextValue(sibling?.innerText || sibling?.textContent);
+      if (siblingText) anchors.push({ kind: 'previous_sibling', text: siblingText });
+      const rowLabel = sameRowLabelOf(element);
+      if (rowLabel) anchors.unshift({ kind: 'same_row_label', text: rowLabel });
+      return anchors.slice(0, 5);
+    };
+    const sanitizedHref = element => {
+      if (!element.hasAttribute('href')) return null;
+      try {
+        const url = new URL(element.getAttribute('href'), document.baseURI);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+        const query = keys.length
+          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+        return bounded(`${url.origin}${url.pathname}${query}`);
+      } catch { return null; }
+    };
+    const stableAttributesOf = (element, sensitive) => {
+      if (sensitive) return {};
+      const attributes = {};
+      const href = sanitizedHref(element);
+      if (href && !looksOpaque(href)) attributes.href = href;
+      for (const name of ['id', 'name', 'title', 'data-testid']) {
+        const value = collapse(element.getAttribute(name));
+        if (!value || value.length > maximumFieldCharacters || looksOpaque(value)
+            || sensitiveIdentifierTerm.test(value)) continue;
+        attributes[name] = bounded(value);
+      }
+      return attributes;
+    };
     const selector = [
       'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
-      '[role]', '[contenteditable="true"]', '[tabindex]'
+      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+      'table', 'tr', 'th', 'td',
+      '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true"]', '[tabindex]'
     ].join(',');
     const allowedRoles = new Set(Array.isArray(roleFilters) ? roleFilters : []);
     const wantedName = collapse(nameFilter).toLowerCase();
-    const matchingElements = Array.from(document.querySelectorAll(selector))
+    const semanticElements = deepQueryAll(document, selector);
+    const pointerElements = deepQueryAll(document, 'a:not([href]), div, li, span')
+      .filter(isPointerControl);
+    const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
       .filter(element => {
         if (!isRendered(element) && !styledControlSurface(element)) return false;
         const role = collapse(roleOf(element)).toLowerCase();
@@ -1984,25 +3118,60 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         ].map(collapse).join(' ');
         const labelMetadata = [element.getAttribute('aria-label'), labelOf(element)]
           .map(collapse).join(' ');
+        const bundleIdentifierMetadata = /(?:^|[^a-z0-9])bundle(?:[ _-]*(?:id|identifier))?(?:$|[^a-z0-9])/i
+          .test(`${identifierMetadata} ${labelMetadata}`);
+        const publicReverseDNSIdentifier = bundleIdentifierMetadata
+          && /^[A-Za-z0-9][A-Za-z0-9-]*(?:\\.[A-Za-z0-9][A-Za-z0-9-]*){2,}$/.test(rawValue ?? '');
         const sensitive = (element instanceof HTMLInputElement && element.type === 'password')
           || autocompleteTokens.some(token => sensitiveAutocomplete.has(token))
           || sensitiveIdentifierTerm.test(identifierMetadata)
           || sensitiveLabelTerm.test(labelMetadata)
-          || (!(element instanceof HTMLSelectElement) && looksOpaque(rawValue));
+          || (!(element instanceof HTMLSelectElement) && looksOpaque(rawValue)
+            && !publicReverseDNSIdentifier);
         const editable = !element.disabled && !element.readOnly;
         let observableValue = null;
         if (!sensitive && editable && element instanceof HTMLSelectElement) {
           observableValue = collapse(
             Array.from(element.selectedOptions).map(option => option.textContent).join(' ')) || null;
         } else if (!sensitive && editable && element instanceof HTMLTextAreaElement) {
-          observableValue = rawValue !== null && rawValue.length <= 1024 ? rawValue : null;
+          observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
         } else if (!sensitive && editable && element instanceof HTMLInputElement
                    && ['text', 'search', 'email', 'tel', 'url', 'number'].includes(element.type)) {
-          observableValue = rawValue !== null && rawValue.length <= 1024 ? rawValue : null;
+          observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
+        } else if (!sensitive && editable && element.isContentEditable) {
+          const editableValue = element.textContent ?? '';
+          observableValue = editableValue.length <= maximumFieldCharacters ? editableValue : null;
         }
         const selectedLabel = element instanceof HTMLSelectElement
           ? collapse(Array.from(element.selectedOptions).map(option => option.textContent).join(' '))
           : null;
+        const isEditableField = element instanceof HTMLInputElement
+          || element instanceof HTMLTextAreaElement || element.isContentEditable;
+        const characterCount = !sensitive && isEditableField
+          ? String(element.isContentEditable ? (element.textContent ?? '') : (rawValue ?? '')).length
+          : null;
+        const ariaInvalid = collapse(element.getAttribute('aria-invalid')).toLowerCase();
+        const invalidByARIA = ['true', 'grammar', 'spelling'].includes(ariaInvalid);
+        const invalidByConstraint = Boolean(element.willValidate && element.validity
+          && !element.validity.valid);
+        const validationReferenceIDs = [
+          ...collapse(element.getAttribute('aria-errormessage')).split(/\\s+/),
+          ...collapse(element.getAttribute('aria-describedby')).split(/\\s+/)
+        ].filter(Boolean);
+        const invalidByVisibleMessage = validationReferenceIDs.some(id => {
+          const node = labelledNode(element, id);
+          if (!node || !isRendered(node) || !collapse(node.textContent)) return false;
+          if (collapse(element.getAttribute('aria-errormessage')).split(/\\s+/).includes(id)) {
+            return true;
+          }
+          const metadata = `${node.id} ${node.className ?? ''} ${node.getAttribute('role') ?? ''}`;
+          return /error|invalid|alert/i.test(metadata) || node.hasAttribute('aria-live');
+        });
+        let validationState = 'not_applicable';
+        if (invalidByARIA || invalidByConstraint || invalidByVisibleMessage) {
+          validationState = 'invalid';
+        }
+        else if (element.willValidate || ariaInvalid === 'false') validationState = 'valid';
         const checked = (element instanceof HTMLInputElement
           && ['checkbox', 'radio'].includes(element.type))
           ? Boolean(element.checked)
@@ -2011,10 +3180,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         const selected = element instanceof HTMLOptionElement
           ? Boolean(element.selected)
           : (element.hasAttribute('aria-selected')
-            ? collapse(element.getAttribute('aria-selected')).toLowerCase() === 'true' : null);
+            ? collapse(element.getAttribute('aria-selected')).toLowerCase() === 'true'
+            : (roleOf(element) === 'tab'
+              ? (element.hasAttribute('aria-current') || hasSelectedToken(element)) : null));
         const stateAttributes = {};
         for (const name of [
-          'aria-checked', 'aria-selected', 'aria-disabled', 'aria-expanded', 'data-state', 'open'
+          'aria-checked', 'aria-selected', 'aria-current', 'aria-disabled', 'aria-expanded',
+          'data-state', 'open'
         ]) {
           if (element.hasAttribute(name)) stateAttributes[name] = element.getAttribute(name) ?? '';
         }
@@ -2031,6 +3203,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           label: bounded(labelOf(element)),
           text: sensitive ? null : bounded(selectedLabel || collapse(element.innerText) || null),
           value: bounded(observableValue),
+          validationState,
+          characterCount,
           sensitive,
           submitsForm: Boolean(
             (element instanceof HTMLButtonElement
@@ -2044,6 +3218,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           selectedOption: bounded(selectedLabel || null),
           stateAttributes: Object.fromEntries(
             Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
+          contextAnchors: sensitive ? [] : contextAnchorsOf(element),
+          stableAttributes: stableAttributesOf(element, sensitive),
           visible: true,
           boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height }
         };
@@ -2060,6 +3236,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       mutationCount: globalThis.__webkituiState?.mutationCount ?? 0,
       crossOriginFrameCount,
       totalElementCount: matchingElements.length,
+      unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
       semanticTextTruncated,
       elements
     });
@@ -2067,41 +3244,86 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private static let actionHelpers = """
     const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+    const deepQueryAll = (root, selector) => {
+      const matches = [];
+      const roots = [root];
+      for (let index = 0; index < roots.length; index += 1) {
+        const current = roots[index];
+        matches.push(...current.querySelectorAll(selector));
+        for (const host of current.querySelectorAll('*')) {
+          if (host.shadowRoot) roots.push(host.shadowRoot);
+        }
+      }
+      return matches;
+    };
+    const labelledNode = (element, id) => {
+      const root = element?.getRootNode?.();
+      return (typeof root?.getElementById === 'function' ? root.getElementById(id) : null)
+        || document.getElementById(id);
+    };
     const labelOf = element => {
       if (element.labels && element.labels.length) {
         return collapse(Array.from(element.labels).map(label => label.innerText).join(' ')) || null;
       }
       const labelledBy = collapse(element.getAttribute('aria-labelledby'));
       if (labelledBy) {
-        return collapse(labelledBy.split(/\\s+/).map(id => document.getElementById(id)?.innerText).join(' ')) || null;
+        return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
       }
       return null;
+    };
+    const classTokens = element => collapse(element?.getAttribute?.('class'));
+    const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
+    const isPointerControl = element => {
+      if (!['a', 'div', 'li', 'span'].includes(element.localName)) return false;
+      if (getComputedStyle(element).cursor !== 'pointer') return false;
+      const name = collapse(element.getAttribute('aria-label') || element.innerText);
+      if (!name) return false;
+      return !Array.from(element.children).some(child =>
+        isRendered(child) && getComputedStyle(child).cursor === 'pointer'
+        && collapse(child.getAttribute('aria-label') || child.innerText) === name);
+    };
+    const hasImplicitTabSemantics = element => {
+      if (element.hasAttribute('aria-selected')) return true;
+      const parent = composedParent(element);
+      return isPointerControl(element)
+        && (collapse(parent?.getAttribute?.('role')).toLowerCase() === 'tablist'
+          || hasTabToken(element) || hasTabToken(parent));
     };
     const roleOf = element => {
       const explicit = collapse(element.getAttribute('role'));
       if (explicit) return explicit;
+      if (hasImplicitTabSemantics(element)) return 'tab';
       if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
       if (element.localName === 'button') return 'button';
+      if (/^h[1-6]$/.test(element.localName)) return 'heading';
+      if (element.localName === 'table') return 'table';
+      if (element.localName === 'tr') return 'row';
+      if (element.localName === 'th') return 'columnheader';
+      if (element.localName === 'td') return 'cell';
       if (element.localName === 'select') return 'combobox';
       if (element.localName === 'textarea') return 'textbox';
       if (element.localName === 'summary') return 'button';
       if (element.localName === 'input') {
         const type = collapse(element.type).toLowerCase();
+        if (type === 'search') return 'searchbox';
         if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
         if (type === 'checkbox') return 'checkbox';
         if (type === 'radio') return 'radio';
         if (type === 'range') return 'slider';
         return 'textbox';
       }
+      if (isPointerControl(element)) return 'button';
       return null;
     };
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
+      || collapse(element.getAttribute('placeholder'))
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
       || collapse(element.innerText) || null;
     const isRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
-      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
         const style = getComputedStyle(cursor);
         if (cursor.hidden || cursor.inert || style.display === 'none'
             || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
@@ -2116,15 +3338,82 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       }
       return element;
     };
+    const directLabelledText = element => {
+      const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
+      if (!labelledBy) return null;
+      return collapse(labelledBy.split(/\\s+/)
+        .slice(0, 8)
+        .map(id => labelledNode(element, id)?.innerText)
+        .join(' ')) || null;
+    };
+    const sameRowLabelOf = element => {
+      const row = element.closest(
+        'tr, [role="row"], li, [data-row], [class~="row"], [class*="form-row"], [class*="capability"]');
+      if (!row) return null;
+      const labelled = Array.from(row.querySelectorAll(
+        'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
+      const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
+      for (const candidate of candidates) {
+        if (candidate === element || candidate.contains(element) || !isRendered(candidate)) continue;
+        const text = collapse(
+          candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
+        if (text && text !== collapse(nameOf(element))) return text;
+      }
+      return null;
+    };
+    const contextAnchorOf = (element, kind) => {
+      if (kind === 'same_row_label') return sameRowLabelOf(element);
+      if (kind === 'fieldset_legend') {
+        return collapse(element.closest('fieldset')?.querySelector(':scope > legend')?.innerText)
+          || null;
+      }
+      if (kind === 'labelled_region') {
+        const region = element.closest(
+          'section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
+        return collapse(region?.getAttribute('aria-label') || directLabelledText(region)) || null;
+      }
+      if (kind === 'nearest_heading') {
+        const structural = element.closest('section, article, nav, main, form, fieldset')
+          || document.body;
+        const headings = Array.from(
+          structural.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]'));
+        const heading = headings.filter(candidate =>
+          candidate !== element
+          && Boolean(candidate.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+        ).pop();
+        return collapse(heading?.innerText || heading?.getAttribute('aria-label')) || null;
+      }
+      if (kind === 'previous_sibling') {
+        let sibling = element.previousElementSibling;
+        while (sibling && !isRendered(sibling)) sibling = sibling.previousElementSibling;
+        return collapse(sibling?.innerText || sibling?.textContent) || null;
+      }
+      return null;
+    };
+    const sanitizedHref = element => {
+      if (!element.hasAttribute('href')) return null;
+      try {
+        const url = new URL(element.getAttribute('href'), document.baseURI);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+        const query = keys.length
+          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+        return `${url.origin}${url.pathname}${query}`;
+      } catch { return null; }
+    };
     const factValue = (element, criterion) => {
       switch (criterion.fact) {
         case 'role': return roleOf(element);
         case 'accessibleName': return nameOf(element);
         case 'label': return labelOf(element);
         case 'text': return collapse(element.innerText) || null;
-        case 'stableAttribute': return criterion.argument === 'tag'
-          ? element.localName : element.getAttribute(criterion.argument);
-        case 'contextAnchor': return collapse(element.closest(criterion.argument)?.innerText) || null;
+        case 'stableAttribute':
+          if (criterion.argument === 'tag') return element.localName;
+          if (criterion.argument === 'href') return sanitizedHref(element);
+          return collapse(element.getAttribute(criterion.argument)) || null;
+        case 'contextAnchor': return contextAnchorOf(element, criterion.argument);
+        case 'enabled': return String(
+          !(element.disabled || element.getAttribute('aria-disabled') === 'true'));
         default: return null;
       }
     };
@@ -2138,9 +3427,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     };
     const selector = [
       'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
-      '[role]', '[contenteditable="true"]', '[tabindex]'
+      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+      'table', 'tr', 'th', 'td',
+      '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true"]', '[tabindex]'
     ].join(',');
-    const matches = Array.from(document.querySelectorAll(selector)).filter(element =>
+    const candidates = Array.from(new Set([
+      ...deepQueryAll(document, selector),
+      ...deepQueryAll(document, 'a:not([href]), div, li, span').filter(isPointerControl)
+    ]));
+    const matches = candidates.filter(element =>
       criteria.every(criterion => matchesCriterion(element, criterion))
     );
     const describe = element => {
@@ -2153,7 +3448,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       return {
         physicalIdentity,
         boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height },
-        geometryStable: true,
+        geometryStable: false,
         actionable: false,
         dispatched: false,
         trustedUserGesture: false
@@ -2285,9 +3580,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         && element.getAttribute('aria-disabled') !== 'true';
       const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
       const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      const hit = document.elementFromPoint(centerX, centerY);
+      let hit = document.elementFromPoint(centerX, centerY);
+      while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        const nested = hit.shadowRoot.elementFromPoint(centerX, centerY);
+        if (!nested || nested === hit) break;
+        hit = nested;
+      }
+      const composedContains = (ancestor, node) => {
+        for (let cursor = node; cursor; cursor = composedParent(cursor)) {
+          if (cursor === ancestor) return true;
+        }
+        return false;
+      };
       const receivesEvents = Boolean(hit && (
-        hit === element || element.contains(hit) || hit === surface || surface.contains(hit)
+        composedContains(element, hit) || composedContains(surface, hit)
       ));
       const editable = operation !== 'fill' || (
         (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
@@ -2416,6 +3722,44 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       return JSON.stringify({ count: matches.length, candidate });
       """
 
+  private static let armNativeFillSource =
+    actionHelpers + """
+      const element = matches.length === 1 ? matches[0] : null;
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      const candidate = describe(element);
+      const surface = surfaceOf(element);
+      const box = surface.getBoundingClientRect();
+      const tolerance = 0.5;
+      candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
+        Math.abs(box[key] - expectedBox[key]) <= tolerance
+      );
+      const editable = element instanceof HTMLInputElement
+        || element instanceof HTMLTextAreaElement || element.isContentEditable;
+      const enabled = !element.matches(':disabled') && !element.readOnly
+        && element.getAttribute('aria-disabled') !== 'true';
+      candidate.actionable = editable && enabled && candidate.geometryStable
+        && element.isConnected && typeof element.focus === 'function';
+      if (candidate.actionable) {
+        element.focus({ preventScroll: true });
+        if (typeof element.select === 'function') {
+          element.select();
+        } else if (element.isContentEditable) {
+          const selection = getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+        const physicalIdentity = candidate.physicalIdentity;
+        element.addEventListener('input', event => {
+          globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
+            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+          });
+        }, { capture: true, once: true });
+      }
+      return JSON.stringify({ count: matches.length, candidate });
+      """
+
   private static func boxDictionary(_ box: ObservedBoundingBox) -> [String: Double] {
     ["x": box.x, "y": box.y, "width": box.width, "height": box.height]
   }
@@ -2520,6 +3864,7 @@ private struct RawObservation: Decodable {
   let mutationCount: UInt64
   let crossOriginFrameCount: Int
   let totalElementCount: Int
+  let unfilteredCandidateCount: Int
   let semanticTextTruncated: Bool
   let elements: [RawElement]
 }
@@ -2529,6 +3874,7 @@ private struct RawAuthenticationUIState: Decodable {
   let hasProgressIndicator: Bool
   let hasVisibleAuthenticationControl: Bool
   let hasInvisibleAuthenticationControl: Bool
+  let hasWebAuthnControl: Bool
 }
 
 private struct RawElement: Decodable {
@@ -2539,6 +3885,8 @@ private struct RawElement: Decodable {
   let label: String?
   let text: String?
   let value: String?
+  let validationState: String
+  let characterCount: Int?
   let sensitive: Bool
   let submitsForm: Bool
   let disabled: Bool
@@ -2546,8 +3894,15 @@ private struct RawElement: Decodable {
   let selected: Bool?
   let selectedOption: String?
   let stateAttributes: [String: String]
+  let contextAnchors: [RawContextAnchor]
+  let stableAttributes: [String: String]
   let visible: Bool
   let boundingBox: ObservedBoundingBox
+}
+
+private struct RawContextAnchor: Decodable {
+  let kind: String
+  let text: String
 }
 
 private struct ObservedTargetRecord {
@@ -2555,6 +3910,7 @@ private struct ObservedTargetRecord {
   let physicalIdentity: String
   let boundingBox: ObservedBoundingBox
   let sensitive: Bool
+  let disabled: Bool
   let observedAtMonotonicNanoseconds: UInt64
 }
 

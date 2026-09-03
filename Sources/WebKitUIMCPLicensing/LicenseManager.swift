@@ -43,6 +43,11 @@ public actor WebKitUILicenseManager {
     }
     switch verifier.verify(stored.token, machineID: try requiredMachineID(), now: currentDate) {
     case .valid(let claims):
+      guard Self.tokenVersionIsCompatible(claims.appVersion, current: appVersion()) else {
+        return WebKitUILicenseStatus(
+          state: .invalid,
+          maskedKey: stored.licenseKey.webKitUILicenseMasked)
+      }
       if currentDate.timeIntervalSince(stored.maximumObservedAt ?? .distantPast)
         >= Self.observationCheckpointInterval
       {
@@ -57,6 +62,11 @@ public actor WebKitUILicenseManager {
       }
       return status(state: .active, stored: stored, claims: claims)
     case .expired(let claims):
+      guard Self.tokenVersionIsCompatible(claims.appVersion, current: appVersion()) else {
+        return WebKitUILicenseStatus(
+          state: .invalid,
+          maskedKey: stored.licenseKey.webKitUILicenseMasked)
+      }
       guard let lastServerSuccessAt = stored.lastServerSuccessAt,
         lastServerSuccessAt.timeIntervalSince1970 <= claims.exp + Self.maximumClockRollback,
         currentDate.timeIntervalSince1970 <= claims.exp + Self.offlineGrace
@@ -77,18 +87,19 @@ public actor WebKitUILicenseManager {
     let normalized = licenseKey.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     guard normalized.hasPrefix("WEBKITUI-") else { throw WebKitUILicenseError.invalidKey }
     let id = try requiredMachineID()
+    let currentVersion = appVersion()
     let receipt = try await api.activate(
       licenseKey: normalized,
       machineID: id,
-      appVersion: appVersion()
+      appVersion: currentVersion
     )
     let activationDate = now()
     guard
       case .valid(let claims) = verifier.verify(
         receipt.token,
         machineID: id,
-        now: activationDate
-      )
+        now: activationDate),
+      Self.tokenVersionIsCompatible(claims.appVersion, current: currentVersion)
     else {
       throw WebKitUILicenseError.tokenVerificationFailed
     }
@@ -115,17 +126,18 @@ public actor WebKitUILicenseManager {
       throw WebKitUILicenseError.clockRollbackDetected
     }
     let id = try requiredMachineID()
+    let currentVersion = appVersion()
     let receipt = try await api.refresh(
       licenseKey: stored.licenseKey,
       machineID: id,
-      appVersion: appVersion()
+      appVersion: currentVersion
     )
     guard
       case .valid(let claims) = verifier.verify(
         receipt.token,
         machineID: id,
-        now: refreshDate
-      )
+        now: refreshDate),
+      Self.tokenVersionIsCompatible(claims.appVersion, current: currentVersion)
     else {
       throw WebKitUILicenseError.tokenVerificationFailed
     }
@@ -150,6 +162,10 @@ public actor WebKitUILicenseManager {
     let id = machineID().trimmingCharacters(in: .whitespacesAndNewlines)
     guard !id.isEmpty else { throw WebKitUILicenseError.machineIdentityUnavailable }
     return id
+  }
+
+  static func tokenVersionIsCompatible(_ claimed: String, current: String) -> Bool {
+    claimed == current && !current.isEmpty && current != "unknown" && current != "source-build"
   }
 
   private func status(

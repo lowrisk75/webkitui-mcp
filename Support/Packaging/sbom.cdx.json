@@ -5,13 +5,13 @@
   "metadata": {
     "component": {
       "type": "application",
-      "bom-ref": "pkg:generic/webkitui-mcp@0.6.0",
+      "bom-ref": "pkg:generic/webkitui-mcp@0.6.1",
       "name": "WebKitUI MCP",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "licenses": [
         {
           "license": {
-            "id": "BUSL-1.1"
+            "id": "MIT"
           }
         }
       ]
@@ -20,9 +20,9 @@
   "components": [
     {
       "type": "file",
-      "bom-ref": "pkg:generic/webkitui-mcp-broker@0.6.0",
+      "bom-ref": "pkg:generic/webkitui-mcp-broker@0.6.1",
       "name": "webkitui-mcp-aqua-broker",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "properties": [
         {
           "name": "com.lorislab.distribution",
@@ -32,9 +32,9 @@
     },
     {
       "type": "file",
-      "bom-ref": "pkg:generic/webkitui-mcp-confirm@0.6.0",
+      "bom-ref": "pkg:generic/webkitui-mcp-confirm@0.6.1",
       "name": "webkitui-mcp-confirm",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "properties": [
         {
           "name": "com.lorislab.distribution",
@@ -44,9 +44,9 @@
     },
     {
       "type": "file",
-      "bom-ref": "pkg:generic/webkitui-mcp-relay@0.6.0",
+      "bom-ref": "pkg:generic/webkitui-mcp-relay@0.6.1",
       "name": "WebKitUI MCP Relay",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "properties": [
         {
           "name": "com.lorislab.distribution",
@@ -57,23 +57,23 @@
   ],
   "dependencies": [
     {
-      "ref": "pkg:generic/webkitui-mcp@0.6.0",
+      "ref": "pkg:generic/webkitui-mcp@0.6.1",
       "dependsOn": [
-        "pkg:generic/webkitui-mcp-broker@0.6.0",
-        "pkg:generic/webkitui-mcp-confirm@0.6.0",
-        "pkg:generic/webkitui-mcp-relay@0.6.0"
+        "pkg:generic/webkitui-mcp-broker@0.6.1",
+        "pkg:generic/webkitui-mcp-confirm@0.6.1",
+        "pkg:generic/webkitui-mcp-relay@0.6.1"
       ]
     },
     {
-      "ref": "pkg:generic/webkitui-mcp-broker@0.6.0",
+      "ref": "pkg:generic/webkitui-mcp-broker@0.6.1",
       "dependsOn": []
     },
     {
-      "ref": "pkg:generic/webkitui-mcp-confirm@0.6.0",
+      "ref": "pkg:generic/webkitui-mcp-confirm@0.6.1",
       "dependsOn": []
     },
     {
-      "ref": "pkg:generic/webkitui-mcp-relay@0.6.0",
+      "ref": "pkg:generic/webkitui-mcp-relay@0.6.1",
       "dependsOn": []
     }
   ]

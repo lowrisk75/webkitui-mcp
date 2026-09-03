@@ -23,11 +23,15 @@ public enum PredicateResult: String, Codable, Equatable, Sendable {
 }
 
 public enum ObservationTextField: String, Codable, CaseIterable, Sendable {
+  case url
+  case title
   case accessibleName = "@accessible_name"
   case label = "@label"
   case text = "@text"
   case value = "@value"
   case dialogName = "@dialog_name"
+  case panelName = "@panel_name"
+  case heading = "@heading"
 }
 
 public enum ObservationPredicate: Codable, Equatable, Sendable {
@@ -39,6 +43,11 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
   /// Provenance remains available in the canonical observation, but is not
   /// silently synthesized by the caller for this comparison.
   case entryTextDigest(ObservationFieldKey, String)
+  /// Proves that one exact text field no longer matches its pre-dispatch value.
+  /// Only the SHA-256 digest is retained in the plan and receipt.
+  case entryTextNotDigest(ObservationFieldKey, String)
+  /// Matches an exact UTF-8 prefix without retaining the caller-supplied text.
+  case entryTextPrefixDigest(ObservationFieldKey, String, Int)
   /// Matches exact text in a bounded set of semantic fields without relying
   /// on an ephemeral element ID. Transaction preparation rejects a match that
   /// was already present before dispatch.
@@ -96,6 +105,21 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
       let text = value.segments.map(\.text).joined()
       let digest = Self.textDigest(of: text)
       return digest == expectedDigest ? .satisfied : .unsatisfied
+    case .entryTextNotDigest(let key, let previousDigest):
+      guard let value = values[key] else {
+        return observation.completeness == .complete ? .unsatisfied : .unknown
+      }
+      let text = value.segments.map(\.text).joined()
+      let digest = Self.textDigest(of: text)
+      return digest != previousDigest ? .satisfied : .unsatisfied
+    case .entryTextPrefixDigest(let key, let expectedDigest, let expectedLength):
+      guard let value = values[key] else {
+        return observation.completeness == .complete ? .unsatisfied : .unknown
+      }
+      let bytes = Array(value.segments.map(\.text).joined().utf8)
+      guard bytes.count >= expectedLength else { return .unsatisfied }
+      let prefix = String(decoding: bytes.prefix(expectedLength), as: UTF8.self)
+      return Self.textDigest(of: prefix) == expectedDigest ? .satisfied : .unsatisfied
     case .anyEntryTextDigest(let fields, let expectedDigest):
       let allowedFields = Set(fields.map(\.rawValue))
       let found = observation.state.entries.contains { entry in
@@ -172,6 +196,8 @@ public struct TransactionalWritePlan: Codable, Sendable {
       let digest: String?
       switch predicate {
       case .entryValueDigest(_, let value), .entryTextDigest(_, let value),
+        .entryTextNotDigest(_, let value),
+        .entryTextPrefixDigest(_, let value, _),
         .anyEntryTextDigest(_, let value), .anyEntryTextContainsDigest(_, let value, _, _):
         digest = value
       default: digest = nil
@@ -186,6 +212,11 @@ public struct TransactionalWritePlan: Codable, Sendable {
       }
       if case .anyEntryTextContainsDigest(let fields, _, let length, _) = predicate {
         guard !fields.isEmpty else { throw TransactionError.emptySemanticTextFields }
+        guard (1...2_048).contains(length) else {
+          throw TransactionError.invalidExpectedDigest
+        }
+      }
+      if case .entryTextPrefixDigest(_, _, let length) = predicate {
         guard (1...2_048).contains(length) else {
           throw TransactionError.invalidExpectedDigest
         }

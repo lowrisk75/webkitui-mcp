@@ -7,6 +7,12 @@ import WebKitUIMCPLicensing
 import WebKitUIMCPRuntime
 import WebKitUIMCPServer
 
+private let aquaClientAdmission = BoundedConnectionAdmission(maximum: 16)
+private let aquaSocketDeadlines = LocalSocketDeadlinePolicy(
+  receiveIdleSeconds: 30 * 60,
+  sendSeconds: 30
+)
+
 @main
 struct WebKitUIMCPAquaBroker {
   @MainActor private static var readSources: [any DispatchSourceRead] = []
@@ -29,22 +35,122 @@ struct WebKitUIMCPAquaBroker {
     let application = NSApplication.shared
     WebKitNativeApplicationMenu.install(on: application)
     application.finishLaunching()
-    application.setActivationPolicy(.accessory)
+    application.setActivationPolicy(.regular)
+    if let auditIndex = CommandLine.arguments.firstIndex(of: "--verify-activity-clear-default"),
+      CommandLine.arguments.indices.contains(auditIndex + 1)
+    {
+      do {
+        let language = CommandLine.arguments[auditIndex + 1]
+        guard ["en", "fr"].contains(language),
+          let localizationURL = Bundle.main.url(forResource: language, withExtension: "lproj"),
+          let localizationBundle = Bundle(url: localizationURL)
+        else {
+          throw CocoaError(.fileReadUnsupportedScheme)
+        }
+        let audit = ActivityLogWindowController.clearConfirmationAudit(
+          language: language,
+          bundle: localizationBundle)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        FileHandle.standardOutput.write(try encoder.encode(audit))
+        FileHandle.standardOutput.write(Data([0x0A]))
+      } catch {
+        diagnostic("activity clear default verification failed", error: error)
+        Foundation.exit(EXIT_FAILURE)
+      }
+      return
+    }
+    if let auditIndex = CommandLine.arguments.firstIndex(of: "--verify-status-ui-layout"),
+      CommandLine.arguments.indices.contains(auditIndex + 1)
+    {
+      do {
+        let language = CommandLine.arguments[auditIndex + 1]
+        guard ["en", "fr"].contains(language),
+          let localizationURL = Bundle.main.url(forResource: language, withExtension: "lproj"),
+          let localizationBundle = Bundle(url: localizationURL)
+        else {
+          throw CocoaError(.fileReadUnsupportedScheme)
+        }
+        let controller = WebKitUICompanionController(
+          application: application,
+          activityLog: nil,
+          localizationBundle: localizationBundle,
+          automaticallyShowsStatus: false,
+          automaticallyRefreshesStatus: false)
+        let audit = try controller.auditStatusLayout(language: language)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        FileHandle.standardOutput.write(try encoder.encode(audit))
+        FileHandle.standardOutput.write(Data([0x0A]))
+      } catch {
+        diagnostic("status UI layout verification failed", error: error)
+        Foundation.exit(EXIT_FAILURE)
+      }
+      return
+    }
+    if let renderIndex = CommandLine.arguments.firstIndex(of: "--render-status-ui"),
+      CommandLine.arguments.indices.contains(renderIndex + 1)
+    {
+      do {
+        let destination = URL(fileURLWithPath: CommandLine.arguments[renderIndex + 1])
+          .standardizedFileURL.resolvingSymlinksInPath()
+        let processTemporaryRoot = FileManager.default.temporaryDirectory.standardizedFileURL.path
+        let allowedTemporaryRoots = [
+          processTemporaryRoot,
+          "/private" + processTemporaryRoot,
+          "/tmp",
+          "/private/tmp",
+        ]
+        guard allowedTemporaryRoots.contains(where: { destination.path.hasPrefix($0 + "/") }) else {
+          throw CocoaError(.fileWriteNoPermission)
+        }
+        let controller = WebKitUICompanionController(
+          application: application,
+          activityLog: nil,
+          automaticallyShowsStatus: false)
+        try controller.renderStatusSnapshot(to: destination)
+      } catch {
+        diagnostic("status UI rendering failed", error: error)
+        Foundation.exit(EXIT_FAILURE)
+      }
+      return
+    }
     if CommandLine.arguments.contains("--visual-smoke-test") {
-      companionController = WebKitUICompanionController(application: application)
-      runVisualSmokeTest()
+      do {
+        let smokeLogDirectory = FileManager.default.temporaryDirectory.appending(
+          path: "WebKitUIMCP-VisualSmoke-\(ProcessInfo.processInfo.processIdentifier)",
+          directoryHint: .isDirectory)
+        companionController = WebKitUICompanionController(
+          application: application,
+          activityLog: try WebKitActivityLog(directoryURL: smokeLogDirectory)
+        )
+        runVisualSmokeTest()
+      } catch {
+        diagnostic("visual smoke test activity journal unavailable", error: error)
+        Foundation.exit(EXIT_FAILURE)
+      }
       return
     }
     do {
+      let applicationSupport = try FileManager.default.url(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask,
+        appropriateFor: nil,
+        create: true)
+      try WebKitUISystemReadiness.requireRuntimeDiskSpace(at: applicationSupport)
       let registry = try WebKitSessionRegistry(
         maximumSessions: 1,
         enforceHostExclusiveSession: true
       )
       let transactionLedgerFactory = try WebKitTransactionLedgerFactory.durable()
+      let activityLog = try WebKitActivityLog.durable()
+      let goalDelegationMonitor = GoalDelegationMonitor()
       let sockets = try activatedOrSelfHostedSockets(named: "MCP")
       companionController = WebKitUICompanionController(
         application: application,
-        ownedSocket: sockets.ownedSocket
+        ownedSocket: sockets.ownedSocket,
+        activityLog: activityLog,
+        goalDelegationMonitor: goalDelegationMonitor
       )
       for descriptor in sockets.descriptors {
         try makeNonBlocking(descriptor)
@@ -54,7 +160,9 @@ struct WebKitUIMCPAquaBroker {
           source,
           descriptor: descriptor,
           registry: registry,
-          transactionLedgerFactory: transactionLedgerFactory
+          transactionLedgerFactory: transactionLedgerFactory,
+          activityLog: activityLog,
+          goalDelegationMonitor: goalDelegationMonitor
         )
         readSources.append(source)
       }
@@ -254,13 +362,17 @@ struct WebKitUIMCPAquaBroker {
     _ source: any DispatchSourceRead,
     descriptor: Int32,
     registry: WebKitSessionRegistry,
-    transactionLedgerFactory: WebKitTransactionLedgerFactory
+    transactionLedgerFactory: WebKitTransactionLedgerFactory,
+    activityLog: WebKitActivityLog,
+    goalDelegationMonitor: GoalDelegationMonitor
   ) {
     source.setEventHandler {
       acceptAvailableConnections(
         from: descriptor,
         registry: registry,
-        transactionLedgerFactory: transactionLedgerFactory
+        transactionLedgerFactory: transactionLedgerFactory,
+        activityLog: activityLog,
+        goalDelegationMonitor: goalDelegationMonitor
       )
     }
     source.setCancelHandler { Darwin.close(descriptor) }
@@ -270,23 +382,35 @@ struct WebKitUIMCPAquaBroker {
   nonisolated private static func acceptAvailableConnections(
     from listener: Int32,
     registry: WebKitSessionRegistry,
-    transactionLedgerFactory: WebKitTransactionLedgerFactory
+    transactionLedgerFactory: WebKitTransactionLedgerFactory,
+    activityLog: WebKitActivityLog,
+    goalDelegationMonitor: GoalDelegationMonitor
   ) {
     while true {
       let client = Darwin.accept(listener, nil, nil)
       if client >= 0 {
-        do {
-          try makeBlocking(client)
-        } catch {
-          diagnostic("aqua broker client setup failed", error: error)
+        guard aquaClientAdmission.tryAcquire() else {
+          diagnostic("aqua broker connection limit reached", error: POSIXError(.EMFILE))
           Darwin.close(client)
           continue
         }
+        do {
+          try makeBlocking(client)
+          try aquaSocketDeadlines.apply(to: client)
+        } catch {
+          diagnostic("aqua broker client setup failed", error: error)
+          Darwin.close(client)
+          aquaClientAdmission.release()
+          continue
+        }
         Task.detached {
+          defer { aquaClientAdmission.release() }
           await serve(
             client,
             registry: registry,
-            transactionLedgerFactory: transactionLedgerFactory
+            transactionLedgerFactory: transactionLedgerFactory,
+            activityLog: activityLog,
+            goalDelegationMonitor: goalDelegationMonitor
           )
         }
         continue
@@ -307,7 +431,9 @@ struct WebKitUIMCPAquaBroker {
   nonisolated private static func serve(
     _ descriptor: Int32,
     registry: WebKitSessionRegistry,
-    transactionLedgerFactory: WebKitTransactionLedgerFactory
+    transactionLedgerFactory: WebKitTransactionLedgerFactory,
+    activityLog: WebKitActivityLog,
+    goalDelegationMonitor: GoalDelegationMonitor
   ) async {
     defer { Darwin.close(descriptor) }
     var peerUserID: uid_t = 0
@@ -321,7 +447,9 @@ struct WebKitUIMCPAquaBroker {
 
     let server = await WebKitMCPServer(
       durableRegistry: registry,
-      transactionLedgerFactory: transactionLedgerFactory
+      transactionLedgerFactory: transactionLedgerFactory,
+      activityLog: activityLog,
+      goalDelegationMonitor: goalDelegationMonitor
     )
     var pending = Data()
     var bytes = [UInt8](repeating: 0, count: 16_384)
@@ -375,6 +503,10 @@ struct WebKitUIMCPAquaBroker {
   }
 
   nonisolated private static func diagnostic(_ message: String, error: Error) {
+    if let storage = WebKitUISystemReadiness.storageDiagnostic(for: error) {
+      FileHandle.standardError.write(Data("\(message): \(storage)\n".utf8))
+      return
+    }
     let nsError = error as NSError
     let type = String(describing: Swift.type(of: error))
     FileHandle.standardError.write(

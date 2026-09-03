@@ -8,10 +8,12 @@ fi
 
 app=$1
 expected_team=$2
+workspace_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 scratch_dir=$(mktemp -d /private/tmp/webkitui-pre-notary-verify.XXXXXX)
 trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
-version=0.6.0
-build=600
+version=$(plutil -extract CFBundleShortVersionString raw \
+  "$workspace_dir/Support/AquaApp/Info.plist")
+build=$(plutil -extract CFBundleVersion raw "$workspace_dir/Support/AquaApp/Info.plist")
 broker="$app/Contents/MacOS/webkitui-mcp-aqua-broker"
 helper="$app/Contents/MacOS/webkitui-mcp-confirm"
 embedded_relay="$app/Contents/MacOS/webkitui-mcp-relay"
@@ -34,7 +36,8 @@ test "$(plutil -extract CFBundleIconFile raw "$app/Contents/Info.plist")" = "App
 
 plutil -lint "$app/Contents/Info.plist" "$resources/PrivacyInfo.xcprivacy" "$provenance"
 for required in \
-  LICENSE LICENSING.md THIRD_PARTY_NOTICES.md sbom.cdx.json \
+  LICENSE LICENSING.md THIRD_PARTY_NOTICES.md RELEASE-MAINTENANCE.md \
+  NETWORK-BOUNDARY.md sbom.cdx.json \
   ReleaseProvenance.plist SOURCE-MANIFEST.sha256; do
   test -s "$resources/$required"
 done
@@ -66,7 +69,7 @@ if grep -Eq '(^|/)(\.env($|\.)|AuthKey_[^/]*\.p8$|[^/]*\.mobileprovision$)' \
   exit 1
 fi
 mkdir -p "$scratch_dir/current-provenance"
-"$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/scripts/generate-release-provenance.sh" \
+"$workspace_dir/scripts/generate-release-provenance.sh" \
   "$scratch_dir/current-provenance" >/dev/null
 cmp "$source_manifest" "$scratch_dir/current-provenance/SOURCE-MANIFEST.sha256"
 test -s "$resources/en.lproj/Localizable.strings"

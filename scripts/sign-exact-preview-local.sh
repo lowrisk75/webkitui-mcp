@@ -13,6 +13,8 @@ output_dir=$3
 signing_identity=$4
 expected_team=$5
 workspace_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+release_version=$(plutil -extract CFBundleShortVersionString raw \
+  "$workspace_dir/Support/AquaApp/Info.plist")
 scratch_dir=$(mktemp -d /private/tmp/webkitui-exact-sign.XXXXXX)
 trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
 
@@ -32,7 +34,7 @@ test -d "$app"
 test -x "$helper"
 test -x "$relay"
 mkdir -p "$output_dir"
-output_archive="$output_dir/WebKitUI-MCP-0.6.0-signed-local.zip"
+output_archive="$output_dir/WebKitUI-MCP-$release_version-signed-local.zip"
 attestation="$output_dir/SigningAttestation.plist"
 for output in "$output_archive" "$attestation"; do
   if [ -e "$output" ]; then
@@ -52,7 +54,12 @@ codesign --force --sign "$signing_identity" \
 
 "$workspace_dir/scripts/verify-pre-notarization.sh" "$app" "$expected_team"
 
-ditto -c -k --sequesterRsrc --keepParent "$app" "$output_archive"
+COPYFILE_DISABLE=1 ditto -c -k --norsrc --noextattr --keepParent \
+  "$app" "$output_archive"
+if zipinfo -1 "$output_archive" | grep -Eq '(^__MACOSX/|(^|/)\._)'; then
+  printf '%s\n' "signed archive contains forbidden AppleDouble metadata" >&2
+  exit 1
+fi
 mkdir -p "$scratch_dir/roundtrip"
 ditto -x -k "$output_archive" "$scratch_dir/roundtrip"
 "$workspace_dir/scripts/verify-pre-notarization.sh" \

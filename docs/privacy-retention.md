@@ -13,10 +13,20 @@ retention policy.
 | Screenshot capture | Returned once to the requesting MCP client | Not written to disk by the native runtime | Released from process memory after the response; client copies are caller-managed |
 | Semantic observation | Bounded current-session representation | Memory only | Invalidated by the next observation, navigation, handoff transition or session close |
 | Browser cookies and site storage | Local persistent WebKit profile when explicitly selected | Profile-scoped macOS storage | User removes the local profile; never included in diagnostics or exports |
+| Browser download | User-approved native save-panel destination; MCP receives only filename, response metadata, size, digest and optional decoded profile UUID | File remains only at the destination selected by the user | User removes the downloaded file; cookies, headers, body and absolute destination path are never serialized to MCP |
 | Transaction ledger | Minimal plan, digests, phase and predicate evidence | HMAC-authenticated file, mode `0600`, profile-scoped; generation/head anchored in Keychain | Retained until explicit local profile/receipt removal; no automatic TTL; new writes fail closed at 10,000 records or 16 MiB |
 | ReceiptV1 export | Redacted JSON and Markdown generated on request | Not automatically written by WebKitUI MCP | Caller chooses destination and removal |
 | Credentials | Held by the separate signed credential boundary | SiliconPass/Keychain policy | Managed in the credential owner; never copied to observations, receipts or diagnostics |
 | License lease | Product-bound signed token and masked status | macOS Keychain/local validation state | Deactivation/uninstall policy; never emitted in full by status or diagnostics |
+
+Optional license activation, refresh and deactivation send only the entered
+license key, the stable local machine identifier, the app version and the fixed
+product identifier to `https://license.lorislab.fr`. The client uses an
+ephemeral, cookie-free, cache-free session, rejects redirects, accepts only a
+bounded JSON response from the same HTTPS origin, and does not send browser
+content, profile data, credentials, observations or receipts. The signed lease
+is stored in Keychain; the service's server-side retention and deletion terms
+remain a publication/legal gate.
 
 ## Why transaction records have no automatic TTL
 
