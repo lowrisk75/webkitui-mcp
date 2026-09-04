@@ -422,6 +422,9 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
   @objc private func showStatus() {
     refreshStatus()
     if window.isMiniaturized { window.deminiaturize(nil) }
+    window.makeFirstResponder(nil)
+    resetStatusScrollPosition()
+    DispatchQueue.main.async { [weak self] in self?.resetStatusScrollPosition() }
     NSApplication.shared.activate(ignoringOtherApps: true)
     window.makeKeyAndOrderFront(nil)
     window.orderFrontRegardless()
