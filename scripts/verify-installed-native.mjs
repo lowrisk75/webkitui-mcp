@@ -113,6 +113,7 @@ try {
 
   const expectedTools = [
     "browser_download",
+    "browser_upload",
     "browser_act",
     "browser_capture",
     "browser_fill_siliconpass",
