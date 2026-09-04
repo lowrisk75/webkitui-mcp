@@ -353,6 +353,27 @@ struct WebKitRuntimeTests {
       observation.elements.first?.accessibleName?.segments.map(\.text).joined() == "LorisLab")
   }
 
+  @Test("A rendered page keeping a loading banner is not treated as still loading")
+  func renderedPageWithLoadingBannerDoesNotStall() async throws {
+    // Play Console's app list keeps "Loading Google Play Console" at the top of its
+    // text while being fully rendered. Treating that as a shell made every
+    // observation wait out the full hydration budget for nothing.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <p>Loading Google Play Console</p>
+      <p>Home</p><p>Policy status</p>
+      <button aria-label="Create app">Create app</button>
+      """,
+      baseURL: URL(string: "https://play.fixture.invalid/app-list"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20))
+
+    let started = ContinuousClock.now
+    let observation = try await runtime.observe(hydrationTimeout: .seconds(30))
+    #expect(ContinuousClock.now - started < .seconds(5))
+    #expect(observation.elements.count == 1)
+  }
+
   @Test("Main-frame navigation audit distinguishes agent actions from web content")
   func navigationActorAttribution() async throws {
     let runtime = WebKitRuntime()

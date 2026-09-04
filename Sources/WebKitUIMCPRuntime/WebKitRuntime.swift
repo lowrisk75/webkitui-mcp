@@ -3333,13 +3333,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       document, '[aria-busy="true"], [role="progressbar"], progress'
     ).some(isRendered);
     const loadingShellText = collapse(document.body?.innerText);
+    // Counted from the raw DOM, not the semantic matcher: a page whose matcher finds
+    // nothing may still be fully rendered, and must not be mistaken for a shell that
+    // has not painted its controls yet.
+    const renderedInteractiveCount = deepQueryAll(
+      document, 'button, a[href], input, select, textarea, [role="button"]'
+    ).filter(isRendered).length;
     const transientLoading = matchingElements.length === 0 && (
       visibleLoadingIndicators
       // Anchored on the start, not the whole body: a loading shell usually renders
       // its navigation labels too, so requiring the entire text to be the phrase
       // never matched a real single-page app. Zero matching controls is what makes
       // this safe — a hydrated page with controls is never treated as loading.
-      || /^(loading|chargement)\\b/i.test(loadingShellText)
+      || (renderedInteractiveCount === 0
+        && /^(loading|chargement)\\b/i.test(loadingShellText))
     );
     return JSON.stringify({
       url: location.href,
