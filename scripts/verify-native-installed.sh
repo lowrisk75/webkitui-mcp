@@ -2,7 +2,8 @@
 set -euo pipefail
 
 project_root=${0:A:h:h}
-expected_version=0.6.0
+expected_version=$(plutil -extract CFBundleShortVersionString raw \
+  "$project_root/Support/AquaApp/Info.plist")
 installed_app="/Users/kevinnadjarian/Applications/WebKitUI MCP.app"
 if [[ ! -d "$installed_app" ]]; then
   installed_app="/Users/kevinnadjarian/Applications/WebkitUIMCP Aqua.app"

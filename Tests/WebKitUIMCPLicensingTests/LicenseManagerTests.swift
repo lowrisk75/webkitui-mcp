@@ -34,7 +34,8 @@ struct LicenseManagerTests {
       store: store,
       api: StubAPI(token: "forged"),
       verifier: StubVerifier(result: .invalid),
-      machineID: { "machine-1" }
+      machineID: { "machine-1" },
+      appVersion: { "0.6.0" }
     )
 
     await #expect(throws: WebKitUILicenseError.tokenVerificationFailed) {
@@ -50,7 +51,8 @@ struct LicenseManagerTests {
       store: MemoryStore(),
       api: StubAPI(token: "unused"),
       verifier: StubVerifier(result: .invalid),
-      machineID: { "" }
+      machineID: { "" },
+      appVersion: { "0.6.0" }
     )
 
     await #expect(throws: WebKitUILicenseError.machineIdentityUnavailable) {
@@ -72,7 +74,8 @@ struct LicenseManagerTests {
       api: StubAPI(token: "signed-token"),
       verifier: StubVerifier(result: .valid(fixtureClaims())),
       machineID: { "machine-1" },
-      now: { Date(timeIntervalSince1970: 1_000) }
+      now: { Date(timeIntervalSince1970: 1_000) },
+      appVersion: { "0.6.0" }
     )
 
     let status = try await manager.status()
@@ -96,7 +99,8 @@ struct LicenseManagerTests {
       api: StubAPI(token: "unused"),
       verifier: StubVerifier(result: .invalid),
       machineID: { "machine-1" },
-      now: { Date(timeIntervalSince1970: 1_000) }
+      now: { Date(timeIntervalSince1970: 1_000) },
+      appVersion: { "0.6.0" }
     )
 
     #expect(try await manager.status().state == .invalid)
@@ -119,7 +123,8 @@ struct LicenseManagerTests {
       api: StubAPI(token: "unused"),
       verifier: StubVerifier(result: .expired(claims)),
       machineID: { "machine-1" },
-      now: { Date(timeIntervalSince1970: 2_100) }
+      now: { Date(timeIntervalSince1970: 2_100) },
+      appVersion: { "0.6.0" }
     )
 
     #expect(try await manager.status().state == .grace)
@@ -141,7 +146,8 @@ struct LicenseManagerTests {
       api: StubAPI(token: "unused"),
       verifier: StubVerifier(result: .valid(fixtureClaims())),
       machineID: { "machine-1" },
-      now: { Date(timeIntervalSince1970: 1_000) }
+      now: { Date(timeIntervalSince1970: 1_000) },
+      appVersion: { "0.6.0" }
     )
 
     #expect(try await manager.status().state == .invalid)
@@ -163,12 +169,46 @@ struct LicenseManagerTests {
       api: StubAPI(token: "new-token"),
       verifier: StubVerifier(result: .valid(fixtureClaims(expiration: 4_000))),
       machineID: { "machine-1" },
-      now: { Date(timeIntervalSince1970: 2_000) }
+      now: { Date(timeIntervalSince1970: 2_000) },
+      appVersion: { "0.6.0" }
     )
 
     #expect(try await manager.refresh().state == .active)
     #expect(try store.load()?.token == "new-token")
     #expect(try store.load()?.lastServerSuccessAt == Date(timeIntervalSince1970: 2_000))
+  }
+
+  @Test("A token for another app version fails closed")
+  func appVersionMismatchFailsClosed() async throws {
+    let store = MemoryStore()
+    try store.save(
+      StoredWebKitUILicense(
+        licenseKey: "WEBKITUI-ABCD-EFGH-2345-6789",
+        token: "signed-token",
+        activatedAt: Date(timeIntervalSince1970: 900)
+      ))
+    let manager = WebKitUILicenseManager(
+      store: store,
+      api: StubAPI(token: "signed-token"),
+      verifier: StubVerifier(result: .valid(fixtureClaims())),
+      machineID: { "machine-1" },
+      now: { Date(timeIntervalSince1970: 1_000) },
+      appVersion: { "0.6.1" }
+    )
+
+    #expect(try await manager.status().state == .invalid)
+    await #expect(throws: WebKitUILicenseError.tokenVerificationFailed) {
+      try await manager.activate(licenseKey: "WEBKITUI-ABCD-EFGH-2345-6789")
+    }
+  }
+
+  @Test("App version compatibility is exact and rejects build placeholders")
+  func appVersionCompatibility() {
+    #expect(WebKitUILicenseManager.tokenVersionIsCompatible("0.6.1", current: "0.6.1"))
+    #expect(!WebKitUILicenseManager.tokenVersionIsCompatible("0.6.0", current: "0.6.1"))
+    #expect(!WebKitUILicenseManager.tokenVersionIsCompatible("unknown", current: "unknown"))
+    #expect(
+      !WebKitUILicenseManager.tokenVersionIsCompatible("source-build", current: "source-build"))
   }
 
   @Test("signed leases require explicit lifecycle claims")
@@ -218,7 +258,8 @@ struct LicenseManagerTests {
       api: StubAPI(token: "unused"),
       verifier: StubVerifier(result: .valid(fixtureClaims(expiration: 4_000))),
       machineID: { "machine-1" },
-      now: { Date(timeIntervalSince1970: 1_100) }
+      now: { Date(timeIntervalSince1970: 1_100) },
+      appVersion: { "0.6.0" }
     )
     #expect(try await withinInterval.status().state == .active)
     #expect(store.saveCount() == 1)
@@ -228,7 +269,8 @@ struct LicenseManagerTests {
       api: StubAPI(token: "unused"),
       verifier: StubVerifier(result: .valid(fixtureClaims(expiration: 4_000))),
       machineID: { "machine-1" },
-      now: { Date(timeIntervalSince1970: 1_301) }
+      now: { Date(timeIntervalSince1970: 1_301) },
+      appVersion: { "0.6.0" }
     )
     #expect(try await afterInterval.status().state == .active)
     #expect(store.saveCount() == 2)

@@ -33,8 +33,8 @@ struct WebKitUIMCPCLI {
 
           Native WebKit MCP server. Reads newline-delimited JSON-RPC from stdin and writes responses to stdout.
 
-          Commercial activation is optional for uses permitted directly by the BSL
-          Additional Use Grant. The license key is never exposed through MCP.
+          License commands exercise optional preview entitlement plumbing. They do
+          not gate capabilities or alter rights granted by MIT. Keys never enter MCP.
 
           doctor performs local, secret-free readiness checks. It never authenticates,
           opens a website, contacts the license service, or reads browser data.
@@ -265,7 +265,8 @@ struct WebKitUIMCPCLI {
       let server = try WebKitMCPServer(
         maximumSessions: 1,
         enforceHostExclusiveSession: true,
-        transactionLedgerFactory: .durable()
+        transactionLedgerFactory: .durable(),
+        activityLog: .durable()
       )
       for try await line in FileHandle.standardInput.bytes.lines {
         if let response = await server.handle(Data(line.utf8)) {

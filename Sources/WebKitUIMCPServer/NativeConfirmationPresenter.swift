@@ -2,9 +2,25 @@ import Darwin
 import Foundation
 import Security
 
+enum NativeConfirmationOutcome: String, Equatable, Sendable {
+  case approved
+  case declined
+  case timedOut = "timed_out"
+  case cancelled
+  case failed
+}
+
+enum NativeConfirmationState: String, Equatable, Sendable {
+  case idle
+  case pending = "pending_native_confirmation"
+}
+
 @MainActor
 protocol BrowserConfirmationPresenting: AnyObject {
-  func confirm(title: String, message: String, approveLabel: String) -> Bool
+  var state: NativeConfirmationState { get }
+  func confirm(title: String, message: String, approveLabel: String) async
+    -> NativeConfirmationOutcome
+  func cancel()
 }
 
 @MainActor
@@ -14,18 +30,28 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   private let helperURL: URL
   private let helperVerification: (URL) -> Bool
   private let runningHelperVerification: ((pid_t) -> Bool)?
+  private let timeout: Duration
+  private var activeProcess: Process?
+  private var cancellationRequested = false
+
+  var state: NativeConfirmationState { activeProcess == nil ? .idle : .pending }
 
   init(
     helperURL: URL? = nil,
     helperVerification: ((URL) -> Bool)? = nil,
-    runningHelperVerification: ((pid_t) -> Bool)? = nil
+    runningHelperVerification: ((pid_t) -> Bool)? = nil,
+    timeout: Duration = .seconds(60)
   ) {
     self.helperURL = helperURL ?? Self.defaultHelperURL()
     self.helperVerification = helperVerification ?? Self.verifyPackagedHelper
     self.runningHelperVerification = runningHelperVerification
+    self.timeout = timeout
   }
 
-  func confirm(title: String, message: String, approveLabel: String) -> Bool {
+  func confirm(title: String, message: String, approveLabel: String) async
+    -> NativeConfirmationOutcome
+  {
+    guard activeProcess == nil else { return .failed }
     let payload: Data
     do {
       payload = try JSONEncoder().encode(
@@ -35,9 +61,9 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
           approveLabel: approveLabel
         ))
     } catch {
-      return false
+      return .failed
     }
-    guard helperVerification(helperURL) else { return false }
+    guard helperVerification(helperURL) else { return .failed }
     let process = Process()
     let input = Pipe()
     process.executableURL = helperURL
@@ -54,16 +80,57 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
         process.terminate()
         try? input.fileHandleForWriting.close()
         process.waitUntilExit()
-        return false
+        return .failed
       }
       try Self.writePayload(payload, to: input.fileHandleForWriting)
       try input.fileHandleForWriting.close()
-      process.waitUntilExit()
+      activeProcess = process
+      cancellationRequested = false
+      defer {
+        activeProcess = nil
+        cancellationRequested = false
+      }
+      let waitOutcome = await Self.wait(for: process, timeout: timeout)
+      if waitOutcome == .timedOut { return .timedOut }
+      if cancellationRequested { return .cancelled }
     } catch {
       try? input.fileHandleForWriting.close()
-      return false
+      return .failed
     }
-    return process.terminationReason == .exit && process.terminationStatus == EXIT_SUCCESS
+    guard process.terminationReason == .exit else { return .failed }
+    if process.terminationStatus == EXIT_SUCCESS { return .approved }
+    if process.terminationStatus == 2 { return .declined }
+    if process.terminationStatus == 3 { return .cancelled }
+    return .failed
+  }
+
+  func cancel() {
+    cancellationRequested = activeProcess != nil
+    activeProcess?.terminate()
+  }
+
+  private static func wait(for process: Process, timeout: Duration) async
+    -> NativeConfirmationOutcome
+  {
+    let box = SendableProcess(process)
+    return await withTaskGroup(of: NativeConfirmationOutcome.self) { group in
+      group.addTask {
+        box.process.waitUntilExit()
+        return .declined
+      }
+      group.addTask {
+        do {
+          try await Task.sleep(for: timeout)
+          return .timedOut
+        } catch {
+          return .cancelled
+        }
+      }
+      let first = await group.next() ?? .failed
+      if first == .timedOut, box.process.isRunning { box.process.terminate() }
+      group.cancelAll()
+      return first
+    }
   }
 
   static var helperArguments: [String] {
@@ -162,6 +229,11 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     }
     return team == expected.team && identifier == expected.identifier
   }
+}
+
+private final class SendableProcess: @unchecked Sendable {
+  let process: Process
+  init(_ process: Process) { self.process = process }
 }
 
 private struct NativeConfirmationRequest: Encodable {

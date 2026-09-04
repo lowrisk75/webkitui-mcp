@@ -8,7 +8,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 
 - Native `WKWebView` runtime using the persistent system WebKit data store for real authenticated sessions.
 - MCP 2026-07-28 stdio server with legacy initialization compatibility.
-- Ten bounded tools, including explicit page/element scrolling and bounded text extraction for rendered virtualized logs.
+- Thirteen bounded tools, including authenticated native downloads, explicit page/element scrolling, and bounded text extraction for rendered virtualized logs.
 - Observation-scoped element symbols backed by semantic locator recipes and fresh action-time resolution.
 - Five separate addressing counters: `address_resolution_failed`, `address_now_ambiguous`, `logical_target_changed`, `node_replaced_but_semantic_locator_recovered`, and `coordinate_invalidated_by_layout_change`.
 - Provenance attached to every serialized page string.
@@ -30,6 +30,11 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - MCP sessions use a per-session loopback SOCKS5 boundary with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
 - The production CLI enforces one browser controller across all local/remote MCP processes for the macOS account; the lease is released on close or process death.
 - Private remote clients can use the app-owned broker plus a forced-command SSH relay; WebKit and authenticated profile data remain on the logged-in Mac.
+- Multiple relay clients may use the same long-lived broker concurrently, but
+  only one client owns the single browser surface at a time. Other clients get
+  `session_in_use` with `wait_only=true`; they cannot observe, navigate, act,
+  invalidate addresses, or request duplicate user control. Ownership transfers
+  after the controlling client disconnects.
 - The app broker owns one live browser across MCP client reconnects. Every
   reconnect invalidates observations, pending approvals, capabilities, and
   transaction coordinators before returning the preserved session handle.
@@ -44,10 +49,17 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   then offers a native human handoff for manual sign-in and addition/update in
   SiliconPass. No credential value crosses MCP, JSON, logs, or the clipboard.
 - Web-content termination invalidates every observation immediately; recovery reloads the host-owned last URL without replaying an action. A forced-crash fixture verifies that an `HttpOnly` authenticated cookie plus `localStorage` and `sessionStorage` survive in the same view/data-store lifetime.
+- The macOS companion is a regular Dock app with a local activity window. It
+  records only allowlisted MCP tool names, outcome, timestamp, duration and a
+  bounded error type. Parameters, URLs, page content, credentials, cookies,
+  keystrokes and response bodies are structurally absent. Owner-only JSONL
+  files rotate automatically and can be exported or cleared from the app.
 
 ## Deliberate limits
 
-- `browser_act` exposes click, native submit-control click, bounded non-sensitive input/textarea fill, Enter/Tab/Escape, blur, and explicit input commit. Fill verifies the freshly re-resolved semantic target's exact value; other actions require a transactional URL, exact/contains semantic text, checked, selected, enabled, value, bounded state-attribute, dialog, or selected-option postcondition. Contains matching stores SHA-256 plus bounded rolling parameters rather than plaintext in the transaction plan. UI state does not prove backend commit.
+- `browser_act` exposes click, native submit-control click, bounded non-sensitive input/textarea fill, Enter/Tab/Escape, blur, and explicit input commit. Native approval also routes public text fills through AppKit insertion with a measured trusted `input` receipt. Fill verifies both the freshly re-resolved semantic target's exact value and that its live validation state is not invalid. Other actions support exact URL or URL prefix, title, heading, exact/contains semantic text, checked, selected, enabled, value, validation state, character count, bounded state attributes, dialog, named panel, or selected-option postconditions. A same-URL SPA mutation returns `same_url_page_state_changed` guidance instead of implying success. UI state never proves backend commit.
+- `browser_download` converts authenticated attachment responses to `WKDownload` from either a fresh observed control or a protected same-origin URL fallback. It requires exact native confirmation plus a save-panel destination, never overwrites an existing file, and succeeds only after an on-disk receipt reports the HTTP status, suggested/final filename, MIME type, byte count, SHA-256, and decoded provisioning-profile UUID when available. Cookies, headers, and the absolute local destination path stay outside MCP.
+- macOS file inputs use WebKit's native open-panel delegate. Selected regular files are bounded to 10 files and 50 MiB each; receipts may expose filenames, byte counts and SHA-256 values, but never local paths or file contents. A file-selection receipt is not provider acceptance: the action's independent postcondition must still verify the uploaded preview or saved state.
 - Fill dispatches normal `input`/`change` events, so site handlers may autosave or cause server effects. It is destructive and human-confirmed; password controls require local human handoff.
 - `approval_mode: "native"` sends confirmed click/submit and Enter/Tab/Escape through public AppKit `NSEvent` handling on the freshly re-resolved `WKWebView` target. An isolated message handler must observe the matching DOM event with `event.isTrusted == true` before the receipt reports trust. Missing/mismatched receipts fail indeterminate; no flag is synthesized. `approval_mode: "mcp"`, fill, blur, and commit remain JavaScript-dispatched and report untrusted.
 - Action results separately expose `confirmation_mode`, `dispatch_mode`, and `trusted_gesture_state`. Native confirmation alone never establishes event trust.
@@ -64,7 +76,9 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - No exactly-once or rollback claim for an uncooperative website.
 - Low concurrency is intentional because WKWebView has no per-view hard memory quota.
 - The protected network path is the MCP session registry or `WebKitRuntime(protectedWebsiteDataStore:)`; the lower-level `WebKitRuntime(websiteDataStore:)` initializer is intentionally unprotected for fixtures and embedding.
-- Proxy tests currently prove HTTP/TCP main-frame and fetch-subresource routing, pin reuse, local-address denial, and UDP-ASSOCIATE rejection. HTTPS, WebSocket, WebRTC, system IPC, and existing socket-pool behavior are not yet measured.
+- This is a bounded website-traffic control, not a complete process egress
+  sandbox. The exact tested transports, exclusions and safe-use rule are in
+  [`docs/network-boundary.md`](docs/network-boundary.md).
 
 ## Build and test
 
@@ -127,7 +141,7 @@ scripts/package-preview.sh dist
 scripts/verify-package-preview.sh dist
 ```
 
-Unzip `WebKitUI-MCP-0.6.0-preview.zip`, move `WebKitUI MCP.app` to the
+Unzip `WebKitUI-MCP-0.6.1-preview.zip`, move `WebKitUI MCP.app` to the
 Applications folder, and open it. In the status window:
 
 1. Enable **Launch at Login**. macOS may require approval in System Settings.
@@ -135,6 +149,12 @@ Applications folder, and open it. In the status window:
    app bundle and the owner-only local Unix socket.
 3. Keep the app in Applications after registration so the saved relay path
    remains valid.
+
+The **Activity journal** button opens the local privacy-safe event history.
+Its files live under `~/Library/Application Support/WebkitUIMCP/Activity` with
+owner-only permissions. Rotation retains at most seven 5 MiB archives plus the
+active file. **Clear** removes activity files but preserves transaction
+receipts; **Export** writes only the same redacted event schema.
 
 The app uses Apple's Service Management API and does not install a mutable
 plist in `~/Library/LaunchAgents`. **Prepare to uninstall** disables Launch at
@@ -179,6 +199,8 @@ Local data lifetimes and explicit-export boundaries are documented in
 [`docs/privacy-retention.md`](docs/privacy-retention.md).
 The stable diagnostic allowlist and forbidden support data are documented in
 [`docs/support-diagnostics.md`](docs/support-diagnostics.md).
+The manual signed-update, rollback, support and incident rules are documented
+in [`docs/release-maintenance-policy.md`](docs/release-maintenance-policy.md).
 
 SiliconPass credential release is deliberately stronger than ordinary browser
 confirmation. After the exact native fill summary is approved, macOS evaluates
@@ -236,30 +258,11 @@ The first measured local lane uses 30 runs of the same deterministic fixture at 
 
 ## Licensing
 
-Future versions first distributed with this checkout's [`LICENSE`](LICENSE) use
-the Business Source License 1.1. Personal noncommercial use, qualifying
-noncommercial organizations, non-production development and testing, and a
-bounded evaluation period are permitted. Other commercial production use
-requires a written LorisLabs commercial license.
-
-The intended Team offer is EUR 299 per organization per year for up to five
-authorized developers. After purchase, activation is performed locally:
-
-```bash
-webkitui-mcp license activate WEBKITUI-XXXX-XXXX-XXXX-XXXX
-webkitui-mcp license status
-```
-
-The key and signed entitlement are stored in the macOS Keychain with
-device-only accessibility. Status output is masked, and the MCP protocol never
-receives or exposes the commercial license key. In this Developer Preview the
-entitlement is verified evidence, not a capability gate; commercial rights
-still come only from the separate written agreement.
-
-This change is not retroactive: revisions already published under MIT remain
-MIT. Each BSL version converts to Apache-2.0 on its Change Date. See
-[`LICENSING.md`](LICENSING.md) for the exact boundary, intended launch policy,
-and unresolved legal publication gates.
+WebKitUI MCP 0.6.1 Developer Preview is available under the
+[MIT License](LICENSE), including commercial use, modification and
+redistribution subject to that license's notice requirement. No purchase or
+activation is required. See [`LICENSING.md`](LICENSING.md) for the exact scope,
+third-party boundary and treatment of earlier revisions.
 
 ## Safety
 

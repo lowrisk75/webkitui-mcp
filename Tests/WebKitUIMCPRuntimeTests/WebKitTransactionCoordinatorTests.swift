@@ -7,6 +7,16 @@ import WebKitUIMCPCore
 @Suite("WebKit transactional coordinator", .serialized)
 @MainActor
 struct WebKitTransactionCoordinatorTests {
+  @Test("A target-not-actionable result is uncertain and must be reconciled")
+  func targetNotActionableIsUncertain() {
+    #expect(
+      WebKitTransactionCoordinator.dispatchOutcome(for: .targetNotActionable).rawValue
+        == DispatchOutcome.unknown.rawValue)
+    #expect(
+      WebKitTransactionCoordinator.dispatchOutcome(for: .targetNotUnique(2)).rawValue
+        == DispatchOutcome.notDispatched.rawValue)
+  }
+
   @Test("A dispatched click is successful only after its postcondition")
   func verifiedClick() async throws {
     let runtime = WebKitRuntime()

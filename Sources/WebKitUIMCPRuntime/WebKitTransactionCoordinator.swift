@@ -6,6 +6,13 @@ public struct WebKitTransactionResult: Sendable {
   public let verification: TransactionVerification
 }
 
+public enum WebKitTransactionExecutionError: Error, Sendable {
+  case uncertainDispatch(
+    verification: TransactionVerification,
+    underlyingDescription: String
+  )
+}
+
 @MainActor
 public final class WebKitTransactionCoordinator {
   private let runtime: WebKitRuntime
@@ -73,19 +80,20 @@ public final class WebKitTransactionCoordinator {
         monotonicNowNanoseconds: dispatchedAtNanoseconds
       )
     } catch let error as WebKitRuntimeError {
-      let knownNotDispatched: Bool
-      switch error {
-      case .staleObservation, .unknownElement, .targetNotUnique, .targetNotActionable,
-        .targetGeometryChanged, .sensitiveInputRequiresHuman:
-        knownNotDispatched = true
-      default:
-        knownNotDispatched = false
-      }
+      let outcome = Self.dispatchOutcome(for: error)
       _ = try await ledger.recordDispatchOutcome(
         idempotencyKey: plan.idempotencyKey,
-        outcome: knownNotDispatched ? .notDispatched : .unknown,
+        outcome: outcome,
         monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
       )
+      if outcome.rawValue == DispatchOutcome.unknown.rawValue {
+        let verification = try await reconcileUncertainDispatch(
+          idempotencyKey: plan.idempotencyKey,
+          fallbackObservation: transactionObservation)
+        throw WebKitTransactionExecutionError.uncertainDispatch(
+          verification: verification,
+          underlyingDescription: String(describing: error))
+      }
       throw error
     } catch {
       _ = try await ledger.recordDispatchOutcome(
@@ -93,7 +101,12 @@ public final class WebKitTransactionCoordinator {
         outcome: .unknown,
         monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
       )
-      throw error
+      let verification = try await reconcileUncertainDispatch(
+        idempotencyKey: plan.idempotencyKey,
+        fallbackObservation: transactionObservation)
+      throw WebKitTransactionExecutionError.uncertainDispatch(
+        verification: verification,
+        underlyingDescription: String(describing: type(of: error)))
     }
 
     let (verificationDeadline, overflow) = dispatchedAtNanoseconds.addingReportingOverflow(
@@ -103,7 +116,7 @@ public final class WebKitTransactionCoordinator {
 
     while true {
       do {
-        let latest = try await runtime.observe()
+        let latest = try await runtime.observe(hydrationTimeout: .zero)
         let verification = try await ledger.verify(
           idempotencyKey: plan.idempotencyKey,
           observation: TransactionObservation(
@@ -139,10 +152,48 @@ public final class WebKitTransactionCoordinator {
     try await ledger.receipt(idempotencyKey: idempotencyKey)
   }
 
+  static func dispatchOutcome(for error: WebKitRuntimeError) -> DispatchOutcome {
+    switch error {
+    case .staleObservation, .unknownElement, .targetNotUnique,
+      .targetGeometryChanged, .sensitiveInputRequiresHuman:
+      .notDispatched
+    case .targetNotActionable, .nativeGestureReceiptUnavailable,
+      .webContentProcessTerminated, .malformedInstrumentationResult, .noDocument,
+      .navigationFailed, .navigationTimedOut, .networkBoundaryDenied,
+      .unsupportedURLScheme, .crossOriginRedirectRequiresHuman,
+      .invalidQuietWindow, .invalidCredentialOrigin, .invalidCredentialBinding,
+      .invalidCredentialSecret, .humanControlActive, .authenticationOriginRequiresHuman,
+      .noPendingCrossOriginNavigation, .invalidControlTransition,
+      .downloadInProgress, .downloadCancelled, .downloadReceiptTimedOut,
+      .unsupportedDownload, .downloadHTTPFailure, .downloadFailed:
+      .unknown
+    }
+  }
+
+  private func reconcileUncertainDispatch(
+    idempotencyKey: String,
+    fallbackObservation: TransactionObservation
+  ) async throws -> TransactionVerification {
+    do {
+      let current = try await runtime.observe(hydrationTimeout: .zero)
+      return try await ledger.reconcile(
+        idempotencyKey: idempotencyKey,
+        observation: TransactionObservation(
+          state: try current.canonicalState(), completeness: .complete),
+        monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    } catch {
+      return try await ledger.reconcile(
+        idempotencyKey: idempotencyKey,
+        observation: TransactionObservation(
+          state: fallbackObservation.state, completeness: .partial),
+        monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    }
+  }
+
   /// Re-observes an indeterminate write and may prove its postcondition later.
   /// It never dispatches or retries the action.
   public func reconcile(idempotencyKey: String) async throws -> TransactionVerification {
-    let observation = try await runtime.observe()
+    let observation = try await runtime.observe(hydrationTimeout: .zero)
     return try await ledger.reconcile(
       idempotencyKey: idempotencyKey,
       observation: TransactionObservation(

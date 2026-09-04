@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import WebKit
@@ -82,10 +83,20 @@ private final class HostControllerLease {
 
 @MainActor
 public final class WebKitSessionRegistry {
+  private struct HandoffResumeCapability {
+    let session: WebKitSessionHandle
+    let expiresAt: Date
+  }
+
   public let maximumSessions: Int
   private let enforceHostExclusiveSession: Bool
   private let hostControllerLockURL: URL?
   private var sessions: [WebKitSessionHandle: WebKitRuntime] = [:]
+  // Resume capabilities belong to the host-owned browser authority, not to a
+  // transient MCP transport. Only a one-way digest is retained in memory.
+  private var handoffResumeCapabilities: [Data: HandoffResumeCapability] = [:]
+  private var handoffOwners: [WebKitSessionHandle: UUID] = [:]
+  private var sessionOwners: [WebKitSessionHandle: UUID] = [:]
   private var hostControllerLease: HostControllerLease?
 
   public init(
@@ -151,7 +162,140 @@ public final class WebKitSessionRegistry {
     guard sessions.removeValue(forKey: handle) != nil else {
       throw WebKitSessionRegistryError.unknownSession
     }
+    revokeHandoffResumeCapabilities(for: handle)
+    handoffOwners.removeValue(forKey: handle)
+    sessionOwners.removeValue(forKey: handle)
     if sessions.isEmpty { hostControllerLease = nil }
+  }
+
+  public func issueHandoffResumeCapability(
+    for handle: WebKitSessionHandle,
+    lifetime: TimeInterval = 3_600,
+    now: Date = Date()
+  ) throws -> (token: String, expiresAt: Date) {
+    _ = try runtime(for: handle)
+    purgeExpiredHandoffResumeCapabilities(now: now)
+    revokeHandoffResumeCapabilities(for: handle)
+    let token = SymmetricKey(size: .bits256).withUnsafeBytes {
+      $0.map { String(format: "%02x", $0) }.joined()
+    }
+    let expiresAt = now.addingTimeInterval(lifetime)
+    handoffResumeCapabilities[handoffResumeDigest(token)] = .init(
+      session: handle, expiresAt: expiresAt)
+    return (token, expiresAt)
+  }
+
+  public func handoffResumeCapabilityIsActive(
+    _ token: String,
+    for handle: WebKitSessionHandle,
+    now: Date = Date()
+  ) -> Bool {
+    purgeExpiredHandoffResumeCapabilities(now: now)
+    guard let capability = handoffResumeCapabilities[handoffResumeDigest(token)] else {
+      return false
+    }
+    return capability.session == handle
+  }
+
+  public func hasActiveHandoffResumeCapability(
+    for handle: WebKitSessionHandle,
+    now: Date = Date()
+  ) -> Bool {
+    purgeExpiredHandoffResumeCapabilities(now: now)
+    return handoffResumeCapabilities.values.contains { $0.session == handle }
+  }
+
+  public func claimHandoffOwnership(
+    for handle: WebKitSessionHandle,
+    owner: UUID
+  ) throws -> Bool {
+    _ = try runtime(for: handle)
+    if let existing = handoffOwners[handle] { return existing == owner }
+    handoffOwners[handle] = owner
+    return true
+  }
+
+  public func handoffOwnershipState(
+    for handle: WebKitSessionHandle,
+    owner: UUID
+  ) throws -> String {
+    _ = try runtime(for: handle)
+    guard let existing = handoffOwners[handle] else { return "inactive" }
+    return existing == owner ? "owned_by_this_client" : "owned_elsewhere"
+  }
+
+  @discardableResult
+  public func releaseHandoffOwnership(
+    for handle: WebKitSessionHandle,
+    owner: UUID? = nil
+  ) -> Bool {
+    guard let existing = handoffOwners[handle] else { return false }
+    if let owner, existing != owner { return false }
+    handoffOwners.removeValue(forKey: handle)
+    return true
+  }
+
+  public func releaseHandoffOwnerships(owner: UUID) {
+    handoffOwners = handoffOwners.filter { $0.value != owner }
+  }
+
+  public func claimSessionOwnership(
+    for handle: WebKitSessionHandle,
+    owner: UUID
+  ) throws -> Bool {
+    _ = try runtime(for: handle)
+    if let existing = sessionOwners[handle] { return existing == owner }
+    sessionOwners[handle] = owner
+    return true
+  }
+
+  public func sessionOwnershipState(
+    for handle: WebKitSessionHandle,
+    owner: UUID
+  ) throws -> String {
+    _ = try runtime(for: handle)
+    guard let existing = sessionOwners[handle] else { return "inactive" }
+    return existing == owner ? "owned_by_this_client" : "owned_elsewhere"
+  }
+
+  public func releaseSessionOwnerships(owner: UUID) {
+    sessionOwners = sessionOwners.filter { $0.value != owner }
+  }
+
+  @discardableResult
+  public func releaseSessionOwnership(
+    for handle: WebKitSessionHandle,
+    owner: UUID? = nil
+  ) -> Bool {
+    guard let existing = sessionOwners[handle] else { return false }
+    if let owner, existing != owner { return false }
+    sessionOwners.removeValue(forKey: handle)
+    return true
+  }
+
+  @discardableResult
+  public func consumeHandoffResumeCapability(
+    _ token: String,
+    for handle: WebKitSessionHandle,
+    now: Date = Date()
+  ) -> Bool {
+    purgeExpiredHandoffResumeCapabilities(now: now)
+    let digest = handoffResumeDigest(token)
+    guard handoffResumeCapabilities[digest]?.session == handle else { return false }
+    handoffResumeCapabilities.removeValue(forKey: digest)
+    return true
+  }
+
+  public func revokeHandoffResumeCapabilities(for handle: WebKitSessionHandle) {
+    handoffResumeCapabilities = handoffResumeCapabilities.filter { $0.value.session != handle }
+  }
+
+  private func purgeExpiredHandoffResumeCapabilities(now: Date) {
+    handoffResumeCapabilities = handoffResumeCapabilities.filter { $0.value.expiresAt > now }
+  }
+
+  private func handoffResumeDigest(_ token: String) -> Data {
+    Data(SHA256.hash(data: Data(token.utf8)))
   }
 
   public func runtime(for handle: WebKitSessionHandle) throws -> WebKitRuntime {

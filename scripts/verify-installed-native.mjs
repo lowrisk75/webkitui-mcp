@@ -4,11 +4,11 @@ import assert from "node:assert/strict";
 import net from "node:net";
 
 const socketPath = process.argv[2];
-const expectedVersion = process.argv[3] ?? "0.6.0";
+const expectedVersion = process.argv[3];
 const timeoutMilliseconds = 10_000;
 
-if (!socketPath) {
-  throw new Error("usage: verify-installed-native.mjs <socket-path> [expected-version]");
+if (!socketPath || !expectedVersion) {
+  throw new Error("usage: verify-installed-native.mjs <socket-path> <expected-version>");
 }
 
 const metadata = {
@@ -112,6 +112,7 @@ try {
   assert.equal(secondDiscovery._meta["io.modelcontextprotocol/serverInfo"].version, expectedVersion);
 
   const expectedTools = [
+    "browser_download",
     "browser_act",
     "browser_capture",
     "browser_fill_siliconpass",
@@ -119,6 +120,7 @@ try {
     "browser_navigate",
     "browser_observe",
     "browser_read_text",
+    "browser_inspect_element",
     "browser_scroll",
     "element_scroll_into_view",
     "browser_session",
