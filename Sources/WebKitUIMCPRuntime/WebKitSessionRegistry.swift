@@ -19,10 +19,29 @@ public struct WebKitSessionStatus: Codable, Equatable, Sendable {
   public let controlState: InteractionControlState
 }
 
+/// Who currently holds the single host controller. Written into the lock file by
+/// the holder so a blocked client can say what it is waiting for. It carries
+/// identity and timing only, never any browsing state.
+public struct HostControllerHolder: Codable, Equatable, Sendable {
+  public let processIdentifier: Int32
+  public let processName: String
+  public let clientName: String?
+  public let acquiredAtEpochSeconds: Double
+  public let lastActivityEpochSeconds: Double
+
+  public func idleSeconds(now: Date) -> Double {
+    max(0, now.timeIntervalSince1970 - lastActivityEpochSeconds)
+  }
+
+  public func heldSeconds(now: Date) -> Double {
+    max(0, now.timeIntervalSince1970 - acquiredAtEpochSeconds)
+  }
+}
+
 public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
   case invalidMaximumSessions
   case capacityReached
-  case hostControllerBusy
+  case hostControllerBusy(HostControllerHolder?)
   case hostControllerLockUnavailable
   case unknownSession
   case networkBoundaryUnavailable
@@ -31,7 +50,22 @@ public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
 private final class HostControllerLease {
   private let descriptor: Int32
 
-  init(lockFileURL: URL? = nil) throws {
+  /// Reads the holder record without taking the lock. `flock` is advisory, so this
+  /// never blocks and never disturbs the holder.
+  static func currentHolder(lockFileURL: URL?) -> HostControllerHolder? {
+    guard let path = try? resolvedPath(lockFileURL: lockFileURL, creatingDirectory: false)
+    else { return nil }
+    let opened = Darwin.open(path, O_RDONLY | O_NOFOLLOW)
+    guard opened >= 0 else { return nil }
+    defer { Darwin.close(opened) }
+    var bytes = [UInt8](repeating: 0, count: 4_096)
+    let read = Darwin.read(opened, &bytes, bytes.count)
+    guard read > 0 else { return nil }
+    return try? JSONDecoder().decode(
+      HostControllerHolder.self, from: Data(bytes[0..<read]))
+  }
+
+  private static func resolvedPath(lockFileURL: URL?, creatingDirectory: Bool) throws -> String {
     let fileManager = FileManager.default
     let directory: URL
     let path: String
@@ -46,6 +80,7 @@ private final class HostControllerLease {
         "com.lorislab.webkitui-mcp", isDirectory: true)
       path = directory.appendingPathComponent("controller.lock").path
     }
+    guard creatingDirectory else { return path }
     do {
       try fileManager.createDirectory(
         at: directory,
@@ -57,6 +92,25 @@ private final class HostControllerLease {
     guard chmod(directory.path, S_IRWXU) == 0 else {
       throw WebKitSessionRegistryError.hostControllerLockUnavailable
     }
+    return path
+  }
+
+  /// Rewrites the holder record. Called on acquisition and on every recorded call,
+  /// so a blocked client can tell a working host from an idle one.
+  func record(clientName: String?, acquiredAt: Date, lastActivityAt: Date) {
+    let holder = HostControllerHolder(
+      processIdentifier: ProcessInfo.processInfo.processIdentifier,
+      processName: ProcessInfo.processInfo.processName,
+      clientName: clientName,
+      acquiredAtEpochSeconds: acquiredAt.timeIntervalSince1970,
+      lastActivityEpochSeconds: lastActivityAt.timeIntervalSince1970)
+    guard let data = try? JSONEncoder().encode(holder) else { return }
+    guard ftruncate(descriptor, 0) == 0, lseek(descriptor, 0, SEEK_SET) == 0 else { return }
+    _ = data.withUnsafeBytes { Darwin.write(descriptor, $0.baseAddress, $0.count) }
+  }
+
+  init(lockFileURL: URL? = nil) throws {
+    let path = try Self.resolvedPath(lockFileURL: lockFileURL, creatingDirectory: true)
     let opened = Darwin.open(path, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
     guard opened >= 0 else {
       throw WebKitSessionRegistryError.hostControllerLockUnavailable
@@ -68,7 +122,8 @@ private final class HostControllerLease {
     guard flock(opened, LOCK_EX | LOCK_NB) == 0 else {
       Darwin.close(opened)
       if errno == EWOULDBLOCK {
-        throw WebKitSessionRegistryError.hostControllerBusy
+        throw WebKitSessionRegistryError.hostControllerBusy(
+          Self.currentHolder(lockFileURL: lockFileURL))
       }
       throw WebKitSessionRegistryError.hostControllerLockUnavailable
     }
@@ -91,6 +146,8 @@ public final class WebKitSessionRegistry {
   public let maximumSessions: Int
   private let enforceHostExclusiveSession: Bool
   private let hostControllerLockURL: URL?
+  private var clientName: String?
+  private var hostControllerAcquiredAt: Date?
   private var sessions: [WebKitSessionHandle: WebKitRuntime] = [:]
   // Resume capabilities belong to the host-owned browser authority, not to a
   // transient MCP transport. Only a one-way digest is retained in memory.
@@ -102,12 +159,58 @@ public final class WebKitSessionRegistry {
   public init(
     maximumSessions: Int = 1,
     enforceHostExclusiveSession: Bool = false,
-    hostControllerLockURL: URL? = nil
+    hostControllerLockURL: URL? = nil,
+    clientName: String? = nil
   ) throws {
     guard maximumSessions > 0 else { throw WebKitSessionRegistryError.invalidMaximumSessions }
     self.maximumSessions = maximumSessions
     self.enforceHostExclusiveSession = enforceHostExclusiveSession
     self.hostControllerLockURL = hostControllerLockURL
+    self.clientName = clientName
+  }
+
+  /// Adopts the name a connected client declared at initialize, so a blocked client
+  /// reads "claude-code" rather than a bare process name. Identity only.
+  public func adoptClientName(_ name: String) {
+    guard !name.isEmpty else { return }
+    clientName = String(name.prefix(64))
+    recordHostActivity()
+  }
+
+  /// Who holds the host controller right now, whether this process or another.
+  /// Returns nil when the host is free or the record is unreadable.
+  public func hostControllerHolder() -> HostControllerHolder? {
+    HostControllerLease.currentHolder(lockFileURL: hostControllerLockURL)
+  }
+
+  public func holdsHostController() -> Bool { hostControllerLease != nil }
+
+  /// Refreshes this holder's last-activity stamp. A blocked client reads it to tell
+  /// a working host from an abandoned one.
+  public func recordHostActivity() {
+    guard let hostControllerLease, let hostControllerAcquiredAt else { return }
+    hostControllerLease.record(
+      clientName: clientName, acquiredAt: hostControllerAcquiredAt, lastActivityAt: Date())
+  }
+
+  /// Opens a session, waiting up to `waitTimeout` for a busy host controller to be
+  /// released instead of failing on the first attempt.
+  public func open(
+    profileIdentifier: UUID? = nil,
+    waitTimeout: Duration,
+    pollInterval: Duration = .milliseconds(50)
+  ) async throws -> WebKitSessionHandle {
+    let deadline = ContinuousClock.now + waitTimeout
+    while true {
+      do {
+        return try open(profileIdentifier: profileIdentifier)
+      } catch WebKitSessionRegistryError.hostControllerBusy(let holder) {
+        guard ContinuousClock.now < deadline else {
+          throw WebKitSessionRegistryError.hostControllerBusy(holder)
+        }
+        try await Task.sleep(for: pollInterval)
+      }
+    }
   }
 
   public var count: Int { sessions.count }
@@ -127,7 +230,12 @@ public final class WebKitSessionRegistry {
     do {
       let dataStore = profileIdentifier.map(WKWebsiteDataStore.init(forIdentifier:)) ?? .default()
       sessions[handle] = try WebKitRuntime(protectedWebsiteDataStore: dataStore)
-      hostControllerLease = lease
+      if let lease {
+        let acquiredAt = Date()
+        hostControllerLease = lease
+        hostControllerAcquiredAt = acquiredAt
+        lease.record(clientName: clientName, acquiredAt: acquiredAt, lastActivityAt: acquiredAt)
+      }
     } catch {
       throw WebKitSessionRegistryError.networkBoundaryUnavailable
     }
@@ -165,7 +273,10 @@ public final class WebKitSessionRegistry {
     revokeHandoffResumeCapabilities(for: handle)
     handoffOwners.removeValue(forKey: handle)
     sessionOwners.removeValue(forKey: handle)
-    if sessions.isEmpty { hostControllerLease = nil }
+    if sessions.isEmpty {
+      hostControllerLease = nil
+      hostControllerAcquiredAt = nil
+    }
   }
 
   public func issueHandoffResumeCapability(

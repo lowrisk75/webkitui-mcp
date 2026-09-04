@@ -636,6 +636,136 @@ struct MCPServerTests {
     #expect(count == 0)
   }
 
+  @Test("Session status without a session reports the host controller")
+  func statusWithoutSessionReportsHost() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-host-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let holderRegistry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL, clientName: "codex-cli")
+    let registry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      clientName: "claude-code")
+    let server = WebKitMCPServer(registry: registry)
+
+    let free = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("status")])
+    let freeStructured = try object(try object(free["result"])["structuredContent"])
+    #expect(freeStructured["host_state"] == .string("free"))
+
+    let held = try holderRegistry.open()
+    defer { try? holderRegistry.close(held) }
+
+    let busy = try await toolCall(
+      server, id: 2, name: "browser_session", arguments: ["operation": .string("status")])
+    let busyStructured = try object(try object(busy["result"])["structuredContent"])
+    #expect(busyStructured["host_state"] == .string("busy"))
+    #expect(busyStructured["host_held_by_this_client"] == .bool(false))
+    let holder = try object(busyStructured["host_holder"])
+    #expect(holder["client_name"] == .string("codex-cli"))
+    #expect(holder["process_identifier"] != nil)
+    #expect(holder["idle_seconds"] != nil)
+    #expect(holder["held_seconds"] != nil)
+    // Host state must never expose what the holder is browsing.
+    let encoded = String(decoding: try JSONEncoder().encode(busyStructured), as: UTF8.self)
+    #expect(!encoded.lowercased().contains("cookie"))
+    #expect(!encoded.contains("http"))
+  }
+
+  @Test("A busy host is reported with a resolvable error, not a bare code")
+  func busyHostReportsResolvableError() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-host-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let holderRegistry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL, clientName: "codex-cli")
+    let registry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      clientName: "claude-code")
+    let server = WebKitMCPServer(registry: registry)
+    let held = try holderRegistry.open()
+    defer { try? holderRegistry.close(held) }
+
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("open"), "wait_timeout_ms": .int(200)])
+    let result = try object(response["result"])
+    #expect(result["isError"] == .bool(true))
+    let structured = try object(result["structuredContent"])
+    #expect(structured["status"] == .string("host_controller_busy"))
+    #expect(structured["code"] == .string("host_controller_busy"))
+    #expect(try string(structured["remediation"]).count > 0)
+    #expect(structured["waited_ms"] == .int(200))
+    let holder = try object(structured["host_holder"])
+    #expect(holder["client_name"] == .string("codex-cli"))
+  }
+
+  @Test("Each tool call refreshes the host controller's activity stamp")
+  func toolCallsRefreshHostActivity() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-host-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let registry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true,
+      hostControllerLockURL: directory.appendingPathComponent("controller.lock"),
+      clientName: "claude-code")
+    let server = WebKitMCPServer(registry: registry)
+    let opened = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("open")])
+    let sessionID = try string(
+      object(try object(opened["result"])["structuredContent"])["session_id"])
+    let first = try #require(registry.hostControllerHolder())
+    // The connected client's declared name wins over the registry's construction default.
+    #expect(first.clientName == "tests")
+
+    try await Task.sleep(for: .milliseconds(60))
+    _ = try await toolCall(
+      server, id: 2, name: "browser_session",
+      arguments: ["operation": .string("status"), "session_id": .string(sessionID)])
+
+    let second = try #require(registry.hostControllerHolder())
+    #expect(second.lastActivityEpochSeconds > first.lastActivityEpochSeconds)
+    #expect(second.acquiredAtEpochSeconds == first.acquiredAtEpochSeconds)
+  }
+
+  @Test("The host holder adopts the connected client's declared name")
+  func hostHolderAdoptsClientName() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-host-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let registry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true,
+      hostControllerLockURL: directory.appendingPathComponent("controller.lock"))
+    let server = WebKitMCPServer(registry: registry)
+    _ = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("open")])
+    // The default harness client declares itself as "tests".
+    #expect(try #require(registry.hostControllerHolder()).clientName == "tests")
+
+    // A differently named client on the same connection is reflected immediately.
+    _ = try await rawCall(
+      server, id: 2, method: "tools/list",
+      params: .object([
+        "_meta": .object([
+          "io.modelcontextprotocol/protocolVersion": .string("2026-07-28"),
+          "io.modelcontextprotocol/clientCapabilities": .object([:]),
+          "io.modelcontextprotocol/clientInfo": .object([
+            "name": .string("claude-code"), "version": .string("2.0.0"),
+          ]),
+        ])
+      ]))
+
+    let holder = try #require(registry.hostControllerHolder())
+    #expect(holder.clientName == "claude-code")
+    #expect(holder.processName == ProcessInfo.processInfo.processName)
+  }
+
   @Test("Download reports an active human handoff without attempting the action")
   func downloadReportsHumanControl() async throws {
     let registry = try WebKitSessionRegistry()

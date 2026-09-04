@@ -487,6 +487,10 @@ public final class WebKitMCPServer {
       }
     }
 
+    // Every accepted call proves the holder is alive and working, so a blocked
+    // client can tell a busy host from an abandoned one.
+    registry.recordHostActivity()
+
     do {
       switch name {
       case "browser_session":
@@ -844,7 +848,11 @@ public final class WebKitMCPServer {
     params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
     let operation = try requireString(arguments["operation"], named: "operation")
-    if operation != "open", operation != "profiles" {
+    // A sessionless status is a host-level question: it needs no session and so
+    // claims no session ownership.
+    if operation != "open", operation != "profiles",
+      !(operation == "status" && arguments["session_id"] == nil)
+    {
       let handle = try sessionHandle(arguments)
       let ownershipState = try registry.sessionOwnershipState(
         for: handle, owner: clientAuthorityID)
@@ -859,10 +867,21 @@ public final class WebKitMCPServer {
       guard
         arguments.keys.allSatisfy({
           $0 == "operation" || $0 == "profile_id" || $0 == "execution_policy"
+            || $0 == "wait_timeout_ms"
         })
       else {
         throw MCPServerError.invalidParams(
-          "open accepts only operation, profile_id, and execution_policy")
+          "open accepts only operation, profile_id, execution_policy, and wait_timeout_ms")
+      }
+      let waitMilliseconds: Int
+      if let requested = arguments["wait_timeout_ms"] {
+        guard case .int(let value) = requested, (0...60_000).contains(value) else {
+          throw MCPServerError.invalidParams(
+            "wait_timeout_ms must be an integer between 0 and 60000")
+        }
+        waitMilliseconds = Int(value)
+      } else {
+        waitMilliseconds = 0
       }
       let requestedProfile = arguments["profile_id"]?.stringValue ?? "default"
       let executionPolicy = arguments["execution_policy"]?.stringValue ?? "auto"
@@ -896,10 +915,22 @@ public final class WebKitMCPServer {
       } else {
         throw MCPServerError.invalidParams("profile_id must be default or a listed UUID")
       }
-      let opened =
-        preserveBrowserOnClose
-        ? try registry.openOrReuse(profileIdentifier: profileIdentifier)
-        : (handle: try registry.open(profileIdentifier: profileIdentifier), reused: false)
+      let opened: (handle: WebKitSessionHandle, reused: Bool)
+      do {
+        if preserveBrowserOnClose {
+          opened = try registry.openOrReuse(profileIdentifier: profileIdentifier)
+        } else {
+          opened = (
+            handle: try await registry.open(
+              profileIdentifier: profileIdentifier,
+              waitTimeout: .milliseconds(waitMilliseconds)),
+            reused: false
+          )
+        }
+      } catch WebKitSessionRegistryError.hostControllerBusy(let holder) {
+        return try hostBusyResult(
+          holder: holder, waitedMilliseconds: waitMilliseconds, modern: modern)
+      }
       let handle = opened.handle
       let controlAvailable = try registry.claimSessionOwnership(
         for: handle, owner: clientAuthorityID)
@@ -941,6 +972,10 @@ public final class WebKitMCPServer {
         ]),
         modern: modern)
     case "status":
+      guard arguments["session_id"] != nil else {
+        // A client with no session must still be able to ask who holds the host.
+        return try toolResult(structured: hostControllerState(), modern: modern)
+      }
       let handle = try sessionHandle(arguments)
       let status = try registry.status(handle)
       var statusObject = try requireObject(.encoded(status), named: "session status")
@@ -2423,6 +2458,55 @@ public final class WebKitMCPServer {
       ), modern: modern)
   }
 
+  /// Host-controller state for a client that holds no session. Identity and timing
+  /// only: never a URL, a profile, or anything the holder is browsing.
+  private func hostControllerState() -> JSONValue {
+    let heldHere = registry.holdsHostController()
+    guard let holder = registry.hostControllerHolder() else {
+      return .object([
+        "host_state": .string("free"),
+        "host_held_by_this_client": .bool(false),
+        "session_count": .int(Int64(registry.count)),
+        "maximum_sessions": .int(Int64(registry.maximumSessions)),
+      ])
+    }
+    return .object([
+      "host_state": .string(heldHere ? "held_by_this_client" : "busy"),
+      "host_held_by_this_client": .bool(heldHere),
+      "host_holder": Self.holderPayload(holder),
+      "session_count": .int(Int64(registry.count)),
+      "maximum_sessions": .int(Int64(registry.maximumSessions)),
+    ])
+  }
+
+  private static func holderPayload(_ holder: HostControllerHolder) -> JSONValue {
+    let now = Date()
+    return .object([
+      "process_identifier": .int(Int64(holder.processIdentifier)),
+      "process_name": .string(holder.processName),
+      "client_name": holder.clientName.map(JSONValue.string) ?? .null,
+      "idle_seconds": .int(Int64(holder.idleSeconds(now: now))),
+      "held_seconds": .int(Int64(holder.heldSeconds(now: now))),
+    ])
+  }
+
+  private func hostBusyResult(
+    holder: HostControllerHolder?, waitedMilliseconds: Int, modern: Bool
+  ) throws -> JSONValue {
+    var structured: [String: JSONValue] = [
+      "status": .string("host_controller_busy"),
+      "code": .string("host_controller_busy"),
+      "message": .string("Another client holds the single host browser controller."),
+      "remediation": .string(
+        "Retry browser_session operation=open with a larger wait_timeout_ms, or ask the holding "
+          + "client to close its session. The host is never taken from a live client."),
+      "waited_ms": .int(Int64(waitedMilliseconds)),
+      "retryable": .bool(true),
+    ]
+    structured["host_holder"] = holder.map(Self.holderPayload) ?? .null
+    return try structuredToolError(structured: .object(structured), modern: modern)
+  }
+
   private func downloadTool(
     arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
@@ -3134,6 +3218,7 @@ public final class WebKitMCPServer {
         throw MCPServerError.invalidParams(
           "io.modelcontextprotocol/clientInfo must contain name and version")
       }
+      registry.adoptClientName(name)
     }
     return true
   }
@@ -3611,7 +3696,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_session",
       description:
-        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation. Profile listing never exposes cookies or credentials.",
+        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. status without session_id is a host-level question answerable by a client that holds no session: it returns host_state, whether this client holds the host, and the holder's process, client name, held age and idle age \u{2014} identity and timing only, never a URL, a profile, or anything the holder is browsing. open accepts wait_timeout_ms to queue for a busy host rather than failing immediately, and a busy host is reported with code, message, remediation and holder. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
@@ -3628,6 +3713,15 @@ public final class WebKitMCPServer {
           "type": .string("string"),
           "description": .string(
             "For open only: default or an exact UUID returned by operation=profiles."
+          ),
+        ]),
+        "wait_timeout_ms": .object([
+          "type": .string("integer"),
+          "minimum": .int(0),
+          "maximum": .int(60_000),
+          "default": .int(0),
+          "description": .string(
+            "For open only: queue for up to this many milliseconds when another client holds the single host controller, instead of failing immediately. A host is never taken from a live client."
           ),
         ]),
         "execution_policy": .object([

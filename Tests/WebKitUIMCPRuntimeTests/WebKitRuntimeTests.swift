@@ -1279,12 +1279,95 @@ struct WebKitRuntimeTests {
     let second = try WebKitSessionRegistry(
       enforceHostExclusiveSession: true, hostControllerLockURL: lockURL)
     let handle = try first.open()
-    #expect(throws: WebKitSessionRegistryError.hostControllerBusy) {
+    #expect(throws: WebKitSessionRegistryError.self) {
       try second.open()
     }
     try first.close(handle)
     let secondHandle = try second.open()
     try second.close(secondHandle)
+  }
+
+  @Test("A busy host controller names its holder, its client and its idle age")
+  func hostControllerBusyNamesItsHolder() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-host-lock-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let first = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      clientName: "codex-cli")
+    let second = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      clientName: "claude-code")
+    let handle = try first.open()
+    defer { try? first.close(handle) }
+
+    var reported: HostControllerHolder?
+    #expect(throws: (any Error).self) {
+      do { _ = try second.open() } catch let error as WebKitSessionRegistryError {
+        if case .hostControllerBusy(let holder) = error { reported = holder }
+        throw error
+      }
+    }
+    let holder = try #require(reported)
+    #expect(holder.processIdentifier == ProcessInfo.processInfo.processIdentifier)
+    #expect(holder.clientName == "codex-cli")
+    #expect(holder.processName == ProcessInfo.processInfo.processName)
+    #expect(holder.idleSeconds(now: Date()) >= 0)
+    // The lock record carries no browsing state, only who holds the host.
+    let raw = try String(contentsOf: lockURL, encoding: .utf8)
+    #expect(!raw.contains("cookie"))
+  }
+
+  @Test("Recorded host activity moves the reported idle age")
+  func hostActivityMovesIdleAge() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-host-lock-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let holderRegistry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      clientName: "codex-cli")
+    let observer = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      clientName: "claude-code")
+    let handle = try holderRegistry.open()
+    defer { try? holderRegistry.close(handle) }
+
+    let stale = try #require(observer.hostControllerHolder())
+    let staleIdle = stale.idleSeconds(now: Date().addingTimeInterval(600))
+    #expect(staleIdle >= 600)
+
+    holderRegistry.recordHostActivity()
+    let fresh = try #require(observer.hostControllerHolder())
+    #expect(fresh.lastActivityEpochSeconds > stale.lastActivityEpochSeconds)
+  }
+
+  @Test("Opening with a wait timeout queues instead of failing immediately")
+  func openQueuesForABoundedWait() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-host-lock-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let first = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      clientName: "codex-cli")
+    let second = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      clientName: "claude-code")
+    let held = try first.open()
+
+    // A busy host is reported only after the caller's own bounded wait elapsed.
+    let start = ContinuousClock.now
+    await #expect(throws: (any Error).self) {
+      _ = try await second.open(waitTimeout: .milliseconds(300))
+    }
+    #expect(ContinuousClock.now - start >= .milliseconds(250))
+
+    // Once the holder leaves, a waiting caller is admitted.
+    try first.close(held)
+    let admitted = try await second.open(waitTimeout: .milliseconds(500))
+    try second.close(admitted)
   }
 
   @Test("Click re-resolves semantics and reports an untrusted JS gesture")
