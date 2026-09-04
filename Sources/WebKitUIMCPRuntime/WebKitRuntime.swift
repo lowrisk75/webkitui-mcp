@@ -195,8 +195,13 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let ariaHiddenDropCount: Int
   /// Controls present in the walked tree before any layout filter.
   public let rawControlCount: Int
+  /// True when a reported control sits under a fully transparent ancestor. The tree
+  /// is usable, but nothing under it is visible to a person right now.
+  public let obscuredByAncestorOpacity: Bool
   public let documentElementCount: Int
   public let bodyTextLength: Int
+  /// One control described in full, so an empty tree can be diagnosed in one look.
+  public let firstControlProbe: String
   public let capturedAtMonotonicNanoseconds: UInt64
 }
 
@@ -695,8 +700,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       renderedInteractiveCount: raw.renderedInteractiveCount,
       ariaHiddenDropCount: raw.ariaHiddenDropCount,
       rawControlCount: raw.rawControlCount,
+      obscuredByAncestorOpacity: raw.obscuredByAncestorOpacity,
       documentElementCount: raw.documentElementCount,
       bodyTextLength: raw.bodyTextLength,
+      firstControlProbe: raw.firstControlProbe,
       capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
     )
     rememberRecoverableURL(URL(string: raw.url) ?? webView.url)
@@ -2978,6 +2985,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return matches;
     };
+    let obscuredByAncestorOpacity = false;
     const isRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
@@ -2990,7 +2998,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         }
         const style = getComputedStyle(cursor);
         if (style.display === 'none' || style.visibility === 'hidden'
-            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+            || style.visibility === 'collapse') {
+          return false;
+        }
+        // A transparent ancestor is reported, not dropped. A single-page app whose
+        // entrance animation never ran leaves its whole tree at opacity 0 while the
+        // controls are laid out and interactive; dropping them makes the page look
+        // empty. Every write still passes an exact human confirmation, and the
+        // observation says the target is obscured.
+        if (Number(style.opacity) === 0 && cursor !== element) {
+          obscuredByAncestorOpacity = true;
+        } else if (Number(style.opacity) === 0) {
           return false;
         }
       }
@@ -3064,6 +3082,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       semanticTextTruncated = true;
       return text.slice(0, maximumFieldCharacters);
     };
+    let obscuredByAncestorOpacity = false;
     const isRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
@@ -3076,7 +3095,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         }
         const style = getComputedStyle(cursor);
         if (style.display === 'none' || style.visibility === 'hidden'
-            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+            || style.visibility === 'collapse') {
+          return false;
+        }
+        // A transparent ancestor is reported, not dropped. A single-page app whose
+        // entrance animation never ran leaves its whole tree at opacity 0 while the
+        // controls are laid out and interactive; dropping them makes the page look
+        // empty. Every write still passes an exact human confirmation, and the
+        // observation says the target is obscured.
+        if (Number(style.opacity) === 0 && cursor !== element) {
+          obscuredByAncestorOpacity = true;
+        } else if (Number(style.opacity) === 0) {
           return false;
         }
       }
@@ -3422,6 +3451,45 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // means the script is walking the wrong document, the second a layout problem.
     const rawControlCount = rawControls.length;
     const documentElementCount = document.querySelectorAll('*').length;
+    // One control described in full: enough to tell a layout problem from a filter
+    // problem without another round trip.
+    const probe = rawControls[0];
+    let firstControlProbe = 'none';
+    if (probe) {
+      const box = probe.getBoundingClientRect();
+      const style = getComputedStyle(probe);
+      firstControlProbe = [
+        probe.tagName.toLowerCase(),
+        'w=' + Math.round(box.width), 'h=' + Math.round(box.height),
+        'rects=' + probe.getClientRects().length,
+        'display=' + style.display, 'visibility=' + style.visibility,
+        'opacity=' + style.opacity,
+        'offsetParent=' + (probe.offsetParent ? 'yes' : 'no'),
+        'connected=' + probe.isConnected,
+        'docW=' + document.documentElement.clientWidth,
+        'docH=' + document.documentElement.clientHeight,
+        'innerW=' + window.innerWidth, 'innerH=' + window.innerHeight
+      ].join(' ');
+      // Which ancestor disqualifies it, and on which property.
+      let reason = 'accepted';
+      for (let cursor = probe; cursor; cursor = composedParent(cursor)) {
+        const tag = cursor.tagName ? cursor.tagName.toLowerCase() : String(cursor.nodeName);
+        if (cursor.hidden) { reason = 'hidden@' + tag; break; }
+        if (cursor.inert) { reason = 'inert@' + tag; break; }
+        if (cursor.getAttribute
+            && collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
+          reason = 'aria-hidden@' + tag; break;
+        }
+        const cs = getComputedStyle(cursor);
+        if (!cs) { reason = 'no-style@' + tag; break; }
+        if (cs.display === 'none') { reason = 'display-none@' + tag; break; }
+        if (cs.visibility === 'hidden' || cs.visibility === 'collapse') {
+          reason = 'visibility-' + cs.visibility + '@' + tag; break;
+        }
+        if (Number(cs.opacity) === 0) { reason = 'opacity0@' + tag; break; }
+      }
+      firstControlProbe += ' | ' + reason;
+    }
     const bodyTextLength = (document.body?.innerText || '').length;
     const transientLoading = matchingElements.length === 0 && (
       visibleLoadingIndicators
@@ -3443,8 +3511,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       renderedInteractiveCount,
       ariaHiddenDropCount,
       rawControlCount,
+      obscuredByAncestorOpacity,
       documentElementCount,
       bodyTextLength,
+      firstControlProbe,
       transientLoading,
       semanticTextTruncated,
       elements
@@ -3529,6 +3599,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       || collapse(element.getAttribute('placeholder'))
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
       || collapse(element.innerText) || null;
+    let obscuredByAncestorOpacity = false;
     const isRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
@@ -4084,8 +4155,10 @@ private struct RawObservation: Decodable {
   let renderedInteractiveCount: Int
   let ariaHiddenDropCount: Int
   let rawControlCount: Int
+  let obscuredByAncestorOpacity: Bool
   let documentElementCount: Int
   let bodyTextLength: Int
+  let firstControlProbe: String
   let semanticTextTruncated: Bool
   let elements: [RawElement]
 }
