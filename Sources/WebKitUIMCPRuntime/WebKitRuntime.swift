@@ -187,6 +187,12 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let nextElementOffset: Int?
   public let semanticTextTruncated: Bool
   public let crossOriginFramesOpaque: Bool
+  /// Controls the raw DOM renders, counted independently of the semantic matcher.
+  public let renderedInteractiveCount: Int
+  /// Rendered controls dropped only because an ancestor is aria-hidden or inert.
+  /// A page that paints its controls and marks them hidden leaves an empty tree for
+  /// a reason the caller must be able to see.
+  public let ariaHiddenDropCount: Int
   public let capturedAtMonotonicNanoseconds: UInt64
 }
 
@@ -665,6 +671,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         ? elementOffset + elements.count : nil,
       semanticTextTruncated: raw.semanticTextTruncated,
       crossOriginFramesOpaque: raw.crossOriginFrameCount > 0,
+      renderedInteractiveCount: raw.renderedInteractiveCount,
+      ariaHiddenDropCount: raw.ariaHiddenDropCount,
       capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
     )
     rememberRecoverableURL(URL(string: raw.url) ?? webView.url)
@@ -3197,9 +3205,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const semanticElements = deepQueryAll(document, selector);
     const pointerElements = deepQueryAll(document, 'a:not([href]), div, li, span')
       .filter(isPointerControl);
+    // Diagnostic: how many otherwise-matching controls are dropped only because an
+    // ancestor is aria-hidden or inert. A page that renders its controls and marks
+    // them hidden leaves the tree empty for a reason worth reporting.
+    let ariaHiddenDropCount = 0;
+    const hiddenOnlyBySemantics = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return false;
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+        if (cursor.inert
+            || collapse(cursor.getAttribute && cursor.getAttribute('aria-hidden')).toLowerCase()
+              === 'true') {
+          return true;
+        }
+      }
+      return false;
+    };
     const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
       .filter(element => {
-        if (!isRendered(element) && !styledControlSurface(element)) return false;
+        if (!isRendered(element) && !styledControlSurface(element)) {
+          if (hiddenOnlyBySemantics(element)) ariaHiddenDropCount += 1;
+          return false;
+        }
         const role = collapse(roleOf(element)).toLowerCase();
         if (allowedRoles.size > 0 && !allowedRoles.has(role)) return false;
         const name = collapse(nameOf(element)).toLowerCase();
@@ -3356,6 +3383,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       crossOriginFrameCount,
       totalElementCount: matchingElements.length,
       unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
+      renderedInteractiveCount,
+      ariaHiddenDropCount,
       transientLoading,
       semanticTextTruncated,
       elements
@@ -3992,6 +4021,8 @@ private struct RawObservation: Decodable {
   let totalElementCount: Int
   let unfilteredCandidateCount: Int
   let transientLoading: Bool
+  let renderedInteractiveCount: Int
+  let ariaHiddenDropCount: Int
   let semanticTextTruncated: Bool
   let elements: [RawElement]
 }

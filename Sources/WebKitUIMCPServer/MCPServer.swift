@@ -3121,6 +3121,8 @@ public final class WebKitMCPServer {
       "nextElementOffset": observation.nextElementOffset.map { .int(Int64($0)) } ?? .null,
       "semanticTextTruncated": .bool(observation.semanticTextTruncated),
       "crossOriginFramesOpaque": .bool(observation.crossOriginFramesOpaque),
+      "rendered_interactive_count": .int(Int64(observation.renderedInteractiveCount)),
+      "aria_hidden_drop_count": .int(Int64(observation.ariaHiddenDropCount)),
       "compact": .bool(true),
     ])
   }
