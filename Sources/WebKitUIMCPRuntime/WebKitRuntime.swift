@@ -301,6 +301,15 @@ public struct WebContentTerminationEvent: Codable, Equatable, Sendable {
   public let monotonicNanoseconds: UInt64
 }
 
+/// AppKit keeps titled windows on a display, which would drag the offscreen layout
+/// host back into view. Declining the constraint is what lets the window stay parked
+/// outside every screen while WebKit still lays its content out.
+private final class UnconstrainedWindow: NSWindow {
+  override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+    frameRect
+  }
+}
+
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
   weak var target: (any WKScriptMessageHandler)?
 
@@ -547,6 +556,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
 
     let hydrationDeadline = ContinuousClock.now + hydrationTimeout
+    ensureLayoutViewport()
     webView.layoutSubtreeIfNeeded()
     var raw = try await captureRawObservation()
     while raw.transientLoading, ContinuousClock.now < hydrationDeadline {
@@ -1184,7 +1194,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "Choose the exact local file. Its name, size, and SHA-256 will be returned to the MCP client; its local path and contents will not."
       panel.prompt = "Choose"
       let response: NSApplication.ModalResponse
-      if let window = browserWindow, window.isVisible {
+      if let window = browserWindow, browserWindowIsOnScreen {
         response = await withCheckedContinuation { continuation in
           panel.beginSheetModal(for: window) { continuation.resume(returning: $0) }
         }
@@ -1444,7 +1454,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       throw WebKitRuntimeError.authenticationOriginRequiresHuman(origin)
     }
     if let window = browserWindow {
-      window.orderOut(nil)
+      // Return to the offscreen layout host rather than hiding outright: WebKit stops
+      // laying the page out for a window that was ordered out, and the next
+      // observation would come back empty.
+      window.setFrameOrigin(NSPoint(x: -32_000, y: -32_000))
+      window.orderFrontRegardless()
       window.ignoresMouseEvents = true
       window.collectionBehavior.remove(.moveToActiveSpace)
       window.collectionBehavior.insert(.stationary)
@@ -1460,7 +1474,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   private func makeBrowserWindow() -> NSWindow {
-    let window = NSWindow(
+    let window = UnconstrainedWindow(
       contentRect: .init(x: 0, y: 0, width: 1280, height: 800),
       styleMask: [.titled, .closable, .miniaturizable, .resizable],
       backing: .buffered,
@@ -1472,6 +1486,30 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     window.orderOut(nil)
     browserWindow = window
     return window
+  }
+
+  /// WebKit does not lay out a view whose window was never ordered in, so a page can
+  /// build its whole DOM while every control reports a zero-sized box. Ordering the
+  /// window in at coordinates outside every screen gives the engine a real viewport
+  /// and shows the user nothing.
+  /// A window ordered in for layout may still sit outside every display. Anything a
+  /// person must actually see — a file panel, the handoff window — must key off this,
+  /// never off `isVisible`, which is true for the offscreen layout host.
+  var browserWindowIsOnScreen: Bool {
+    guard let window = browserWindow, window.isVisible else { return false }
+    return NSScreen.screens.contains { $0.frame.intersects(window.frame) }
+  }
+
+  private func ensureLayoutViewport() {
+    let window = browserWindow ?? makeBrowserWindow()
+    guard !window.isVisible else { return }
+    window.ignoresMouseEvents = true
+    window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) - 1)
+    window.collectionBehavior.insert([.stationary, .ignoresCycle, .transient])
+    window.setFrameOrigin(NSPoint(x: -32_000, y: -32_000))
+    window.orderFrontRegardless()
+    webView.needsLayout = true
+    webView.layoutSubtreeIfNeeded()
   }
 
   private func presentHumanControlWindow() {

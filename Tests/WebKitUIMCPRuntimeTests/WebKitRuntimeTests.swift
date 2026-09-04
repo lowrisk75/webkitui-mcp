@@ -1282,7 +1282,9 @@ struct WebKitRuntimeTests {
 
     try runtime.requestAgentResume()
     _ = try await runtime.resumeAfterHumanControl()
-    #expect(!window.isVisible)
+    // The window stays ordered in so WebKit keeps laying the page out, but it is
+    // parked outside every display: nothing is shown to the user.
+    #expect(!runtime.browserWindowIsOnScreen)
     #expect(runtime.webView.window === window)
   }
 
