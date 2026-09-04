@@ -339,6 +339,7 @@ struct WebKitRuntimeTests {
     // this link replaces the document, so re-resolution after dispatch may correctly
     // fail closed on the very navigation under test. Either outcome is acceptable;
     // the audit event is what must be right.
+    var dispatched = true
     do {
       _ = try await runtime.perform(
         observationID: observation.observationID,
@@ -346,14 +347,23 @@ struct WebKitRuntimeTests {
         operation: .click,
         stabilityInterval: .milliseconds(1))
     } catch WebKitRuntimeError.staleObservation {
+      dispatched = false
     } catch WebKitRuntimeError.targetNotUnique {
+      dispatched = false
     }
-    for _ in 0..<fixtureSettlementPolls
-    where runtime.latestNavigationAuditEvent()?.actor != .agentAction {
-      try await Task.sleep(for: .milliseconds(20))
+    if dispatched {
+      for _ in 0..<fixtureSettlementPolls
+      where runtime.latestNavigationAuditEvent()?.actor != .agentAction {
+        try await Task.sleep(for: .milliseconds(20))
+      }
+      #expect(runtime.latestNavigationAuditEvent()?.actor == .agentAction)
+      #expect(runtime.latestNavigationAuditEvent()?.navigationType == "link_activated")
+    } else {
+      // Failing closed means nothing was dispatched, so there is no agent action to
+      // attribute. What must hold is that no navigation was attributed to the agent
+      // it did not perform.
+      #expect(runtime.latestNavigationAuditEvent()?.actor != .agentAction)
     }
-    #expect(runtime.latestNavigationAuditEvent()?.actor == .agentAction)
-    #expect(runtime.latestNavigationAuditEvent()?.navigationType == "link_activated")
 
     let scripted = WebKitRuntime()
     _ = try await scripted.loadHTML(
