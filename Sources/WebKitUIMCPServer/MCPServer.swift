@@ -1223,6 +1223,10 @@ public final class WebKitMCPServer {
       // process that is gone: the host is still held, but by someone else.
       "pid_alive": .bool(holder.processIsRunning),
       "record_trustworthy": .bool(holder.processIsRunning),
+      // The pid is the broker's, never the MCP client's: clients reach the broker
+      // over a socket and their liveness is not tracked. When this is true, pid_alive
+      // says nothing about whether the owning client is still there.
+      "pid_is_this_broker": .bool(holder.processID == ProcessInfo.processInfo.processIdentifier),
     ])
   }
 
