@@ -31,6 +31,8 @@ public final class WebKitMCPServer {
   private let activityLog: WebKitActivityLog?
   private let goalDelegationMonitor: GoalDelegationMonitor
   private let clientAuthorityID = UUID()
+  private var clientName = "unknown-client"
+  private var clientVersion: String?
   private let capabilityAuthority = CapabilityAuthority()
   private var observations: [WebKitSessionHandle: WebKitPageObservation] = [:]
   private var coordinators: [WebKitSessionHandle: WebKitTransactionCoordinator] = [:]
@@ -424,6 +426,8 @@ public final class WebKitMCPServer {
   private func callTool(params: JSONValue?, modern: Bool) async throws -> JSONValue {
     let startedAt = Date()
     let rawToolName = params?.objectValue?["name"]?.stringValue
+    registry.beginClientCall(owner: clientAuthorityID)
+    defer { registry.endClientCall(owner: clientAuthorityID) }
     do {
       let result = try await performToolCall(params: params, modern: modern)
       let failed = result.objectValue?["isError"] == .bool(true)
@@ -457,18 +461,13 @@ public final class WebKitMCPServer {
       let ownershipState = try registry.sessionOwnershipState(
         for: requestedHandle, owner: clientAuthorityID)
       if ownershipState == "inactive" {
-        _ = try registry.claimSessionOwnership(for: requestedHandle, owner: clientAuthorityID)
+        _ = try registry.claimSessionOwnership(
+          for: requestedHandle, owner: clientAuthorityID, holder: clientHolder())
       } else if ownershipState == "owned_elsewhere" {
-        return try structuredToolError(
-          structured: .object([
-            "status": .string("session_in_use"),
-            "control_available": .bool(false),
-            "wait_only": .bool(true),
-            "safe_next_step": .string(
-              "Wait for the client that owns this browser session to disconnect; "
-                + "do not navigate, act, or request user control."),
-          ]),
-          modern: modern)
+        return try sessionInUseResult(handle: requestedHandle, modern: modern)
+      } else {
+        _ = try registry.claimSessionOwnership(
+          for: requestedHandle, owner: clientAuthorityID, holder: clientHolder())
       }
     }
 
@@ -744,6 +743,19 @@ public final class WebKitMCPServer {
       }
     } catch let error as MCPServerError {
       throw error
+    } catch WebKitSessionRegistryError.hostControllerBusy(let holder) {
+      return try structuredToolError(
+        structured: .object([
+          "code": .string("host_controller_busy"),
+          "message": .string("Another local client currently holds the WebKitUI host."),
+          "remediation": .string(
+            "Inspect browser_session operation=status without a session_id, then wait for the holder to disconnect."
+          ),
+          "holder": holderValue(holder),
+          "control_available": .bool(false),
+          "wait_only": .bool(true),
+        ]),
+        modern: modern)
     } catch WebKitRuntimeError.targetNotActionable {
       return try toolError(
         "target_not_actionable: scroll/re-observe first; if the site requires a trusted human gesture, use browser_session operation=handoff",
@@ -841,14 +853,20 @@ public final class WebKitMCPServer {
     params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
     let operation = try requireString(arguments["operation"], named: "operation")
-    if operation != "open", operation != "profiles" {
+    if operation != "open", operation != "profiles", operation != "status",
+      operation != "client_handoff"
+    {
       let handle = try sessionHandle(arguments)
       let ownershipState = try registry.sessionOwnershipState(
         for: handle, owner: clientAuthorityID)
       if ownershipState == "inactive" {
-        _ = try registry.claimSessionOwnership(for: handle, owner: clientAuthorityID)
+        _ = try registry.claimSessionOwnership(
+          for: handle, owner: clientAuthorityID, holder: clientHolder())
       } else if ownershipState == "owned_elsewhere" {
-        return try sessionInUseResult(modern: modern)
+        return try sessionInUseResult(handle: handle, modern: modern)
+      } else {
+        _ = try registry.claimSessionOwnership(
+          for: handle, owner: clientAuthorityID, holder: clientHolder())
       }
     }
     switch operation {
@@ -856,31 +874,22 @@ public final class WebKitMCPServer {
       guard
         arguments.keys.allSatisfy({
           $0 == "operation" || $0 == "profile_id" || $0 == "execution_policy"
+            || $0 == "wait_timeout_ms"
         })
       else {
         throw MCPServerError.invalidParams(
-          "open accepts only operation, profile_id, and execution_policy")
+          "open accepts only operation, profile_id, execution_policy, and wait_timeout_ms")
       }
       let requestedProfile = arguments["profile_id"]?.stringValue ?? "default"
       let executionPolicy = arguments["execution_policy"]?.stringValue ?? "auto"
+      let waitTimeoutMilliseconds = try boundedInteger(
+        arguments["wait_timeout_ms"], defaultValue: 0, range: 0...60_000,
+        name: "wait_timeout_ms")
       guard
-        ["auto", "trusted_local", "compatibility", "isolated_read_only"].contains(
-          executionPolicy)
+        ["auto", "trusted_local"].contains(executionPolicy)
       else {
         throw MCPServerError.invalidParams(
-          "execution_policy must be auto, trusted_local, compatibility, or isolated_read_only")
-      }
-      guard executionPolicy == "auto" || executionPolicy == "trusted_local" else {
-        return try structuredToolError(
-          structured: .object([
-            "status": .string("backend_unavailable"),
-            "execution_policy": .string(executionPolicy),
-            "available_internal_backends": .array([.string("native_webkit")]),
-            "session_transfer_supported": .bool(false),
-            "credential_transfer_supported": .bool(false),
-          ]),
-          modern: modern
-        )
+          "execution_policy must be auto or trusted_local")
       }
       let profileIdentifier: UUID?
       if requestedProfile == "default" {
@@ -895,11 +904,20 @@ public final class WebKitMCPServer {
       }
       let opened =
         preserveBrowserOnClose
-        ? try registry.openOrReuse(profileIdentifier: profileIdentifier)
-        : (handle: try registry.open(profileIdentifier: profileIdentifier), reused: false)
+        ? try await registry.openOrReuse(
+          profileIdentifier: profileIdentifier,
+          holder: clientHolder(policy: executionPolicy),
+          waitTimeoutMilliseconds: waitTimeoutMilliseconds)
+        : (
+          handle: try await registry.open(
+            profileIdentifier: profileIdentifier,
+            holder: clientHolder(policy: executionPolicy),
+            waitTimeoutMilliseconds: waitTimeoutMilliseconds),
+          reused: false
+        )
       let handle = opened.handle
       let controlAvailable = try registry.claimSessionOwnership(
-        for: handle, owner: clientAuthorityID)
+        for: handle, owner: clientAuthorityID, holder: clientHolder(policy: executionPolicy))
       sessionBackends[handle] = "native_webkit"
       coordinators[handle] = WebKitTransactionCoordinator(
         runtime: try registry.runtime(for: handle),
@@ -932,15 +950,52 @@ public final class WebKitMCPServer {
             await registry.availableProfileIDs().map { .string($0) }),
           "contains_credentials": .bool(false),
           "available_execution_policies": .array([
-            .string("auto"), .string("trusted_local"), .string("compatibility"),
-            .string("isolated_read_only"),
+            .string("auto"), .string("trusted_local"),
+          ]),
+          "unavailable_execution_policies": .object([
+            "compatibility": .string("use operation=compatibility_start after local confirmation"),
+            "isolated_read_only": .string("not implemented"),
+          ]),
+          "authenticated_origins": .array([]),
+          "authenticated_origins_status": .string(
+            "not_observable_without_inspecting_credentials_or_cookies"),
+          "restricted_origins": .array([
+            .string("https://idmsa.apple.com")
           ]),
         ]),
         modern: modern)
     case "status":
-      let handle = try sessionHandle(arguments)
+      guard arguments.keys.allSatisfy({ $0 == "operation" || $0 == "session_id" }) else {
+        throw MCPServerError.invalidParams("status accepts only operation and session_id")
+      }
+      let handle: WebKitSessionHandle
+      if arguments["session_id"] != nil {
+        handle = try sessionHandle(arguments)
+      } else if let existing = registry.existingHandle {
+        handle = existing
+      } else {
+        if let holder = registry.externalHostControllerHolder() {
+          return try toolResult(
+            structured: .object([
+              "status": .string("host_controller_busy"),
+              "control_available": .bool(false),
+              "wait_only": .bool(true),
+              "holder": holderValue(holder),
+              "remediation": .string(
+                "Retry open with wait_timeout_ms up to 60000, or wait for the holder to disconnect."
+              ),
+            ]), modern: modern)
+        }
+        return try toolResult(
+          structured: .object([
+            "status": .string("no_active_session"),
+            "control_available": .bool(true),
+            "holder": .null,
+          ]), modern: modern)
+      }
       let status = try registry.status(handle)
       var statusObject = try requireObject(.encoded(status), named: "session status")
+      statusObject["session_id"] = .string(handle.rawValue.uuidString)
       statusObject["control_state"] = .string(status.controlState.rawValue)
       statusObject["human_step_completed"] = .bool(
         status.controlState == .humanStepCompleted)
@@ -951,6 +1006,7 @@ public final class WebKitMCPServer {
         try registry.handoffOwnershipState(for: handle, owner: clientAuthorityID))
       statusObject["session_owner_state"] = .string(
         try registry.sessionOwnershipState(for: handle, owner: clientAuthorityID))
+      statusObject["holder"] = holderValue(try registry.sessionOwner(for: handle))
       statusObject["file_upload_receipt"] =
         try registry.runtime(for: handle)
         .latestFileUploadReceipt().map(JSONValue.encoded) ?? .null
@@ -1015,6 +1071,8 @@ public final class WebKitMCPServer {
           "browser_preserved": .bool(preserveBrowserOnClose),
         ]),
         modern: modern)
+    case "client_handoff":
+      return try await clientHandoff(arguments: arguments, modern: modern)
     case "handoff":
       await revokeGoalDelegation(for: try sessionHandle(arguments))
       return try await handoffTool(params: params, arguments: arguments, modern: modern)
@@ -1036,22 +1094,123 @@ public final class WebKitMCPServer {
       return try await goalDelegationRevoke(arguments: arguments, modern: modern)
     default:
       throw MCPServerError.invalidParams(
-        "operation must be open, profiles, status, close, handoff, handoff_start, handoff_status, handoff_resume, compatibility_start, goal_delegation_start, goal_delegation_status, goal_delegation_revoke, or confirmation_cancel"
+        "operation must be open, profiles, status, close, client_handoff, handoff, handoff_start, handoff_status, handoff_resume, compatibility_start, goal_delegation_start, goal_delegation_status, goal_delegation_revoke, or confirmation_cancel"
       )
     }
   }
 
-  private func sessionInUseResult(modern: Bool) throws -> JSONValue {
+  private func sessionInUseResult(
+    handle: WebKitSessionHandle, modern: Bool
+  ) throws -> JSONValue {
     try structuredToolError(
       structured: .object([
+        "code": .string("session_in_use"),
+        "message": .string("Another local client owns this browser session."),
+        "remediation": .string(
+          "Wait for the holder to disconnect, or request browser_session operation=client_handoff for local human confirmation."
+        ),
+        "holder": holderValue(try registry.sessionOwner(for: handle)),
         "status": .string("session_in_use"),
         "control_available": .bool(false),
         "wait_only": .bool(true),
         "safe_next_step": .string(
-          "Wait for the client that owns this browser session to disconnect; "
-            + "do not navigate, act, or request user control."),
+          "Wait for the current owner to disconnect, or request a local human-confirmed client_handoff; do not navigate or act until transfer succeeds."
+        ),
       ]),
       modern: modern)
+  }
+
+  private func clientHandoff(
+    arguments: [String: JSONValue], modern: Bool
+  ) async throws -> JSONValue {
+    let handle = try sessionHandle(arguments)
+    guard arguments.keys.allSatisfy({ $0 == "operation" || $0 == "session_id" }) else {
+      throw MCPServerError.invalidParams(
+        "client_handoff accepts only operation and session_id")
+    }
+    let ownershipState = try registry.sessionOwnershipState(
+      for: handle, owner: clientAuthorityID)
+    if ownershipState == "owned_by_this_client" {
+      return try toolResult(
+        structured: .object([
+          "status": .string("already_owner"),
+          "control_available": .bool(true),
+        ]), modern: modern)
+    }
+    if ownershipState == "inactive" {
+      _ = try registry.claimSessionOwnership(
+        for: handle, owner: clientAuthorityID, holder: clientHolder())
+      return try toolResult(
+        structured: .object([
+          "status": .string("ownership_claimed"),
+          "control_available": .bool(true),
+        ]), modern: modern)
+    }
+    let previousHolder = try registry.sessionOwner(for: handle)
+    guard
+      await confirmationPresenter.confirm(
+        title: "Transfer WebKitUI Control",
+        message:
+          "Transfer browser control from \(previousHolder?.clientName ?? "another local client") "
+          + "(PID \(previousHolder.map { String($0.processID) } ?? "unknown")) to "
+          + "\(clientName) (PID \(getpid()))? The previous client will immediately lose "
+          + "navigation and action authority. No cookies or credentials are transferred.",
+        approveLabel: "Transfer Control"
+      ) == .approved
+    else {
+      return try structuredToolError(
+        structured: .object([
+          "code": .string("client_handoff_declined"),
+          "message": .string("The local user did not approve the client handoff."),
+          "remediation": .string("Keep waiting or ask the user to approve a later request."),
+          "holder": holderValue(previousHolder),
+        ]), modern: modern)
+    }
+    guard
+      try registry.transferSessionOwnership(
+        for: handle, to: clientAuthorityID, holder: clientHolder())
+    else {
+      return try structuredToolError(
+        structured: .object([
+          "code": .string("client_handoff_owner_active"),
+          "message": .string("The current owner is executing a tool call."),
+          "remediation": .string("Wait for that call to finish, then request handoff again."),
+          "holder": holderValue(try registry.sessionOwner(for: handle)),
+        ]), modern: modern)
+    }
+    sessionBackends[handle] = "native_webkit"
+    coordinators[handle] = WebKitTransactionCoordinator(
+      runtime: try registry.runtime(for: handle),
+      ledger: try transactionLedgerFactory.make(scope: try registry.status(handle).profileID)
+    )
+    return try toolResult(
+      structured: .object([
+        "status": .string("ownership_transferred"),
+        "control_available": .bool(true),
+        "previous_holder": holderValue(previousHolder),
+        "holder": holderValue(try registry.sessionOwner(for: handle)),
+      ]), modern: modern)
+  }
+
+  private func clientHolder(policy: String = "auto") -> WebKitControllerHolder {
+    WebKitControllerHolder(
+      clientName: clientName,
+      clientVersion: clientVersion,
+      executionPolicy: policy)
+  }
+
+  private func holderValue(_ holder: WebKitControllerHolder?) -> JSONValue {
+    guard let holder else { return .null }
+    let now = Date()
+    return .object([
+      "client_name": .string(holder.clientName),
+      "client_version": holder.clientVersion.map(JSONValue.string) ?? .null,
+      "pid": .int(Int64(holder.processID)),
+      "age_ms": .int(Int64(max(0, now.timeIntervalSince(holder.acquiredAt) * 1_000))),
+      "inactive_ms": .int(
+        Int64(max(0, now.timeIntervalSince(holder.lastActivityAt) * 1_000))),
+      "policy": .string(holder.executionPolicy),
+    ])
   }
 
   private func goalDelegationStart(
@@ -2810,8 +2969,25 @@ public final class WebKitMCPServer {
   }
 
   private func toolError(_ message: String, modern: Bool) throws -> JSONValue {
+    let components = message.split(separator: ":", maxSplits: 1).map(String.init)
+    let candidateCode = components.first ?? ""
+    let code =
+      !candidateCode.isEmpty
+        && candidateCode.allSatisfy({ $0.isLowercase || $0.isNumber || $0 == "_" })
+      ? candidateCode : "tool_error"
+    let remediation =
+      components.count == 2
+      ? components[1].trimmingCharacters(in: .whitespacesAndNewlines)
+      : "Correct the reported condition and retry the same bounded operation."
+    let structured: JSONValue = .object([
+      "code": .string(code),
+      "message": .string(message),
+      "remediation": .string(remediation),
+      "holder": .null,
+    ])
     var result: [String: JSONValue] = [
       "content": .array([.object(["type": .string("text"), "text": .string(message)])]),
+      "structuredContent": structured,
       "isError": .bool(true),
     ]
     if modern { result["resultType"] = .string("complete") }
@@ -2956,6 +3132,8 @@ public final class WebKitMCPServer {
         throw MCPServerError.invalidParams(
           "io.modelcontextprotocol/clientInfo must contain name and version")
       }
+      clientName = String(name.prefix(128))
+      clientVersion = String(version.prefix(64))
     }
     return true
   }
@@ -3386,12 +3564,13 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_session",
       description:
-        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation. Profile listing never exposes cookies or credentials.",
+        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
           "enum": .array([
             .string("open"), .string("profiles"), .string("status"), .string("close"),
+            .string("client_handoff"),
             .string("handoff"), .string("handoff_start"), .string("handoff_status"),
             .string("handoff_resume"), .string("compatibility_start"),
             .string("goal_delegation_start"), .string("goal_delegation_status"),
@@ -3408,12 +3587,18 @@ public final class WebKitMCPServer {
         "execution_policy": .object([
           "type": .string("string"),
           "enum": .array([
-            .string("auto"), .string("trusted_local"), .string("compatibility"),
-            .string("isolated_read_only"),
+            .string("auto"), .string("trusted_local"),
           ]),
           "default": .string("auto"),
           "description": .string(
-            "For open only. Selects an internal backend policy without exposing a second MCP or transferring credentials between backends."
+            "For open only. Only policies backed by the current native WebKit backend are advertised."
+          ),
+        ]),
+        "wait_timeout_ms": .object([
+          "type": .string("integer"), "minimum": .int(0), "maximum": .int(60_000),
+          "default": .int(0),
+          "description": .string(
+            "For open only. Wait locally for the exclusive host lease for up to 60 seconds; never steals an active lease."
           ),
         ]),
         "resume_token": .object([

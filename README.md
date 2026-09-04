@@ -45,6 +45,12 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - The stdio relay stays alive across broker restarts. It reconnects before the
   next undispatched request and never silently replays a request whose outcome
   became unknown during a restart.
+- Durable multi-client status works without a session ID and reports only
+  privacy-safe holder metadata (client name/version, PID, age, inactivity and
+  policy). `open(wait_timeout_ms: ...)` can wait up to 60 seconds for the local
+  host lease without stealing it; dead transports release their session owner.
+  `browser_session(operation: "client_handoff")` can transfer an idle session
+  only after local human confirmation and a final no-active-call check.
 - A secretless SiliconPass fill can return `credential_not_found`; WebkitUIMCP
   then offers a native human handoff for manual sign-in and addition/update in
   SiliconPass. No credential value crosses MCP, JSON, logs, or the clipboard.

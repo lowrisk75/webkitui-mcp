@@ -19,10 +19,35 @@ public struct WebKitSessionStatus: Codable, Equatable, Sendable {
   public let controlState: InteractionControlState
 }
 
+public struct WebKitControllerHolder: Codable, Equatable, Sendable {
+  public let clientName: String
+  public let clientVersion: String?
+  public let processID: Int32
+  public let acquiredAt: Date
+  public let lastActivityAt: Date
+  public let executionPolicy: String
+
+  public init(
+    clientName: String,
+    clientVersion: String? = nil,
+    processID: Int32 = getpid(),
+    acquiredAt: Date = Date(),
+    lastActivityAt: Date = Date(),
+    executionPolicy: String = "auto"
+  ) {
+    self.clientName = String(clientName.prefix(128))
+    self.clientVersion = clientVersion.map { String($0.prefix(64)) }
+    self.processID = processID
+    self.acquiredAt = acquiredAt
+    self.lastActivityAt = lastActivityAt
+    self.executionPolicy = String(executionPolicy.prefix(64))
+  }
+}
+
 public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
   case invalidMaximumSessions
   case capacityReached
-  case hostControllerBusy
+  case hostControllerBusy(WebKitControllerHolder?)
   case hostControllerLockUnavailable
   case unknownSession
   case networkBoundaryUnavailable
@@ -30,8 +55,9 @@ public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
 
 private final class HostControllerLease {
   private let descriptor: Int32
+  private var holder: WebKitControllerHolder
 
-  init(lockFileURL: URL? = nil) throws {
+  init(lockFileURL: URL? = nil, holder: WebKitControllerHolder) throws {
     let fileManager = FileManager.default
     let directory: URL
     let path: String
@@ -66,13 +92,81 @@ private final class HostControllerLease {
       throw WebKitSessionRegistryError.hostControllerLockUnavailable
     }
     guard flock(opened, LOCK_EX | LOCK_NB) == 0 else {
+      let lockError = errno
+      let currentHolder = Self.readHolder(from: opened)
       Darwin.close(opened)
-      if errno == EWOULDBLOCK {
-        throw WebKitSessionRegistryError.hostControllerBusy
+      if lockError == EWOULDBLOCK {
+        throw WebKitSessionRegistryError.hostControllerBusy(currentHolder)
       }
       throw WebKitSessionRegistryError.hostControllerLockUnavailable
     }
     descriptor = opened
+    self.holder = holder
+    writeHolder()
+  }
+
+  func recordActivity(at now: Date) {
+    holder = WebKitControllerHolder(
+      clientName: holder.clientName,
+      clientVersion: holder.clientVersion,
+      processID: holder.processID,
+      acquiredAt: holder.acquiredAt,
+      lastActivityAt: now,
+      executionPolicy: holder.executionPolicy)
+    writeHolder()
+  }
+
+  func recordHolder(_ newHolder: WebKitControllerHolder, at now: Date) {
+    holder = WebKitControllerHolder(
+      clientName: newHolder.clientName,
+      clientVersion: newHolder.clientVersion,
+      processID: newHolder.processID,
+      acquiredAt: newHolder.acquiredAt,
+      lastActivityAt: now,
+      executionPolicy: newHolder.executionPolicy)
+    writeHolder()
+  }
+
+  private func writeHolder() {
+    guard let data = try? JSONEncoder().encode(holder), data.count <= 4_096 else { return }
+    guard ftruncate(descriptor, 0) == 0, lseek(descriptor, 0, SEEK_SET) >= 0 else { return }
+    data.withUnsafeBytes { bytes in
+      guard let baseAddress = bytes.baseAddress else { return }
+      _ = Darwin.write(descriptor, baseAddress, bytes.count)
+    }
+    _ = fsync(descriptor)
+  }
+
+  private static func readHolder(from descriptor: Int32) -> WebKitControllerHolder? {
+    guard lseek(descriptor, 0, SEEK_SET) >= 0 else { return nil }
+    var bytes = [UInt8](repeating: 0, count: 4_096)
+    let count = Darwin.read(descriptor, &bytes, bytes.count)
+    guard count > 0 else { return nil }
+    return try? JSONDecoder().decode(
+      WebKitControllerHolder.self, from: Data(bytes.prefix(Int(count))))
+  }
+
+  static func existingHolderIfBusy(lockFileURL: URL?) -> WebKitControllerHolder? {
+    let fileManager = FileManager.default
+    let url: URL
+    if let lockFileURL {
+      url = lockFileURL
+    } else {
+      guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+        return nil
+      }
+      url = caches.appendingPathComponent(
+        "com.lorislab.webkitui-mcp/controller.lock", isDirectory: false)
+    }
+    let opened = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+    guard opened >= 0 else { return nil }
+    defer { Darwin.close(opened) }
+    if flock(opened, LOCK_EX | LOCK_NB) == 0 {
+      flock(opened, LOCK_UN)
+      return nil
+    }
+    guard errno == EWOULDBLOCK else { return nil }
+    return readHolder(from: opened)
   }
 
   deinit {
@@ -96,7 +190,13 @@ public final class WebKitSessionRegistry {
   // transient MCP transport. Only a one-way digest is retained in memory.
   private var handoffResumeCapabilities: [Data: HandoffResumeCapability] = [:]
   private var handoffOwners: [WebKitSessionHandle: UUID] = [:]
-  private var sessionOwners: [WebKitSessionHandle: UUID] = [:]
+  private struct SessionOwner {
+    let authorityID: UUID
+    var holder: WebKitControllerHolder
+  }
+
+  private var sessionOwners: [WebKitSessionHandle: SessionOwner] = [:]
+  private var activeClientCalls: [UUID: Int] = [:]
   private var hostControllerLease: HostControllerLease?
 
   public init(
@@ -116,13 +216,24 @@ public final class WebKitSessionRegistry {
     sessions.keys.first
   }
 
-  public func open(profileIdentifier: UUID? = nil) throws -> WebKitSessionHandle {
+  public func externalHostControllerHolder() -> WebKitControllerHolder? {
+    guard enforceHostExclusiveSession else { return nil }
+    return HostControllerLease.existingHolderIfBusy(lockFileURL: hostControllerLockURL)
+  }
+
+  public func open(
+    profileIdentifier: UUID? = nil,
+    holder: WebKitControllerHolder? = nil
+  ) throws -> WebKitSessionHandle {
     guard sessions.count < maximumSessions else {
       throw WebKitSessionRegistryError.capacityReached
     }
     let lease =
       try enforceHostExclusiveSession
-      ? HostControllerLease(lockFileURL: hostControllerLockURL) : nil
+      ? HostControllerLease(
+        lockFileURL: hostControllerLockURL,
+        holder: holder ?? WebKitControllerHolder(clientName: ProcessInfo.processInfo.processName))
+      : nil
     let handle = WebKitSessionHandle(rawValue: UUID())
     do {
       let dataStore = profileIdentifier.map(WKWebsiteDataStore.init(forIdentifier:)) ?? .default()
@@ -134,11 +245,30 @@ public final class WebKitSessionRegistry {
     return handle
   }
 
+  public func open(
+    profileIdentifier: UUID? = nil,
+    holder: WebKitControllerHolder? = nil,
+    waitTimeoutMilliseconds: Int
+  ) async throws -> WebKitSessionHandle {
+    let timeout = max(0, waitTimeoutMilliseconds)
+    let deadline = Date().addingTimeInterval(Double(timeout) / 1_000)
+    while true {
+      do {
+        return try open(profileIdentifier: profileIdentifier, holder: holder)
+      } catch let error as WebKitSessionRegistryError {
+        guard case .hostControllerBusy = error else { throw error }
+        guard timeout > 0, Date() < deadline else { throw error }
+        try await Task.sleep(for: .milliseconds(100))
+      }
+    }
+  }
+
   /// Reuses the host-owned browser when a durable broker reconnects. The
   /// session handle remains process-private and no observation or action
   /// authority is carried by this operation.
   public func openOrReuse(
-    profileIdentifier: UUID? = nil
+    profileIdentifier: UUID? = nil,
+    holder: WebKitControllerHolder? = nil
   ) throws -> (handle: WebKitSessionHandle, reused: Bool) {
     if let existingHandle {
       let currentIdentifier = try runtime(for: existingHandle).webView.configuration
@@ -148,7 +278,29 @@ public final class WebKitSessionRegistry {
       }
       return (existingHandle, true)
     }
-    return (try open(profileIdentifier: profileIdentifier), false)
+    return (try open(profileIdentifier: profileIdentifier, holder: holder), false)
+  }
+
+  public func openOrReuse(
+    profileIdentifier: UUID? = nil,
+    holder: WebKitControllerHolder? = nil,
+    waitTimeoutMilliseconds: Int
+  ) async throws -> (handle: WebKitSessionHandle, reused: Bool) {
+    if let existingHandle {
+      let currentIdentifier = try runtime(for: existingHandle).webView.configuration
+        .websiteDataStore.identifier
+      guard currentIdentifier == profileIdentifier else {
+        throw WebKitSessionRegistryError.capacityReached
+      }
+      return (existingHandle, true)
+    }
+    return (
+      try await open(
+        profileIdentifier: profileIdentifier,
+        holder: holder,
+        waitTimeoutMilliseconds: waitTimeoutMilliseconds),
+      false
+    )
   }
 
   public func availableProfileIDs() async -> [String] {
@@ -241,11 +393,32 @@ public final class WebKitSessionRegistry {
 
   public func claimSessionOwnership(
     for handle: WebKitSessionHandle,
-    owner: UUID
+    owner: UUID,
+    holder: WebKitControllerHolder? = nil,
+    now: Date = Date()
   ) throws -> Bool {
     _ = try runtime(for: handle)
-    if let existing = sessionOwners[handle] { return existing == owner }
-    sessionOwners[handle] = owner
+    if var existing = sessionOwners[handle] {
+      guard existing.authorityID == owner else { return false }
+      existing.holder = WebKitControllerHolder(
+        clientName: existing.holder.clientName,
+        clientVersion: existing.holder.clientVersion,
+        processID: existing.holder.processID,
+        acquiredAt: existing.holder.acquiredAt,
+        lastActivityAt: now,
+        executionPolicy: existing.holder.executionPolicy)
+      sessionOwners[handle] = existing
+      hostControllerLease?.recordActivity(at: now)
+      return true
+    }
+    sessionOwners[handle] = SessionOwner(
+      authorityID: owner,
+      holder: holder
+        ?? WebKitControllerHolder(
+          clientName: ProcessInfo.processInfo.processName, lastActivityAt: now))
+    if let newHolder = sessionOwners[handle]?.holder {
+      hostControllerLease?.recordHolder(newHolder, at: now)
+    }
     return true
   }
 
@@ -255,11 +428,78 @@ public final class WebKitSessionRegistry {
   ) throws -> String {
     _ = try runtime(for: handle)
     guard let existing = sessionOwners[handle] else { return "inactive" }
-    return existing == owner ? "owned_by_this_client" : "owned_elsewhere"
+    return existing.authorityID == owner ? "owned_by_this_client" : "owned_elsewhere"
+  }
+
+  public func sessionOwner(for handle: WebKitSessionHandle) throws -> WebKitControllerHolder? {
+    _ = try runtime(for: handle)
+    return sessionOwners[handle]?.holder
   }
 
   public func releaseSessionOwnerships(owner: UUID) {
-    sessionOwners = sessionOwners.filter { $0.value != owner }
+    let previousCount = sessionOwners.count
+    sessionOwners = sessionOwners.filter { $0.value.authorityID != owner }
+    if previousCount != sessionOwners.count, sessionOwners.isEmpty {
+      hostControllerLease?.recordHolder(
+        WebKitControllerHolder(clientName: "WebKitUI MCP host", executionPolicy: "unowned"),
+        at: Date())
+    }
+  }
+
+  public func beginClientCall(owner: UUID) {
+    activeClientCalls[owner, default: 0] += 1
+    let now = Date()
+    let ownedHandles = sessionOwners.compactMap { handle, sessionOwner in
+      sessionOwner.authorityID == owner ? handle : nil
+    }
+    for handle in ownedHandles {
+      guard var sessionOwner = sessionOwners[handle] else { continue }
+      sessionOwner.holder = WebKitControllerHolder(
+        clientName: sessionOwner.holder.clientName,
+        clientVersion: sessionOwner.holder.clientVersion,
+        processID: sessionOwner.holder.processID,
+        acquiredAt: sessionOwner.holder.acquiredAt,
+        lastActivityAt: now,
+        executionPolicy: sessionOwner.holder.executionPolicy)
+      sessionOwners[handle] = sessionOwner
+      hostControllerLease?.recordHolder(sessionOwner.holder, at: now)
+    }
+  }
+
+  public func endClientCall(owner: UUID) {
+    let remaining = max(0, activeClientCalls[owner, default: 0] - 1)
+    if remaining == 0 {
+      activeClientCalls.removeValue(forKey: owner)
+    } else {
+      activeClientCalls[owner] = remaining
+    }
+  }
+
+  public func transferSessionOwnership(
+    for handle: WebKitSessionHandle,
+    to owner: UUID,
+    holder: WebKitControllerHolder,
+    now: Date = Date()
+  ) throws -> Bool {
+    _ = try runtime(for: handle)
+    if let existing = sessionOwners[handle], existing.authorityID != owner,
+      activeClientCalls[existing.authorityID, default: 0] > 0
+    {
+      return false
+    }
+    sessionOwners[handle] = SessionOwner(
+      authorityID: owner,
+      holder: WebKitControllerHolder(
+        clientName: holder.clientName,
+        clientVersion: holder.clientVersion,
+        processID: holder.processID,
+        acquiredAt: now,
+        lastActivityAt: now,
+        executionPolicy: holder.executionPolicy))
+    if let newHolder = sessionOwners[handle]?.holder {
+      hostControllerLease?.recordHolder(newHolder, at: now)
+    }
+    return true
   }
 
   @discardableResult
@@ -268,8 +508,13 @@ public final class WebKitSessionRegistry {
     owner: UUID? = nil
   ) -> Bool {
     guard let existing = sessionOwners[handle] else { return false }
-    if let owner, existing != owner { return false }
+    if let owner, existing.authorityID != owner { return false }
     sessionOwners.removeValue(forKey: handle)
+    if sessionOwners.isEmpty {
+      hostControllerLease?.recordHolder(
+        WebKitControllerHolder(clientName: "WebKitUI MCP host", executionPolicy: "unowned"),
+        at: Date())
+    }
     return true
   }
 

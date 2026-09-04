@@ -1238,8 +1238,13 @@ struct WebKitRuntimeTests {
     let second = try WebKitSessionRegistry(
       enforceHostExclusiveSession: true, hostControllerLockURL: lockURL)
     let handle = try first.open()
-    #expect(throws: WebKitSessionRegistryError.hostControllerBusy) {
-      try second.open()
+    do {
+      _ = try second.open()
+      Issue.record("A second host controller unexpectedly acquired the lock")
+    } catch WebKitSessionRegistryError.hostControllerBusy(let holder) {
+      #expect(holder?.processID == getpid())
+      #expect(holder?.clientName == ProcessInfo.processInfo.processName)
+      #expect(holder?.executionPolicy == "auto")
     }
     try first.close(handle)
     let secondHandle = try second.open()

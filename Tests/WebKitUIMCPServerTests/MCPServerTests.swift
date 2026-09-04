@@ -908,27 +908,96 @@ struct MCPServerTests {
     #expect(presenter.state == .idle)
   }
 
-  @Test("Unavailable internal backends fail closed without recommending another MCP")
-  func unavailableInternalBackendFailsClosed() async throws {
+  @Test("Profiles advertise only executable policies and disclose privacy limits")
+  func profilesAdvertiseOnlyExecutablePolicies() async throws {
     let server = try WebKitMCPServer()
     let response = try await toolCall(
       server,
       id: 1,
       name: "browser_session",
       arguments: [
-        "operation": .string("open"),
-        "profile_id": .string("default"),
-        "execution_policy": .string("compatibility"),
+        "operation": .string("profiles")
       ]
     )
-    let result = try object(response["result"])
-    #expect(result["isError"] == .bool(true))
-    let structured = try object(result["structuredContent"])
-    #expect(structured["status"] == .string("backend_unavailable"))
-    #expect(structured["execution_policy"] == .string("compatibility"))
-    #expect(structured["available_internal_backends"] == .array([.string("native_webkit")]))
-    let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
-    #expect(!encoded.contains("safari_mcp"))
+    let structured = try object(try object(response["result"])["structuredContent"])
+    #expect(
+      structured["available_execution_policies"]
+        == .array([.string("auto"), .string("trusted_local")]))
+    #expect(structured["authenticated_origins"] == .array([]))
+    #expect(
+      structured["authenticated_origins_status"]
+        == .string("not_observable_without_inspecting_credentials_or_cookies"))
+    let unavailable = try object(structured["unavailable_execution_policies"])
+    #expect(unavailable["compatibility"] != nil)
+    #expect(unavailable["isolated_read_only"] != nil)
+
+    let unknown = try await toolCall(
+      server, id: 2, name: "not_a_tool", arguments: [:])
+    let unknownResult = try object(unknown["result"])
+    let error = try object(unknownResult["structuredContent"])
+    #expect(unknownResult["isError"] == .bool(true))
+    #expect(error["code"] == .string("tool_error"))
+    #expect(error["message"] != nil)
+    #expect(error["remediation"] != nil)
+    #expect(error["holder"] == .null)
+  }
+
+  @Test("A competing host gets holder details and may wait without stealing the lease")
+  func hostBusyIsStructuredAndWaitable() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-server-host-lock-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let firstRegistry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL)
+    let secondRegistry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL)
+    let firstClient = WebKitMCPServer(registry: firstRegistry)
+    let secondClient = WebKitMCPServer(registry: secondRegistry)
+
+    let firstOpen = try await toolCall(
+      firstClient, id: 1, name: "browser_session",
+      arguments: ["operation": .string("open")])
+    let firstState = try object(
+      try object(firstOpen["result"])["structuredContent"])
+    let firstHandle = WebKitSessionHandle(
+      rawValue: try #require(UUID(uuidString: try string(firstState["session_id"]))))
+
+    let externalStatus = try await toolCall(
+      secondClient, id: 2, name: "browser_session",
+      arguments: ["operation": .string("status")])
+    let externalState = try object(
+      try object(externalStatus["result"])["structuredContent"])
+    #expect(externalState["status"] == .string("host_controller_busy"))
+    #expect(externalState["control_available"] == .bool(false))
+    #expect(try object(externalState["holder"])["client_name"] == .string("tests"))
+
+    let busy = try await toolCall(
+      secondClient, id: 3, name: "browser_session",
+      arguments: ["operation": .string("open")])
+    let blocked = try object(try object(busy["result"])["structuredContent"])
+    #expect(blocked["code"] == .string("host_controller_busy"))
+    #expect(blocked["message"] != nil)
+    #expect(blocked["remediation"] != nil)
+    let holder = try object(blocked["holder"])
+    #expect(holder["client_name"] == .string("tests"))
+    #expect(holder["pid"] == .int(Int64(getpid())))
+
+    let releaseTask = Task { @MainActor in
+      try await Task.sleep(for: .milliseconds(150))
+      try firstRegistry.close(firstHandle)
+    }
+    let waited = try await toolCall(
+      secondClient, id: 4, name: "browser_session",
+      arguments: [
+        "operation": .string("open"),
+        "wait_timeout_ms": .int(1_000),
+      ])
+    let waitedState = try object(
+      try object(waited["result"])["structuredContent"])
+    try await releaseTask.value
+    #expect(waitedState["control_available"] == .bool(true))
+    #expect(secondRegistry.count == 1)
   }
 
   @Test("A durable host reuses its live browser but invalidates client observations")
@@ -1012,6 +1081,20 @@ struct MCPServerTests {
     #expect(first["reused"] == .bool(false))
     #expect(first["control_available"] == .bool(true))
 
+    let publicStatus = try await toolCall(
+      secondClient, id: 2, name: "browser_session",
+      arguments: ["operation": .string("status")])
+    let publicState = try object(
+      try object(publicStatus["result"])["structuredContent"])
+    #expect(publicState["session_id"] == .string(sessionID))
+    #expect(publicState["session_owner_state"] == .string("owned_elsewhere"))
+    let holder = try object(publicState["holder"])
+    #expect(holder["client_name"] == .string("tests"))
+    #expect(holder["pid"] == .int(Int64(getpid())))
+    #expect(holder["age_ms"] != nil)
+    #expect(holder["inactive_ms"] != nil)
+    #expect(holder["policy"] == .string("auto"))
+
     let runtime = try registry.runtime(
       for: WebKitSessionHandle(rawValue: try #require(UUID(uuidString: sessionID))))
     _ = try await runtime.loadHTML(
@@ -1053,6 +1136,10 @@ struct MCPServerTests {
       arguments: ["session_id": .string(sessionID)])
     let blocked = try object(try object(blockedObservation["result"])["structuredContent"])
     #expect(blocked["status"] == .string("session_in_use"))
+    #expect(blocked["code"] == .string("session_in_use"))
+    #expect(blocked["message"] != nil)
+    #expect(blocked["remediation"] != nil)
+    #expect(blocked["holder"] != nil)
     #expect(blocked["wait_only"] == .bool(true))
 
     let firstStillFresh = try await toolCall(
@@ -1069,6 +1156,48 @@ struct MCPServerTests {
       secondClient, id: 7, name: "browser_observe",
       arguments: ["session_id": .string(sessionID)])
     #expect(try object(secondStillConnected["result"])["isError"] == nil)
+  }
+
+  @Test("A local human may transfer an idle session between durable clients")
+  func durableClientHandoff() async throws {
+    let registry = try WebKitSessionRegistry()
+    let firstClient = WebKitMCPServer(durableRegistry: registry)
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let secondClient = WebKitMCPServer(
+      registry: registry,
+      confirmationPresenter: presenter,
+      preserveBrowserOnClose: true)
+
+    let opened = try await toolCall(
+      firstClient, id: 1, name: "browser_session",
+      arguments: ["operation": .string("open")])
+    let sessionID = try string(
+      object(try object(opened["result"])["structuredContent"])["session_id"])
+
+    let handoff = try await toolCall(
+      secondClient, id: 2, name: "browser_session",
+      arguments: [
+        "operation": .string("client_handoff"),
+        "session_id": .string(sessionID),
+      ])
+    let handoffState = try object(
+      try object(handoff["result"])["structuredContent"])
+    #expect(handoffState["status"] == .string("ownership_transferred"))
+    #expect(handoffState["control_available"] == .bool(true))
+    #expect(presenter.requests.count == 1)
+    #expect(presenter.requests.first?.title == "Transfer WebKitUI Control")
+
+    let oldOwner = try await toolCall(
+      firstClient, id: 3, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    let oldState = try object(
+      try object(oldOwner["result"])["structuredContent"])
+    #expect(oldState["code"] == .string("session_in_use"))
+
+    let newOwner = try await toolCall(
+      secondClient, id: 4, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    #expect(try object(newOwner["result"])["isError"] == nil)
   }
 
   @Test("A second durable client cannot replace an active handoff capability")
