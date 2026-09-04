@@ -340,4 +340,5 @@ private struct StubAPI: WebKitUILicenseAPI {
   {
     WebKitUIActivationReceipt(token: token, activeMachines: 1, maximumMachines: 10)
   }
+
 }

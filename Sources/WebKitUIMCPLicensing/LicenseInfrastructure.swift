@@ -231,10 +231,43 @@ public struct WebKitUIRS256TokenVerifier: WebKitUILicenseTokenVerifying, @unchec
     self.publicKey = Self.makePublicKey(pem: pem)
   }
 
+  static let resourceBundleName = "WebKitUIMCP_WebKitUIMCPLicensing.bundle"
+  static let publicKeyResourceName = "lorislabs-license-public.pem"
+
+  /// Locations a packaged licence bundle can sit in, relative to the running
+  /// executable. Deliberately does not use `Bundle.module`: SPM's generated accessor
+  /// calls `fatalError` when the bundle is missing, and an MCP server that dies on a
+  /// licence resource is undiagnosable from the client.
+  public static func defaultSearchRoots() -> [URL] {
+    var roots: [URL] = []
+    if let resources = Bundle.main.resourceURL { roots.append(resources) }
+    roots.append(Bundle.main.bundleURL)
+    if let executable = Bundle.main.executableURL?.deletingLastPathComponent() {
+      roots.append(executable)
+      // A CLI installed in bin/ next to an app bundle's Resources/.
+      roots.append(executable.deletingLastPathComponent().appending(path: "Resources"))
+    }
+    return roots
+  }
+
+  /// Returns the packaged public key, or an empty string when no bundle is present.
+  /// An empty key yields a verifier that rejects every token, which is the correct
+  /// fail-closed outcome — and it never traps.
+  public static func bundledPublicKeyPEM(searchRoots: [URL] = defaultSearchRoots()) -> String {
+    for root in searchRoots {
+      let candidate =
+        root
+        .appending(path: resourceBundleName, directoryHint: .isDirectory)
+        .appending(path: publicKeyResourceName)
+      if let pem = try? String(contentsOf: candidate, encoding: .utf8), !pem.isEmpty {
+        return pem
+      }
+    }
+    return ""
+  }
+
   public static func bundled() -> Self {
-    let url = Bundle.module.url(forResource: "lorislabs-license-public", withExtension: "pem")
-    let pem = url.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
-    return Self(pem: pem)
+    Self(pem: bundledPublicKeyPEM())
   }
 
   public func verify(

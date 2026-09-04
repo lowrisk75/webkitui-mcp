@@ -44,6 +44,20 @@ public struct WebKitControllerHolder: Codable, Equatable, Sendable {
   }
 }
 
+extension WebKitControllerHolder {
+  /// The lock record is written by whoever last acquired the lease, not by whoever
+  /// holds it now. A client that took the lock afterwards without rewriting it leaves
+  /// a record naming a process that no longer exists, which misdirects the operator.
+  /// Liveness is what tells the two apart.
+  public static func isProcessRunning(_ processID: Int32) -> Bool {
+    guard processID > 0 else { return false }
+    if kill(processID, 0) == 0 { return true }
+    return errno == EPERM
+  }
+
+  public var processIsRunning: Bool { Self.isProcessRunning(processID) }
+}
+
 public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
   case invalidMaximumSessions
   case capacityReached

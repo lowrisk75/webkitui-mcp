@@ -1218,6 +1218,11 @@ public final class WebKitMCPServer {
       "inactive_ms": .int(
         Int64(max(0, now.timeIntervalSince(holder.lastActivityAt) * 1_000))),
       "policy": .string(holder.executionPolicy),
+      // The record is written on acquisition, not by whoever holds the lock now. A
+      // dead pid means the record is stale and its name, age and policy describe a
+      // process that is gone: the host is still held, but by someone else.
+      "pid_alive": .bool(holder.processIsRunning),
+      "record_trustworthy": .bool(holder.processIsRunning),
     ])
   }
 
