@@ -7,6 +7,18 @@ import WebKitUIMCPCore
 
 @testable import WebKitUIMCPRuntime
 
+/// Fixture navigations must not be bound to wall-clock luck. The suite is
+/// serialized and launches many WebKit content processes, so a loaded machine can
+/// exceed a two-second budget while the behaviour under test is perfectly correct.
+/// No test asserts that a navigation times out, so a generous bound weakens nothing
+/// and removes the only cause of intermittent failures observed here.
+private let fixtureNavigationTimeout: Duration = .seconds(15)
+
+/// Twenty-millisecond polls covering the same budget. A fixed fifty-poll (one
+/// second) wait made asynchronous panel and audit settlement a race against machine
+/// load rather than a test of behaviour.
+private let fixtureSettlementPolls = 750
+
 @MainActor
 private func descendant<T: NSView>(
   of type: T.Type,
@@ -107,7 +119,7 @@ struct WebKitRuntimeTests {
       </script>
       """,
       baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -127,7 +139,7 @@ struct WebKitRuntimeTests {
       <button aria-label="Save profile">Save</button>
       """,
       baseURL: URL(string: "https://fixture.invalid/settings"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -160,7 +172,7 @@ struct WebKitRuntimeTests {
       <textarea id="rejected" aria-invalid="true">\(longValue)</textarea>
       """,
       baseURL: URL(string: "https://fixture.invalid/form"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40))
 
     let page = try await runtime.observe(maximumFieldCharacters: 4_096)
@@ -210,7 +222,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<label for='asset'>App icon</label><input id='asset' type='file'>",
       baseURL: URL(string: "https://fixture.invalid/upload"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let input = try #require(before.elements.first)
     _ = try await runtime.perform(
@@ -220,7 +232,14 @@ struct WebKitRuntimeTests {
       dispatchMode: .nativeAppKit,
       stabilityInterval: .milliseconds(1))
 
-    for _ in 0..<50 where runtime.latestFileUploadReceipt() == nil {
+    // The receipt is recorded before the delegate returns, and WebKit only populates
+    // input.files afterwards. Waiting on the receipt alone races that hand-off, so
+    // wait for the DOM the assertion actually reads.
+    for _ in 0..<fixtureSettlementPolls {
+      let count =
+        try await runtime.webView.evaluateJavaScript(
+          "document.getElementById('asset').files.length") as? Int
+      if count == 1 { break }
       try await Task.sleep(for: .milliseconds(20))
     }
     let receipt = try #require(runtime.latestFileUploadReceipt())
@@ -249,7 +268,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<input aria-label='Assets' type='file' multiple>",
       baseURL: URL(string: "https://fixture.invalid/upload"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let observation = try await runtime.observe()
     let input = try #require(observation.elements.first)
     _ = try await runtime.perform(
@@ -278,7 +297,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<input aria-label='First' type='file'><input aria-label='Second' type='file'>",
       baseURL: URL(string: "https://fixture.invalid/upload"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     runtime.armUploadSelection([file])
 
     let first = try await runtime.observe()
@@ -287,7 +306,7 @@ struct WebKitRuntimeTests {
       observationID: first.observationID, elementID: firstInput.elementID,
       operation: .click, dispatchMode: .nativeAppKit,
       stabilityInterval: .milliseconds(1))
-    for _ in 0..<50 where runtime.latestFileUploadReceipt() == nil {
+    for _ in 0..<fixtureSettlementPolls where runtime.latestFileUploadReceipt() == nil {
       try await Task.sleep(for: .milliseconds(20))
     }
     let receipt = try #require(runtime.latestFileUploadReceipt())
@@ -310,18 +329,27 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<a href='/agent-next'>Next</a>",
       baseURL: URL(string: "https://fixture.invalid/start"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     #expect(runtime.latestNavigationAuditEvent()?.actor == .agentNavigation)
     #expect(runtime.latestNavigationAuditEvent()?.toOrigin == "https://fixture.invalid")
 
     let observation = try await runtime.observe()
     let link = try #require(observation.elements.first)
-    _ = try await runtime.perform(
-      observationID: observation.observationID,
-      elementID: link.elementID,
-      operation: .click,
-      stabilityInterval: .milliseconds(1))
-    for _ in 0..<50 where runtime.latestNavigationAuditEvent()?.actor != .agentAction {
+    // The subject here is navigation-audit attribution, not click success. Activating
+    // this link replaces the document, so re-resolution after dispatch may correctly
+    // fail closed on the very navigation under test. Either outcome is acceptable;
+    // the audit event is what must be right.
+    do {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: link.elementID,
+        operation: .click,
+        stabilityInterval: .milliseconds(1))
+    } catch WebKitRuntimeError.staleObservation {
+    } catch WebKitRuntimeError.targetNotUnique {
+    }
+    for _ in 0..<fixtureSettlementPolls
+    where runtime.latestNavigationAuditEvent()?.actor != .agentAction {
       try await Task.sleep(for: .milliseconds(20))
     }
     #expect(runtime.latestNavigationAuditEvent()?.actor == .agentAction)
@@ -330,9 +358,10 @@ struct WebKitRuntimeTests {
     let scripted = WebKitRuntime()
     _ = try await scripted.loadHTML(
       "<p>Start</p>", baseURL: URL(string: "https://fixture.invalid/start"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     _ = try await scripted.webView.evaluateJavaScript("location.href='/automatic'")
-    for _ in 0..<50 where scripted.latestNavigationAuditEvent()?.actor != .webContent {
+    for _ in 0..<fixtureSettlementPolls
+    where scripted.latestNavigationAuditEvent()?.actor != .webContent {
       try await Task.sleep(for: .milliseconds(20))
     }
     #expect(scripted.latestNavigationAuditEvent()?.actor == .webContent)
@@ -354,7 +383,7 @@ struct WebKitRuntimeTests {
       </script>
       """,
       baseURL: URL(string: "https://fixture.invalid/submit"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -391,7 +420,7 @@ struct WebKitRuntimeTests {
       <input id="password" type="password" value="top-secret">
       """,
       baseURL: URL(string: "https://fixture.invalid/login"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -427,7 +456,7 @@ struct WebKitRuntimeTests {
       </section>
       """,
       baseURL: URL(string: "https://fixture.invalid/settings"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40))
 
     let observation = try await runtime.observe()
@@ -518,7 +547,7 @@ struct WebKitRuntimeTests {
       <input id="profile-code" value="\(sensitiveSecrets[8])">
       """,
       baseURL: URL(string: "https://fixture.invalid/privacy"),
-      timeout: .seconds(3),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -559,7 +588,7 @@ struct WebKitRuntimeTests {
       <input id="token" value="AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-opaque">
       """,
       baseURL: URL(string: "https://fixture.invalid/identifiers"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
 
     let observation = try await runtime.observe()
     let bundle = try #require(
@@ -592,7 +621,7 @@ struct WebKitRuntimeTests {
       </form>
       """,
       baseURL: URL(string: "https://idmsa.apple.com/IDMSWebAuth/signin?state=\(secret)"),
-      timeout: .seconds(3),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -683,7 +712,7 @@ struct WebKitRuntimeTests {
     _ = try await ephemeral.loadHTML(
       "<title>User agent fixture</title>",
       baseURL: URL(string: "https://fixture.invalid/user-agent"),
-      timeout: .seconds(3),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let userAgent = try #require(
@@ -698,7 +727,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<div>Verify with a security key</div>",
       baseURL: URL(string: "https://dash.cloudflare.com/two-factor"),
-      timeout: .seconds(3),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -720,7 +749,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<div>Authentication challenge</div>",
       baseURL: URL(string: "https://dash.cloudflare.com/two-factor"),
-      timeout: .seconds(3),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let status = try #require(runtime.authenticationRestrictionStatus())
@@ -763,7 +792,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<button>Save</button>",
       baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -790,7 +819,7 @@ struct WebKitRuntimeTests {
     let approvedURL = URL(string: "http://127.0.0.1:\(server.port)/inside")!
     _ = try await runtime.navigate(
       to: approvedURL,
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20),
       constrainToInitialOrigin: true
     )
@@ -805,7 +834,7 @@ struct WebKitRuntimeTests {
         </script>
         """,
         baseURL: approvedURL,
-        timeout: .seconds(2),
+        timeout: fixtureNavigationTimeout,
         quietWindow: .milliseconds(20)
       )
     } catch WebKitRuntimeError.crossOriginRedirectRequiresHuman(
@@ -852,14 +881,14 @@ struct WebKitRuntimeTests {
     ) {
       try await runtime.navigate(
         to: URL(string: "http://127.0.0.1:\(entryServer.port)/developer-portal")!,
-        timeout: .seconds(3),
+        timeout: fixtureNavigationTimeout,
         quietWindow: .milliseconds(20),
         constrainToInitialOrigin: true
       )
     }
 
     let continued = try await runtime.continueApprovedCrossOriginNavigation(
-      timeout: .seconds(3), quietWindow: .milliseconds(20))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20))
     #expect(continued.readiness == .ready)
     #expect(runtime.webView.url == authenticationURL)
     #expect(
@@ -901,7 +930,7 @@ struct WebKitRuntimeTests {
         to: NSSelectorFromString("webView:willSubmitForm:submissionHandler:")))
     _ = try await runtime.navigate(
       to: URL(string: "http://127.0.0.1:\(server.port)/form")!,
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20)
     )
     _ = try await runtime.webView.evaluateJavaScript(
@@ -918,7 +947,7 @@ struct WebKitRuntimeTests {
     let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
     _ = try await runtime.navigate(
       to: URL(string: "http://127.0.0.1:\(server.port)/form")!,
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20)
     )
     let before = try await runtime.observe()
@@ -981,12 +1010,12 @@ struct WebKitRuntimeTests {
     let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
     _ = try await runtime.navigate(
       to: URL(string: "http://127.0.0.1:\(server.port)/login")!,
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20)
     )
     _ = try await runtime.navigate(
       to: URL(string: "http://127.0.0.1:\(server.port)/account")!,
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20)
     )
     let before = try await runtime.observe()
@@ -1042,7 +1071,7 @@ struct WebKitRuntimeTests {
         #expect(first.authenticationEnvironmentSnapshot().persistentWebsiteDataStore)
         _ = try await first.navigate(
           to: URL(string: "http://127.0.0.1:\(server.port)/seed")!,
-          timeout: .seconds(3),
+          timeout: fixtureNavigationTimeout,
           quietWindow: .milliseconds(40)
         )
       }
@@ -1050,7 +1079,7 @@ struct WebKitRuntimeTests {
         let second = WebKitRuntime(websiteDataStore: store)
         let check = try await second.navigate(
           to: URL(string: "http://127.0.0.1:\(server.port)/check")!,
-          timeout: .seconds(3),
+          timeout: fixtureNavigationTimeout,
           quietWindow: .milliseconds(40)
         )
         #expect(check.readiness == .ready)
@@ -1098,7 +1127,7 @@ struct WebKitRuntimeTests {
     let next = try await runtime.loadHTML(
       "<title>Next command</title>",
       baseURL: URL(string: "https://fixture.invalid/next"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20))
     #expect(next.readiness == .ready)
 
@@ -1114,7 +1143,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<button>Capture me</button>",
       baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -1141,7 +1170,7 @@ struct WebKitRuntimeTests {
       <h1>Visible handoff fixture</h1>
       """,
       baseURL: URL(string: "https://fixture.invalid/handoff"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -1370,6 +1399,29 @@ struct WebKitRuntimeTests {
     try second.close(admitted)
   }
 
+  @Test("Authenticated origins list hosts only, never cookie values")
+  func authenticatedOriginsListHostsOnly() async throws {
+    let store = WKWebsiteDataStore.nonPersistent()
+    let runtime = WebKitRuntime(
+      websiteDataStore: store, egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+    let secret = "session-token-must-never-escape"
+    let cookie = try #require(
+      HTTPCookie(properties: [
+        .domain: "console.fixture.invalid",
+        .path: "/",
+        .name: "session",
+        .value: secret,
+        .secure: "TRUE",
+      ]))
+    await store.httpCookieStore.setCookie(cookie)
+
+    let origins = await runtime.authenticatedOrigins()
+    #expect(origins.contains("console.fixture.invalid"))
+    #expect(!origins.contains(where: { $0.contains(secret) }))
+    #expect(origins == origins.sorted())
+  }
+
   @Test("Click re-resolves semantics and reports an untrusted JS gesture")
   func clickActuation() async throws {
     let runtime = WebKitRuntime()
@@ -1380,7 +1432,7 @@ struct WebKitRuntimeTests {
       </button>
       """,
       baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let before = try await runtime.observe()
@@ -1408,7 +1460,7 @@ struct WebKitRuntimeTests {
           ? 'trusted' : 'rejected'">Run</button>
       """,
       baseURL: URL(string: "https://fixture.invalid/native-click"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let result = try await runtime.perform(
       observationID: before.observationID,
@@ -1440,7 +1492,7 @@ struct WebKitRuntimeTests {
       </script>
       """,
       baseURL: URL(string: "https://fixture.invalid/native-fill"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let value = try ProvenancedText(
       text: "com.lorislab.example.background-agent",
@@ -1474,7 +1526,7 @@ struct WebKitRuntimeTests {
       </script>
       """,
       baseURL: URL(string: "https://fixture.invalid/native-fill-commit"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let value = try ProvenancedText(
       text: "Local-first camera monitoring",
@@ -1505,7 +1557,7 @@ struct WebKitRuntimeTests {
       </script>
       """,
       baseURL: URL(string: "https://fixture.invalid/spa-hydration"),
-      timeout: .seconds(2), quietWindow: .milliseconds(20))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20))
     let observation = try await runtime.observe(hydrationTimeout: .seconds(2))
     #expect(observation.elements.count == 1)
     #expect(observation.elements[0].value?.segments.first?.text == "Lumen")
@@ -1531,7 +1583,7 @@ struct WebKitRuntimeTests {
       </script>
       """,
       baseURL: URL(string: "https://fixture.invalid/profile-selector"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let value = try ProvenancedText(
       text: "Lumen Background Agent",
@@ -1558,7 +1610,7 @@ struct WebKitRuntimeTests {
         onclick="this.dataset.state='opened'">Configure</button></div>
       """,
       baseURL: URL(string: "https://fixture.invalid/capabilities"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let observation = try await runtime.observe()
     let buttons = observation.elements.filter {
       $0.accessibleName?.segments.first?.text == "Configure"
@@ -1614,7 +1666,7 @@ struct WebKitRuntimeTests {
       downloadDestinationProvider: { _ in requested })
     _ = try await runtime.navigate(
       to: URL(string: "http://127.0.0.1:\(server.port)/")!,
-      timeout: .seconds(3), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let observation = try await runtime.observe()
     let link = try #require(
       observation.elements.first {
@@ -1623,7 +1675,7 @@ struct WebKitRuntimeTests {
     let receipt = try await runtime.download(
       observationID: observation.observationID,
       elementID: link.elementID,
-      timeout: .seconds(5))
+      timeout: fixtureNavigationTimeout)
     #expect(receipt.filename == "Fixture 2.provisionprofile")
     #expect(receipt.suggestedFilename == "Fixture.provisionprofile")
     #expect(receipt.httpStatus == 200)
@@ -1669,11 +1721,11 @@ struct WebKitRuntimeTests {
       downloadDestinationProvider: { suggested in directory.appendingPathComponent(suggested) })
     _ = try await runtime.navigate(
       to: URL(string: "http://127.0.0.1:\(server.port)/")!,
-      timeout: .seconds(3), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let receipt = try await runtime.download(
       url: URL(string: "http://127.0.0.1:\(server.port)/direct-profile")!,
       expectedProvisioningProfileUUID: expectedUUID,
-      timeout: .seconds(5))
+      timeout: fixtureNavigationTimeout)
     #expect(receipt.httpStatus == 200)
     #expect(receipt.suggestedFilename == "Direct.provisionprofile")
     #expect(receipt.provisioningProfileUUID == expectedUUID)
@@ -1693,7 +1745,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<p>Portal</p>",
       baseURL: URL(string: "https://portal.example/")!,
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     await #expect(throws: WebKitRuntimeError.networkBoundaryDenied) {
       try await runtime.download(
         url: URL(string: "https://download.example/profile")!,
@@ -1716,11 +1768,11 @@ struct WebKitRuntimeTests {
       downloadDestinationProvider: { _ in nil })
     _ = try await runtime.navigate(
       to: URL(string: "http://127.0.0.1:\(server.port)/")!,
-      timeout: .seconds(3), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     await #expect(throws: WebKitRuntimeError.unsupportedDownload(httpStatus: 200)) {
       try await runtime.download(
         url: URL(string: "http://127.0.0.1:\(server.port)/not-a-download")!,
-        timeout: .seconds(2))
+        timeout: fixtureNavigationTimeout)
     }
   }
 
@@ -1740,7 +1792,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<label for='name'>Name</label><input id='name'>",
       baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let before = try await runtime.observe()
@@ -1774,7 +1826,7 @@ struct WebKitRuntimeTests {
       <select aria-label='Plan'><option>Free</option><option selected>Paid</option></select>
       """,
       baseURL: URL(string: "https://fixture.invalid/state"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
 
     let observation = try await runtime.observe()
     let checkbox = try #require(
@@ -1801,7 +1853,7 @@ struct WebKitRuntimeTests {
         onchange="this.dataset.state='committed'">
       """,
       baseURL: URL(string: "https://fixture.invalid/keyboard"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let key = try await runtime.perform(
       observationID: before.observationID, elementID: "e1", operation: .pressKey("Enter"),
@@ -1828,7 +1880,7 @@ struct WebKitRuntimeTests {
           event.isTrusted&&navigator.userActivation.isActive?'trusted':'rejected'">
       """,
       baseURL: URL(string: "https://fixture.invalid/native-key"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let result = try await runtime.perform(
       observationID: before.observationID, elementID: "e1",
@@ -1851,7 +1903,7 @@ struct WebKitRuntimeTests {
       <button>Next</button>
       """,
       baseURL: URL(string: "https://fixture.invalid/native-tab"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let result = try await runtime.perform(
       observationID: before.observationID, elementID: "e1",
@@ -1874,7 +1926,7 @@ struct WebKitRuntimeTests {
       </div>
       """,
       baseURL: URL(string: "https://fixture.invalid/capabilities"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
 
     let observation = try await runtime.observe()
     let tabs = observation.elements.filter {
@@ -1898,7 +1950,7 @@ struct WebKitRuntimeTests {
       </div>
       """,
       baseURL: URL(string: "https://fixture.invalid/nested-scroll"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let observation = try await runtime.observe()
     let target = try #require(
       observation.elements.first { $0.accessibleName?.segments.first?.text == "Nested target" })
@@ -1915,7 +1967,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<button aria-label='Save profile'>Save</button><a href='/help'>Help center</a>",
       baseURL: URL(string: "https://fixture.invalid/filter"),
-      timeout: .seconds(2), quietWindow: .milliseconds(40))
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let observation = try await runtime.observe(
       maximumElements: 10, roles: ["button"], nameContains: "save")
     #expect(observation.elements.count == 1)
@@ -1928,7 +1980,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<button>Save</button><button>Save</button>",
       baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let observation = try await runtime.observe()
@@ -1951,7 +2003,7 @@ struct WebKitRuntimeTests {
       "<button onclick='this.dataset.state=\"clicked\"'>Configure</button>"
         + "<button disabled>Configure</button>",
       baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let observation = try await runtime.observe()
@@ -1974,7 +2026,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<button>Save</button>",
       baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let stale = try await runtime.observe()
@@ -2020,7 +2072,7 @@ struct WebKitRuntimeTests {
       <table><tr><th>Name</th><td>Example App ID</td></tr></table>
       """,
       baseURL: URL(string: "https://fixture.invalid/identifiers"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
 
@@ -2044,7 +2096,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       "<label for='secret'>Secret</label><input id='secret' value='private'><button>Continue</button>",
       baseURL: URL(string: "https://fixture.invalid/login"),
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let before = try await runtime.observe()

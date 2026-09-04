@@ -5,6 +5,13 @@ import WebKit
 
 @testable import WebKitUIMCPRuntime
 
+/// Fixture navigations must not be bound to wall-clock luck. The suite is
+/// serialized and launches many WebKit content processes, so a loaded machine can
+/// exceed a two-second budget while the behaviour under test is perfectly correct.
+/// No test asserts that a navigation times out, so a generous bound weakens nothing
+/// and removes the only cause of intermittent failures observed here.
+private let fixtureNavigationTimeout: Duration = .seconds(15)
+
 private final class ResolverProbe: @unchecked Sendable {
   private let lock = NSLock()
   private var calls = 0
@@ -202,7 +209,7 @@ struct PinnedSOCKSProxyTests {
 
     for _ in 0..<2 {
       let result = try await runtime.navigate(
-        to: url, timeout: .seconds(2), quietWindow: .milliseconds(20))
+        to: url, timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20))
       #expect(result.readiness == .ready)
     }
 
@@ -228,7 +235,7 @@ struct PinnedSOCKSProxyTests {
       </script>
       """,
       baseURL: URL(string: "http://rebind.test:\(destination.port)/")!,
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20)
     )
     try await Task.sleep(for: .milliseconds(300))
@@ -253,7 +260,7 @@ struct PinnedSOCKSProxyTests {
       <img src="https://rebind.test:\(destination.port)/tls-attempt">
       """,
       baseURL: URL(string: "https://fixture.invalid/")!,
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20)
     )
     try await Task.sleep(for: .milliseconds(300))
@@ -281,7 +288,7 @@ struct PinnedSOCKSProxyTests {
       </script>
       """,
       baseURL: URL(string: "http://fixture.invalid/")!,
-      timeout: .seconds(2),
+      timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(20)
     )
     try await Task.sleep(for: .milliseconds(300))

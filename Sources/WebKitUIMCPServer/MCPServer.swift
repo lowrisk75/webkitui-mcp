@@ -965,9 +965,25 @@ public final class WebKitMCPServer {
           "profiles": .array(
             await registry.availableProfileIDs().map { .string($0) }),
           "contains_credentials": .bool(false),
+          // Advertise only what actually works. The rejected policies are named
+          // separately with their reason, so a client never plans around a policy
+          // that fails by design.
           "available_execution_policies": .array([
-            .string("auto"), .string("trusted_local"), .string("compatibility"),
-            .string("isolated_read_only"),
+            .string("auto"), .string("trusted_local"),
+          ]),
+          "unavailable_execution_policies": .array([
+            .object([
+              "policy": .string("compatibility"),
+              "reason": .string(
+                "Safari compatibility is reachable only through operation=compatibility_start, "
+                  + "which opens one exact private authentication URL after native confirmation. "
+                  + "It is not an execution policy for open."),
+            ]),
+            .object([
+              "policy": .string("isolated_read_only"),
+              "reason": .string(
+                "No isolated read-only backend is implemented. Use auto or trusted_local."),
+            ]),
           ]),
         ]),
         modern: modern)
@@ -999,6 +1015,11 @@ public final class WebKitMCPServer {
         Int64(try registry.runtime(for: handle).navigationAuditEventCount()))
       statusObject["file_picker_visible"] = .bool(
         try registry.runtime(for: handle).isFilePickerVisible())
+      // Host names only: a client can tell whether this profile is already signed in
+      // to an origin without any cookie ever leaving the store.
+      let statusRuntime = try registry.runtime(for: handle)
+      statusObject["authenticated_origins"] = .array(
+        await statusRuntime.authenticatedOrigins().map(JSONValue.string))
       statusObject["native_confirmation_state"] = .string(confirmationPresenter.state.rawValue)
       statusObject["native_confirmation_cancel_available"] = .bool(
         confirmationPresenter.state == .pending)

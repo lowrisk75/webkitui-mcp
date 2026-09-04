@@ -766,6 +766,56 @@ struct MCPServerTests {
     #expect(holder.processName == ProcessInfo.processInfo.processName)
   }
 
+  @Test("Profiles advertise only the execution policies that work")
+  func profilesAdvertiseOnlyWorkingPolicies() async throws {
+    let registry = try WebKitSessionRegistry()
+    let server = WebKitMCPServer(registry: registry)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("profiles")])
+    let structured = try object(try object(response["result"])["structuredContent"])
+    #expect(
+      structured["available_execution_policies"]
+        == .array([.string("auto"), .string("trusted_local")]))
+    let unavailable = try array(structured["unavailable_execution_policies"])
+    let names = try unavailable.map { try string(object($0)["policy"]) }
+    #expect(names == ["compatibility", "isolated_read_only"])
+    for entry in unavailable {
+      #expect(try string(object(entry)["reason"]).count > 0)
+    }
+  }
+
+  @Test("Session status names the origins a profile is already signed in to")
+  func statusNamesAuthenticatedOrigins() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    defer { try? registry.close(handle) }
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<p>Portal</p>", baseURL: URL(string: "https://fixture.invalid/")!,
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let secret = "authenticated-origin-cookie-secret"
+    let cookie = try #require(
+      HTTPCookie(properties: [
+        .domain: "console.fixture.invalid", .path: "/", .name: "session",
+        .value: secret, .secure: "TRUE",
+      ]))
+    await runtime.webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie)
+
+    let server = WebKitMCPServer(registry: registry)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("status"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let result = try object(response["result"])
+    let structured = try object(result["structuredContent"])
+    let origins = try array(structured["authenticated_origins"]).map { try string($0) }
+    #expect(origins.contains("console.fixture.invalid"))
+    let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+    #expect(!encoded.contains(secret))
+  }
+
   @Test("Download reports an active human handoff without attempting the action")
   func downloadReportsHumanControl() async throws {
     let registry = try WebKitSessionRegistry()

@@ -1043,18 +1043,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       candidate.physicalIdentity == target.physicalIdentity ? .same : .different
     let geometry: EvidenceComparison = candidate.geometryStable ? .same : .different
     let actionTime = DispatchTime.now().uptimeNanoseconds
-    let attempt = try AddressingAttempt(
-      observationID: observationID,
-      locatorRecipeID: elementID,
-      observationGeneration: target.recipe.observationGeneration,
-      actionGeneration: observationGeneration,
-      observationMonotonicNanoseconds: target.observedAtMonotonicNanoseconds,
-      actionMonotonicNanoseconds: actionTime,
-      finalCandidateCount: second.count,
-      semanticComparison: .same,
-      physicalIdentity: physicalIdentity,
-      geometryComparison: geometry
-    )
+    // A telemetry enum must never surface as this API's error. The only constructible
+    // failure here is a generation that moved backwards, which means the document was
+    // replaced between observation and action: that is a stale observation, and the
+    // caller is told so.
+    let attempt: AddressingAttempt
+    do {
+      attempt = try AddressingAttempt(
+        observationID: observationID,
+        locatorRecipeID: elementID,
+        observationGeneration: target.recipe.observationGeneration,
+        actionGeneration: observationGeneration,
+        observationMonotonicNanoseconds: target.observedAtMonotonicNanoseconds,
+        actionMonotonicNanoseconds: actionTime,
+        finalCandidateCount: second.count,
+        semanticComparison: .same,
+        physicalIdentity: physicalIdentity,
+        geometryComparison: geometry
+      )
+    } catch {
+      throw WebKitRuntimeError.staleObservation
+    }
     let outcome = AddressingClassifier.classify(attempt)
     addressingCounters.record(outcome)
 
@@ -1088,6 +1097,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   public func navigationAuditEventCount() -> Int { navigationAuditEvents.count }
+
+  /// Hosts this session's data store holds credential-bearing storage for, so a
+  /// client can tell whether a profile is already signed in to an origin. Host names
+  /// only: cookie names, values, paths and expiries never leave the store.
+  public func authenticatedOrigins() async -> [String] {
+    let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+    // Only the domain leaves this function. Names, values, paths and expiries stay
+    // inside the store.
+    let hosts = cookies.map { cookie -> String in
+      let domain = cookie.domain
+      return domain.hasPrefix(".") ? String(domain.dropFirst()) : domain
+    }
+    return Set(hosts.filter { !$0.isEmpty }).sorted()
+  }
 
   public func latestFileUploadReceipt() -> WebKitFileUploadReceipt? {
     lastUploadReceipt
@@ -2380,7 +2403,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private func recordCardinality(_ count: Int, target: ObservedTargetRecord) throws {
     guard count != 1 else { return }
     let now = DispatchTime.now().uptimeNanoseconds
-    let attempt = try AddressingAttempt(
+    // Measuring a failure must never replace it. An attempt that cannot be recorded
+    // — a document replaced under us moves the generation backwards — is dropped,
+    // and the caller still learns why addressing failed.
+    if let attempt = try? AddressingAttempt(
       observationID: target.recipe.observationID,
       locatorRecipeID: target.recipe.elementID,
       observationGeneration: target.recipe.observationGeneration,
@@ -2391,8 +2417,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       semanticComparison: .unknown,
       physicalIdentity: .unknown,
       geometryComparison: .unknown
-    )
-    addressingCounters.record(AddressingClassifier.classify(attempt))
+    ) {
+      addressingCounters.record(AddressingClassifier.classify(attempt))
+    }
     throw WebKitRuntimeError.targetNotUnique(count)
   }
 
