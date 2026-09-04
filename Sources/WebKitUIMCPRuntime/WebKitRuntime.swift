@@ -414,6 +414,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       configuration: configuration
     )
     super.init()
+    // A WKWebView that belongs to no window can lay out to nothing: the DOM is
+    // built and readable while every control reports a zero-sized box, so the
+    // semantic tree comes back empty on a page that is perfectly loaded. Measured
+    // on Play Console: 690 elements, 35 controls, 764 characters of text, zero
+    // rendered. Hosting the view in an offscreen window from the start gives the
+    // engine a real viewport without ever showing anything.
+    _ = makeBrowserWindow()
     contentController.add(
       WeakScriptMessageHandler(target: self),
       contentWorld: world,
