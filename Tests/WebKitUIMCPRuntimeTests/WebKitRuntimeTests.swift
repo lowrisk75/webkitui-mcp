@@ -323,6 +323,36 @@ struct WebKitRuntimeTests {
     #expect(count == 0)
   }
 
+  @Test("A loading shell that also renders navigation labels still waits for hydration")
+  func loadingShellWithChromeWaitsForHydration() async throws {
+    // Play Console's shell shows "Loading Google Play Console" alongside its
+    // navigation labels, so a rule anchored on the whole body text never matched and
+    // the observation returned zero elements on a page that was still hydrating.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div id="shell">
+        <p>Loading Google Play Console</p>
+        <p>notifications_unread</p><p>Unread notifications</p>
+        <p>features</p><p>Home</p><p>Policy status</p>
+      </div>
+      <script>
+        setTimeout(() => {
+          document.getElementById('shell').remove();
+          document.body.insertAdjacentHTML(
+            'beforeend', '<button aria-label="LorisLab">LorisLab</button>');
+        }, 400);
+      </script>
+      """,
+      baseURL: URL(string: "https://play.fixture.invalid/console"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20))
+
+    let observation = try await runtime.observe(hydrationTimeout: .seconds(10))
+    #expect(observation.elements.count == 1)
+    #expect(
+      observation.elements.first?.accessibleName?.segments.map(\.text).joined() == "LorisLab")
+  }
+
   @Test("Main-frame navigation audit distinguishes agent actions from web content")
   func navigationActorAttribution() async throws {
     let runtime = WebKitRuntime()
