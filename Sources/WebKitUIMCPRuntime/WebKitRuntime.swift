@@ -193,6 +193,10 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// A page that paints its controls and marks them hidden leaves an empty tree for
   /// a reason the caller must be able to see.
   public let ariaHiddenDropCount: Int
+  /// Controls present in the walked tree before any layout filter.
+  public let rawControlCount: Int
+  public let documentElementCount: Int
+  public let bodyTextLength: Int
   public let capturedAtMonotonicNanoseconds: UInt64
 }
 
@@ -673,6 +677,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       crossOriginFramesOpaque: raw.crossOriginFrameCount > 0,
       renderedInteractiveCount: raw.renderedInteractiveCount,
       ariaHiddenDropCount: raw.ariaHiddenDropCount,
+      rawControlCount: raw.rawControlCount,
+      documentElementCount: raw.documentElementCount,
+      bodyTextLength: raw.bodyTextLength,
       capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
     )
     rememberRecoverableURL(URL(string: raw.url) ?? webView.url)
@@ -3363,9 +3370,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // Counted from the raw DOM, not the semantic matcher: a page whose matcher finds
     // nothing may still be fully rendered, and must not be mistaken for a shell that
     // has not painted its controls yet.
-    const renderedInteractiveCount = deepQueryAll(
-      document, 'button, a[href], input, select, textarea, [role="button"]'
-    ).filter(isRendered).length;
+    const rawControls = deepQueryAll(
+      document, 'button, a[href], input, select, textarea, [role="button"]');
+    const renderedInteractiveCount = rawControls.filter(isRendered).length;
+    // Separates "not in this tree" from "in the tree but not laid out": the first
+    // means the script is walking the wrong document, the second a layout problem.
+    const rawControlCount = rawControls.length;
+    const documentElementCount = document.querySelectorAll('*').length;
+    const bodyTextLength = (document.body?.innerText || '').length;
     const transientLoading = matchingElements.length === 0 && (
       visibleLoadingIndicators
       // Anchored on the start, not the whole body: a loading shell usually renders
@@ -3385,6 +3397,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
       renderedInteractiveCount,
       ariaHiddenDropCount,
+      rawControlCount,
+      documentElementCount,
+      bodyTextLength,
       transientLoading,
       semanticTextTruncated,
       elements
@@ -4023,6 +4038,9 @@ private struct RawObservation: Decodable {
   let transientLoading: Bool
   let renderedInteractiveCount: Int
   let ariaHiddenDropCount: Int
+  let rawControlCount: Int
+  let documentElementCount: Int
+  let bodyTextLength: Int
   let semanticTextTruncated: Bool
   let elements: [RawElement]
 }
