@@ -2586,7 +2586,7 @@ public final class WebKitMCPServer {
       // for a panel the site opens later.
       runtime.disarmUploadSelection()
     }
-    return try await executeActuation(
+    let result = try await executeActuation(
       PendingActuation(
         arguments: arguments,
         session: handle,
@@ -2599,6 +2599,32 @@ public final class WebKitMCPServer {
         dispatchMode: .nativeAppKit,
         expiresAt: Date().addingTimeInterval(60)
       ), modern: modern)
+    return Self.annotatingConfirmedDigests(result, confirmed: candidates.map(\.sha256))
+  }
+
+  /// The digests shown at confirmation are read before the panel consumes the files,
+  /// so a file swapped in between would be sent under a hash the user never approved.
+  /// The receipt carries what was actually read; comparing the two turns that window
+  /// into a reported fact instead of a silent divergence.
+  static func annotatingConfirmedDigests(
+    _ result: JSONValue, confirmed: [String]
+  ) -> JSONValue {
+    guard !confirmed.isEmpty,
+      case .object(var envelope) = result,
+      case .object(var structured) = envelope["structuredContent"] ?? .null
+    else { return result }
+    guard case .object(let receipt) = structured["file_upload_receipt"] ?? .null,
+      case .array(let uploaded) = receipt["sha256"] ?? .null
+    else {
+      structured["confirmed_digests_match"] = .string("no_receipt")
+      envelope["structuredContent"] = .object(structured)
+      return .object(envelope)
+    }
+    let sent = uploaded.compactMap(\.stringValue)
+    structured["confirmed_digests"] = .array(confirmed.map(JSONValue.string))
+    structured["confirmed_digests_match"] = .string(sent == confirmed ? "true" : "false")
+    envelope["structuredContent"] = .object(structured)
+    return .object(envelope)
   }
 
   private func downloadTool(

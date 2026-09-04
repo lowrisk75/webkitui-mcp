@@ -668,6 +668,31 @@ struct MCPServerTests {
     #expect(!encoded.contains(secret))
   }
 
+  @Test("A file swapped after confirmation is reported, not sent silently")
+  func swappedFileAfterConfirmationIsReported() async throws {
+    let sent = JSONValue.object([
+      "structuredContent": .object([
+        "file_upload_receipt": .object(["sha256": .array([.string("aaa"), .string("bbb")])])
+      ])
+    ])
+    let matching = WebKitMCPServer.annotatingConfirmedDigests(sent, confirmed: ["aaa", "bbb"])
+    #expect(
+      try object(object(matching)["structuredContent"])["confirmed_digests_match"]
+        == .string("true"))
+
+    let swapped = WebKitMCPServer.annotatingConfirmedDigests(sent, confirmed: ["aaa", "ccc"])
+    let swappedContent = try object(object(swapped)["structuredContent"])
+    #expect(swappedContent["confirmed_digests_match"] == .string("false"))
+    #expect(swappedContent["confirmed_digests"] == .array([.string("aaa"), .string("ccc")]))
+
+    // No receipt at all must not read as a match.
+    let none = WebKitMCPServer.annotatingConfirmedDigests(
+      .object(["structuredContent": .object([:])]), confirmed: ["aaa"])
+    #expect(
+      try object(object(none)["structuredContent"])["confirmed_digests_match"]
+        == .string("no_receipt"))
+  }
+
   @Test("Download reports an active human handoff without attempting the action")
   func downloadReportsHumanControl() async throws {
     let registry = try WebKitSessionRegistry()
