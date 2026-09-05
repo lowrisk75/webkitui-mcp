@@ -24,6 +24,10 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   /// Nothing matched the address at all. Carries the required facts whose removal would
   /// have matched, which names what changed under the observation.
   case targetNotFound([String])
+  /// The control exists and can be reached, but this operation is not one it accepts.
+  /// Carries its role and the route that does work, because target_not_actionable was
+  /// also what an overlay and a disabled button returned.
+  case operationUnsupportedForControl(role: String, alternative: String)
   case sensitiveInputRequiresHuman
   case downloadInProgress
   case downloadCancelled
@@ -216,6 +220,9 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// Rendered controls dropped only because an ancestor is aria-hidden or inert.
   /// A page that paints its controls and marks them hidden leaves an empty tree for
   /// a reason the caller must be able to see.
+  /// The interface language the page declares. A postcondition written against an
+  /// English label fails silently on a French console, and nothing said which it was.
+  public let documentLanguage: String?
   public let ariaHiddenDropCount: Int
   /// Controls dropped only because nothing up their row has a layout box. They cannot
   /// be clicked, but the only exit from a form can be one of them, so they are named
@@ -736,6 +743,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       semanticTextTruncated: raw.semanticTextTruncated,
       crossOriginFramesOpaque: raw.crossOriginFrameCount > 0,
       renderedInteractiveCount: raw.renderedInteractiveCount,
+      documentLanguage: raw.documentLanguage,
       ariaHiddenDropCount: raw.ariaHiddenDropCount,
       unrenderedControlCount: raw.unrenderedControlCount,
       unrenderedControlNames: raw.unrenderedControlNames,
@@ -1177,6 +1185,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     addressingCounters.record(outcome)
 
     guard candidate.geometryStable else { throw WebKitRuntimeError.targetGeometryChanged }
+    if let role = candidate.unsupportedOperationRole {
+      throw WebKitRuntimeError.operationUnsupportedForControl(
+        role: role,
+        alternative:
+          "A \(role) does not accept typed input. Click it to open its options, then click "
+          + "the option you want.")
+    }
     guard candidate.actionable, candidate.dispatched else {
       throw WebKitRuntimeError.targetNotActionable
     }
@@ -2386,7 +2401,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             geometryStable: candidate.geometryStable,
             actionable: candidate.actionable,
             dispatched: true,
-            trustedUserGesture: receipt.trusted
+            trustedUserGesture: receipt.trusted,
+            unsupportedOperationRole: nil
           ),
           eliminatedBy: nil)
       }
@@ -2461,7 +2477,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             geometryStable: candidate.geometryStable,
             actionable: candidate.actionable,
             dispatched: true,
-            trustedUserGesture: receipt.trusted
+            trustedUserGesture: receipt.trusted,
+            unsupportedOperationRole: nil
           ),
           eliminatedBy: nil)
       }
@@ -2519,7 +2536,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
                 geometryStable: candidate.geometryStable,
                 actionable: candidate.actionable,
                 dispatched: true,
-                trustedUserGesture: inputReceipt.trusted && commitReceipt.trusted
+                trustedUserGesture: inputReceipt.trusted && commitReceipt.trusted,
+                unsupportedOperationRole: nil
               ),
               eliminatedBy: nil)
           }
@@ -3804,6 +3822,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       totalElementCount: matchingElements.length,
       unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
       renderedInteractiveCount,
+      documentLanguage: bounded(
+        collapse(document.documentElement.getAttribute('lang'))
+          || collapse(document.body?.getAttribute('lang'))
+          || null),
       ariaHiddenDropCount,
       unrenderedControlCount,
       unrenderedControlNames,
@@ -4334,6 +4356,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
           || element.isContentEditable) && !element.readOnly
       );
+      // A control that cannot be typed into is not the same failure as one behind an
+      // overlay or a disabled one, and target_not_actionable was all three.
+      if (!editable) candidate.unsupportedOperationRole = roleOf(element) || element.localName;
       candidate.actionable = visible && enabled && receivesEvents && editable
         && candidate.geometryStable && element.isConnected;
       if (candidate.actionable && operation === 'click') {
@@ -4608,6 +4633,7 @@ private struct RawObservation: Decodable {
   let unfilteredCandidateCount: Int
   let transientLoading: Bool
   let renderedInteractiveCount: Int
+  let documentLanguage: String?
   let ariaHiddenDropCount: Int
   let unrenderedControlCount: Int
   let unrenderedControlNames: [String]
@@ -4686,6 +4712,7 @@ private struct RawActionCandidate: Decodable {
   let actionable: Bool
   let dispatched: Bool
   let trustedUserGesture: Bool
+  let unsupportedOperationRole: String?
 }
 
 private struct NativeGestureReceipt {

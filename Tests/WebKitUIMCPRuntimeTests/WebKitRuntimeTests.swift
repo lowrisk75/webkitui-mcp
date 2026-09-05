@@ -1030,6 +1030,60 @@ struct WebKitRuntimeTests {
     #expect(withModal.compositorEffectsMayBeMissing)
   }
 
+  @Test("The observation says which language the interface is in")
+  func observationReportsInterfaceLanguage() async throws {
+    // They wrote a postcondition looking for "SKU" against a French App Store Connect
+    // and got unsatisfied, then had to work out whether the tool or the expectation
+    // was wrong. Nothing in the payload said the page was in French.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><html lang="fr"><title>App Store Connect</title>
+      <body><label for="sku">UGS</label><input id="sku"></body></html>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/apps"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    #expect(observation.documentLanguage == "fr")
+  }
+
+  @Test("Filling a control that cannot be typed into says what to do instead")
+  func fillOnAComboboxExplainsItself() async throws {
+    // browser_act fill on the "Langue principale" combobox failed as
+    // target_not_actionable — the same code returned for an element behind an overlay,
+    // for a disabled button, and for a control that simply is not a text field. The
+    // agent has no way to know that clicking it and choosing an option is the route.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>ASC</title>
+      <div role="combobox" id="lang" aria-label="Langue principale" tabindex="0">Choisir</div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/apps"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let combobox = try #require(observation.elements.first)
+
+    let value = try ProvenancedText(
+      text: "Français",
+      source: ProvenanceSource(classification: .modelGenerated))
+    do {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: combobox.elementID,
+        operation: .fill(value),
+        stabilityInterval: .milliseconds(1))
+      Issue.record("a combobox accepted a fill")
+    } catch let error as WebKitRuntimeError {
+      guard case .operationUnsupportedForControl(let role, let alternative) = error else {
+        Issue.record("expected operationUnsupportedForControl, got \(error)")
+        return
+      }
+      #expect(role == "combobox")
+      #expect(alternative.contains("click"))
+    }
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()
