@@ -1069,8 +1069,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   ) async throws -> LocatorResolution {
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
     guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    // The transaction refuses before dispatch on this count, so it has to resolve the
+    // same way the dispatch does. Without the identity and the population it saw four
+    // identical buttons and stopped, while the actuation path would have reached the
+    // right one — the write was refused by its own preflight.
     let resolution = try await resolveTarget(
-      criteria: locatorCriteria(recipe, expectedEnabled: !target.disabled), scrollIntoView: false)
+      criteria: locatorCriteria(recipe, expectedEnabled: !target.disabled),
+      scrollIntoView: false,
+      physicalIdentity: target.physicalIdentity,
+      expectedCandidateCount: target.observedCandidateCount)
     return LocatorResolution(
       recipeElementID: elementID,
       evaluations: (0..<resolution.count).map {
@@ -4265,9 +4272,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (locatorMatches.length !== expectedCandidateCount) return locatorMatches;
       const corroborating = criteria.filter(criterion => criterion.strength !== 'required');
       if (corroborating.length === 0) return locatorMatches;
-      const exact = locatorMatches.filter(element =>
-        corroborating.every(criterion => matchesCriterion(element, criterion)));
-      return exact.length === 1 ? exact : locatorMatches;
+      const singled = clauses => {
+        const exact = locatorMatches.filter(element =>
+          clauses.every(criterion => matchesCriterion(element, criterion)));
+        return exact.length === 1 ? exact : null;
+      };
+      // All of them first: agreement across every corroborating fact is the strongest
+      // evidence available. But one volatile fact — a neighbouring label that moved, a
+      // caption that changed — must not veto the rest, so fall back to position alone,
+      // which is the one corroborator guaranteed to single out a member of a set that
+      // has not itself changed.
+      const byEverything = singled(corroborating);
+      if (byEverything) return byEverything;
+      const positional = corroborating.filter(criterion => criterion.fact === 'domPath');
+      return (positional.length > 0 ? singled(positional) : null) ?? locatorMatches;
     })();
     const matches = pinnedNode ? [pinnedNode] : narrowed;
     // Zero matches is an absence, not an ambiguity. A client told "not unique" goes
