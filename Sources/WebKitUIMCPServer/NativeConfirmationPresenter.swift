@@ -2,6 +2,39 @@ import Darwin
 import Foundation
 import Security
 
+/// Where the confirmation helper must sit. `doctor` and the presenter have to
+/// agree: a doctor that resolved its own executable differently reported
+/// `action_required` on an installation the server was perfectly happy with.
+public enum NativeConfirmationHelperLocation {
+  public static let helperName = "webkitui-mcp-confirm"
+
+  /// `CommandLine.arguments[0]` is whatever the caller typed. Invoked by bare
+  /// name through PATH it carries no directory at all, and the helper was then
+  /// looked for in the working directory. The bundle knows the real path.
+  public static var executableURL: URL {
+    Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+  }
+
+  public static func helperURL(besideExecutable executable: URL) -> URL {
+    executable.standardizedFileURL
+      .deletingLastPathComponent()
+      .appendingPathComponent(helperName)
+  }
+
+  public static var helperURL: URL { helperURL(besideExecutable: executableURL) }
+
+  public static func helperIsAvailable(
+    besideExecutable executable: URL,
+    fileManager: FileManager = .default
+  ) -> Bool {
+    fileManager.isExecutableFile(atPath: helperURL(besideExecutable: executable).path)
+  }
+
+  public static var helperIsAvailable: Bool {
+    helperIsAvailable(besideExecutable: executableURL)
+  }
+}
+
 enum NativeConfirmationOutcome: String, Equatable, Sendable {
   case approved
   case declined
@@ -145,20 +178,15 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   }
 
   private static func defaultHelperURL() -> URL {
-    let executable =
-      Bundle.main.executableURL
-      ?? URL(fileURLWithPath: CommandLine.arguments[0])
-    return executable.deletingLastPathComponent().appendingPathComponent("webkitui-mcp-confirm")
+    NativeConfirmationHelperLocation.helperURL
   }
 
   private static func verifyPackagedHelper(_ helperURL: URL) -> Bool {
     let helper = helperURL.standardizedFileURL
-    let executable =
-      (Bundle.main.executableURL
-      ?? URL(fileURLWithPath: CommandLine.arguments[0])).standardizedFileURL
+    let executable = NativeConfirmationHelperLocation.executableURL.standardizedFileURL
     guard
       helper.deletingLastPathComponent() == executable.deletingLastPathComponent(),
-      helper.lastPathComponent == "webkitui-mcp-confirm",
+      helper.lastPathComponent == NativeConfirmationHelperLocation.helperName,
       FileManager.default.isExecutableFile(atPath: helper.path),
       let helperIdentity = validatedSigningIdentity(at: helper),
       let executableIdentity = validatedSigningIdentity(at: executable),

@@ -64,10 +64,7 @@ struct WebKitUIMCPCLI {
   }
 
   private static func runDoctor() async {
-    let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-    let helperURL = executableURL.deletingLastPathComponent()
-      .appendingPathComponent("webkitui-mcp-confirm")
-    let helperAvailable = FileManager.default.isExecutableFile(atPath: helperURL.path)
+    let helperAvailable = NativeConfirmationHelperLocation.helperIsAvailable
 
     let context = LAContext()
     var authenticationError: NSError?
