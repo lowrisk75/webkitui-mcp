@@ -536,6 +536,45 @@ struct WebKitRuntimeTests {
     #expect(observation.elements.contains { $0.role?.segments.first?.text == "checkbox" } == false)
   }
 
+  @Test("A radio covered by its own painted overlay is clicked through its wrapper")
+  func coveredRadioIsClickedThroughItsWrapper() async throws {
+    // D3, and the second half of D2: the input is rendered at 18x18 and passes every
+    // visibility check, but the painted box sits on top of it, so hit testing at its
+    // centre lands on the overlay and the click is refused as target_not_actionable —
+    // indeterminate, which costs a failed round trip on every radio Play renders.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Government apps</title>
+      <div class="wrapper" onclick="document.getElementById('no').click()"
+        style="position:relative;width:600px;height:40px">
+        <input type="radio" name="gov" id="no" aria-label="No" style="width:18px;height:18px">
+        <div aria-hidden="true"
+          style="position:absolute;left:0;top:0;width:600px;height:40px"></div>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/app-content/government-apps"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let before = try await runtime.observe()
+    let radio = try #require(
+      before.elements.first { $0.role?.segments.first?.text == "radio" })
+    let result = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: radio.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+
+    let after = try await runtime.observe()
+    let updated = try #require(
+      after.elements.first { $0.role?.segments.first?.text == "radio" })
+    #expect(updated.checked == true)
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

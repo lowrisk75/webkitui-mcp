@@ -3193,6 +3193,31 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return null;
     };
+    // A control can be rendered, sized and enabled and still be unable to receive its
+    // own click: Material paints the box in a sibling that covers it. Hit testing is
+    // the only way to tell, and without it every radio on the page costs a failed
+    // round trip reported as indeterminate.
+    const receivesOwnEvents = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return false;
+      const x = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const y = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      let hit = document.elementFromPoint(x, y);
+      while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        const nested = hit.shadowRoot.elementFromPoint(x, y);
+        if (!nested || nested === hit) break;
+        hit = nested;
+      }
+      for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
+        if (cursor === element) return true;
+      }
+      return false;
+    };
+    const controlSurfaceOf = element => {
+      const fallback = hiddenControlSurface(element);
+      if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
+      return isRendered(element) ? element : fallback;
+    };
     const classTokens = element => collapse(element?.getAttribute?.('class'));
     const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
     const hasSelectedToken = element =>
@@ -3375,7 +3400,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     };
     const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
       .filter(element => {
-        if (!isRendered(element) && !hiddenControlSurface(element)) {
+        if (!controlSurfaceOf(element)) {
           if (hiddenOnlyBySemantics(element)) ariaHiddenDropCount += 1;
           return false;
         }
@@ -3387,7 +3412,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const elements = matchingElements
       .slice(elementOffset, elementOffset + __MAXIMUM_ELEMENTS__)
       .map(element => {
-        const surface = isRendered(element) ? element : hiddenControlSurface(element);
+        const surface = controlSurfaceOf(element) || element;
         const box = surface.getBoundingClientRect();
         const rawValue = typeof element.value === 'string' ? element.value : null;
         const autocomplete = collapse(element.getAttribute('autocomplete')).toLowerCase();
@@ -3705,10 +3730,32 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return null;
     };
-    const surfaceOf = element => {
-      if (isRendered(element)) return element;
-      return hiddenControlSurface(element) || element;
+    // A control can be rendered, sized and enabled and still be unable to receive its
+    // own click: Material paints the box in a sibling that covers it. Hit testing is
+    // the only way to tell, and without it every radio on the page costs a failed
+    // round trip reported as indeterminate.
+    const receivesOwnEvents = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return false;
+      const x = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const y = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      let hit = document.elementFromPoint(x, y);
+      while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        const nested = hit.shadowRoot.elementFromPoint(x, y);
+        if (!nested || nested === hit) break;
+        hit = nested;
+      }
+      for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
+        if (cursor === element) return true;
+      }
+      return false;
     };
+    const controlSurfaceOf = element => {
+      const fallback = hiddenControlSurface(element);
+      if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
+      return isRendered(element) ? element : fallback;
+    };
+    const surfaceOf = element => controlSurfaceOf(element) || element;
     const directLabelledText = element => {
       const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
       if (!labelledBy) return null;
