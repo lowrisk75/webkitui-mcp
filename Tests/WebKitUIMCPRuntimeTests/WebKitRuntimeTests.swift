@@ -575,6 +575,90 @@ struct WebKitRuntimeTests {
     #expect(updated.checked == true)
   }
 
+  @Test("A borrowed surface lends its label, not just its geometry")
+  func borrowedSurfaceLendsItsLabel() async throws {
+    // B1: exposing the checkbox was only half the job. Play's inputs carry no
+    // aria-label and no aria-labelledby, so twenty-two checkboxes came back with
+    // name, label and text all null and no context at all. Their locators held role
+    // and nothing else, and every act failed as targetNotUnique(22).
+    let runtime = WebKitRuntime()
+    let rows = ["Banking and loans", "Payments and transfers", "Trading and funds"]
+      .enumerated()
+      .map { index, title in
+        """
+        <div class="row" onclick="document.getElementById('c\(index)').click()">
+          <div class="mdc-checkbox">
+            <input type="checkbox" id="c\(index)"
+              style="position:absolute;width:0;height:0;opacity:0">
+            <div class="box" aria-hidden="true" style="width:18px;height:18px"></div>
+          </div>
+          <span style="display:inline-block;width:400px">\(title)</span>
+        </div>
+        """
+      }
+      .joined()
+    _ = try await runtime.loadHTML(
+      "<!doctype html><title>Financial features</title>"
+        + "<div role=\"group\" aria-label=\"Select the features your app provides\">"
+        + rows + "</div>",
+      baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let observation = try await runtime.observe()
+    let checkboxes = observation.elements.filter { $0.role?.segments.first?.text == "checkbox" }
+    #expect(checkboxes.count == 3)
+    let names = checkboxes.compactMap { $0.accessibleName?.segments.first?.text }
+    #expect(names.sorted() == ["Banking and loans", "Payments and transfers", "Trading and funds"])
+
+    // Named uniquely, so it can actually be addressed rather than failing as not unique.
+    let payments = try #require(
+      checkboxes.first { $0.accessibleName?.segments.first?.text == "Payments and transfers" })
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: payments.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+
+    let after = try await runtime.observe()
+    let checkedNames = after.elements
+      .filter { $0.role?.segments.first?.text == "checkbox" && $0.checked == true }
+      .compactMap { $0.accessibleName?.segments.first?.text }
+    #expect(checkedNames == ["Payments and transfers"])
+  }
+
+  @Test("A control with no layout box is named in the diagnostics, never silently dropped")
+  func zeroSizeControlIsNamedInDiagnostics() async throws {
+    // B2: the escape option after the "Or" separator — "none of these features" — has
+    // no layout box anywhere up its row, and Next stays disabled without it. A control
+    // with no box genuinely cannot be clicked, so exposing it as actionable would be a
+    // lie. What the agent needs is to know the exit exists, and what it is called, so
+    // it can hand the form to a human instead of concluding the page is complete.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Financial features</title>
+      <div class="row" style="height:0;overflow:hidden">
+        <input type="checkbox" id="none" style="width:0;height:0">
+        <span>My app does not provide any of these features</span>
+      </div>
+      <button>Next</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let observation = try await runtime.observe()
+    #expect(observation.unrenderedControlCount >= 1)
+    #expect(
+      observation.unrenderedControlNames.contains(
+        "My app does not provide any of these features"))
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

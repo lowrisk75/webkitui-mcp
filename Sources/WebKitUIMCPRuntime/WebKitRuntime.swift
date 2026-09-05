@@ -195,6 +195,11 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// A page that paints its controls and marks them hidden leaves an empty tree for
   /// a reason the caller must be able to see.
   public let ariaHiddenDropCount: Int
+  /// Controls dropped only because nothing up their row has a layout box. They cannot
+  /// be clicked, but the only exit from a form can be one of them, so they are named
+  /// rather than silently withheld.
+  public let unrenderedControlCount: Int
+  public let unrenderedControlNames: [String]
   /// Controls present in the walked tree before any layout filter.
   public let rawControlCount: Int
   /// True when a reported control sits under a fully transparent ancestor. The tree
@@ -701,6 +706,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       crossOriginFramesOpaque: raw.crossOriginFrameCount > 0,
       renderedInteractiveCount: raw.renderedInteractiveCount,
       ariaHiddenDropCount: raw.ariaHiddenDropCount,
+      unrenderedControlCount: raw.unrenderedControlCount,
+      unrenderedControlNames: raw.unrenderedControlNames,
       rawControlCount: raw.rawControlCount,
       obscuredByAncestorOpacity: raw.obscuredByAncestorOpacity,
       documentElementCount: raw.documentElementCount,
@@ -3186,12 +3193,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         const node = labelledNode(element, id);
         if (node && isRendered(node)) return node;
       }
+      // Climb to the outermost ancestor that still owns this one control and nothing
+      // else interactive: that is the labelled row, which carries both the visible text
+      // and the click handler. The tight wrapper around the input holds neither — it is
+      // the painted box, and its text is empty.
+      let widest = null;
       for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
         if (cursor === document.body || cursor === document.documentElement) break;
-        if (deepQueryAll(cursor, 'input[type="checkbox"], input[type="radio"]').length !== 1) break;
-        if (isRendered(cursor)) return cursor;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        if (isRendered(cursor)) widest = cursor;
       }
-      return null;
+      return widest;
     };
     // A control can be rendered, sized and enabled and still be unable to receive its
     // own click: Material paints the box in a sibling that covers it. Hit testing is
@@ -3213,10 +3225,22 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return false;
     };
+    const soleControl =
+      'input, button, select, textarea, a[href], summary,'
+      + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
     const controlSurfaceOf = element => {
       const fallback = hiddenControlSurface(element);
       if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
       return isRendered(element) ? element : fallback;
+    };
+    // A control that borrows a surface for its geometry borrows its label with it.
+    // Play's checkboxes carry no aria-label and no aria-labelledby — the visible text
+    // is a sibling — so without this they are exposed and anonymous, their locator
+    // holds role and nothing else, and every act on them fails as not unique.
+    const borrowedLabel = element => {
+      const surface = controlSurfaceOf(element);
+      if (!surface || surface === element) return null;
+      return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
     };
     const classTokens = element => collapse(element?.getAttribute?.('class'));
     const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
@@ -3281,7 +3305,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (labelledBy) {
         return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
       }
-      return null;
+      return borrowedLabel(element);
     };
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
       || collapse(element.getAttribute('placeholder'))
@@ -3386,6 +3410,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // ancestor is aria-hidden or inert. A page that renders its controls and marks
     // them hidden leaves the tree empty for a reason worth reporting.
     let ariaHiddenDropCount = 0;
+    // A control with no layout box anywhere up its row cannot be clicked, so reporting
+    // it as actionable would be a lie. Reporting nothing at all is worse: the only exit
+    // from a form can be one of these, and an agent that cannot see it concludes the
+    // page is complete instead of handing over to a human.
+    let unrenderedControlCount = 0;
+    const unrenderedControlNames = [];
+    const unrenderedControlName = element => {
+      const direct = collapse(element.getAttribute('aria-label')) || labelOf(element);
+      if (direct) return direct;
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        const text = collapse(cursor.textContent);
+        if (text) return bounded(text);
+      }
+      return null;
+    };
     const hiddenOnlyBySemantics = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0)) return false;
@@ -3401,7 +3442,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
       .filter(element => {
         if (!controlSurfaceOf(element)) {
-          if (hiddenOnlyBySemantics(element)) ariaHiddenDropCount += 1;
+          if (hiddenOnlyBySemantics(element)) {
+            ariaHiddenDropCount += 1;
+          } else if (element.matches(soleControl)) {
+            unrenderedControlCount += 1;
+            const name = unrenderedControlName(element);
+            if (name && unrenderedControlNames.length < 10
+                && !unrenderedControlNames.includes(name)) {
+              unrenderedControlNames.push(name);
+            }
+          }
           return false;
         }
         const role = collapse(roleOf(element)).toLowerCase();
@@ -3606,6 +3656,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
       renderedInteractiveCount,
       ariaHiddenDropCount,
+      unrenderedControlCount,
+      unrenderedControlNames,
       rawControlCount,
       obscuredByAncestorOpacity,
       documentElementCount,
@@ -3645,7 +3697,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (labelledBy) {
         return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
       }
-      return null;
+      return borrowedLabel(element);
     };
     const classTokens = element => collapse(element?.getAttribute?.('class'));
     const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
@@ -3723,12 +3775,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         const node = labelledNode(element, id);
         if (node && isRendered(node)) return node;
       }
+      // Climb to the outermost ancestor that still owns this one control and nothing
+      // else interactive: that is the labelled row, which carries both the visible text
+      // and the click handler. The tight wrapper around the input holds neither — it is
+      // the painted box, and its text is empty.
+      let widest = null;
       for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
         if (cursor === document.body || cursor === document.documentElement) break;
-        if (deepQueryAll(cursor, 'input[type="checkbox"], input[type="radio"]').length !== 1) break;
-        if (isRendered(cursor)) return cursor;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        if (isRendered(cursor)) widest = cursor;
       }
-      return null;
+      return widest;
     };
     // A control can be rendered, sized and enabled and still be unable to receive its
     // own click: Material paints the box in a sibling that covers it. Hit testing is
@@ -3750,10 +3807,22 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return false;
     };
+    const soleControl =
+      'input, button, select, textarea, a[href], summary,'
+      + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
     const controlSurfaceOf = element => {
       const fallback = hiddenControlSurface(element);
       if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
       return isRendered(element) ? element : fallback;
+    };
+    // A control that borrows a surface for its geometry borrows its label with it.
+    // Play's checkboxes carry no aria-label and no aria-labelledby — the visible text
+    // is a sibling — so without this they are exposed and anonymous, their locator
+    // holds role and nothing else, and every act on them fails as not unique.
+    const borrowedLabel = element => {
+      const surface = controlSurfaceOf(element);
+      if (!surface || surface === element) return null;
+      return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
     };
     const surfaceOf = element => controlSurfaceOf(element) || element;
     const directLabelledText = element => {
@@ -4292,6 +4361,8 @@ private struct RawObservation: Decodable {
   let transientLoading: Bool
   let renderedInteractiveCount: Int
   let ariaHiddenDropCount: Int
+  let unrenderedControlCount: Int
+  let unrenderedControlNames: [String]
   let rawControlCount: Int
   let obscuredByAncestorOpacity: Bool
   let documentElementCount: Int

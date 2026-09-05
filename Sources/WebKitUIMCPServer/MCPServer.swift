@@ -3265,6 +3265,8 @@ public final class WebKitMCPServer {
       "crossOriginFramesOpaque": .bool(observation.crossOriginFramesOpaque),
       "rendered_interactive_count": .int(Int64(observation.renderedInteractiveCount)),
       "aria_hidden_drop_count": .int(Int64(observation.ariaHiddenDropCount)),
+      "unrendered_control_count": .int(Int64(observation.unrenderedControlCount)),
+      "unrendered_control_names": .array(observation.unrenderedControlNames.map(JSONValue.string)),
       "compact": .bool(true),
     ])
   }
