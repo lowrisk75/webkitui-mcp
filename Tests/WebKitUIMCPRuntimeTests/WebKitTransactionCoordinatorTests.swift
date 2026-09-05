@@ -13,7 +13,8 @@ struct WebKitTransactionCoordinatorTests {
       WebKitTransactionCoordinator.dispatchOutcome(for: .targetNotActionable).rawValue
         == DispatchOutcome.unknown.rawValue)
     #expect(
-      WebKitTransactionCoordinator.dispatchOutcome(for: .targetNotUnique(2)).rawValue
+      WebKitTransactionCoordinator.dispatchOutcome(for: .targetNotUnique(2, pinned: "detached"))
+        .rawValue
         == DispatchOutcome.notDispatched.rawValue)
   }
 

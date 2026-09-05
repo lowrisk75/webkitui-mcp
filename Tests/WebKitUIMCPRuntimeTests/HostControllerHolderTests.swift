@@ -40,4 +40,35 @@ struct HostControllerHolderTests {
     let decoded = try JSONDecoder().decode(WebKitControllerHolder.self, from: legacy)
     #expect(decoded.isHostPlaceholder == false)
   }
+
+  @Test("Stamping a holder keeps every field, including ones added later")
+  func stampingPreservesEveryField() {
+    // Five call sites rebuilt a holder field by field to refresh its timestamp, so a
+    // field added afterwards was dropped by all of them. isHostPlaceholder reached disk
+    // as false on the record that is the placeholder, and the flag meant to end the
+    // guessing became another thing to distrust.
+    let original = WebKitControllerHolder(
+      clientName: "WebKitUI MCP host",
+      clientVersion: "0.6.1",
+      processID: 4242,
+      acquiredAt: Date(timeIntervalSince1970: 1_000),
+      lastActivityAt: Date(timeIntervalSince1970: 1_000),
+      executionPolicy: "unowned",
+      isHostPlaceholder: true)
+    let later = Date(timeIntervalSince1970: 2_000)
+
+    let stamped = original.active(at: later)
+    #expect(stamped.isHostPlaceholder)
+    #expect(stamped.clientName == original.clientName)
+    #expect(stamped.clientVersion == original.clientVersion)
+    #expect(stamped.processID == original.processID)
+    #expect(stamped.executionPolicy == original.executionPolicy)
+    #expect(stamped.acquiredAt == original.acquiredAt)
+    #expect(stamped.lastActivityAt == later)
+
+    let reacquired = original.acquired(at: later)
+    #expect(reacquired.isHostPlaceholder)
+    #expect(reacquired.acquiredAt == later)
+    #expect(reacquired.lastActivityAt == later)
+  }
 }

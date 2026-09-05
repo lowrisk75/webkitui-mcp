@@ -47,4 +47,18 @@ shasum -a 256 \
   "$installed_cli_confirm" \
   "$installed_relay"
 
-echo "WebKitUI MCP $expected_version source, installation, and two-client transport verified."
+# The lease must be free when the verifier leaves. It used to stay taken until it timed
+# out, so every delivery handed the next client a locked host — including the client
+# about to test what was just installed.
+lock="$HOME/Library/Caches/com.lorislab.webkitui-mcp/controller.lock"
+released=0
+for _ in {1..40}; do
+  if [[ ! -f "$lock" ]] || ! lsof "$lock" >/dev/null 2>&1; then released=1; break; fi
+  sleep 1
+done
+if (( ! released )); then
+  print -u2 "host lease still held after verification"
+  exit 1
+fi
+
+echo "WebKitUI MCP $expected_version source, installation, two-client transport, and host release verified."

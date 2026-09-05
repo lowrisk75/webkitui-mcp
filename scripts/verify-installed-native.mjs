@@ -155,6 +155,16 @@ try {
   assert.equal(firstSession.profile_id, "default");
   assert.equal(secondSession.profile_id, "default");
 
+  // Closing the sockets leaves the browser session open, so the host lease is rewritten
+  // as unowned and stays taken until it times out. Every delivery therefore ended with a
+  // phantom lease and the next client had to wait or kill the broker — including the
+  // client about to test the fix that was just installed. Close the session, not just
+  // the pipe.
+  await tool(first, "browser_session", {
+    operation: "close",
+    session_id: firstSession.session_id,
+  });
+
   console.log(JSON.stringify({
     status: "verified",
     version: expectedVersion,
@@ -162,6 +172,7 @@ try {
     tools: expectedTools.length,
     profile: "default",
     sharedSession: true,
+    hostReleased: true,
   }, null, 2));
 } finally {
   first.close();

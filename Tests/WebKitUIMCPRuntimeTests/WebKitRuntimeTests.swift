@@ -865,9 +865,10 @@ struct WebKitRuntimeTests {
     // handed out an identity for each and browser_act was given it back; re-deriving
     // the target from a name they do not have threw that away.
     let runtime = WebKitRuntime()
-    let boxes = (0..<22)
-      .map { "<input type='checkbox' data-index='\($0)'>" }
-      .joined()
+    // Nothing whatsoever to tell them apart: no id, no name, no attribute. The locator
+    // can only say "a checkbox", twenty-two times over. Only the identity the
+    // observation handed out distinguishes them.
+    let boxes = String(repeating: "<input type='checkbox'>", count: 22)
     _ = try await runtime.loadHTML(
       "<!doctype html><title>Financial features</title><div role='group'>" + boxes + "</div>",
       baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
@@ -1082,6 +1083,84 @@ struct WebKitRuntimeTests {
       #expect(role == "combobox")
       #expect(alternative.contains("click"))
     }
+  }
+
+  @Test("When the identity does not settle an ambiguous address, it says why")
+  func pinnedResolutionReportsWhyItDidNotApply()
+    async throws
+  {
+    // Twenty-two anonymous checkboxes still came back targetNotUnique(22) on a build
+    // that resolves by identity, on a page I cannot see. Guessing the reason from the
+    // outside costs a round trip each time, so the resolver now states it: the node was
+    // never registered, it was replaced by a re-render, or it no longer matches what was
+    // observed. Each of those calls for a different move.
+    let runtime = WebKitRuntime()
+    let rows = String(
+      repeating: """
+        <div class="row">
+          <div class="mdc-checkbox">
+            <input type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+            <div class="box" aria-hidden="true" style="width:18px;height:18px"></div>
+          </div>
+        </div>
+        """, count: 22)
+    _ = try await runtime.loadHTML(
+      "<!doctype html><title>F</title><div role='group'>" + rows + "</div>",
+      baseURL: URL(string: "https://fixture.invalid/finance"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let checkboxes = observation.elements.filter {
+      $0.role?.segments.first?.text == "checkbox"
+    }
+    let target = try #require(checkboxes.dropFirst(7).first)
+    #expect(target.locatorQuality.candidateCount == 22)
+
+    // A single-page app re-renders and swaps every row for a fresh node. The address is
+    // still of the current generation, and the observed node is simply gone.
+    _ = try await runtime.webView.evaluateJavaScript(
+      "for (const row of document.querySelectorAll('.row')) { row.replaceWith(row.cloneNode(true)); }"
+    )
+
+    do {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID,
+        operation: .click,
+        stabilityInterval: .milliseconds(1))
+      Issue.record("a replaced node was acted on")
+    } catch let error as WebKitRuntimeError {
+      guard case .targetNotUnique(let count, let pinned) = error else {
+        Issue.record("expected targetNotUnique, got \(error)")
+        return
+      }
+      #expect(count == 22)
+      #expect(pinned == "detached", "the reason was reported as \(pinned)")
+    }
+  }
+
+  @Test("A browser under human control is never yielded, however long the client is gone")
+  func handoffSuspendsTheUnownedYield() async throws {
+    // Yielding an unowned lease must not reach a session a person is working in: the
+    // MCP client being gone is exactly the situation a handoff creates, and the browser
+    // is the thing that has to survive it.
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-handoff-yield-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let holder = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      unownedLeaseGrace: .milliseconds(120))
+
+    let handle = try holder.open()
+    let owner = UUID()
+    #expect(try holder.claimSessionOwnership(for: handle, owner: owner))
+    _ = try holder.issueHandoffResumeCapability(for: handle)
+    holder.releaseSessionOwnerships(owner: owner)
+
+    try await Task.sleep(for: .milliseconds(400))
+    #expect(holder.existingHandle == handle, "a session under handoff was torn down")
+    try holder.close(handle)
   }
 
   @Test("Open shadow DOM controls remain observable and actionable")
@@ -2691,7 +2770,7 @@ struct WebKitRuntimeTests {
     )
     let observation = try await runtime.observe()
 
-    await #expect(throws: WebKitRuntimeError.targetNotUnique(2)) {
+    await #expect(throws: WebKitRuntimeError.targetNotUnique(2, pinned: "used")) {
       try await runtime.perform(
         observationID: observation.observationID,
         elementID: "e1",

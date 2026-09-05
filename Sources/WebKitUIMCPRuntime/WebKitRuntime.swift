@@ -18,7 +18,9 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case invalidQuietWindow
   case staleObservation
   case unknownElement
-  case targetNotUnique(Int)
+  /// Carries why addressing by the identity the observation handed out did not settle
+  /// it, because that is what tells a client whether to re-observe or look again.
+  case targetNotUnique(Int, pinned: String)
   case targetNotActionable
   case targetGeometryChanged
   /// Nothing matched the address at all. Carries the required facts whose removal would
@@ -783,7 +785,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     let resolution = try await resolveTarget(
       criteria: criteria, scrollIntoView: true)
     guard resolution.count == 1 else {
-      throw WebKitRuntimeError.targetNotUnique(resolution.count)
+      throw WebKitRuntimeError.targetNotUnique(
+        resolution.count, pinned: resolution.pinnedState ?? "not_requested")
     }
     return try await performScroll(
       source: Self.nearestScrollStateSource,
@@ -1094,12 +1097,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     let first = try await resolveTarget(
       criteria: criteria, scrollIntoView: true, physicalIdentity: target.physicalIdentity)
     try recordCardinality(
-      first.count, target: target, eliminatedBy: first.eliminatedBy ?? [])
+      first.count, target: target, eliminatedBy: first.eliminatedBy ?? [],
+      pinnedState: first.pinnedState ?? "not_requested")
     guard let firstCandidate = first.candidate else {
       if first.count == 0 {
         throw WebKitRuntimeError.targetNotFound(first.eliminatedBy ?? [])
       }
-      throw WebKitRuntimeError.targetNotUnique(first.count)
+      throw WebKitRuntimeError.targetNotUnique(
+        first.count, pinned: first.pinnedState ?? "not_requested")
     }
     try await Task.sleep(for: stabilityInterval)
 
@@ -1148,12 +1153,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       )
     }
     try recordCardinality(
-      second.count, target: target, eliminatedBy: second.eliminatedBy ?? [])
+      second.count, target: target, eliminatedBy: second.eliminatedBy ?? [],
+      pinnedState: second.pinnedState ?? "not_requested")
     guard let candidate = second.candidate else {
       if second.count == 0 {
         throw WebKitRuntimeError.targetNotFound(second.eliminatedBy ?? [])
       }
-      throw WebKitRuntimeError.targetNotUnique(second.count)
+      throw WebKitRuntimeError.targetNotUnique(
+        second.count, pinned: second.pinnedState ?? "not_requested")
     }
 
     let physicalIdentity: EvidenceComparison =
@@ -2404,7 +2411,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             trustedUserGesture: receipt.trusted,
             unsupportedOperationRole: nil
           ),
-          eliminatedBy: nil)
+          eliminatedBy: nil, pinnedState: nil)
       }
       try await Task.sleep(for: .milliseconds(10))
     }
@@ -2480,7 +2487,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             trustedUserGesture: receipt.trusted,
             unsupportedOperationRole: nil
           ),
-          eliminatedBy: nil)
+          eliminatedBy: nil, pinnedState: nil)
       }
       try await Task.sleep(for: .milliseconds(10))
     }
@@ -2539,7 +2546,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
                 trustedUserGesture: inputReceipt.trusted && commitReceipt.trusted,
                 unsupportedOperationRole: nil
               ),
-              eliminatedBy: nil)
+              eliminatedBy: nil, pinnedState: nil)
           }
           try await Task.sleep(for: .milliseconds(10))
         }
@@ -2623,7 +2630,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   private func recordCardinality(
-    _ count: Int, target: ObservedTargetRecord, eliminatedBy: [String] = []
+    _ count: Int, target: ObservedTargetRecord, eliminatedBy: [String] = [],
+    pinnedState: String = "not_requested"
   ) throws {
     guard count != 1 else { return }
     let now = DispatchTime.now().uptimeNanoseconds
@@ -2645,7 +2653,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       addressingCounters.record(AddressingClassifier.classify(attempt))
     }
     if count == 0 { throw WebKitRuntimeError.targetNotFound(eliminatedBy) }
-    throw WebKitRuntimeError.targetNotUnique(count)
+    throw WebKitRuntimeError.targetNotUnique(count, pinned: pinnedState)
   }
 
   private func requireAgentControl() throws {
@@ -4127,6 +4135,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       ...deepQueryAll(document, selector),
       ...deepQueryAll(document, 'a:not([href]), div, li, span').filter(isPointerControl)
     ]));
+    const reportedFactNames = {
+      role: 'role', accessibleName: 'accessible_name', label: 'label',
+      contextAnchor: 'context_anchor', stableAttribute: 'stable_attribute',
+      framePath: 'frame_path', text: 'value', domPath: 'dom_path', enabled: 'enabled'
+    };
+    const reportedFactName = criterion => {
+      const base = reportedFactNames[criterion.fact] || criterion.fact;
+      return criterion.argument ? base + ':' + criterion.argument : base;
+    };
     const locatorMatches = candidates.filter(element =>
       criteria.every(criterion => matchesCriterion(element, criterion))
     );
@@ -4137,26 +4154,31 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // It is not a licence to skip the locator. A virtual list recycles its rows, so the
     // pinned node still has to satisfy every required clause, or it is not the element
     // that was observed and this falls back to addressing by meaning.
+    // When the pin does not save an ambiguous address, the reason decides what the
+    // client should do, and guessing it from the outside costs a round trip each time.
+    let pinnedState = 'not_requested';
     const pinnedNode = (() => {
       if (typeof physicalIdentity !== 'string' || !physicalIdentity) return null;
       const reference = globalThis.__webkituiState?.nodesByID?.get(physicalIdentity);
-      const node = typeof reference?.deref === 'function' ? reference.deref() : null;
-      if (!node || !node.isConnected) return null;
-      return criteria.every(criterion => matchesCriterion(node, criterion)) ? node : null;
+      if (!reference) { pinnedState = 'absent_from_registry'; return null; }
+      const node = typeof reference.deref === 'function' ? reference.deref() : null;
+      if (!node) { pinnedState = 'collected'; return null; }
+      if (!node.isConnected) { pinnedState = 'detached'; return null; }
+      const failed = criteria
+        .filter(criterion => criterion.strength === 'required')
+        .filter(criterion => !matchesCriterion(node, criterion))
+        .map(reportedFactName);
+      if (failed.length > 0) {
+        pinnedState = 'clause_mismatch:' + failed.join(',');
+        return null;
+      }
+      pinnedState = 'used';
+      return node;
     })();
     const matches = pinnedNode ? [pinnedNode] : locatorMatches;
     // Zero matches is an absence, not an ambiguity. A client told "not unique" goes
     // looking for a second candidate that does not exist; what it needs is which
     // required fact stopped matching, because that is usually one re-observation away.
-    const reportedFactNames = {
-      role: 'role', accessibleName: 'accessible_name', label: 'label',
-      contextAnchor: 'context_anchor', stableAttribute: 'stable_attribute',
-      framePath: 'frame_path', text: 'value', domPath: 'dom_path', enabled: 'enabled'
-    };
-    const reportedFactName = criterion => {
-      const base = reportedFactNames[criterion.fact] || criterion.fact;
-      return criterion.argument ? base + ':' + criterion.argument : base;
-    };
     const eliminatedBy = matches.length > 0 ? [] : criteria
       .filter(criterion => criterion.strength === 'required')
       .filter(criterion => !candidates.some(element => matchesCriterion(element, criterion)))
@@ -4185,7 +4207,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       const element = matches.length === 1 ? matches[0] : null;
       if (element && scrollIntoView) surfaceOf(element).scrollIntoView({ block: 'center', inline: 'center' });
       return JSON.stringify({
-        count: matches.length, candidate: element ? describe(element) : null, eliminatedBy });
+        count: matches.length, candidate: element ? describe(element) : null, eliminatedBy,
+        pinnedState });
       """
 
   private static let captureStateSource = """
@@ -4322,7 +4345,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private static let performSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
       const box = surface.getBoundingClientRect();
@@ -4403,7 +4426,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         candidate.trustedUserGesture = trusted;
         candidate.dispatched = true;
       }
-      return JSON.stringify({ count: matches.length, candidate, eliminatedBy });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
       """
 
   private static let nativeGestureMessageHandlerName = "webkituiNativeGesture"
@@ -4411,7 +4434,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private static let armNativeClickSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
       const box = surface.getBoundingClientRect();
@@ -4444,13 +4467,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           surface.addEventListener('click', report, { capture: true, once: true });
         }
       }
-      return JSON.stringify({ count: matches.length, candidate, eliminatedBy });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
       """
 
   private static let armNativeKeySource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
       const box = surface.getBoundingClientRect();
@@ -4479,13 +4502,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           }, { capture: true, once: true });
         }
       }
-      return JSON.stringify({ count: matches.length, candidate, eliminatedBy });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
       """
 
   private static let armNativeFillSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
       const box = surface.getBoundingClientRect();
@@ -4523,7 +4546,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           });
         }, { capture: true, once: true });
       }
-      return JSON.stringify({ count: matches.length, candidate, eliminatedBy });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
       """
 
   private static func boxDictionary(_ box: ObservedBoundingBox) -> [String: Double] {
@@ -4703,6 +4726,7 @@ private struct RawActionResolution: Decodable {
   let count: Int
   let candidate: RawActionCandidate?
   let eliminatedBy: [String]?
+  let pinnedState: String?
 }
 
 private struct RawActionCandidate: Decodable {

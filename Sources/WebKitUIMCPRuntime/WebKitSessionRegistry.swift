@@ -77,6 +77,32 @@ extension WebKitControllerHolder {
   }
 
   public var processIsRunning: Bool { Self.isProcessRunning(processID) }
+
+  /// A copy with a fresh activity stamp. Five call sites used to rebuild a holder field
+  /// by field, so every field added afterwards was silently dropped by all of them —
+  /// which is how isHostPlaceholder reached disk as false on the very record that is
+  /// the placeholder.
+  public func active(at now: Date) -> WebKitControllerHolder {
+    WebKitControllerHolder(
+      clientName: clientName,
+      clientVersion: clientVersion,
+      processID: processID,
+      acquiredAt: acquiredAt,
+      lastActivityAt: now,
+      executionPolicy: executionPolicy,
+      isHostPlaceholder: isHostPlaceholder)
+  }
+
+  public func acquired(at now: Date) -> WebKitControllerHolder {
+    WebKitControllerHolder(
+      clientName: clientName,
+      clientVersion: clientVersion,
+      processID: processID,
+      acquiredAt: now,
+      lastActivityAt: now,
+      executionPolicy: executionPolicy,
+      isHostPlaceholder: isHostPlaceholder)
+  }
 }
 
 public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
@@ -141,24 +167,12 @@ private final class HostControllerLease {
   }
 
   func recordActivity(at now: Date) {
-    holder = WebKitControllerHolder(
-      clientName: holder.clientName,
-      clientVersion: holder.clientVersion,
-      processID: holder.processID,
-      acquiredAt: holder.acquiredAt,
-      lastActivityAt: now,
-      executionPolicy: holder.executionPolicy)
+    holder = holder.active(at: now)
     writeHolder()
   }
 
   func recordHolder(_ newHolder: WebKitControllerHolder, at now: Date) {
-    holder = WebKitControllerHolder(
-      clientName: newHolder.clientName,
-      clientVersion: newHolder.clientVersion,
-      processID: newHolder.processID,
-      acquiredAt: newHolder.acquiredAt,
-      lastActivityAt: now,
-      executionPolicy: newHolder.executionPolicy)
+    holder = newHolder.active(at: now)
     writeHolder()
   }
 
@@ -240,7 +254,11 @@ public final class WebKitSessionRegistry {
     maximumSessions: Int = 1,
     enforceHostExclusiveSession: Bool = false,
     hostControllerLockURL: URL? = nil,
-    unownedLeaseGrace: Duration = .seconds(120)
+    // A reconnecting client comes back in under a second. Two minutes was chosen for
+    // caution and paid for on every delivery: the host stayed locked long enough that
+    // the next client — usually the one about to test the build just installed — had to
+    // wait it out or kill the broker.
+    unownedLeaseGrace: Duration = .seconds(20)
   ) throws {
     guard maximumSessions > 0 else { throw WebKitSessionRegistryError.invalidMaximumSessions }
     self.maximumSessions = maximumSessions
@@ -262,6 +280,12 @@ public final class WebKitSessionRegistry {
       unownedLeaseYield = nil
       return
     }
+    // A person may be working in the window right now: the MCP client is gone, and the
+    // browser is exactly what must survive. Never yield under a handoff.
+    guard handoffOwners.isEmpty, handoffResumeCapabilities.isEmpty else {
+      unownedLeaseYield = nil
+      return
+    }
     let grace = unownedLeaseGrace
     unownedLeaseYield = Task { @MainActor [weak self] in
       try? await Task.sleep(for: grace)
@@ -272,6 +296,7 @@ public final class WebKitSessionRegistry {
 
   private func yieldUnownedHostLease() {
     guard sessionOwners.isEmpty, hostControllerLease != nil else { return }
+    guard handoffOwners.isEmpty, handoffResumeCapabilities.isEmpty else { return }
     for handle in sessions.keys {
       revokeHandoffResumeCapabilities(for: handle)
       handoffOwners.removeValue(forKey: handle)
@@ -485,13 +510,7 @@ public final class WebKitSessionRegistry {
     _ = try runtime(for: handle)
     if var existing = sessionOwners[handle] {
       guard existing.authorityID == owner else { return false }
-      existing.holder = WebKitControllerHolder(
-        clientName: existing.holder.clientName,
-        clientVersion: existing.holder.clientVersion,
-        processID: existing.holder.processID,
-        acquiredAt: existing.holder.acquiredAt,
-        lastActivityAt: now,
-        executionPolicy: existing.holder.executionPolicy)
+      existing.holder = existing.holder.active(at: now)
       sessionOwners[handle] = existing
       hostControllerLease?.recordActivity(at: now)
       cancelUnownedLeaseYield()
@@ -544,13 +563,7 @@ public final class WebKitSessionRegistry {
     }
     for handle in ownedHandles {
       guard var sessionOwner = sessionOwners[handle] else { continue }
-      sessionOwner.holder = WebKitControllerHolder(
-        clientName: sessionOwner.holder.clientName,
-        clientVersion: sessionOwner.holder.clientVersion,
-        processID: sessionOwner.holder.processID,
-        acquiredAt: sessionOwner.holder.acquiredAt,
-        lastActivityAt: now,
-        executionPolicy: sessionOwner.holder.executionPolicy)
+      sessionOwner.holder = sessionOwner.holder.active(at: now)
       sessionOwners[handle] = sessionOwner
       hostControllerLease?.recordHolder(sessionOwner.holder, at: now)
     }
@@ -579,13 +592,7 @@ public final class WebKitSessionRegistry {
     }
     sessionOwners[handle] = SessionOwner(
       authorityID: owner,
-      holder: WebKitControllerHolder(
-        clientName: holder.clientName,
-        clientVersion: holder.clientVersion,
-        processID: holder.processID,
-        acquiredAt: now,
-        lastActivityAt: now,
-        executionPolicy: holder.executionPolicy))
+      holder: holder.acquired(at: now))
     if let newHolder = sessionOwners[handle]?.holder {
       hostControllerLease?.recordHolder(newHolder, at: now)
     }
