@@ -1184,6 +1184,40 @@ struct WebKitRuntimeTests {
       "a refusal must leave the page untouched")
   }
 
+  @Test("Acting on a control with nothing rendered to borrow from does not crash the resolver")
+  func borrowedLabelFallbackWorksInTheActionScript() async throws {
+    // The observation and actuation scripts share their resolution helpers but not all
+    // their utilities. The label fallback called one that exists only on the
+    // observation side, so the branch threw a ReferenceError inside the action script —
+    // invisible to every fixture, and hit by the first real page on the first click.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Toolbar</title>
+      <style>html,body{margin:0}</style>
+      <div class="bar">
+        <button aria-label="View source">source</button>
+        <button aria-label="Open in editor">editor</button>
+      </div>
+      <!-- Not rendered, and still a candidate the resolver names while matching. Every
+           real page has some; no fixture did. -->
+      <div style="display:none"><span><button>Hidden action</button></span></div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/toolbar"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "View source" })
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: target.elementID,
+      operation: .click,
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

@@ -3406,7 +3406,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (cursor === document.body || cursor === document.documentElement) break;
         if (deepQueryAll(cursor, soleControl).length !== 1) break;
         const text = collapse(cursor.textContent);
-        if (text) return bounded(text);
+        // Bounded inline: this helper is shared with the action script, which has no
+        // bounded(). Reaching this branch there threw a ReferenceError that no fixture
+        // exercised and the first real page found on the first click.
+        if (text) return text.length > 512 ? text.slice(0, 512) : text;
       }
       return null;
     };
@@ -4079,7 +4082,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (cursor === document.body || cursor === document.documentElement) break;
         if (deepQueryAll(cursor, soleControl).length !== 1) break;
         const text = collapse(cursor.textContent);
-        if (text) return bounded(text);
+        // Bounded inline: this helper is shared with the action script, which has no
+        // bounded(). Reaching this branch there threw a ReferenceError that no fixture
+        // exercised and the first real page found on the first click.
+        if (text) return text.length > 512 ? text.slice(0, 512) : text;
       }
       return null;
     };
