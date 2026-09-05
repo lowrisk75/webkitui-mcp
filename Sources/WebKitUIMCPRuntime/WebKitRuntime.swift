@@ -3711,14 +3711,25 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       firstControlProbe += ' | ' + reason;
     }
     const bodyTextLength = (document.body?.innerText || '').length;
-    const transientLoading = matchingElements.length === 0 && (
-      visibleLoadingIndicators
-      // Anchored on the start, not the whole body: a loading shell usually renders
-      // its navigation labels too, so requiring the entire text to be the phrase
-      // never matched a real single-page app. Zero matching controls is what makes
-      // this safe — a hydrated page with controls is never treated as loading.
-      || (renderedInteractiveCount === 0
-        && /^(loading|chargement)\\b/i.test(loadingShellText))
+    // The entire visible text of the document is one short loading phrase. A shell that
+    // has already painted a menu button still says only this, and requiring zero
+    // controls handed such a page over as complete — the agent then read an empty form.
+    // The bound is deliberately tight: Play's rendered app list keeps the same phrase at
+    // the top of its text and must stay ready, so anything that says more than the
+    // phrase alone is a page, not a shell. Being wrong the other way costs a stall on
+    // every observation.
+    const bodyIsOnlyTheLoadingPhrase =
+      /^(loading|chargement)\\b/i.test(loadingShellText) && loadingShellText.length <= 32;
+    const transientLoading = bodyIsOnlyTheLoadingPhrase || (
+      matchingElements.length === 0 && (
+        visibleLoadingIndicators
+        // Anchored on the start, not the whole body: a loading shell usually renders
+        // its navigation labels too, so requiring the entire text to be the phrase
+        // never matched a real single-page app. Zero matching controls is what makes
+        // this safe — a hydrated page with controls is never treated as loading.
+        || (renderedInteractiveCount === 0
+          && /^(loading|chargement)\\b/i.test(loadingShellText))
+      )
     );
     return JSON.stringify({
       url: location.href,

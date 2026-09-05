@@ -353,6 +353,41 @@ struct WebKitRuntimeTests {
       observation.elements.first?.accessibleName?.segments.map(\.text).joined() == "LorisLab")
   }
 
+  @Test("A shell whose entire text is the loading phrase waits, even with a control on it")
+  func loadingShellWithAControlWaitsForHydration() async throws {
+    // Reported on the first navigation to app-content/finance: readiness "ready",
+    // mutationCount 433, and a page whose whole visible text was "Loading Google Play
+    // Console". The rule required zero matching controls, and the shell renders one, so
+    // the observation was handed over as complete and the agent concluded the form was
+    // empty. When the entire body text is the loading phrase and nothing else, the page
+    // has not painted yet whatever else is on it — a hydrated page always says more.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div id="shell">
+        <p>Loading Google Play Console</p>
+        <button aria-label="Menu"></button>
+      </div>
+      <script>
+        setTimeout(() => {
+          document.getElementById('shell').remove();
+          document.body.insertAdjacentHTML(
+            'beforeend',
+            '<p>Select the financial features your app provides</p>'
+              + '<button aria-label="Save">Save</button>');
+        }, 400);
+      </script>
+      """,
+      baseURL: URL(string: "https://play.fixture.invalid/app-content/finance"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20))
+
+    let observation = try await runtime.observe(hydrationTimeout: .seconds(10))
+    #expect(
+      observation.elements.contains {
+        $0.accessibleName?.segments.map(\.text).joined() == "Save"
+      })
+  }
+
   @Test("A rendered page keeping a loading banner is not treated as still loading")
   func renderedPageWithLoadingBannerDoesNotStall() async throws {
     // Play Console's app list keeps "Loading Google Play Console" at the top of its
