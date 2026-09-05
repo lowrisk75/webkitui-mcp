@@ -215,6 +215,10 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let totalElementCount: Int
   public let elementOffset: Int
   public let nextElementOffset: Int?
+  /// The page held more than this observation returned. An agent that reads a partial
+  /// observation as the whole page concludes things are absent that are on screen —
+  /// which is how a complete declaration was reported to a user as missing.
+  public var isPartial: Bool { totalElementCount > elements.count }
   public let semanticTextTruncated: Bool
   public let crossOriginFramesOpaque: Bool
   /// Controls the raw DOM renders, counted independently of the semantic matcher.
@@ -3141,9 +3145,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     let status: LocatorQualityStatus
     let recommended: String?
-    if !hasStrongIdentity || candidateCount == 0 || candidateCountIsLowerBound {
+    if !hasStrongIdentity || candidateCount == 0 {
       status = .insufficient
       recommended = "contextual_reobserve_or_handoff"
+    } else if candidateCount == 1, candidateCountIsLowerBound {
+      // Truncation is a caveat on the verdict, not a replacement for it. Forcing every
+      // element to insufficient because the page was long left the one field meant to
+      // say whether a target is unambiguous saying nothing on exactly the pages where
+      // that mattered. The lower-bound flag carries the honesty.
+      status = .unique
+      recommended = "observation_is_partial_page_further_to_confirm_uniqueness"
     } else if candidateCount > 1 {
       status = .ambiguous
       recommended = "inspect_or_contextual_reobserve"

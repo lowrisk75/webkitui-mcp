@@ -1259,6 +1259,48 @@ struct WebKitRuntimeTests {
     #expect(abs(viewportHeight - Double(fullHeight)) < 1)
   }
 
+  @Test("A partial observation says so, and still tells a unique target from an ambiguous one")
+  func partialObservationStaysUsefulAndHonest() async throws {
+    // Two costs from one cause. A Play Console form has more controls than the default
+    // budget, so the returned slice stopped before the table at the bottom of the page.
+    // Nothing said the observation was partial, and the agent concluded a declaration
+    // was missing and told the user the app risked rejection. It was there on screen.
+    // Meanwhile every element's locatorQuality was forced to insufficient purely
+    // because the page was truncated, so the one field meant to say whether a target is
+    // unambiguous said nothing on exactly the pages where it was needed.
+    let runtime = WebKitRuntime()
+    let filler = (0..<40).map { "<button>Item \($0)</button>" }.joined()
+    _ = try await runtime.loadHTML(
+      "<!doctype html><title>Long</title>" + filler
+        + "<button aria-label='Only one of these'>Unique</button>",
+      baseURL: URL(string: "https://fixture.invalid/long"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let partial = try await runtime.observe(maximumElements: 10)
+    #expect(partial.isPartial)
+    #expect(partial.totalElementCount > partial.elements.count)
+    #expect(partial.nextElementOffset != nil)
+
+    // The truncation is real and stays reported, but it must not erase the difference
+    // between a target that is unambiguous here and one that is not.
+    let whole = try await runtime.observe(maximumElements: 200)
+    #expect(whole.isPartial == false)
+    let unique = try #require(
+      whole.elements.first { $0.accessibleName?.segments.first?.text == "Only one of these" })
+    #expect(unique.locatorQuality.status == .unique)
+
+    let tail = try await runtime.observe(maximumElements: 10, elementOffset: 38)
+    let sameElement = tail.elements.first {
+      $0.accessibleName?.segments.first?.text == "Only one of these"
+    }
+    if let sameElement {
+      #expect(sameElement.locatorQuality.candidateCountIsLowerBound)
+      #expect(
+        sameElement.locatorQuality.status == .unique,
+        "truncation must caveat a verdict, not replace it")
+    }
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

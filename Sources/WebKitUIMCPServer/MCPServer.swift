@@ -598,6 +598,9 @@ public final class WebKitMCPServer {
           try runtime.latestNavigationAuditEvent()
           .map(JSONValue.encoded) ?? .null
         observed["navigation_event_count"] = .int(Int64(runtime.navigationAuditEventCount()))
+        // A computed property is not encoded, and this one must never be missing from
+        // the payload a caller actually reads.
+        observed["observation_is_partial"] = .bool(observation.isPartial)
         observed["file_picker_visible"] = .bool(runtime.isFilePickerVisible())
         return try toolResult(structured: .object(observed), modern: modern)
       case "browser_inspect_element":
@@ -3291,6 +3294,9 @@ public final class WebKitMCPServer {
       ]),
       "elements": .array(rows),
       "totalElementCount": .int(Int64(observation.totalElementCount)),
+      // Said plainly, because reading a partial observation as the whole page is how a
+      // declaration that was on screen got reported to a user as missing.
+      "observation_is_partial": .bool(observation.isPartial),
       "elementOffset": .int(Int64(observation.elementOffset)),
       "nextElementOffset": observation.nextElementOffset.map { .int(Int64($0)) } ?? .null,
       "semanticTextTruncated": .bool(observation.semanticTextTruncated),
