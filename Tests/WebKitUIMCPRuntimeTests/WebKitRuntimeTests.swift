@@ -1530,6 +1530,63 @@ struct WebKitRuntimeTests {
     try second.close(secondHandle)
   }
 
+  @Test("An unowned host lease is yielded to the next process after its grace window")
+  func unownedHostLeaseIsYielded() async throws {
+    // O11. Every client reaches WebKit through its own process, so a lease kept for an
+    // owner that never came back locked every other client out of the machine until an
+    // operator pressed Release host lease. Ownership is released on disconnect and the
+    // browser is deliberately kept for a reconnect — but only for as long as a
+    // reconnect is plausible.
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-unowned-lease-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let holder = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      unownedLeaseGrace: .milliseconds(150))
+    let next = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL)
+
+    let handle = try holder.open()
+    let owner = UUID()
+    #expect(try holder.claimSessionOwnership(for: handle, owner: owner))
+    holder.releaseSessionOwnerships(owner: owner)
+
+    // Inside the window the browser is still there for the client that walked away.
+    #expect(holder.existingHandle == handle)
+    #expect(throws: WebKitSessionRegistryError.self) { _ = try next.open() }
+
+    try await Task.sleep(for: .milliseconds(400))
+    #expect(holder.existingHandle == nil)
+    let adopted = try next.open()
+    try next.close(adopted)
+  }
+
+  @Test("A client that comes back inside the grace window keeps its browser")
+  func reconnectInsideGraceKeepsTheSession() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-grace-reconnect-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lockURL = directory.appendingPathComponent("controller.lock")
+    let holder = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
+      unownedLeaseGrace: .milliseconds(300))
+
+    let handle = try holder.open()
+    let first = UUID()
+    #expect(try holder.claimSessionOwnership(for: handle, owner: first))
+    holder.releaseSessionOwnerships(owner: first)
+
+    try await Task.sleep(for: .milliseconds(80))
+    let second = UUID()
+    #expect(try holder.claimSessionOwnership(for: handle, owner: second))
+
+    try await Task.sleep(for: .milliseconds(500))
+    // Reclaimed in time, so the grace no longer applies and the browser survives.
+    #expect(holder.existingHandle == handle)
+    try holder.close(handle)
+  }
+
   @Test("Authenticated origins list hosts only, never cookie values")
   func authenticatedOriginsListHostsOnly() async throws {
     let store = WKWebsiteDataStore.nonPersistent()

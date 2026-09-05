@@ -212,16 +212,57 @@ public final class WebKitSessionRegistry {
   private var sessionOwners: [WebKitSessionHandle: SessionOwner] = [:]
   private var activeClientCalls: [UUID: Int] = [:]
   private var hostControllerLease: HostControllerLease?
+  private let unownedLeaseGrace: Duration
+  private var unownedLeaseYield: Task<Void, Never>?
 
   public init(
     maximumSessions: Int = 1,
     enforceHostExclusiveSession: Bool = false,
-    hostControllerLockURL: URL? = nil
+    hostControllerLockURL: URL? = nil,
+    unownedLeaseGrace: Duration = .seconds(120)
   ) throws {
     guard maximumSessions > 0 else { throw WebKitSessionRegistryError.invalidMaximumSessions }
     self.maximumSessions = maximumSessions
     self.enforceHostExclusiveSession = enforceHostExclusiveSession
     self.hostControllerLockURL = hostControllerLockURL
+    self.unownedLeaseGrace = unownedLeaseGrace
+  }
+
+  /// The browser is deliberately kept across a client reconnect, so releasing ownership
+  /// must not close it. But every client reaches WebKit through its own process, and a
+  /// lease held for an owner that never comes back locks the whole machine out until an
+  /// operator presses Release host lease. So the session waits exactly as long as a
+  /// reconnect is plausible, then yields. The profile is persistent: whoever opens next
+  /// is still signed in, and only the page position is lost — once nobody is left to
+  /// lose it.
+  private func scheduleUnownedLeaseYield() {
+    unownedLeaseYield?.cancel()
+    guard enforceHostExclusiveSession, hostControllerLease != nil, sessionOwners.isEmpty else {
+      unownedLeaseYield = nil
+      return
+    }
+    let grace = unownedLeaseGrace
+    unownedLeaseYield = Task { @MainActor [weak self] in
+      try? await Task.sleep(for: grace)
+      guard !Task.isCancelled else { return }
+      self?.yieldUnownedHostLease()
+    }
+  }
+
+  private func yieldUnownedHostLease() {
+    guard sessionOwners.isEmpty, hostControllerLease != nil else { return }
+    for handle in sessions.keys {
+      revokeHandoffResumeCapabilities(for: handle)
+      handoffOwners.removeValue(forKey: handle)
+    }
+    sessions.removeAll()
+    hostControllerLease = nil
+    unownedLeaseYield = nil
+  }
+
+  private func cancelUnownedLeaseYield() {
+    unownedLeaseYield?.cancel()
+    unownedLeaseYield = nil
   }
 
   public var count: Int { sessions.count }
@@ -256,6 +297,9 @@ public final class WebKitSessionRegistry {
       let dataStore = profileIdentifier.map(WKWebsiteDataStore.init(forIdentifier:)) ?? .default()
       sessions[handle] = try WebKitRuntime(protectedWebsiteDataStore: dataStore)
       hostControllerLease = lease
+      // A session opened but not yet owned must not be swept by a yield armed for the
+      // previous client.
+      cancelUnownedLeaseYield()
     } catch {
       throw WebKitSessionRegistryError.networkBoundaryUnavailable
     }
@@ -334,7 +378,10 @@ public final class WebKitSessionRegistry {
     revokeHandoffResumeCapabilities(for: handle)
     handoffOwners.removeValue(forKey: handle)
     sessionOwners.removeValue(forKey: handle)
-    if sessions.isEmpty { hostControllerLease = nil }
+    if sessions.isEmpty {
+      hostControllerLease = nil
+      cancelUnownedLeaseYield()
+    }
   }
 
   public func issueHandoffResumeCapability(
@@ -426,6 +473,7 @@ public final class WebKitSessionRegistry {
         executionPolicy: existing.holder.executionPolicy)
       sessionOwners[handle] = existing
       hostControllerLease?.recordActivity(at: now)
+      cancelUnownedLeaseYield()
       return true
     }
     sessionOwners[handle] = SessionOwner(
@@ -436,6 +484,7 @@ public final class WebKitSessionRegistry {
     if let newHolder = sessionOwners[handle]?.holder {
       hostControllerLease?.recordHolder(newHolder, at: now)
     }
+    cancelUnownedLeaseYield()
     return true
   }
 
@@ -460,6 +509,7 @@ public final class WebKitSessionRegistry {
       hostControllerLease?.recordHolder(
         WebKitControllerHolder(clientName: "WebKitUI MCP host", executionPolicy: "unowned"),
         at: Date())
+      scheduleUnownedLeaseYield()
     }
   }
 
@@ -531,6 +581,7 @@ public final class WebKitSessionRegistry {
       hostControllerLease?.recordHolder(
         WebKitControllerHolder(clientName: "WebKitUI MCP host", executionPolicy: "unowned"),
         at: Date())
+      scheduleUnownedLeaseYield()
     }
     return true
   }
