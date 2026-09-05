@@ -3744,7 +3744,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
                    && ['text', 'search', 'email', 'tel', 'url', 'number'].includes(element.type)) {
           observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
         } else if (!sensitive && editable && element.isContentEditable) {
-          const editableValue = element.textContent ?? '';
+          // WebKit's own editing leaves a trailing newline in a contenteditable's text.
+          // Reported verbatim it makes every exact-text postcondition fail on a write
+          // that landed perfectly.
+          const editableValue = (element.textContent ?? '').replace(/\\s+$/, '');
           observableValue = editableValue.length <= maximumFieldCharacters ? editableValue : null;
         }
         const selectedLabel = element instanceof HTMLSelectElement
@@ -4393,18 +4396,46 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     });
     """
 
+  /// Which element the page really scrolls in. A single-page app commonly scrolls a
+  /// pane while the document itself is fixed, so scrolling the document moved nothing
+  /// and then reported the bottom had been reached — the tool said it had finished a
+  /// job it had not started.
+  private static let scrollerSource = """
+    const documentRoot = document.scrollingElement || document.documentElement;
+    const documentScrolls = documentRoot.scrollHeight > documentRoot.clientHeight + 1;
+    const paneScroller = () => {
+      let best = null;
+      let bestArea = 0;
+      for (const node of document.querySelectorAll('*')) {
+        const style = getComputedStyle(node);
+        const scrollable = ['auto', 'scroll', 'overlay'].includes(style.overflowY);
+        if (!scrollable) continue;
+        if (node.scrollHeight <= node.clientHeight + 1) continue;
+        const box = node.getBoundingClientRect();
+        const area = box.width * box.height;
+        if (area > bestArea) { best = node; bestArea = area; }
+      }
+      return best;
+    };
+    const scroller = documentScrolls ? documentRoot : (paneScroller() ?? documentRoot);
+    const scrollerIsDocument = scroller === documentRoot;
+    """
+
   private static let scrollStateSource = """
-    const root = document.scrollingElement || document.documentElement;
-    const maximumY = Math.max(0, root.scrollHeight - innerHeight);
+    const viewportHeight = scrollerIsDocument ? innerHeight : scroller.clientHeight;
+    const viewportWidth = scrollerIsDocument ? innerWidth : scroller.clientWidth;
+    const offsetY = scrollerIsDocument ? scrollY : scroller.scrollTop;
+    const offsetX = scrollerIsDocument ? scrollX : scroller.scrollLeft;
+    const maximumY = Math.max(0, scroller.scrollHeight - viewportHeight);
     return JSON.stringify({
-      x: scrollX,
-      y: scrollY,
-      viewportWidth: innerWidth,
-      viewportHeight: innerHeight,
-      documentWidth: root.scrollWidth,
-      documentHeight: root.scrollHeight,
-      reachedTop: scrollY <= 0,
-      reachedBottom: scrollY >= maximumY - 1,
+      x: offsetX,
+      y: offsetY,
+      viewportWidth,
+      viewportHeight,
+      documentWidth: scroller.scrollWidth,
+      documentHeight: scroller.scrollHeight,
+      reachedTop: offsetY <= 0,
+      reachedBottom: offsetY >= maximumY - 1,
       observationInvalidated: true
     });
     """
@@ -4446,9 +4477,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       });
       """
 
-  private static let pageScrollSource = """
-    scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' });
-    """ + scrollStateSource
+  private static let pageScrollSource =
+    scrollerSource + """
+      if (scrollerIsDocument) {
+        scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' });
+      } else {
+        scroller.scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' });
+      }
+      """ + scrollStateSource
 
   private static let textSnapshotSource = """
     const collapseLines = value => String(value ?? '')
@@ -4564,7 +4600,22 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         const listener = event => { trusted = event.isTrusted; };
         element.addEventListener('input', listener, { capture: true, once: true });
         if (element.isContentEditable) {
-          element.textContent = value;
+          // A framework editor keeps its own model and only trusts input events.
+          // Assigning textContent went behind its back: the node changed, the model did
+          // not, and the field stayed visibly empty while the write reported half a
+          // success. Select the contents and let the editor perform the insertion.
+          element.focus({ preventScroll: true });
+          const selection = getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          // execCommand is the only route WebKit exposes that drives its own editing
+          // pipeline, so the editor sees the beforeinput and input it is listening for.
+          // Raising those events by hand as well would deliver the text twice.
+          if (!document.execCommand('insertText', false, value)) {
+            element.textContent = value;
+          }
         } else {
           const prototype = element instanceof HTMLTextAreaElement
             ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;

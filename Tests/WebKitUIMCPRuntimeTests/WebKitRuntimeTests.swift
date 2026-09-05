@@ -1301,6 +1301,98 @@ struct WebKitRuntimeTests {
     }
   }
 
+  @Test("Scrolling reaches the container the page actually scrolls in")
+  func scrollReachesTheRealScroller() async throws {
+    // Play Console scrolls inside a div — clientHeight 736 against scrollHeight 1789 —
+    // and the document does not scroll at all. browser_scroll moved the document,
+    // reported reachedTop and reachedBottom both true with documentHeight equal to the
+    // viewport, and nothing on screen moved. Every form taller than the viewport was
+    // out of reach.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Inner scroller</title>
+      <style>
+        html, body { margin: 0; height: 100%; overflow: hidden; }
+        #pane { height: 100%; overflow-y: auto; }
+        #tall { height: 4000px; }
+      </style>
+      <div id="pane"><div id="tall"></div>
+        <button aria-label="Bottom control">Bottom</button></div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/inner"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let before =
+      try await runtime.webView.evaluateJavaScript("document.getElementById('pane').scrollTop")
+      as? Double ?? -1
+    #expect(before == 0)
+
+    let result = try await runtime.scrollBy(deltaX: 0, deltaY: 600)
+    let after =
+      try await runtime.webView.evaluateJavaScript("document.getElementById('pane').scrollTop")
+      as? Double ?? -1
+    #expect(after >= 500, "the pane did not move: scrollTop is \(after)")
+    // And the report must describe the thing that actually scrolled.
+    #expect(result.documentHeight > result.viewportHeight)
+    #expect(result.reachedBottom == false)
+  }
+
+  @Test("Filling a rich text editor either takes, or fails — never half of each")
+  func fillOnARichTextEditorIsHonest() async throws {
+    // Reddit's Lexical composer: fill on the contenteditable body reported
+    // @validation_accepted satisfied and @value unsatisfied, and the field stayed
+    // visibly empty. A half-success is the worst possible answer — the caller cannot
+    // tell whether to retry, and retrying a write is how a page gets corrupted.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Composer</title>
+      <div id="body" contenteditable="true" role="textbox"
+        aria-label="Post body text field" style="min-height:80px;border:1px solid #ccc">
+      </div>
+      <script>
+        // A framework editor keeps its own model and only trusts input events.
+        const body = document.getElementById('body');
+        let model = '';
+        body.addEventListener('beforeinput', event => {
+          if (event.inputType === 'insertText' && typeof event.data === 'string') {
+            model += event.data;
+            body.dataset.model = model;
+          }
+        });
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/composer"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let editor = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Post body text field"
+      })
+    let value = try ProvenancedText(
+      text: "Bonjour", source: ProvenanceSource(classification: .modelGenerated))
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: editor.elementID,
+      operation: .fill(value),
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+
+    // The editor's own model saw the text, which is what a framework composer needs.
+    let model =
+      try await runtime.webView.evaluateJavaScript(
+        "document.getElementById('body').dataset.model ?? ''") as? String ?? ""
+    #expect(model == "Bonjour", "the editor never received the input, model is \(model)")
+    let after = try await runtime.observe()
+    let updated = try #require(
+      after.elements.first {
+        $0.accessibleName?.segments.first?.text == "Post body text field"
+      })
+    #expect(updated.value?.segments.first?.text == "Bonjour")
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()
