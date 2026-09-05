@@ -133,3 +133,13 @@
 "Target ID:" = "Target ID:";
 "Verification:" = "Verification:";
 "AppKit key" = "AppKit key";
+"Force render" = "Force render";
+"Re-establish the layout viewport when a page reports nothing observable." = "Re-establish the layout viewport when a page reports nothing observable.";
+"Clear browsing data" = "Clear browsing data";
+"Remove this profile's cookies, caches and local storage." = "Remove this profile's cookies, caches and local storage.";
+"Clear this profile's browsing data?" = "Clear this profile's browsing data?";
+"Cookies, caches and local storage are removed. Signed-in sites will ask you to sign in again. Nothing is sent anywhere." = "Cookies, caches and local storage are removed. Signed-in sites will ask you to sign in again. Nothing is sent anywhere.";
+"Release host lease" = "Release host lease";
+"Close this host's sessions so another client can open one." = "Close this host's sessions so another client can open one.";
+"Release the host lease?" = "Release the host lease?";
+"Sessions open on this host are closed so another client can take it. Work in progress in those sessions is lost." = "Sessions open on this host are closed so another client can take it. Work in progress in those sessions is lost.";

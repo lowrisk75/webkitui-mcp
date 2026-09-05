@@ -133,3 +133,13 @@
 "Target ID:" = "Identifiant de la cible :";
 "Verification:" = "Vérification :";
 "AppKit key" = "touche AppKit";
+"Force render" = "Forcer le rendu";
+"Re-establish the layout viewport when a page reports nothing observable." = "Rétablit la zone de mise en page quand une page ne renvoie rien d’observable.";
+"Clear browsing data" = "Effacer les données de navigation";
+"Remove this profile's cookies, caches and local storage." = "Supprime les cookies, les caches et le stockage local de ce profil.";
+"Clear this profile's browsing data?" = "Effacer les données de navigation de ce profil ?";
+"Cookies, caches and local storage are removed. Signed-in sites will ask you to sign in again. Nothing is sent anywhere." = "Les cookies, les caches et le stockage local sont supprimés. Les sites où vous étiez connecté vous redemanderont de vous connecter. Rien n’est envoyé nulle part.";
+"Release host lease" = "Libérer le bail d’hôte";
+"Close this host's sessions so another client can open one." = "Ferme les sessions de cet hôte pour qu’un autre client puisse en ouvrir une.";
+"Release the host lease?" = "Libérer le bail d’hôte ?";
+"Sessions open on this host are closed so another client can take it. Work in progress in those sessions is lost." = "Les sessions ouvertes sur cet hôte sont fermées pour qu’un autre client puisse le prendre. Le travail en cours dans ces sessions est perdu.";
