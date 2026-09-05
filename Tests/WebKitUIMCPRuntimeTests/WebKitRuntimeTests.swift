@@ -926,6 +926,110 @@ struct WebKitRuntimeTests {
     }
   }
 
+  @Test("A composited overlay is present in the capture, or the capture says it is not")
+  func compositedOverlayIsCaptured() async throws {
+    // Reported from the App Store Connect session: the "+" menu opens, browser_observe
+    // returns role dialog with its items, and a capture taken in the same second shows
+    // the bare page. A system screenshot taken at the same instant shows the menu, so
+    // the content is on screen. browser_capture is the one tool that looks like ground
+    // truth, which makes a silent omission worse than no capture at all.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Overlay</title>
+      <style>
+        html, body { margin: 0; background: #ffffff; }
+        .overlay {
+          position: fixed; inset: 0; background: #ff0000;
+          transform: translateZ(0); will-change: transform; z-index: 1000;
+        }
+      </style>
+      <div class="overlay" role="dialog" aria-label="Nouvelle app"></div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/overlay"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(80))
+
+    let capture = try await runtime.capture()
+    let image = try #require(NSBitmapImageRep(data: capture.pngData))
+    let centre = try #require(
+      image.colorAt(x: image.pixelsWide / 2, y: image.pixelsHigh / 2))
+    let red = centre.usingColorSpace(.deviceRGB)?.redComponent ?? 0
+    let green = centre.usingColorSpace(.deviceRGB)?.greenComponent ?? 0
+    // Either the overlay is in the image, or the capture must not claim to be one.
+    let overlayPresent = red > 0.8 && green < 0.2
+    #expect(
+      overlayPresent || capture.compositorEffectsMayBeMissing == false,
+      "the overlay is missing from the capture and nothing said so")
+    #expect(overlayPresent, "a composited overlay was dropped from the capture")
+  }
+
+  @Test("An overlay that has just appeared is painted in the capture, not skipped")
+  func freshlyOpenedOverlayIsPainted() async throws {
+    // The difference between what observe sees and what capture shows: observe reads
+    // the DOM, which has the menu the instant it opens, while a snapshot reads pixels.
+    // Taken before the first paint of the new layer, the image is the bare page — and
+    // says nothing about it, which is how a menu that was on screen came back missing.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Menu</title>
+      <style>
+        html, body { margin: 0; background: #ffffff; }
+        #menu { position: fixed; inset: 0; background: #ff0000; display: none; }
+      </style>
+      <button id="open" onclick="document.getElementById('menu').style.display = 'block'">+</button>
+      <div id="menu" role="menu" aria-label="Nouvelle app"></div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/menu"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(80))
+
+    // Open it and capture immediately, exactly as an agent does after a click.
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.getElementById('open').click()")
+    let capture = try await runtime.capture()
+    let image = try #require(NSBitmapImageRep(data: capture.pngData))
+    let centre = try #require(image.colorAt(x: image.pixelsWide / 2, y: image.pixelsHigh / 2))
+    let rgb = centre.usingColorSpace(.deviceRGB)
+    #expect(
+      (rgb?.redComponent ?? 0) > 0.8 && (rgb?.greenComponent ?? 1) < 0.2,
+      "the menu was open in the DOM and absent from the image")
+  }
+
+  @Test("A capture reports what the page was showing when the shutter opened")
+  func captureIsCrossCheckable() async throws {
+    // browser_capture looks like ground truth, and reported
+    // compositor_effects_may_be_missing: true on every single call, so the field said
+    // nothing. When a menu that was demonstrably on screen came back absent from the
+    // image, there was no way to tell a WebKit omission from a page that really was
+    // bare. A capture that cannot be cross-checked against the DOM is a trap.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Menu</title>
+      <style>html,body{margin:0;background:#fff}</style>
+      <button aria-label="Ajouter">+</button>
+      <dialog id="d" style="width:200px;height:120px">Nouvelle app</dialog>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/apps"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(80))
+
+    let bare = try await runtime.capture()
+    #expect(bare.topLayerElementCount == 0)
+    #expect(bare.modalPresent == false)
+    // Nothing that could be dropped, so nothing to warn about.
+    #expect(bare.compositorEffectsMayBeMissing == false)
+
+    _ = try await runtime.webView.evaluateJavaScript("document.getElementById('d').showModal()")
+    let withModal = try await runtime.capture()
+    #expect(withModal.topLayerElementCount == 1)
+    #expect(withModal.modalPresent)
+    // Now there is layered content, so the caller is told the image can disagree with
+    // the page — and given the fact that lets it check.
+    #expect(withModal.compositorEffectsMayBeMissing)
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()
@@ -1699,7 +1803,7 @@ struct WebKitRuntimeTests {
     #expect(title == "Next command")
   }
 
-  @Test("Snapshot is a real PNG with an explicit compositor caveat")
+  @Test("Snapshot is a real PNG whose caveat is earned, not assumed")
   func snapshot() async throws {
     let runtime = WebKitRuntime()
     #expect(runtime.webView.window != nil)
@@ -1715,7 +1819,11 @@ struct WebKitRuntimeTests {
     #expect(capture.width == Int(1280 * capture.backingScaleFactor))
     #expect(capture.height == Int(800 * capture.backingScaleFactor))
     #expect(capture.backingScaleFactor >= 1)
-    #expect(capture.compositorEffectsMayBeMissing)
+    // A lone button has no layered content, so there is nothing a snapshot could drop
+    // and nothing to warn about. The caveat used to be hardcoded true, which is why it
+    // told a caller nothing on the one page where it mattered.
+    #expect(capture.compositorEffectsMayBeMissing == false)
+    #expect(capture.renderedInteractiveCount == 1)
   }
 
   @Test("Human handoff presents the live rendered WebView")

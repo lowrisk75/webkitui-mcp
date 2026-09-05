@@ -676,9 +676,19 @@ public final class WebKitMCPServer {
             "width": .int(Int64(capture.width)),
             "height": .int(Int64(capture.height)),
             "backing_scale_factor": .double(capture.backingScaleFactor),
+            // True only when the page has layered content a snapshot can drop. It
+            // used to be hardcoded, so it warned about nothing.
             "compositor_effects_may_be_missing": .bool(
               capture.compositorEffectsMayBeMissing
             ),
+            // What the page was showing when the shutter opened. An image that
+            // disagrees with these is a WebKit omission the caller can detect, rather
+            // than a bare page it has to believe.
+            "page_at_capture": .object([
+              "top_layer_element_count": .int(Int64(capture.topLayerElementCount)),
+              "modal_present": .bool(capture.modalPresent),
+              "rendered_interactive_count": .int(Int64(capture.renderedInteractiveCount)),
+            ]),
           ]),
         ]
         if modern { result["resultType"] = .string("complete") }

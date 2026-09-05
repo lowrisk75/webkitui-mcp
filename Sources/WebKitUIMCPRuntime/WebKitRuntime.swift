@@ -239,7 +239,15 @@ public struct WebKitCapture: Sendable {
   public let width: Int
   public let height: Int
   public let backingScaleFactor: Double
+  /// True only when the page actually has layered content that a snapshot can drop.
+  /// It used to be hardcoded true, so it warned about nothing and meant nothing.
   public let compositorEffectsMayBeMissing: Bool
+  /// What the page was showing when the shutter opened, so an image that disagrees
+  /// with the page is detectable instead of believed. A capture is the one tool that
+  /// looks like ground truth; it has to be checkable.
+  public let topLayerElementCount: Int
+  public let modalPresent: Bool
+  public let renderedInteractiveCount: Int
 }
 
 public struct WebKitScrollResult: Codable, Equatable, Sendable {
@@ -808,13 +816,30 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     else {
       throw WebKitRuntimeError.malformedInstrumentationResult
     }
+    let onScreen = try await captureDOMState()
     return WebKitCapture(
       pngData: png,
       width: bitmap.pixelsWide,
       height: bitmap.pixelsHigh,
       backingScaleFactor: Double(bitmap.pixelsWide) / webView.bounds.width,
-      compositorEffectsMayBeMissing: true
+      compositorEffectsMayBeMissing: onScreen.topLayerElementCount > 0
+        || onScreen.compositedLayerCount > 0,
+      topLayerElementCount: onScreen.topLayerElementCount,
+      modalPresent: onScreen.modalPresent,
+      renderedInteractiveCount: onScreen.renderedInteractiveCount
     )
+  }
+
+  /// Read at snapshot time, so the two describe the same instant.
+  private func captureDOMState() async throws -> RawCaptureDOMState {
+    guard
+      let json = try await webView.callAsyncJavaScript(
+        Self.captureStateSource, arguments: [:], in: nil, contentWorld: instrumentationWorld
+      ) as? String,
+      let data = json.data(using: .utf8),
+      let state = try? JSONDecoder().decode(RawCaptureDOMState.self, from: data)
+    else { throw WebKitRuntimeError.malformedInstrumentationResult }
+    return state
   }
 
   public func addressingCounterSnapshot() -> AddressingCounterSnapshot {
@@ -4141,6 +4166,38 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         count: matches.length, candidate: element ? describe(element) : null, eliminatedBy });
       """
 
+  private static let captureStateSource = """
+    const inTopLayer = Array.from(
+      document.querySelectorAll('dialog[open], :popover-open')).length;
+    const modal = Array.from(document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"]'))
+      .some(node => {
+        const box = node.getBoundingClientRect();
+        return box.width > 0 && box.height > 0;
+      });
+    // Layers a snapshot can render separately from the page, and therefore drop.
+    let composited = 0;
+    for (const node of document.querySelectorAll('*')) {
+      const style = getComputedStyle(node);
+      if (style.position === 'fixed' || style.willChange === 'transform'
+          || (style.transform && style.transform !== 'none')) {
+        const box = node.getBoundingClientRect();
+        if (box.width > 0 && box.height > 0) composited += 1;
+      }
+      if (composited > 64) break;
+    }
+    const interactive = Array.from(document.querySelectorAll(
+      'button, a[href], input, select, textarea, [role="button"]')).filter(node => {
+        const box = node.getBoundingClientRect();
+        return box.width > 0 && box.height > 0;
+      }).length;
+    return JSON.stringify({
+      topLayerElementCount: inTopLayer,
+      modalPresent: modal,
+      compositedLayerCount: composited,
+      renderedInteractiveCount: interactive
+    });
+    """
+
   private static let scrollStateSource = """
     const root = document.scrollingElement || document.documentElement;
     const maximumY = Math.max(0, root.scrollHeight - innerHeight);
@@ -4607,6 +4664,13 @@ private struct ObservedTargetRecord {
   let sensitive: Bool
   let disabled: Bool
   let observedAtMonotonicNanoseconds: UInt64
+}
+
+private struct RawCaptureDOMState: Decodable {
+  let topLayerElementCount: Int
+  let modalPresent: Bool
+  let compositedLayerCount: Int
+  let renderedInteractiveCount: Int
 }
 
 private struct RawActionResolution: Decodable {
