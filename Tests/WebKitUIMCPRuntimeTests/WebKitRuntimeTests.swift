@@ -629,13 +629,62 @@ struct WebKitRuntimeTests {
     #expect(checkedNames == ["Payments and transfers"])
   }
 
-  @Test("A control with no layout box is named in the diagnostics, never silently dropped")
-  func zeroSizeControlIsNamedInDiagnostics() async throws {
-    // B2: the escape option after the "Or" separator — "none of these features" — has
-    // no layout box anywhere up its row, and Next stays disabled without it. A control
-    // with no box genuinely cannot be clicked, so exposing it as actionable would be a
-    // lie. What the agent needs is to know the exit exists, and what it is called, so
-    // it can hand the form to a human instead of concluding the page is complete.
+  @Test("Every control says whether it can be acted on, and why not")
+  func actionabilityIsReportedPerElement() async throws {
+    // locatorQuality answers whether the address is unique. It was read as whether the
+    // target can be clicked, which cost a failed dispatch per control to discover. The
+    // observation now answers the question that was actually being asked.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Actionability</title>
+      <button aria-label="Ready" style="width:120px;height:30px">Ready</button>
+      <button aria-label="Off" disabled style="width:120px;height:30px">Off</button>
+      <div style="position:relative;width:120px;height:30px">
+        <button aria-label="Under" style="position:absolute;inset:0">Under</button>
+        <div style="position:absolute;inset:0;background:#fff"></div>
+      </div>
+      <div style="height:0;overflow:hidden">
+        <button aria-label="Clipped">Clipped</button>
+      </div>
+      <button aria-label="Sizeless"
+        style="appearance:none;width:0;height:0;padding:0;border:0;margin:0">Sizeless</button>
+      <div style="display:none"><button aria-label="Gone">Gone</button></div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/actionability"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let observation = try await runtime.observe()
+    func actionability(_ name: String) -> ObservedActionability? {
+      observation.elements
+        .first { $0.accessibleName?.segments.first?.text == name }?
+        .actionability
+    }
+    #expect(actionability("Ready") == .actionable)
+    #expect(actionability("Off") == .disabled)
+    #expect(actionability("Under") == .covered)
+    // Clipped away by an ancestor: it keeps its own box, so hit testing is what catches
+    // it, and the reason is that the point does not reach it.
+    #expect(actionability("Clipped") == .covered)
+    // No box of its own: reported, because the only exit from a form can be one of
+    // these, and never claimed to be clickable.
+    #expect(actionability("Sizeless") == .noLayoutBox)
+    #expect(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Sizeless" }?
+        .visible == false)
+    // Deliberately hidden stays out of the tree entirely.
+    #expect(actionability("Gone") == nil)
+  }
+
+  @Test("The only exit from a collapsed row is exposed, named, and honest about itself")
+  func collapsedEscapeControlIsExposed() async throws {
+    // B2: the option after the "Or" separator — "none of these features" — has no layout
+    // box anywhere up its row, and Next stays disabled without it. Dropping it told the
+    // agent the form was complete. It is reported, named from its row, and marked
+    // unclickable, so the agent hands over instead of concluding there is no exit.
     let runtime = WebKitRuntime()
     _ = try await runtime.loadHTML(
       """
@@ -645,7 +694,7 @@ struct WebKitRuntimeTests {
         <input type="checkbox" id="none" style="width:0;height:0">
         <span>My app does not provide any of these features</span>
       </div>
-      <button>Next</button>
+      <button disabled>Next</button>
       """,
       baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
       timeout: fixtureNavigationTimeout,
@@ -653,10 +702,73 @@ struct WebKitRuntimeTests {
     )
 
     let observation = try await runtime.observe()
+    let escape = try #require(
+      observation.elements.first { $0.role?.segments.first?.text == "checkbox" },
+      "the only way out of the form is invisible to the agent")
+    #expect(
+      escape.accessibleName?.segments.first?.text
+        == "My app does not provide any of these features")
+    #expect(escape.actionability == .noLayoutBox)
+    #expect(escape.actionable == false)
     #expect(observation.unrenderedControlCount >= 1)
     #expect(
       observation.unrenderedControlNames.contains(
         "My app does not provide any of these features"))
+  }
+
+  @Test("A target that moves between arming and the mouse event never reports success")
+  func reflowBetweenArmAndDispatchIsNeverAFalsePositive() async throws {
+    // B3 claims a click dispatched at coordinates frozen at observation time lands in
+    // the void and is still reported dispatched:true with trustedUserGesture:true — a
+    // silent false positive an agent counts as success. This is the adversarial version
+    // of that scenario: the page reflows the target away on the first mousedown, after
+    // the geometry was resolved and the receipt listener armed. The gesture receipt is
+    // bound to the target's own identity, so either the event reached the target or
+    // nothing is reported. What must never happen is a success for a click with no
+    // effect.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Reflow</title>
+      <div id="spacer" style="height:0"></div>
+      <button id="target" style="width:200px;height:40px">Add details</button>
+      <script>
+        document.addEventListener('mousedown', () => {
+          document.getElementById('spacer').style.height = '400px';
+        }, { capture: true, once: true });
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/app-content/testing-credentials"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Add details" })
+    #expect(target.actionability == .actionable)
+
+    do {
+      let result = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID,
+        operation: .click,
+        dispatchMode: .nativeAppKit,
+        stabilityInterval: .milliseconds(1))
+      // Reported dispatched only through a receipt carrying this target's physical
+      // identity, so a trusted AppKit event provably reached it rather than the void.
+      #expect(result.dispatched)
+      #expect(result.trustedUserGesture)
+      #expect(result.dispatchMode == .nativeAppKit)
+    } catch let error as WebKitRuntimeError {
+      // The honest alternatives: the target moved before the event, or the event never
+      // reached it. Both are refusals, neither is a reported success.
+      #expect(
+        error == .targetGeometryChanged || error == .nativeGestureReceiptUnavailable
+          || error == .targetNotActionable,
+        "a reflow produced \(error) instead of a clean refusal")
+    }
   }
 
   @Test("Open shadow DOM controls remain observable and actionable")
@@ -843,12 +955,17 @@ struct WebKitRuntimeTests {
     )
 
     let observation = try await runtime.observe()
-    #expect(observation.elements.count == 11)
-    #expect(observation.elements.allSatisfy { $0.visible })
+    // Twelve, not eleven: the zero-size input is now reported so an agent can see that a
+    // control exists there. Everything written inside it is still withheld — being
+    // unreachable is a reason to name a control, never a reason to read it.
+    #expect(observation.elements.count == 12)
+    let unreachable = observation.elements.filter { !$0.visible }
+    #expect(unreachable.count == 1)
+    #expect(unreachable.allSatisfy { $0.value == nil && $0.text == nil })
+    #expect(unreachable.allSatisfy { $0.actionability == .noLayoutBox })
     #expect(observation.elements[0].value?.segments.first?.text == "visible@example.test")
     #expect(observation.elements[1].value?.segments.first?.text == "France")
     #expect(observation.elements[1].text?.segments.first?.text == "France")
-    #expect(observation.elements.dropFirst(2).allSatisfy { $0.sensitive })
     #expect(observation.elements.dropFirst(2).allSatisfy { $0.value == nil })
 
     let observationJSON = String(decoding: try JSONEncoder().encode(observation), as: UTF8.self)

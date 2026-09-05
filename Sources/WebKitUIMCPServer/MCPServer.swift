@@ -3206,10 +3206,16 @@ public final class WebKitMCPServer {
       value.map { .string($0.segments.map(\.text).joined()) } ?? .null
     }
     let rows = observation.elements.map { element -> JSONValue in
+      // Never optional: whether a target can be acted on is a safety fact, not a field
+      // a caller may forget to request.
       var row: [String: JSONValue] = [
         "elementID": .string(element.elementID),
         "sensitive": .bool(element.sensitive),
+        "actionable": .bool(element.actionable),
       ]
+      if !element.actionable {
+        row["not_actionable_because"] = .string(element.actionability.rawValue)
+      }
       if fields.contains("tag") { row["tag"] = plain(element.tag) }
       if fields.contains("role") { row["role"] = plain(element.role) }
       if fields.contains("name") { row["name"] = plain(element.accessibleName) }

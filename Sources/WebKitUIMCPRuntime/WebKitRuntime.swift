@@ -164,9 +164,28 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let contextAnchors: [ObservedContextAnchor]
   public let stableAttributes: [String: ProvenancedText]
   public let visible: Bool
+  public let actionability: ObservedActionability
+  public var actionable: Bool { actionability == .actionable }
   public let boundingBox: ObservedBoundingBox
   public let locatorRecipe: LocatorRecipe
   public let locatorQuality: LocatorQuality
+}
+
+/// Why a control can or cannot be acted on, decided during observation so an agent
+/// never has to spend a failed dispatch to find out. `locatorQuality` answers whether
+/// the address is unique; it was read as whether the target can be clicked.
+public enum ObservedActionability: String, Codable, Equatable, Sendable {
+  case actionable
+  /// Laid out but collapsed to nothing. Reported because the only exit from a form can
+  /// be one of these, but no click can reach it.
+  case noLayoutBox = "no_layout_box"
+  case notVisible = "not_visible"
+  case disabled
+  /// Scrolled out of the viewport. Recoverable with element_scroll_into_view.
+  case offViewport = "off_viewport"
+  /// Another element occupies the target's own centre, which is how Material paints a
+  /// checkbox over its input.
+  case covered
 }
 
 public enum ObservedValidationState: String, Codable, Equatable, Sendable {
@@ -667,6 +686,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           try ProvenancedText(text: $0, source: pageSource)
         },
         visible: element.visible,
+        actionability: ObservedActionability(rawValue: element.actionability) ?? .actionable,
         boundingBox: element.boundingBox,
         locatorRecipe: recipe,
         locatorQuality: quality
@@ -3209,9 +3229,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // own click: Material paints the box in a sibling that covers it. Hit testing is
     // the only way to tell, and without it every radio on the page costs a failed
     // round trip reported as indeterminate.
-    const receivesOwnEvents = element => {
-      const box = element.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0)) return false;
+    const hitAtCentreOf = box => {
       const x = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
       const y = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
       let hit = document.elementFromPoint(x, y);
@@ -3220,10 +3238,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (!nested || nested === hit) break;
         hit = nested;
       }
+      return hit;
+    };
+    const hitReaches = (hit, ...targets) => {
       for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
-        if (cursor === element) return true;
+        if (targets.includes(cursor)) return true;
       }
       return false;
+    };
+    const receivesOwnEvents = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return false;
+      return hitReaches(hitAtCentreOf(box), element);
     };
     const soleControl =
       'input, button, select, textarea, a[href], summary,'
@@ -3239,8 +3265,36 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // holds role and nothing else, and every act on them fails as not unique.
     const borrowedLabel = element => {
       const surface = controlSurfaceOf(element);
-      if (!surface || surface === element) return null;
-      return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
+      if (surface === element) return null;
+      if (surface) {
+        return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
+      }
+      // Nothing rendered to borrow from. A control that cannot be clicked must still be
+      // nameable, or the agent cannot report what it is unable to reach.
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        const text = collapse(cursor.textContent);
+        if (text) return bounded(text);
+      }
+      return null;
+    };
+    // Why a control cannot be acted on, decided once and reported before the agent
+    // spends a round trip finding out. locatorQuality answers "is this the only match";
+    // it was read as "can I click this", and nothing answered that question.
+    const actionabilityOf = (element, surface) => {
+      const box = surface.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return 'no_layout_box';
+      const style = getComputedStyle(surface);
+      if (style.visibility === 'hidden' || style.display === 'none') return 'not_visible';
+      if (element.disabled
+          || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
+        return 'disabled';
+      }
+      if (box.bottom <= 0 || box.right <= 0 || box.top >= innerHeight || box.left >= innerWidth) {
+        return 'off_viewport';
+      }
+      return hitReaches(hitAtCentreOf(box), element, surface) ? 'actionable' : 'covered';
     };
     const classTokens = element => collapse(element?.getAttribute?.('class'));
     const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
@@ -3416,16 +3470,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // page is complete instead of handing over to a human.
     let unrenderedControlCount = 0;
     const unrenderedControlNames = [];
-    const unrenderedControlName = element => {
-      const direct = collapse(element.getAttribute('aria-label')) || labelOf(element);
-      if (direct) return direct;
-      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
-        if (cursor === document.body || cursor === document.documentElement) break;
-        if (deepQueryAll(cursor, soleControl).length !== 1) break;
-        const text = collapse(cursor.textContent);
-        if (text) return bounded(text);
+    const unrenderedControlName = element =>
+      collapse(element.getAttribute('aria-label')) || labelOf(element);
+    // Laid out but collapsed to nothing is not the same as deliberately hidden. The
+    // only exit from a Play form is a control like this — the "none of these features"
+    // option that keeps Next disabled — so it is reported with the truth about why it
+    // cannot be clicked, rather than dropped as if it did not exist.
+    const hiddenOnlyByGeometry = element => {
+      const box = element.getBoundingClientRect();
+      if (box.width > 0 && box.height > 0) return false;
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+        if (cursor.hidden || cursor.inert
+            || collapse(cursor.getAttribute?.('aria-hidden')).toLowerCase() === 'true') {
+          return false;
+        }
+        const style = getComputedStyle(cursor);
+        if (style.display === 'none' || style.visibility === 'hidden'
+            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+          return false;
+        }
       }
-      return null;
+      return element.matches(soleControl);
     };
     const hiddenOnlyBySemantics = element => {
       const box = element.getBoundingClientRect();
@@ -3444,15 +3509,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (!controlSurfaceOf(element)) {
           if (hiddenOnlyBySemantics(element)) {
             ariaHiddenDropCount += 1;
-          } else if (element.matches(soleControl)) {
-            unrenderedControlCount += 1;
-            const name = unrenderedControlName(element);
-            if (name && unrenderedControlNames.length < 10
-                && !unrenderedControlNames.includes(name)) {
-              unrenderedControlNames.push(name);
-            }
+            return false;
           }
-          return false;
+          if (!hiddenOnlyByGeometry(element)) return false;
+          unrenderedControlCount += 1;
+          const name = unrenderedControlName(element);
+          if (name && unrenderedControlNames.length < 10
+              && !unrenderedControlNames.includes(name)) {
+            unrenderedControlNames.push(name);
+          }
         }
         const role = collapse(roleOf(element)).toLowerCase();
         if (allowedRoles.size > 0 && !allowedRoles.has(role)) return false;
@@ -3463,6 +3528,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       .slice(elementOffset, elementOffset + __MAXIMUM_ELEMENTS__)
       .map(element => {
         const surface = controlSurfaceOf(element) || element;
+        const actionability = actionabilityOf(element, surface);
+        // A control nobody can see is reported so the agent knows it exists and what it
+        // is called. What is written inside it is a different matter: reading the value
+        // of a box the user cannot see is exactly the leak the visibility filter was
+        // there to prevent.
+        const withheldForInvisibility =
+          actionability === 'no_layout_box' || actionability === 'not_visible';
         const box = surface.getBoundingClientRect();
         const rawValue = typeof element.value === 'string' ? element.value : null;
         const autocomplete = collapse(element.getAttribute('autocomplete')).toLowerCase();
@@ -3555,10 +3627,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           role: roleOf(element),
           accessibleName: bounded(nameOf(element)),
           label: bounded(labelOf(element)),
-          text: sensitive ? null : bounded(selectedLabel || collapse(element.innerText) || null),
-          value: boundedFieldValue(observableValue),
+          text: sensitive || withheldForInvisibility
+            ? null : bounded(selectedLabel || collapse(element.innerText) || null),
+          value: withheldForInvisibility ? null : boundedFieldValue(observableValue),
           validationState,
-          characterCount,
+          characterCount: withheldForInvisibility ? null : characterCount,
           sensitive,
           submitsForm: Boolean(
             (element instanceof HTMLButtonElement
@@ -3569,12 +3642,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
           checked,
           selected,
-          selectedOption: bounded(selectedLabel || null),
+          selectedOption: withheldForInvisibility ? null : bounded(selectedLabel || null),
           stateAttributes: Object.fromEntries(
             Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
           contextAnchors: sensitive ? [] : contextAnchorsOf(element),
           stableAttributes: stableAttributesOf(element, sensitive),
-          visible: true,
+          visible: actionability !== 'no_layout_box' && actionability !== 'not_visible',
+          actionability,
           boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height }
         };
       });
@@ -3791,9 +3865,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // own click: Material paints the box in a sibling that covers it. Hit testing is
     // the only way to tell, and without it every radio on the page costs a failed
     // round trip reported as indeterminate.
-    const receivesOwnEvents = element => {
-      const box = element.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0)) return false;
+    const hitAtCentreOf = box => {
       const x = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
       const y = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
       let hit = document.elementFromPoint(x, y);
@@ -3802,10 +3874,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (!nested || nested === hit) break;
         hit = nested;
       }
+      return hit;
+    };
+    const hitReaches = (hit, ...targets) => {
       for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
-        if (cursor === element) return true;
+        if (targets.includes(cursor)) return true;
       }
       return false;
+    };
+    const receivesOwnEvents = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return false;
+      return hitReaches(hitAtCentreOf(box), element);
     };
     const soleControl =
       'input, button, select, textarea, a[href], summary,'
@@ -3821,8 +3901,36 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // holds role and nothing else, and every act on them fails as not unique.
     const borrowedLabel = element => {
       const surface = controlSurfaceOf(element);
-      if (!surface || surface === element) return null;
-      return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
+      if (surface === element) return null;
+      if (surface) {
+        return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
+      }
+      // Nothing rendered to borrow from. A control that cannot be clicked must still be
+      // nameable, or the agent cannot report what it is unable to reach.
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        const text = collapse(cursor.textContent);
+        if (text) return bounded(text);
+      }
+      return null;
+    };
+    // Why a control cannot be acted on, decided once and reported before the agent
+    // spends a round trip finding out. locatorQuality answers "is this the only match";
+    // it was read as "can I click this", and nothing answered that question.
+    const actionabilityOf = (element, surface) => {
+      const box = surface.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return 'no_layout_box';
+      const style = getComputedStyle(surface);
+      if (style.visibility === 'hidden' || style.display === 'none') return 'not_visible';
+      if (element.disabled
+          || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
+        return 'disabled';
+      }
+      if (box.bottom <= 0 || box.right <= 0 || box.top >= innerHeight || box.left >= innerWidth) {
+        return 'off_viewport';
+      }
+      return hitReaches(hitAtCentreOf(box), element, surface) ? 'actionable' : 'covered';
     };
     const surfaceOf = element => controlSurfaceOf(element) || element;
     const directLabelledText = element => {
@@ -4400,6 +4508,7 @@ private struct RawElement: Decodable {
   let contextAnchors: [RawContextAnchor]
   let stableAttributes: [String: String]
   let visible: Bool
+  let actionability: String
   let boundingBox: ObservedBoundingBox
 }
 
