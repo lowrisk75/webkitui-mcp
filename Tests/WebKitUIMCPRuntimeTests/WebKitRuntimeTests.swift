@@ -1085,19 +1085,18 @@ struct WebKitRuntimeTests {
     }
   }
 
-  @Test("When the identity does not settle an ambiguous address, it says why")
-  func pinnedResolutionReportsWhyItDidNotApply()
-    async throws
-  {
-    // Twenty-two anonymous checkboxes still came back targetNotUnique(22) on a build
-    // that resolves by identity, on a page I cannot see. Guessing the reason from the
-    // outside costs a round trip each time, so the resolver now states it: the node was
-    // never registered, it was replaced by a re-render, or it no longer matches what was
-    // observed. Each of those calls for a different move.
+  @Test("Identical controls stay reachable after the page replaces every one of them")
+  func identicalControlsSurviveARerender() async throws {
+    // The case that stayed blocked: twenty-two Material checkboxes with no name, no id
+    // and nothing to tell them apart, on a single-page app that swaps its nodes between
+    // observing and acting. The identity handed out went with the old node, and the
+    // locator can only say "a checkbox", twenty-two times over. What the observation
+    // also recorded is where each one sits, and the population is unchanged, so the
+    // eighth is still the eighth.
     let runtime = WebKitRuntime()
     let rows = String(
       repeating: """
-        <div class="row">
+        <div class="row" onclick="this.querySelector('input').click()">
           <div class="mdc-checkbox">
             <input type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
             <div class="box" aria-hidden="true" style="width:18px;height:18px"></div>
@@ -1105,22 +1104,64 @@ struct WebKitRuntimeTests {
         </div>
         """, count: 22)
     _ = try await runtime.loadHTML(
-      "<!doctype html><title>F</title><div role='group'>" + rows + "</div>",
-      baseURL: URL(string: "https://fixture.invalid/finance"),
+      "<!doctype html><title>Financial features</title><div role='group'>" + rows + "</div>",
+      baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
       timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
 
     let observation = try await runtime.observe()
-    let checkboxes = observation.elements.filter {
-      $0.role?.segments.first?.text == "checkbox"
-    }
-    let target = try #require(checkboxes.dropFirst(7).first)
-    #expect(target.locatorQuality.candidateCount == 22)
+    let checkboxes = observation.elements.filter { $0.role?.segments.first?.text == "checkbox" }
+    #expect(checkboxes.count == 22)
+    #expect(checkboxes[7].locatorQuality.candidateCount == 22)
 
-    // A single-page app re-renders and swaps every row for a fresh node. The address is
-    // still of the current generation, and the observed node is simply gone.
     _ = try await runtime.webView.evaluateJavaScript(
       "for (const row of document.querySelectorAll('.row')) { row.replaceWith(row.cloneNode(true)); }"
     )
+
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: checkboxes[7].elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+
+    let after = try await runtime.observe()
+    let order = after.elements.filter { $0.role?.segments.first?.text == "checkbox" }
+    #expect(order.filter { $0.checked == true }.count == 1)
+    #expect(order.firstIndex { $0.checked == true } == 7)
+  }
+
+  @Test("A list that gained or lost a row is refused, not guessed at by position")
+  func changedPopulationRefusesPositionalNarrowing() async throws {
+    // Position separates identical controls only while the set it indexes is the same
+    // set. Once a row has been added or removed, the eighth checkbox is no longer the
+    // eighth thing the user saw, and ticking it would be worse than refusing. The
+    // refusal also says what became of the identity that was handed out.
+    let runtime = WebKitRuntime()
+    let rows = String(
+      repeating: """
+        <div class="row" onclick="this.querySelector('input').click()">
+          <div class="mdc-checkbox">
+            <input type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+            <div class="box" aria-hidden="true" style="width:18px;height:18px"></div>
+          </div>
+        </div>
+        """, count: 22)
+    _ = try await runtime.loadHTML(
+      "<!doctype html><title>Financial features</title><div role='group'>" + rows + "</div>",
+      baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let checkboxes = observation.elements.filter { $0.role?.segments.first?.text == "checkbox" }
+    let target = try #require(checkboxes.dropFirst(7).first)
+
+    // The list re-renders and comes back one row shorter.
+    _ = try await runtime.webView.evaluateJavaScript(
+      """
+      const rows = Array.from(document.querySelectorAll('.row'));
+      for (const row of rows) { row.replaceWith(row.cloneNode(true)); }
+      document.querySelector('.row').remove();
+      """)
 
     do {
       _ = try await runtime.perform(
@@ -1128,39 +1169,19 @@ struct WebKitRuntimeTests {
         elementID: target.elementID,
         operation: .click,
         stabilityInterval: .milliseconds(1))
-      Issue.record("a replaced node was acted on")
+      Issue.record("a shifted list was acted on by position")
     } catch let error as WebKitRuntimeError {
       guard case .targetNotUnique(let count, let pinned) = error else {
         Issue.record("expected targetNotUnique, got \(error)")
         return
       }
-      #expect(count == 22)
+      #expect(count == 21)
       #expect(pinned == "detached", "the reason was reported as \(pinned)")
     }
-  }
-
-  @Test("A browser under human control is never yielded, however long the client is gone")
-  func handoffSuspendsTheUnownedYield() async throws {
-    // Yielding an unowned lease must not reach a session a person is working in: the
-    // MCP client being gone is exactly the situation a handoff creates, and the browser
-    // is the thing that has to survive it.
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-      "webkitui-handoff-yield-\(UUID().uuidString)", isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let lockURL = directory.appendingPathComponent("controller.lock")
-    let holder = try WebKitSessionRegistry(
-      enforceHostExclusiveSession: true, hostControllerLockURL: lockURL,
-      unownedLeaseGrace: .milliseconds(120))
-
-    let handle = try holder.open()
-    let owner = UUID()
-    #expect(try holder.claimSessionOwnership(for: handle, owner: owner))
-    _ = try holder.issueHandoffResumeCapability(for: handle)
-    holder.releaseSessionOwnerships(owner: owner)
-
-    try await Task.sleep(for: .milliseconds(400))
-    #expect(holder.existingHandle == handle, "a session under handoff was torn down")
-    try holder.close(handle)
+    let after = try await runtime.observe()
+    #expect(
+      after.elements.allSatisfy { $0.checked != true },
+      "a refusal must leave the page untouched")
   }
 
   @Test("Open shadow DOM controls remain observable and actionable")

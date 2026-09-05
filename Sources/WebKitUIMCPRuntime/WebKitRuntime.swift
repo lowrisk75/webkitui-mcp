@@ -723,7 +723,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             boundingBox: rawElement.boundingBox,
             sensitive: rawElement.sensitive,
             disabled: rawElement.disabled,
-            observedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
+            observedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            observedCandidateCount: element.locatorQuality.candidateCount
           )
         )
       }
@@ -790,7 +791,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     return try await performScroll(
       source: Self.nearestScrollStateSource,
-      arguments: ["criteria": criteria, "physicalIdentity": ""]
+      arguments: [
+        "criteria": criteria, "physicalIdentity": "", "expectedCandidateCount": 0,
+      ]
     )
   }
 
@@ -1095,7 +1098,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
     let criteria = locatorCriteria(target.recipe, expectedEnabled: !target.disabled)
     let first = try await resolveTarget(
-      criteria: criteria, scrollIntoView: true, physicalIdentity: target.physicalIdentity)
+      criteria: criteria, scrollIntoView: true, physicalIdentity: target.physicalIdentity,
+      expectedCandidateCount: target.observedCandidateCount)
     try recordCardinality(
       first.count, target: target, eliminatedBy: first.eliminatedBy ?? [],
       pinnedState: first.pinnedState ?? "not_requested")
@@ -1134,19 +1138,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if dispatchMode == .nativeAppKit, operationName == "click" {
       second = try await resolveAndPerformNativeClick(
         criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount,
         expectedBoundingBox: firstCandidate.boundingBox)
     } else if dispatchMode == .nativeAppKit, operationName == "press_key", let value {
       second = try await resolveAndPerformNativeKey(
         criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount,
         expectedBoundingBox: firstCandidate.boundingBox, key: value)
     } else if dispatchMode == .nativeAppKit, operationName == "fill", let value {
       second = try await resolveAndPerformNativeFill(
         criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount,
         expectedBoundingBox: firstCandidate.boundingBox, value: value)
     } else {
       second = try await resolveAndPerform(
         criteria: criteria,
         physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount,
         expectedBoundingBox: firstCandidate.boundingBox,
         operation: operationName,
         value: value
@@ -2338,13 +2346,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private func resolveTarget(
     criteria: [[String: String]],
     scrollIntoView: Bool,
-    physicalIdentity: String = ""
+    physicalIdentity: String = "",
+    expectedCandidateCount: Int = 0
   ) async throws -> RawActionResolution {
     try await actionScript(
       source: Self.resolveSource,
       arguments: [
         "criteria": criteria,
         "physicalIdentity": physicalIdentity,
+        "expectedCandidateCount": expectedCandidateCount,
         "scrollIntoView": scrollIntoView,
       ]
     )
@@ -2353,6 +2363,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private func resolveAndPerform(
     criteria: [[String: String]],
     physicalIdentity: String,
+    expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
     operation: String,
     value: String?
@@ -2360,6 +2371,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     var arguments: [String: Any] = [
       "criteria": criteria,
       "physicalIdentity": physicalIdentity,
+      "expectedCandidateCount": expectedCandidateCount,
       "expectedBox": [
         "x": expectedBoundingBox.x,
         "y": expectedBoundingBox.y,
@@ -2375,6 +2387,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private func resolveAndPerformNativeClick(
     criteria: [[String: String]],
     physicalIdentity: String,
+    expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox
   ) async throws -> RawActionResolution {
     let token = UUID().uuidString
@@ -2388,6 +2401,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       arguments: [
         "criteria": criteria,
         "physicalIdentity": physicalIdentity,
+        "expectedCandidateCount": expectedCandidateCount,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
       ])
@@ -2445,6 +2459,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private func resolveAndPerformNativeKey(
     criteria: [[String: String]],
     physicalIdentity: String,
+    expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
     key: String
   ) async throws -> RawActionResolution {
@@ -2462,6 +2477,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       arguments: [
         "criteria": criteria,
         "physicalIdentity": physicalIdentity,
+        "expectedCandidateCount": expectedCandidateCount,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
         "expectedKey": key,
@@ -2497,6 +2513,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private func resolveAndPerformNativeFill(
     criteria: [[String: String]],
     physicalIdentity: String,
+    expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
     value: String
   ) async throws -> RawActionResolution {
@@ -2514,6 +2531,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       arguments: [
         "criteria": criteria,
         "physicalIdentity": physicalIdentity,
+        "expectedCandidateCount": expectedCandidateCount,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
       ])
@@ -3015,6 +3033,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           strength: strongIdentity ? .required : .corroborating,
           comparison: .exact))
     }
+    if !element.domPath.isEmpty {
+      clauses.append(
+        .init(fact: .domPath, expectedValue: element.domPath, strength: .corroborating))
+    }
     if clauses.isEmpty {
       clauses.append(
         .init(
@@ -3339,6 +3361,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0)) return false;
       return hitReaches(hitAtCentreOf(box), element);
+    };
+    // An ordinal path from the document root. Structure is never identity — a recycled
+    // row keeps its position while meaning changes — so this only ever separates
+    // candidates that already satisfy every identity clause. Without it, twenty-two
+    // checkboxes that carry no name, no id and no distinguishing attribute have exactly
+    // one address between them.
+    const domPathOf = element => {
+      const steps = [];
+      for (let node = element; node && node.nodeType === 1; node = composedParent(node)) {
+        const parent = composedParent(node);
+        if (!parent) { steps.push(node.localName); break; }
+        let index = 0;
+        for (const sibling of parent.children) {
+          if (sibling === node) break;
+          if (sibling.localName === node.localName) index += 1;
+        }
+        steps.push(node.localName + '[' + index + ']');
+        if (steps.length >= 32) break;
+      }
+      return steps.reverse().join('/');
     };
     const soleControl =
       'input, button, select, textarea, a[href], summary,'
@@ -3736,6 +3778,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           stateAttributes: Object.fromEntries(
             Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
           contextAnchors: sensitive ? [] : contextAnchorsOf(element),
+          domPath: domPathOf(element),
           stableAttributes: stableAttributesOf(element, sensitive),
           visible: actionability !== 'no_layout_box' && actionability !== 'not_visible',
           actionability,
@@ -3992,6 +4035,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (!(box.width > 0 && box.height > 0)) return false;
       return hitReaches(hitAtCentreOf(box), element);
     };
+    // An ordinal path from the document root. Structure is never identity — a recycled
+    // row keeps its position while meaning changes — so this only ever separates
+    // candidates that already satisfy every identity clause. Without it, twenty-two
+    // checkboxes that carry no name, no id and no distinguishing attribute have exactly
+    // one address between them.
+    const domPathOf = element => {
+      const steps = [];
+      for (let node = element; node && node.nodeType === 1; node = composedParent(node)) {
+        const parent = composedParent(node);
+        if (!parent) { steps.push(node.localName); break; }
+        let index = 0;
+        for (const sibling of parent.children) {
+          if (sibling === node) break;
+          if (sibling.localName === node.localName) index += 1;
+        }
+        steps.push(node.localName + '[' + index + ']');
+        if (steps.length >= 32) break;
+      }
+      return steps.reverse().join('/');
+    };
     const soleControl =
       'input, button, select, textarea, a[href], summary,'
       + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
@@ -4112,6 +4175,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           if (criterion.argument === 'href') return sanitizedHref(element);
           return collapse(element.getAttribute(criterion.argument)) || null;
         case 'contextAnchor': return contextAnchorOf(element, criterion.argument);
+        case 'domPath': return domPathOf(element);
         case 'enabled': return String(
           !(element.disabled || element.getAttribute('aria-disabled') === 'true'));
         default: return null;
@@ -4144,8 +4208,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       const base = reportedFactNames[criterion.fact] || criterion.fact;
       return criterion.argument ? base + ':' + criterion.argument : base;
     };
+    // Required clauses decide what the target is. Corroborating ones were filtering just
+    // as hard whenever they had a value, which made "corroborating" a lie and let a
+    // single structural fact pick an element on its own — the exact thing a DOM path
+    // must never be allowed to do.
+    const requiredCriteria = criteria.filter(criterion => criterion.strength === 'required');
     const locatorMatches = candidates.filter(element =>
-      criteria.every(criterion => matchesCriterion(element, criterion))
+      requiredCriteria.every(criterion => matchesCriterion(element, criterion))
     );
     // The observation handed out this element's identity and browser_act was given it
     // back. Re-deriving the target from a name the element may not have throws that
@@ -4175,7 +4244,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       pinnedState = 'used';
       return node;
     })();
-    const matches = pinnedNode ? [pinnedNode] : locatorMatches;
+    // Identity clauses say what the target is; when several elements are the same
+    // thing, the corroborating clauses say which one. Refusing at that point left
+    // twenty-two identical checkboxes permanently unreachable, while the observation
+    // had already recorded exactly what separates them. This can only ever narrow a set
+    // that already satisfies every required clause, so it cannot promote a wrong
+    // element — and if it does not land on exactly one, the ambiguity stands.
+    const narrowed = (() => {
+      if (locatorMatches.length <= 1) return locatorMatches;
+      // Position only means something while the set it indexes is the same set. If a row
+      // has been added or removed since the observation, the eighth checkbox is no
+      // longer the eighth thing the user saw, and picking by structure would silently
+      // tick the wrong box — worse than refusing. Same population, or no narrowing.
+      if (locatorMatches.length !== expectedCandidateCount) return locatorMatches;
+      const corroborating = criteria.filter(criterion => criterion.strength !== 'required');
+      if (corroborating.length === 0) return locatorMatches;
+      const exact = locatorMatches.filter(element =>
+        corroborating.every(criterion => matchesCriterion(element, criterion)));
+      return exact.length === 1 ? exact : locatorMatches;
+    })();
+    const matches = pinnedNode ? [pinnedNode] : narrowed;
     // Zero matches is an absence, not an ambiguity. A client told "not unique" goes
     // looking for a second candidate that does not exist; what it needs is which
     // required fact stopped matching, because that is usually one re-observation away.
@@ -4695,6 +4783,7 @@ private struct RawElement: Decodable {
   let selectedOption: String?
   let stateAttributes: [String: String]
   let contextAnchors: [RawContextAnchor]
+  let domPath: String
   let stableAttributes: [String: String]
   let visible: Bool
   let actionability: String
@@ -4713,6 +4802,9 @@ private struct ObservedTargetRecord {
   let sensitive: Bool
   let disabled: Bool
   let observedAtMonotonicNanoseconds: UInt64
+  /// How many candidates the address matched when it was handed out. Structure can
+  /// separate identical controls only while the set it indexes is unchanged.
+  let observedCandidateCount: Int
 }
 
 private struct RawCaptureDOMState: Decodable {
