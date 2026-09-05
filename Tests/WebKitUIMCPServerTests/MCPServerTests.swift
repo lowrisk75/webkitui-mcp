@@ -693,6 +693,22 @@ struct MCPServerTests {
         == .string("no_receipt"))
   }
 
+  @Test("Profiles state the single host lease before any session is opened")
+  func profilesStateTheHostLeaseUpFront() async throws {
+    // A client could previously learn that the host allows one session only from a
+    // successful open, so it could not tell contention from failure.
+    let registry = try WebKitSessionRegistry()
+    let server = WebKitMCPServer(registry: registry)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("profiles")])
+    let structured = try object(try object(response["result"])["structuredContent"])
+    #expect(structured["maximum_sessions"] == .int(1))
+    let lease = try object(structured["host_lease"])
+    #expect(lease["exclusive"] == .bool(true))
+    #expect(try string(lease["state"]).count > 0)
+    #expect(try string(lease["remediation"]).count > 0)
+  }
+
   @Test("Download reports an active human handoff without attempting the action")
   func downloadReportsHumanControl() async throws {
     let registry = try WebKitSessionRegistry()

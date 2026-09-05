@@ -268,6 +268,10 @@ struct WebKitUIMCPCLI {
         transactionLedgerFactory: .durable(),
         activityLog: .durable()
       )
+      // A client that dies without closing the pipe would otherwise leave this
+      // server alive holding the single host lease, starving every other client.
+      let orphanWatch = WebKitUIProcessLifetime.exitWhenOrphaned()
+      defer { orphanWatch.cancel() }
       for try await line in FileHandle.standardInput.bytes.lines {
         if let response = await server.handle(Data(line.utf8)) {
           FileHandle.standardOutput.write(response)

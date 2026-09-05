@@ -952,6 +952,10 @@ public final class WebKitMCPServer {
           "profiles": .array(
             await registry.availableProfileIDs().map { .string($0) }),
           "contains_credentials": .bool(false),
+          // Stated before any open is attempted: a client must be able to learn it is
+          // competing for a single lease without having to win it first.
+          "maximum_sessions": .int(Int64(registry.maximumSessions)),
+          "host_lease": hostControllerLeaseSummary(),
           "available_execution_policies": .array([
             .string("auto"), .string("trusted_local"),
           ]),
@@ -1205,6 +1209,58 @@ public final class WebKitMCPServer {
       clientName: clientName,
       clientVersion: clientVersion,
       executionPolicy: policy)
+  }
+
+  /// The host lease as a client can see it before opening anything.
+  private func hostControllerLeaseSummary() -> JSONValue {
+    let holder = registry.externalHostControllerHolder()
+    return .object([
+      "exclusive": .bool(true),
+      "state": .string(
+        holder == nil ? (registry.count > 0 ? "held_by_this_client" : "free") : "held_elsewhere"),
+      "holder": holderValue(holder),
+      "remediation": .string(
+        holder == nil
+          ? "Open a session normally."
+          : "Only the holding client releasing its session frees the host. Retry open with "
+            + "wait_timeout_ms up to 60000; a server whose client has exited releases it "
+            + "automatically within a few seconds."),
+    ])
+  }
+
+  /// A confirmation that never reached a person must never be reported as a refusal.
+  /// Blaming the user for a broken or unverifiable helper sends every caller looking
+  /// for a decision that was never offered.
+  private func confirmationOutcomeResult(
+    _ outcome: NativeConfirmationOutcome, action: String, modern: Bool
+  ) throws -> JSONValue {
+    switch outcome {
+    case .approved:
+      throw MCPServerError.invalidParams("internal confirmation state mismatch")
+    case .declined:
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("declined_by_user"),
+          "code": .string("declined_by_user"),
+          "message": .string("The user declined this \(action)."),
+          "confirmation_presented": .bool(true),
+          "remediation": .string("Ask for a different action, or none."),
+        ]), modern: modern)
+    case .timedOut, .cancelled, .failed:
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("confirmation_unavailable"),
+          "code": .string("confirmation_unavailable"),
+          "message": .string(
+            "The confirmation helper did not present a prompt, so no decision was taken."),
+          "confirmation_presented": .bool(false),
+          "confirmation_outcome": .string(outcome.rawValue),
+          "remediation": .string(
+            "Verify the packaged confirmation helper beside the running executable: it must "
+              + "be present, executable, and signed by the same team as the server. Nothing "
+              + "was dispatched."),
+        ]), modern: modern)
+    }
   }
 
   private func holderValue(_ holder: WebKitControllerHolder?) -> JSONValue {
@@ -1538,14 +1594,12 @@ public final class WebKitMCPServer {
     )
     if !modern || approvalMode == "native" {
       let currentURL = runtime.agentSafeCurrentURL() ?? "no current page"
-      guard
-        await confirmationPresenter.confirm(
-          title: "Approve Web Navigation",
-          message: navigationConfirmationMessage(currentURL: currentURL, url: url),
-          approveLabel: "Navigate"
-        ) == .approved
-      else {
-        return try toolError("The user did not approve this navigation", modern: modern)
+      let outcome = await confirmationPresenter.confirm(
+        title: "Approve Web Navigation",
+        message: navigationConfirmationMessage(currentURL: currentURL, url: url),
+        approveLabel: "Navigate")
+      guard outcome == .approved else {
+        return try confirmationOutcomeResult(outcome, action: "navigation", modern: modern)
       }
       return try await executeNavigation(pending, runtime: runtime, modern: modern)
     }
@@ -2168,13 +2222,13 @@ public final class WebKitMCPServer {
       dispatchMode: pending.dispatchMode
     )
     if !modern || approvalMode == "native" {
-      guard
-        await confirmationPresenter.confirm(
-          title: "Approve Browser Action",
-          message: confirmationMessage,
-          approveLabel: "Approve Once"
-        ) == .approved
-      else { return try toolError("The user did not approve this action", modern: modern) }
+      let outcome = await confirmationPresenter.confirm(
+        title: "Approve Browser Action",
+        message: confirmationMessage,
+        approveLabel: "Approve Once")
+      guard outcome == .approved else {
+        return try confirmationOutcomeResult(outcome, action: "action", modern: modern)
+      }
       return try await executeActuation(pending, modern: modern)
     }
     pendingActuations = pendingActuations.filter {
@@ -2563,19 +2617,17 @@ public final class WebKitMCPServer {
     let label = String(
       ((target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text).joined() ?? "")
         .prefix(120))
-    guard
-      await confirmationPresenter.confirm(
-        title: "Approve Browser Upload",
-        message: uploadConfirmationMessage(
-          candidates: candidates,
-          currentURL: observation.url.segments.first?.text ?? "unknown",
-          elementID: elementID,
-          label: label,
-          postcondition: postcondition),
-        approveLabel: candidates.isEmpty ? "Choose Files" : "Attach Files"
-      ) == .approved
-    else {
-      return try toolError("The user did not approve this upload", modern: modern)
+    let uploadOutcome = await confirmationPresenter.confirm(
+      title: "Approve Browser Upload",
+      message: uploadConfirmationMessage(
+        candidates: candidates,
+        currentURL: observation.url.segments.first?.text ?? "unknown",
+        elementID: elementID,
+        label: label,
+        postcondition: postcondition),
+      approveLabel: candidates.isEmpty ? "Choose Files" : "Attach Files")
+    guard uploadOutcome == .approved else {
+      return try confirmationOutcomeResult(uploadOutcome, action: "upload", modern: modern)
     }
 
     if !candidates.isEmpty {
