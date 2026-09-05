@@ -1218,6 +1218,47 @@ struct WebKitRuntimeTests {
     #expect(result.dispatched)
   }
 
+  @Test("Resuming from a handoff gives the page its whole viewport back")
+  func resumeRestoresTheFullViewport() async throws {
+    // Reported from Play Console: a dialog opened, and every element inside it came
+    // back with a height between 0.004 and 0.06 pixels at y ~= 745.9, marked covered.
+    // 800 minus the 54 pixel handoff bar is 746. The bar is added to the window when a
+    // human takes over and never removed, so the page keeps laying out against a
+    // viewport that is 54 pixels shorter for the rest of the session, and anything the
+    // site puts near the bottom is crushed against that edge.
+    let runtime = makeWindowHandoffRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Viewport</title>
+      <style>html,body{margin:0}#tall{height:2000px}</style>
+      <div id="tall"></div><button aria-label="Continue">Continue</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/viewport"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let window = try #require(runtime.webView.window)
+    let fullHeight = window.contentLayoutRect.height
+    #expect(runtime.webView.bounds.height == fullHeight)
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: true)
+    #expect(
+      runtime.webView.bounds.height < fullHeight,
+      "the handoff bar should take room while a person is in control")
+
+    try runtime.markHumanStepCompleted()
+    try runtime.requestAgentResume()
+    _ = try await runtime.resumeAfterHumanControl()
+
+    // Whatever the page measures after this has to be measured against the whole thing.
+    #expect(
+      runtime.webView.bounds.height == fullHeight,
+      "the page kept a viewport 54 points short after control came back")
+    let viewportHeight =
+      try await runtime.webView.evaluateJavaScript("window.innerHeight") as? Double ?? 0
+    #expect(abs(viewportHeight - Double(fullHeight)) < 1)
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

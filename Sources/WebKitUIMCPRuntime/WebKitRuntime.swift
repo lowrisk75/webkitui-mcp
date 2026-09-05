@@ -1575,6 +1575,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       throw WebKitRuntimeError.authenticationOriginRequiresHuman(origin)
     }
     if let window = browserWindow {
+      // Give the page its whole viewport back. The handoff bar is 54 points tall and
+      // was never removed, so a page kept laying out against a viewport that short for
+      // the rest of the session — a dialog opened afterwards came back with every
+      // element crushed to a fraction of a pixel against that edge, and reported as
+      // covered. The bar belongs to the human's turn, not to the agent's.
+      attachWebView(to: window)
       // Return to the offscreen layout host rather than hiding outright: WebKit stops
       // laying the page out for a window that was ordered out, and the next
       // observation would come back empty.
@@ -1869,6 +1875,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           quietWindow: .milliseconds(300)
         )
       }
+      // Restoring the view is not the same as the page knowing about it. Observing
+      // before WebKit has propagated the new size measures everything against the
+      // viewport the human's turn left behind.
+      await awaitViewportSettled()
       return try await observe(maximumElements: maximumElements)
     } catch {
       if controlState == .resumeRequested {
@@ -1876,6 +1886,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         transition(to: .humanControlled, observationID: nil)
       }
       throw error
+    }
+  }
+
+  /// Waits, briefly and boundedly, for the page's own viewport to agree with the view
+  /// it lives in. Never fails: a page that cannot answer is observed anyway, and the
+  /// observation still reports what it measured.
+  private func awaitViewportSettled(timeout: Duration = .milliseconds(500)) async {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+      let expected = webView.bounds.height
+      guard expected > 0 else { return }
+      let reported =
+        (try? await webView.evaluateJavaScript("window.innerHeight")) as? Double
+      if let reported, abs(reported - expected) < 1 { return }
+      webView.needsLayout = true
+      webView.layoutSubtreeIfNeeded()
+      try? await Task.sleep(for: .milliseconds(20))
     }
   }
 
