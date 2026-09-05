@@ -374,6 +374,30 @@ struct WebKitRuntimeTests {
     #expect(observation.elements.count == 1)
   }
 
+  @Test("Handing control to a human puts the window back on a display")
+  func humanHandoffRestoresAnOnScreenWindow() async throws {
+    // The window is parked outside every display so pages lay out without being
+    // shown. A handoff that ordered it front without moving it back asked the user
+    // to act in a window that was nowhere on screen.
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+    _ = try await runtime.loadHTML(
+      "<p>Sign in</p>", baseURL: URL(string: "https://fixture.invalid/signin"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20))
+    // Observing is what parks the window outside every display.
+    _ = try await runtime.observe()
+    #expect(!runtime.browserWindowIsOnScreen)
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: true)
+    #expect(runtime.browserWindowIsOnScreen)
+
+    try runtime.requestAgentResume()
+    _ = try await runtime.resumeAfterHumanControl()
+    #expect(!runtime.browserWindowIsOnScreen)
+  }
+
   @Test("Main-frame navigation audit distinguishes agent actions from web content")
   func navigationActorAttribution() async throws {
     let runtime = WebKitRuntime()

@@ -36,6 +36,8 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case noPendingCrossOriginNavigation
   case invalidControlTransition
   case nativeGestureReceiptUnavailable
+  /// A handoff was requested but no window a human could act in could be shown.
+  case handoffSurfaceUnavailable
 }
 
 public enum AuthenticationUIClassification: String, Codable, Equatable, Sendable {
@@ -1439,7 +1441,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     latestTargets.removeAll(keepingCapacity: true)
     topLevelOriginLock = nil
     transition(to: .humanControlled, observationID: nil)
-    if presentWindow { presentHumanControlWindow() }
+    if presentWindow {
+      presentHumanControlWindow()
+      // Fail closed rather than delegate to a human who has nothing to act in: the
+      // step would wait forever on a control that was never presented.
+      guard humanControlSurfaceIsPresented else {
+        throw WebKitRuntimeError.handoffSurfaceUnavailable
+      }
+    }
   }
 
   public func markHumanStepCompleted() throws {
@@ -1540,6 +1549,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     webView.isHidden = false
     webView.alphaValue = 1
     attachHumanControlView(to: window)
+    // The window is parked outside every display so pages lay out without being
+    // shown. Handing control to a human must undo that, or the user is asked to act
+    // in a window that is nowhere on screen.
+    window.level = .normal
+    window.collectionBehavior.remove(.transient)
+    window.setFrame(
+      NSRect(origin: .zero, size: window.frame.size), display: false)
+    window.center()
     window.makeKeyAndOrderFront(nil)
     window.orderFrontRegardless()
     if managesApplicationActivationPolicy {
@@ -1548,6 +1565,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     window.makeFirstResponder(webView)
     window.displayIfNeeded()
   }
+
+  /// True once a human can actually see and act in the browser window.
+  public var humanControlSurfaceIsPresented: Bool { browserWindowIsOnScreen }
 
   private static let emptyHandoffDocument = """
     <!doctype html>

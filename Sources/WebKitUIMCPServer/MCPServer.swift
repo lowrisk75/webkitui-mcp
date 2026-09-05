@@ -1883,7 +1883,25 @@ public final class WebKitMCPServer {
     switch runtime.interactionControlState() {
     case .agentControlled, .freshlyReobserved:
       try runtime.requestHumanHandoff()
-      try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+      do {
+        try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+      } catch WebKitRuntimeError.handoffSurfaceUnavailable {
+        // Symmetric to a confirmation that was never presented: never delegate a step
+        // to a person who has no window to take it in. The session stays under agent
+        // control and keeps its lease usable.
+        try? runtime.requestAgentResume()
+        return try structuredToolError(
+          structured: .object([
+            "status": .string("handoff_surface_unavailable"),
+            "code": .string("handoff_surface_unavailable"),
+            "surface_presented": .bool(false),
+            "message": .string(
+              "No browser window could be shown, so the human step was not delegated."),
+            "remediation": .string(
+              "The session stays under agent control. Retry once a window can be "
+                + "presented; nothing was handed over and no resume token was issued."),
+          ]), modern: modern)
+      }
     case .humanControlled, .humanStepCompleted:
       break
     default:
@@ -1942,7 +1960,25 @@ public final class WebKitMCPServer {
     switch runtime.interactionControlState() {
     case .agentControlled, .freshlyReobserved:
       try runtime.requestHumanHandoff()
-      try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+      do {
+        try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+      } catch WebKitRuntimeError.handoffSurfaceUnavailable {
+        // Symmetric to a confirmation that was never presented: never delegate a step
+        // to a person who has no window to take it in. The session stays under agent
+        // control and keeps its lease usable.
+        try? runtime.requestAgentResume()
+        return try structuredToolError(
+          structured: .object([
+            "status": .string("handoff_surface_unavailable"),
+            "code": .string("handoff_surface_unavailable"),
+            "surface_presented": .bool(false),
+            "message": .string(
+              "No browser window could be shown, so the human step was not delegated."),
+            "remediation": .string(
+              "The session stays under agent control. Retry once a window can be "
+                + "presented; nothing was handed over and no resume token was issued."),
+          ]), modern: modern)
+      }
     case .humanControlled, .humanStepCompleted:
       break
     default:
