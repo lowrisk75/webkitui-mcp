@@ -2066,10 +2066,12 @@ public final class WebKitMCPServer {
     guard
       arguments.keys.allSatisfy({
         $0 == "operation" || $0 == "session_id" || $0 == "resume_token"
+          || $0 == "compact" || $0 == "maximum_elements"
       })
     else {
       throw MCPServerError.invalidParams(
-        "handoff_resume accepts only operation, session_id, and resume_token")
+        "handoff_resume accepts only operation, session_id, resume_token, compact, and maximum_elements"
+      )
     }
     let handle = try sessionHandle(arguments)
     let token = try requireString(arguments["resume_token"], named: "resume_token")
@@ -2112,16 +2114,38 @@ public final class WebKitMCPServer {
     guard registry.consumeHandoffResumeCapability(token, for: handle) else {
       throw MCPServerError.invalidParams("resume_token is unknown, expired, or session-mismatched")
     }
+    // The handoff is the only escape hatch left when a control cannot be actuated, so
+    // its observation has to fit. It used to return 500 elements with every field, which
+    // is hundreds of thousands of characters on a real console page: past the client's
+    // limit, the escape hatch does not exist. Compact rows are the default here; a caller
+    // that wants the full payload asks for it.
+    let compact: Bool
+    switch arguments["compact"] {
+    case .bool(let value): compact = value
+    case nil: compact = true
+    default: throw MCPServerError.invalidParams("compact must be a boolean")
+    }
+    let maximumElements = try boundedInteger(
+      arguments["maximum_elements"], defaultValue: 150, range: 1...2_000,
+      name: "maximum_elements")
     try runtime.requestAgentResume()
-    let observation = try await runtime.resumeAfterHumanControl()
+    let observation = try await runtime.resumeAfterHumanControl(
+      maximumElements: maximumElements)
     registry.releaseHandoffOwnership(for: handle)
     observations[handle] = observation
+    let encodedObservation =
+      compact
+      ? compactObservation(
+        observation,
+        fields: Set(["role", "name", "href", "bbox", "state", "locator_quality"]))
+      : try JSONValue.encoded(observation)
     return try toolResult(
       structured: .object([
         "control_state": .string(runtime.interactionControlState().rawValue),
         "resume_token_state": .string("consumed"),
         "resumed": .bool(true),
-        "observation": try .encoded(observation),
+        "observation_compact": .bool(compact),
+        "observation": encodedObservation,
       ]), modern: modern)
   }
 
@@ -3954,7 +3978,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_session",
       description:
-        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation. Profile listing never exposes cookies or credentials.",
+        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
@@ -3996,6 +4020,13 @@ public final class WebKitMCPServer {
           "description": .string(
             "Required for handoff_status and handoff_resume; returned only by handoff_start."),
         ]),
+        "compact": .object([
+          "type": .string("boolean"), "default": .bool(true),
+          "description": .string(
+            "For handoff_resume only. Concise element rows, which is the default because the full payload does not fit a client. Pass false for every field."
+          ),
+        ]),
+        "maximum_elements": integerSchema(minimum: 1, maximum: 2_000, defaultValue: 150),
         "goal_display": .object([
           "type": .string("string"), "minLength": .int(1), "maxLength": .int(200),
           "description": .string(

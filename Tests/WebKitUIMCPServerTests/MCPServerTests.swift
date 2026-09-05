@@ -2828,6 +2828,90 @@ struct MCPServerTests {
     #expect(try string(observation["observationID"]) != before.observationID)
   }
 
+  @Test("Handoff resume returns a bounded observation the client can actually read")
+  func handoffResumeIsBounded() async throws {
+    // The human handoff is the only escape hatch when a control cannot be actuated,
+    // and it returned an unbounded 500-element observation — ~289 000 characters on a
+    // real console page, past the client's limit. An escape hatch that cannot be read
+    // is not an escape hatch.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    let buttons = (0..<400)
+      .map { "<button aria-label='Control \($0) with a deliberately long accessible name'>" }
+      .joined()
+    _ = try await runtime.loadHTML(
+      "<title>Wide form</title>" + buttons,
+      baseURL: URL(string: "https://example.test/handoff-bounds"),
+      timeout: .seconds(4), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: ConfirmationPresenterStub(responses: []))
+    let sessionID = handle.rawValue.uuidString
+
+    let started = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff_start"), "session_id": .string(sessionID)])
+    let token = try string(
+      try object(try object(started["result"])["structuredContent"])["resume_token"])
+    try runtime.markHumanStepCompleted()
+
+    let resumed = try await toolCall(
+      server, id: 2, name: "browser_session",
+      arguments: [
+        "operation": .string("handoff_resume"), "session_id": .string(sessionID),
+        "resume_token": .string(token),
+      ])
+    let structured = try object(try object(resumed["result"])["structuredContent"])
+    #expect(structured["resumed"] == .bool(true))
+    guard case .array(let elements) = try object(structured["observation"])["elements"] else {
+      Issue.record("the resumed observation carried no element rows")
+      return
+    }
+    #expect(elements.count <= 150)
+    let encoded =
+      String(
+        data: try JSONEncoder().encode(JSONValue.object(structured)), encoding: .utf8) ?? ""
+    #expect(
+      encoded.count < 100_000,
+      "the resume payload is \(encoded.count) characters, which the client cannot read")
+  }
+
+  @Test("A caller can still ask handoff resume for the full observation")
+  func handoffResumeStillOffersTheFullObservation() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Small form</title><button aria-label='Continue'>",
+      baseURL: URL(string: "https://example.test/handoff-full"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: ConfirmationPresenterStub(responses: []))
+    let sessionID = handle.rawValue.uuidString
+
+    let started = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff_start"), "session_id": .string(sessionID)])
+    let token = try string(
+      try object(try object(started["result"])["structuredContent"])["resume_token"])
+    try runtime.markHumanStepCompleted()
+
+    let resumed = try await toolCall(
+      server, id: 2, name: "browser_session",
+      arguments: [
+        "operation": .string("handoff_resume"), "session_id": .string(sessionID),
+        "resume_token": .string(token), "compact": .bool(false),
+      ])
+    let structured = try object(try object(resumed["result"])["structuredContent"])
+    #expect(structured["observation_compact"] == .bool(false))
+    let observation = try object(structured["observation"])
+    // The full payload carries fields the compact rows drop.
+    #expect(observation["elements"] != nil)
+    #expect(observation["hydration"] != nil || observation["readyState"] != nil)
+  }
+
   @Test("Non-blocking handoff survives a transport reconnect and consumes its token once")
   func nonBlockingHandoffLifecycle() async throws {
     let registry = try WebKitSessionRegistry()
