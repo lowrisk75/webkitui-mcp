@@ -1393,6 +1393,64 @@ struct WebKitRuntimeTests {
     #expect(updated.value?.segments.first?.text == "Bonjour")
   }
 
+  @Test("A form that grows a question with every answer does not take the session down")
+  func selfExtendingFormSurvivesRepeatedActuation() async throws {
+    // The IARC questionnaire appends the next question to the same document on every
+    // answer: ten questions took mutationCount from 3935 to 4097 and generation from 12
+    // to 366. browser_act returned Internal error and then all fourteen tools vanished,
+    // losing a half-finished questionnaire that Play had saved none of. They asked for
+    // this shape to be in the suite; here it is.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Questionnaire</title>
+      <div id="questions"></div>
+      <script>
+        let asked = 0;
+        function ask() {
+          asked += 1;
+          const block = document.createElement('div');
+          block.className = 'q';
+          block.innerHTML =
+            '<p>Question ' + asked + '</p>' +
+            '<button aria-label="Answer ' + asked + '">Yes</button>';
+          block.querySelector('button').addEventListener('click', () => {
+            // Each answer rewrites the whole list, which is what churns the generation.
+            for (const node of document.querySelectorAll('.q')) {
+              node.replaceWith(node.cloneNode(true));
+            }
+            if (asked < 12) ask();
+          });
+          document.getElementById('questions').append(block);
+        }
+        ask();
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/iarc"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    // Answer every question the form produces, re-observing between each as an agent
+    // must, and never letting a failure pass as anything but a failure.
+    for step in 1...10 {
+      let observation = try await runtime.observe()
+      guard
+        let target = observation.elements.first(where: {
+          $0.accessibleName?.segments.first?.text == "Answer \(step)"
+        })
+      else { continue }
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID,
+        operation: .click,
+        stabilityInterval: .milliseconds(1))
+    }
+
+    // Still alive, still answering: the point is that nothing tore the runtime down.
+    let final = try await runtime.observe()
+    #expect(final.elements.isEmpty == false)
+    #expect(final.generation > 1)
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()
