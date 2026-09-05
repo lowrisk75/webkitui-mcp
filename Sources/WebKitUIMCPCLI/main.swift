@@ -265,9 +265,33 @@ struct WebKitUIMCPCLI {
         transactionLedgerFactory: .durable(),
         activityLog: .durable()
       )
+      // Going away silently is indistinguishable from crashing: the client sees an
+      // internal error on its next call and the tools vanish. Say so on the way out,
+      // and say when the file underneath us was rebuilt while we were running.
+      let executable = NativeConfirmationHelperLocation.executableURL
+      let startedAs = WebKitUIExecutableIdentity(at: executable)
+      @Sendable func announceShutdown(_ fallback: WebKitUIProcessLifetime.ShutdownReason) {
+        let replaced =
+          startedAs.map {
+            WebKitUIProcessLifetime.executableWasReplaced(since: $0, at: executable)
+          } ?? false
+        let notice = WebKitUIProcessLifetime.shutdownNotice(
+          reason: replaced ? .executableReplaced : fallback)
+        FileHandle.standardOutput.write(notice)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+      }
+      let termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+      termination.setEventHandler {
+        announceShutdown(.terminated)
+        Foundation.exit(EXIT_SUCCESS)
+      }
+      signal(SIGTERM, SIG_IGN)
+      termination.resume()
       // A client that dies without closing the pipe would otherwise leave this
       // server alive holding the single host lease, starving every other client.
-      let orphanWatch = WebKitUIProcessLifetime.exitWhenOrphaned()
+      let orphanWatch = WebKitUIProcessLifetime.exitWhenOrphaned {
+        announceShutdown(.clientGone)
+      }
       defer { orphanWatch.cancel() }
       for try await line in FileHandle.standardInput.bytes.lines {
         if let response = await server.handle(Data(line.utf8)) {
@@ -275,6 +299,7 @@ struct WebKitUIMCPCLI {
           FileHandle.standardOutput.write(Data("\n".utf8))
         }
       }
+      announceShutdown(.clientGone)
       Foundation.exit(EXIT_SUCCESS)
     } catch {
       FileHandle.standardError.write(Data("webkitui-mcp stopped: \(error)\n".utf8))
