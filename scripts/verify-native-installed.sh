@@ -28,6 +28,28 @@ xcrun swift-format lint --strict --recursive Sources Tests Package.swift
 swift test -c debug --no-parallel --skip hostExclusiveSession
 swift test -c release --no-parallel --skip hostExclusiveSession
 
+# The installed binaries must be the ones this source builds. `swift build
+# --show-bin-path` prints a path without building, so an install script that asks for
+# the path and copies what it finds can ship the previous build and pass every other
+# check — which is exactly what happened, twice, while a real page kept failing on a
+# defect that had already been fixed.
+swift build -c release --arch arm64 >/dev/null
+release_bin=$(swift build -c release --arch arm64 --show-bin-path)
+for tool in webkitui-mcp webkitui-mcp-confirm webkitui-mcp-relay; do
+  installed_path="$HOME/.local/bin/$tool"
+  [[ -x "$installed_path" ]] || { print -u2 "missing installed $tool"; exit 1; }
+  # Signing rewrites the code directory, so compare the machine code itself, which it
+  # leaves untouched.
+  built_text=$(otool -s __TEXT __text "$release_bin/$tool" | tail -n +3 | shasum -a 256 | cut -d' ' -f1)
+  installed_text=$(otool -s __TEXT __text "$installed_path" | tail -n +3 | shasum -a 256 | cut -d' ' -f1)
+  if [[ "$built_text" != "$installed_text" ]]; then
+    print -u2 "installed $tool is not built from this source"
+    print -u2 "  built:     $built_text"
+    print -u2 "  installed: $installed_text"
+    exit 1
+  fi
+done
+
 test -x "$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker"
 test -x "$installed_app_confirm"
 test -x "$installed_cli"
