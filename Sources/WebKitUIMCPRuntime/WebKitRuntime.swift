@@ -3169,11 +3169,29 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const sensitiveAutocomplete = new Set([
       'current-password', 'new-password', 'one-time-code', 'webauthn'
     ]);
-    const styledControlSurface = element => {
+    // A Material-style control renders in two halves: the real input, given no size
+    // or clipped away, and the painted box beside it marked aria-hidden. Neither half
+    // survives a visibility filter on its own, so the form observes as a group with no
+    // children and cannot be filled at all. Stand the pair up as one unit, addressed by
+    // the visible half. The walk stops at the first ancestor owning a second control,
+    // so a surface is never shared between two checkboxes.
+    const hiddenControlSurface = element => {
       if (!(element instanceof HTMLInputElement)
           || !['checkbox', 'radio'].includes(element.type)) return null;
       const labels = element.labels ? Array.from(element.labels) : [];
-      return labels.find(isRendered) || null;
+      const label = labels.find(isRendered);
+      if (label) return label;
+      const labelledBy = collapse(element.getAttribute('aria-labelledby'));
+      for (const id of labelledBy.split(/\\s+/).slice(0, 8).filter(Boolean)) {
+        const node = labelledNode(element, id);
+        if (node && isRendered(node)) return node;
+      }
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, 'input[type="checkbox"], input[type="radio"]').length !== 1) break;
+        if (isRendered(cursor)) return cursor;
+      }
+      return null;
     };
     const classTokens = element => collapse(element?.getAttribute?.('class'));
     const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
@@ -3357,7 +3375,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     };
     const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
       .filter(element => {
-        if (!isRendered(element) && !styledControlSurface(element)) {
+        if (!isRendered(element) && !hiddenControlSurface(element)) {
           if (hiddenOnlyBySemantics(element)) ariaHiddenDropCount += 1;
           return false;
         }
@@ -3369,7 +3387,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const elements = matchingElements
       .slice(elementOffset, elementOffset + __MAXIMUM_ELEMENTS__)
       .map(element => {
-        const surface = isRendered(element) ? element : styledControlSurface(element);
+        const surface = isRendered(element) ? element : hiddenControlSurface(element);
         const box = surface.getBoundingClientRect();
         const rawValue = typeof element.value === 'string' ? element.value : null;
         const autocomplete = collapse(element.getAttribute('autocomplete')).toLowerCase();
@@ -3663,13 +3681,33 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return true;
     };
+    // A Material-style control renders in two halves: the real input, given no size
+    // or clipped away, and the painted box beside it marked aria-hidden. Neither half
+    // survives a visibility filter on its own, so the form observes as a group with no
+    // children and cannot be filled at all. Stand the pair up as one unit, addressed by
+    // the visible half. The walk stops at the first ancestor owning a second control,
+    // so a surface is never shared between two checkboxes.
+    const hiddenControlSurface = element => {
+      if (!(element instanceof HTMLInputElement)
+          || !['checkbox', 'radio'].includes(element.type)) return null;
+      const labels = element.labels ? Array.from(element.labels) : [];
+      const label = labels.find(isRendered);
+      if (label) return label;
+      const labelledBy = collapse(element.getAttribute('aria-labelledby'));
+      for (const id of labelledBy.split(/\\s+/).slice(0, 8).filter(Boolean)) {
+        const node = labelledNode(element, id);
+        if (node && isRendered(node)) return node;
+      }
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, 'input[type="checkbox"], input[type="radio"]').length !== 1) break;
+        if (isRendered(cursor)) return cursor;
+      }
+      return null;
+    };
     const surfaceOf = element => {
       if (isRendered(element)) return element;
-      if (element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)) {
-        const labels = element.labels ? Array.from(element.labels) : [];
-        return labels.find(isRendered) || element;
-      }
-      return element;
+      return hiddenControlSurface(element) || element;
     };
     const directLabelledText = element => {
       const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));

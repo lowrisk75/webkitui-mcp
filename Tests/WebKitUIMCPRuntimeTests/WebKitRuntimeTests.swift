@@ -460,6 +460,82 @@ struct WebKitRuntimeTests {
     #expect(scripted.latestNavigationAuditEvent()?.navigationType == "other")
   }
 
+  @Test("A Material checkbox hidden behind an aria-hidden box stays addressable")
+  func materialCheckboxRemainsAddressable() async throws {
+    // Play Console renders every checkbox in two halves: a real input with no size,
+    // and the painted box beside it marked aria-hidden. The filter dropped both, so
+    // a page of six expanded sections observed as groups with no children at all and
+    // four of the eleven publishing forms could not be filled by any means.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Financial features</title>
+      <div role="group" aria-label="Banking and loans">
+        <div class="row" onclick="document.getElementById('loans').click()">
+          <div class="mdc-checkbox">
+            <input type="checkbox" id="loans" aria-labelledby="loans-text"
+              style="position:absolute;width:0;height:0;opacity:0">
+            <div class="mdc-checkbox__background" aria-hidden="true"
+              style="width:18px;height:18px"></div>
+          </div>
+          <span id="loans-text" style="display:inline-block;width:400px">Banking and loans</span>
+        </div>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let before = try await runtime.observe()
+    let checkbox = try #require(
+      before.elements.first { $0.role?.segments.first?.text == "checkbox" },
+      "the checkbox was dropped: the page observes as a group with no children")
+    #expect(checkbox.accessibleName?.segments.first?.text == "Banking and loans")
+    // Addressed by the visible half. The input's own box is 0x0 and would refuse
+    // every click as target_not_actionable.
+    #expect(checkbox.boundingBox.width > 0 && checkbox.boundingBox.height > 0)
+
+    let result = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: checkbox.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+
+    let after = try await runtime.observe()
+    let updated = try #require(
+      after.elements.first { $0.role?.segments.first?.text == "checkbox" })
+    #expect(updated.checked == true)
+  }
+
+  @Test("Two hidden controls in one row never borrow the same surface")
+  func hiddenControlsDoNotShareASurface() async throws {
+    // Standing a hidden control up on an ancestor is only safe while that ancestor
+    // owns exactly one control. Sharing a surface would send both clicks to the same
+    // pixels and silently toggle the wrong box.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Ambiguous row</title>
+      <div class="row" style="width:400px;height:40px">
+        <input type="checkbox" id="a" aria-label="Loans"
+          style="position:absolute;width:0;height:0;opacity:0">
+        <input type="checkbox" id="b" aria-label="Deposits"
+          style="position:absolute;width:0;height:0;opacity:0">
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let observation = try await runtime.observe()
+    #expect(observation.elements.contains { $0.role?.segments.first?.text == "checkbox" } == false)
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()
