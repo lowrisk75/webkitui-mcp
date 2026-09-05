@@ -771,7 +771,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     return try await performScroll(
       source: Self.nearestScrollStateSource,
-      arguments: ["criteria": criteria]
+      arguments: ["criteria": criteria, "physicalIdentity": ""]
     )
   }
 
@@ -1058,7 +1058,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
 
     let criteria = locatorCriteria(target.recipe, expectedEnabled: !target.disabled)
-    let first = try await resolveTarget(criteria: criteria, scrollIntoView: true)
+    let first = try await resolveTarget(
+      criteria: criteria, scrollIntoView: true, physicalIdentity: target.physicalIdentity)
     try recordCardinality(
       first.count, target: target, eliminatedBy: first.eliminatedBy ?? [])
     guard let firstCandidate = first.candidate else {
@@ -1094,16 +1095,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     let second: RawActionResolution
     if dispatchMode == .nativeAppKit, operationName == "click" {
       second = try await resolveAndPerformNativeClick(
-        criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox)
+        criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedBoundingBox: firstCandidate.boundingBox)
     } else if dispatchMode == .nativeAppKit, operationName == "press_key", let value {
       second = try await resolveAndPerformNativeKey(
-        criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox, key: value)
+        criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedBoundingBox: firstCandidate.boundingBox, key: value)
     } else if dispatchMode == .nativeAppKit, operationName == "fill", let value {
       second = try await resolveAndPerformNativeFill(
-        criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox, value: value)
+        criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedBoundingBox: firstCandidate.boundingBox, value: value)
     } else {
       second = try await resolveAndPerform(
         criteria: criteria,
+        physicalIdentity: target.physicalIdentity,
         expectedBoundingBox: firstCandidate.boundingBox,
         operation: operationName,
         value: value
@@ -2285,22 +2290,29 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private func resolveTarget(
     criteria: [[String: String]],
-    scrollIntoView: Bool
+    scrollIntoView: Bool,
+    physicalIdentity: String = ""
   ) async throws -> RawActionResolution {
     try await actionScript(
       source: Self.resolveSource,
-      arguments: ["criteria": criteria, "scrollIntoView": scrollIntoView]
+      arguments: [
+        "criteria": criteria,
+        "physicalIdentity": physicalIdentity,
+        "scrollIntoView": scrollIntoView,
+      ]
     )
   }
 
   private func resolveAndPerform(
     criteria: [[String: String]],
+    physicalIdentity: String,
     expectedBoundingBox: ObservedBoundingBox,
     operation: String,
     value: String?
   ) async throws -> RawActionResolution {
     var arguments: [String: Any] = [
       "criteria": criteria,
+      "physicalIdentity": physicalIdentity,
       "expectedBox": [
         "x": expectedBoundingBox.x,
         "y": expectedBoundingBox.y,
@@ -2315,6 +2327,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private func resolveAndPerformNativeClick(
     criteria: [[String: String]],
+    physicalIdentity: String,
     expectedBoundingBox: ObservedBoundingBox
   ) async throws -> RawActionResolution {
     let token = UUID().uuidString
@@ -2327,6 +2340,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       source: Self.armNativeClickSource,
       arguments: [
         "criteria": criteria,
+        "physicalIdentity": physicalIdentity,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
       ])
@@ -2382,6 +2396,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private func resolveAndPerformNativeKey(
     criteria: [[String: String]],
+    physicalIdentity: String,
     expectedBoundingBox: ObservedBoundingBox,
     key: String
   ) async throws -> RawActionResolution {
@@ -2398,6 +2413,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       source: Self.armNativeKeySource,
       arguments: [
         "criteria": criteria,
+        "physicalIdentity": physicalIdentity,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
         "expectedKey": key,
@@ -2431,6 +2447,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private func resolveAndPerformNativeFill(
     criteria: [[String: String]],
+    physicalIdentity: String,
     expectedBoundingBox: ObservedBoundingBox,
     value: String
   ) async throws -> RawActionResolution {
@@ -2447,6 +2464,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       source: Self.armNativeFillSource,
       arguments: [
         "criteria": criteria,
+        "physicalIdentity": physicalIdentity,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
       ])
@@ -3045,6 +3063,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         mutationCount: 0,
         readyState: document.readyState,
         nodeIDs: new WeakMap(),
+        // The reverse direction, so an element observed a moment ago can be acted on by
+        // the identity it was given rather than re-derived from a name it may not have.
+        nodesByID: new Map(),
         nextNodeID: 1
       };
       Object.defineProperty(globalThis, '__webkituiState', {
@@ -3637,6 +3658,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (!physicalIdentity) {
           physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
           globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
+          globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
         }
         return {
           physicalIdentity,
@@ -4058,9 +4080,24 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       ...deepQueryAll(document, selector),
       ...deepQueryAll(document, 'a:not([href]), div, li, span').filter(isPointerControl)
     ]));
-    const matches = candidates.filter(element =>
+    const locatorMatches = candidates.filter(element =>
       criteria.every(criterion => matchesCriterion(element, criterion))
     );
+    // The observation handed out this element's identity and browser_act was given it
+    // back. Re-deriving the target from a name the element may not have throws that
+    // away: twenty-two anonymous checkboxes are one address each, and every one of them
+    // resolved to twenty-two candidates. The identity is the disambiguation.
+    // It is not a licence to skip the locator. A virtual list recycles its rows, so the
+    // pinned node still has to satisfy every required clause, or it is not the element
+    // that was observed and this falls back to addressing by meaning.
+    const pinnedNode = (() => {
+      if (typeof physicalIdentity !== 'string' || !physicalIdentity) return null;
+      const reference = globalThis.__webkituiState?.nodesByID?.get(physicalIdentity);
+      const node = typeof reference?.deref === 'function' ? reference.deref() : null;
+      if (!node || !node.isConnected) return null;
+      return criteria.every(criterion => matchesCriterion(node, criterion)) ? node : null;
+    })();
+    const matches = pinnedNode ? [pinnedNode] : locatorMatches;
     // Zero matches is an absence, not an ambiguity. A client told "not unique" goes
     // looking for a second candidate that does not exist; what it needs is which
     // required fact stopped matching, because that is usually one re-observation away.
@@ -4083,6 +4120,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (!physicalIdentity) {
         physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
         globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
+        globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
       }
       return {
         physicalIdentity,

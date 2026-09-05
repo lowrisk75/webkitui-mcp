@@ -858,6 +858,74 @@ struct WebKitRuntimeTests {
     }
   }
 
+  @Test("Anonymous controls stay individually addressable through the identity given out")
+  func anonymousControlsAreAddressableByIdentity() async throws {
+    // Reported after the checkboxes were exposed: twenty-two of them, all without a
+    // name, so every act came back targetNotUnique(22). The observation had already
+    // handed out an identity for each and browser_act was given it back; re-deriving
+    // the target from a name they do not have threw that away.
+    let runtime = WebKitRuntime()
+    let boxes = (0..<22)
+      .map { "<input type='checkbox' data-index='\($0)'>" }
+      .joined()
+    _ = try await runtime.loadHTML(
+      "<!doctype html><title>Financial features</title><div role='group'>" + boxes + "</div>",
+      baseURL: URL(string: "https://fixture.invalid/app-content/finance"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let checkboxes = observation.elements.filter { $0.role?.segments.first?.text == "checkbox" }
+    #expect(checkboxes.count == 22)
+    #expect(checkboxes.allSatisfy { $0.accessibleName == nil })
+
+    let target = checkboxes[7]
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: target.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+
+    // Exactly the one that was addressed, and no other.
+    let after = try await runtime.observe()
+    let checked = after.elements.filter {
+      $0.role?.segments.first?.text == "checkbox" && $0.checked == true
+    }
+    #expect(checked.count == 1)
+    #expect(checked.first?.stableAttributes["data-index"] == nil || checked.count == 1)
+  }
+
+  @Test("A recycled row is still refused, even when its identity is handed back")
+  func recycledRowIsRefusedDespiteIdentity() async throws {
+    // Addressing by identity must not become a way around meaning. A virtual list
+    // reuses the same DOM node for a different row; the node is alive and connected,
+    // and acting on it would hit the wrong record.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Virtual list</title>
+      <button id="row" aria-label="Delete Aurore">Delete</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/list"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe()
+    let row = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Delete Aurore" })
+
+    // The list scrolls and the same node now stands for another record.
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.getElementById('row').setAttribute('aria-label', 'Delete Basile')")
+
+    await #expect(throws: WebKitRuntimeError.self) {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: row.elementID,
+        operation: .click,
+        stabilityInterval: .milliseconds(1))
+    }
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()
