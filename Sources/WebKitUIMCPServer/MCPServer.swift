@@ -309,6 +309,10 @@ public final class WebKitMCPServer {
     pendingNavigations.removeAll(keepingCapacity: false)
     goalDelegations.removeAll(keepingCapacity: false)
     safariCompatibilityHandoffs.removeAll(keepingCapacity: false)
+    // The durable broker deliberately preserves the browser across a reconnect, so
+    // the session is not closed here. Ownership is released, which leaves it
+    // claimable by the next client; an operator can free the lease outright from the
+    // Status window when a crash leaves it stranded.
     registry.releaseHandoffOwnerships(owner: clientAuthorityID)
     registry.releaseSessionOwnerships(owner: clientAuthorityID)
     await capabilityAuthority.revokeAll()
@@ -1261,6 +1265,32 @@ public final class WebKitMCPServer {
               + "was dispatched."),
         ]), modern: modern)
     }
+  }
+
+  /// Releases everything this client held once its connection ends. A session left
+  /// behind keeps the single host lease under a holder that names the broker itself,
+  /// with no client to release it — a lease nothing inside MCP can then free.
+  ///
+  /// A session under human control is left alone: a person may be mid-step in it.
+  public func relinquishClientResources() async {
+    for handle in registry.openSessionHandles() {
+      guard
+        (try? registry.sessionOwnershipState(for: handle, owner: clientAuthorityID))
+          == "owned_by_this_client"
+      else { continue }
+      await revokeGoalDelegation(for: handle)
+      if let runtime = try? registry.runtime(for: handle),
+        runtime.interactionControlState() == .humanControlled
+          || runtime.interactionControlState() == .humanStepCompleted
+      {
+        continue
+      }
+      observations.removeValue(forKey: handle)
+      coordinators.removeValue(forKey: handle)
+      try? registry.close(handle)
+    }
+    registry.releaseSessionOwnerships(owner: clientAuthorityID)
+    registry.releaseHandoffOwnerships(owner: clientAuthorityID)
   }
 
   private func holderValue(_ holder: WebKitControllerHolder?) -> JSONValue {

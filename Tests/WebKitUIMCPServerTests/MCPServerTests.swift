@@ -709,6 +709,28 @@ struct MCPServerTests {
     #expect(try string(lease["remediation"]).count > 0)
   }
 
+  @Test("A disconnected client releases its session and the host lease")
+  func disconnectedClientReleasesTheLease() async throws {
+    // A per-connection server that ends without releasing leaves the session open in
+    // the durable registry, holding the single host lease under a holder that names
+    // the broker itself. Nothing inside MCP can then free it.
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "webkitui-release-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let registry = try WebKitSessionRegistry(
+      enforceHostExclusiveSession: true,
+      hostControllerLockURL: directory.appendingPathComponent("controller.lock"))
+    let server = WebKitMCPServer(registry: registry)
+    _ = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("open")])
+    #expect(registry.count == 1)
+
+    await server.relinquishClientResources()
+    #expect(registry.count == 0)
+    #expect(registry.externalHostControllerHolder() == nil)
+  }
+
   @Test("Download reports an active human handoff without attempting the action")
   func downloadReportsHumanControl() async throws {
     let registry = try WebKitSessionRegistry()
