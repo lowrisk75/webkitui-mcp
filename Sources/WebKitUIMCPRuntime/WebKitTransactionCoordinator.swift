@@ -154,7 +154,7 @@ public final class WebKitTransactionCoordinator {
 
   static func dispatchOutcome(for error: WebKitRuntimeError) -> DispatchOutcome {
     switch error {
-    case .staleObservation, .unknownElement, .targetNotUnique,
+    case .staleObservation, .unknownElement, .targetNotUnique, .targetNotFound,
       .targetGeometryChanged, .sensitiveInputRequiresHuman, .handoffSurfaceUnavailable:
       .notDispatched
     case .targetNotActionable, .nativeGestureReceiptUnavailable,

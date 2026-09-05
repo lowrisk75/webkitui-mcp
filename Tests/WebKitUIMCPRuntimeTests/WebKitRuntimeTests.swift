@@ -806,6 +806,58 @@ struct WebKitRuntimeTests {
     }
   }
 
+  @Test("An address that matches nothing is reported as absent, and says what moved")
+  func absentTargetIsNotReportedAsAmbiguous() async throws {
+    // Reported from the App Store Connect session: a combobox the observation called
+    // unique, addressable by a stable id, came back targetNotUnique(0) on every act,
+    // even after a completely fresh observation. Zero candidates is an absence, not an
+    // ambiguity: a client reads "not unique" and tries to disambiguate, which leads
+    // nowhere. It needs to know that nothing matched, and which required fact stopped
+    // matching — React renumbers ids between renders.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>App Store Connect</title>
+      <div role="dialog">
+        <div role="combobox" id="react-select-3" aria-label="Langue principale"
+          tabindex="0">Choisir</div>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/apps"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let observation = try await runtime.observe(roles: ["combobox"])
+    let combobox = try #require(observation.elements.first)
+    #expect(combobox.locatorQuality.status == .unique)
+    #expect(combobox.locatorQuality.facts.contains("stable_attribute:id"))
+
+    // The render that happens between observing and acting renumbers the id.
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('[role=combobox]').id = 'react-select-7'")
+
+    await #expect(throws: WebKitRuntimeError.self) {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: combobox.elementID,
+        operation: .click,
+        stabilityInterval: .milliseconds(1))
+    }
+    do {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: combobox.elementID,
+        operation: .click,
+        stabilityInterval: .milliseconds(1))
+    } catch let error as WebKitRuntimeError {
+      guard case .targetNotFound(let eliminatedBy) = error else {
+        Issue.record("expected targetNotFound, got \(error)")
+        return
+      }
+      // Naming the clause is the point: it turns a dead end into one re-observation.
+      #expect(eliminatedBy == ["stable_attribute:id"])
+    }
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

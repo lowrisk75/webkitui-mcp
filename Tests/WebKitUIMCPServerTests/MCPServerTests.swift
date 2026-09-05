@@ -2912,6 +2912,45 @@ struct MCPServerTests {
     #expect(observation["hydration"] != nil || observation["readyState"] != nil)
   }
 
+  @Test("The host lease names the client that took it, from its own handshake")
+  func hostLeaseNamesTheClient() async throws {
+    // Reported from the Play campaign: the holder came back as "unknown-client" with a
+    // null version, so the only way to learn who was blocking the machine was to leave
+    // the MCP and run ps. An agent without a shell cannot do that, and the difference
+    // matters: another session working is something to wait for, an orphan is something
+    // to recover. The classic initialize carries clientInfo in params, which is what
+    // real clients send and what this server was ignoring.
+    let registry = try WebKitSessionRegistry()
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: ConfirmationPresenterStub(responses: []))
+
+    _ = try await call(
+      server, id: 1, method: "initialize",
+      params: .object([
+        "protocolVersion": .string("2025-11-25"),
+        "capabilities": .object([:]),
+        "clientInfo": .object([
+          "name": .string("claude-code"), "version": .string("2.1.7"),
+        ]),
+      ]),
+      modern: false)
+
+    let opened = try await legacyToolCall(
+      server, id: 2, name: "browser_session",
+      arguments: ["operation": .string("open"), "profile_id": .string("default")])
+    let sessionID = try string(
+      try object(try object(opened["result"])["structuredContent"])["session_id"])
+
+    let status = try await legacyToolCall(
+      server, id: 3, name: "browser_session",
+      arguments: ["operation": .string("status"), "session_id": .string(sessionID)])
+    let structured = try object(try object(status["result"])["structuredContent"])
+    let holder = try object(structured["holder"])
+    #expect(holder["client_name"] == .string("claude-code"))
+    #expect(holder["client_version"] == .string("2.1.7"))
+  }
+
   @Test("Non-blocking handoff survives a transport reconnect and consumes its token once")
   func nonBlockingHandoffLifecycle() async throws {
     let registry = try WebKitSessionRegistry()

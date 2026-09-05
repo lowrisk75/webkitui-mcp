@@ -21,6 +21,9 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case targetNotUnique(Int)
   case targetNotActionable
   case targetGeometryChanged
+  /// Nothing matched the address at all. Carries the required facts whose removal would
+  /// have matched, which names what changed under the observation.
+  case targetNotFound([String])
   case sensitiveInputRequiresHuman
   case downloadInProgress
   case downloadCancelled
@@ -1056,8 +1059,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
     let criteria = locatorCriteria(target.recipe, expectedEnabled: !target.disabled)
     let first = try await resolveTarget(criteria: criteria, scrollIntoView: true)
-    try recordCardinality(first.count, target: target)
+    try recordCardinality(
+      first.count, target: target, eliminatedBy: first.eliminatedBy ?? [])
     guard let firstCandidate = first.candidate else {
+      if first.count == 0 {
+        throw WebKitRuntimeError.targetNotFound(first.eliminatedBy ?? [])
+      }
       throw WebKitRuntimeError.targetNotUnique(first.count)
     }
     try await Task.sleep(for: stabilityInterval)
@@ -1102,8 +1109,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         value: value
       )
     }
-    try recordCardinality(second.count, target: target)
+    try recordCardinality(
+      second.count, target: target, eliminatedBy: second.eliminatedBy ?? [])
     guard let candidate = second.candidate else {
+      if second.count == 0 {
+        throw WebKitRuntimeError.targetNotFound(second.eliminatedBy ?? [])
+      }
       throw WebKitRuntimeError.targetNotUnique(second.count)
     }
 
@@ -2337,7 +2348,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             actionable: candidate.actionable,
             dispatched: true,
             trustedUserGesture: receipt.trusted
-          ))
+          ),
+          eliminatedBy: nil)
       }
       try await Task.sleep(for: .milliseconds(10))
     }
@@ -2409,7 +2421,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             actionable: candidate.actionable,
             dispatched: true,
             trustedUserGesture: receipt.trusted
-          ))
+          ),
+          eliminatedBy: nil)
       }
       try await Task.sleep(for: .milliseconds(10))
     }
@@ -2464,7 +2477,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
                 actionable: candidate.actionable,
                 dispatched: true,
                 trustedUserGesture: inputReceipt.trusted && commitReceipt.trusted
-              ))
+              ),
+              eliminatedBy: nil)
           }
           try await Task.sleep(for: .milliseconds(10))
         }
@@ -2547,7 +2561,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     return result
   }
 
-  private func recordCardinality(_ count: Int, target: ObservedTargetRecord) throws {
+  private func recordCardinality(
+    _ count: Int, target: ObservedTargetRecord, eliminatedBy: [String] = []
+  ) throws {
     guard count != 1 else { return }
     let now = DispatchTime.now().uptimeNanoseconds
     // Measuring a failure must never replace it. An attempt that cannot be recorded
@@ -2567,6 +2583,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     ) {
       addressingCounters.record(AddressingClassifier.classify(attempt))
     }
+    if count == 0 { throw WebKitRuntimeError.targetNotFound(eliminatedBy) }
     throw WebKitRuntimeError.targetNotUnique(count)
   }
 
@@ -4044,6 +4061,22 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const matches = candidates.filter(element =>
       criteria.every(criterion => matchesCriterion(element, criterion))
     );
+    // Zero matches is an absence, not an ambiguity. A client told "not unique" goes
+    // looking for a second candidate that does not exist; what it needs is which
+    // required fact stopped matching, because that is usually one re-observation away.
+    const reportedFactNames = {
+      role: 'role', accessibleName: 'accessible_name', label: 'label',
+      contextAnchor: 'context_anchor', stableAttribute: 'stable_attribute',
+      framePath: 'frame_path', text: 'value', domPath: 'dom_path', enabled: 'enabled'
+    };
+    const reportedFactName = criterion => {
+      const base = reportedFactNames[criterion.fact] || criterion.fact;
+      return criterion.argument ? base + ':' + criterion.argument : base;
+    };
+    const eliminatedBy = matches.length > 0 ? [] : criteria
+      .filter(criterion => criterion.strength === 'required')
+      .filter(criterion => !candidates.some(element => matchesCriterion(element, criterion)))
+      .map(reportedFactName);
     const describe = element => {
       const box = surfaceOf(element).getBoundingClientRect();
       let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
@@ -4066,7 +4099,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
       if (element && scrollIntoView) surfaceOf(element).scrollIntoView({ block: 'center', inline: 'center' });
-      return JSON.stringify({ count: matches.length, candidate: element ? describe(element) : null });
+      return JSON.stringify({
+        count: matches.length, candidate: element ? describe(element) : null, eliminatedBy });
       """
 
   private static let scrollStateSource = """
@@ -4171,7 +4205,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private static let performSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy });
       const candidate = describe(element);
       const surface = surfaceOf(element);
       const box = surface.getBoundingClientRect();
@@ -4249,7 +4283,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         candidate.trustedUserGesture = trusted;
         candidate.dispatched = true;
       }
-      return JSON.stringify({ count: matches.length, candidate });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy });
       """
 
   private static let nativeGestureMessageHandlerName = "webkituiNativeGesture"
@@ -4257,7 +4291,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private static let armNativeClickSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy });
       const candidate = describe(element);
       const surface = surfaceOf(element);
       const box = surface.getBoundingClientRect();
@@ -4290,13 +4324,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           surface.addEventListener('click', report, { capture: true, once: true });
         }
       }
-      return JSON.stringify({ count: matches.length, candidate });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy });
       """
 
   private static let armNativeKeySource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy });
       const candidate = describe(element);
       const surface = surfaceOf(element);
       const box = surface.getBoundingClientRect();
@@ -4325,13 +4359,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           }, { capture: true, once: true });
         }
       }
-      return JSON.stringify({ count: matches.length, candidate });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy });
       """
 
   private static let armNativeFillSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy });
       const candidate = describe(element);
       const surface = surfaceOf(element);
       const box = surface.getBoundingClientRect();
@@ -4369,7 +4403,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           });
         }, { capture: true, once: true });
       }
-      return JSON.stringify({ count: matches.length, candidate });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy });
       """
 
   private static func boxDictionary(_ box: ObservedBoundingBox) -> [String: Double] {
@@ -4540,6 +4574,7 @@ private struct ObservedTargetRecord {
 private struct RawActionResolution: Decodable {
   let count: Int
   let candidate: RawActionCandidate?
+  let eliminatedBy: [String]?
 }
 
 private struct RawActionCandidate: Decodable {

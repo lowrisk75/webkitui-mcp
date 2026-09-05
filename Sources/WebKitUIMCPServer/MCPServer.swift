@@ -3173,6 +3173,19 @@ public final class WebKitMCPServer {
   }
 
   private func legacyInitializeResult(_ params: JSONValue?) -> JSONValue {
+    // The classic handshake carries clientInfo in params, which is what real clients
+    // send. Ignoring it left every host lease reported as "unknown-client" with a null
+    // version, so the only way to learn who held the machine was to leave the MCP and
+    // run ps — impossible for an agent without a shell, and the difference decides
+    // whether to wait for a working session or recover an orphan.
+    if let clientInfo = params?.objectValue?["clientInfo"]?.objectValue {
+      if let name = clientInfo["name"]?.stringValue, !name.isEmpty {
+        clientName = String(name.prefix(128))
+      }
+      if let version = clientInfo["version"]?.stringValue, !version.isEmpty {
+        clientVersion = String(version.prefix(64))
+      }
+    }
     let requested = params?.objectValue?["protocolVersion"]?.stringValue
     let supported = [Self.legacyProtocolVersion, "2025-06-18"]
     let negotiated =
