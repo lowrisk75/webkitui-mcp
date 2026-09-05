@@ -26,6 +26,10 @@ public struct WebKitControllerHolder: Codable, Equatable, Sendable {
   public let acquiredAt: Date
   public let lastActivityAt: Date
   public let executionPolicy: String
+  /// True when the host wrote this record for itself because no client owns a session.
+  /// A client reading only the pid cannot tell that apart from a peer at work, and the
+  /// two call for opposite reactions: wait, or take the host.
+  public let isHostPlaceholder: Bool
 
   public init(
     clientName: String,
@@ -33,7 +37,8 @@ public struct WebKitControllerHolder: Codable, Equatable, Sendable {
     processID: Int32 = getpid(),
     acquiredAt: Date = Date(),
     lastActivityAt: Date = Date(),
-    executionPolicy: String = "auto"
+    executionPolicy: String = "auto",
+    isHostPlaceholder: Bool = false
   ) {
     self.clientName = String(clientName.prefix(128))
     self.clientVersion = clientVersion.map { String($0.prefix(64)) }
@@ -41,6 +46,22 @@ public struct WebKitControllerHolder: Codable, Equatable, Sendable {
     self.acquiredAt = acquiredAt
     self.lastActivityAt = lastActivityAt
     self.executionPolicy = String(executionPolicy.prefix(64))
+    self.isHostPlaceholder = isHostPlaceholder
+  }
+
+  /// A lock file written by an earlier build has no such field, and failing to decode
+  /// it would leave a client unable to read the lease at all. Absent means a peer,
+  /// which is the safe reading: wait rather than take.
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    clientName = try container.decode(String.self, forKey: .clientName)
+    clientVersion = try container.decodeIfPresent(String.self, forKey: .clientVersion)
+    processID = try container.decode(Int32.self, forKey: .processID)
+    acquiredAt = try container.decode(Date.self, forKey: .acquiredAt)
+    lastActivityAt = try container.decode(Date.self, forKey: .lastActivityAt)
+    executionPolicy = try container.decode(String.self, forKey: .executionPolicy)
+    isHostPlaceholder =
+      try container.decodeIfPresent(Bool.self, forKey: .isHostPlaceholder) ?? false
   }
 }
 
@@ -507,7 +528,9 @@ public final class WebKitSessionRegistry {
     sessionOwners = sessionOwners.filter { $0.value.authorityID != owner }
     if previousCount != sessionOwners.count, sessionOwners.isEmpty {
       hostControllerLease?.recordHolder(
-        WebKitControllerHolder(clientName: "WebKitUI MCP host", executionPolicy: "unowned"),
+        WebKitControllerHolder(
+          clientName: "WebKitUI MCP host", executionPolicy: "unowned",
+          isHostPlaceholder: true),
         at: Date())
       scheduleUnownedLeaseYield()
     }
@@ -579,7 +602,9 @@ public final class WebKitSessionRegistry {
     sessionOwners.removeValue(forKey: handle)
     if sessionOwners.isEmpty {
       hostControllerLease?.recordHolder(
-        WebKitControllerHolder(clientName: "WebKitUI MCP host", executionPolicy: "unowned"),
+        WebKitControllerHolder(
+          clientName: "WebKitUI MCP host", executionPolicy: "unowned",
+          isHostPlaceholder: true),
         at: Date())
       scheduleUnownedLeaseYield()
     }

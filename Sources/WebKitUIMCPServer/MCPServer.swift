@@ -1319,10 +1319,13 @@ public final class WebKitMCPServer {
       // process that is gone: the host is still held, but by someone else.
       "pid_alive": .bool(holder.processIsRunning),
       "record_trustworthy": .bool(holder.processIsRunning),
-      // The pid is the broker's, never the MCP client's: clients reach the broker
-      // over a socket and their liveness is not tracked. When this is true, pid_alive
-      // says nothing about whether the owning client is still there.
+      // Whether this very server is the holder. It is false for every holder a client
+      // sees, including the host itself, because the answer is asked of a different
+      // process — which is exactly how a host placeholder read as a peer at work.
       "pid_is_this_broker": .bool(holder.processID == ProcessInfo.processInfo.processIdentifier),
+      // The question that decides what to do: a peer holding the host is something to
+      // wait for, a record the host wrote for itself is something to take over.
+      "holder_is_host_placeholder": .bool(holder.isHostPlaceholder),
     ])
   }
 
