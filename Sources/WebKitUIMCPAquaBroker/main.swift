@@ -152,6 +152,24 @@ struct WebKitUIMCPAquaBroker {
         activityLog: activityLog,
         goalDelegationMonitor: goalDelegationMonitor
       )
+      companionController?.maintenance = WebKitUIMaintenanceActions(
+        forceRender: { [weak registry] in
+          guard let handle = registry?.existingHandle,
+            let runtime = try? registry?.runtime(for: handle)
+          else { return }
+          runtime.forceRender()
+        },
+        clearBrowsingData: { [weak registry] in
+          guard let handle = registry?.existingHandle,
+            let runtime = try? registry?.runtime(for: handle)
+          else { return }
+          Task { @MainActor in await runtime.clearBrowsingData() }
+        },
+        releaseHostLease: { [weak registry] in
+          guard let registry else { return }
+          for handle in registry.openSessionHandles() { try? registry.close(handle) }
+        }
+      )
       for descriptor in sockets.descriptors {
         try makeNonBlocking(descriptor)
         let source = DispatchSource.makeReadSource(

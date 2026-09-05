@@ -66,6 +66,9 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
   private let goalValue = NSTextField(labelWithString: "")
   private let goalDetail = NSTextField(wrappingLabelWithString: "")
   private let goalStopButton = NSButton()
+  /// Recovery the operator can trigger from the Status window. Supplied by the host so
+  /// this controller never reaches into the session registry itself.
+  var maintenance: WebKitUIMaintenanceActions?
   private let ownedSocket: SocketOwnership?
   private let activityWindowController: ActivityLogWindowController
   private let goalDelegationMonitor: GoalDelegationMonitor
@@ -259,7 +262,34 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
     )
     prepareToUninstall.bezelStyle = .rounded
     prepareToUninstall.setAccessibilityIdentifier("webkitui.action.prepare-uninstall")
-    let actionsCard = card(title: text("Quick actions"), views: [secondaryButtons, buttons])
+    // Recovery an operator can reach when the agent surface is stuck. Every one of
+    // these had to be done from a terminal until now.
+    let forceRender = NSButton(
+      title: text("Force render"), target: self, action: #selector(forceRenderAction))
+    forceRender.bezelStyle = .rounded
+    forceRender.toolTip = text(
+      "Re-establish the layout viewport when a page reports nothing observable.")
+    forceRender.setAccessibilityIdentifier("webkitui.action.force-render")
+    let clearData = NSButton(
+      title: text("Clear browsing data"), target: self, action: #selector(clearBrowsingDataAction))
+    clearData.bezelStyle = .rounded
+    clearData.toolTip = text("Remove this profile's cookies, caches and local storage.")
+    clearData.setAccessibilityIdentifier("webkitui.action.clear-browsing-data")
+    let releaseLease = NSButton(
+      title: text("Release host lease"), target: self, action: #selector(releaseHostLeaseAction))
+    releaseLease.bezelStyle = .rounded
+    releaseLease.contentTintColor = .systemOrange
+    releaseLease.toolTip = text("Close this host's sessions so another client can open one.")
+    releaseLease.setAccessibilityIdentifier("webkitui.action.release-lease")
+    let recoveryButtons = NSStackView(views: [forceRender, clearData, releaseLease])
+    recoveryButtons.orientation = .horizontal
+    recoveryButtons.spacing = 8
+    recoveryButtons.alignment = .centerY
+    recoveryButtons.setContentHuggingPriority(.required, for: .vertical)
+    recoveryButtons.setContentCompressionResistancePriority(.required, for: .vertical)
+
+    let actionsCard = card(
+      title: text("Quick actions"), views: [secondaryButtons, buttons, recoveryButtons])
 
     let note = NSTextField(
       wrappingLabelWithString: text(
@@ -442,6 +472,45 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
   }
 
   @objc private func refreshStatusAction() { refreshStatus() }
+
+  @objc private func forceRenderAction() {
+    maintenance?.forceRender()
+    refreshStatus()
+  }
+
+  @objc private func clearBrowsingDataAction() {
+    guard
+      confirmDestructive(
+        message: text("Clear this profile's browsing data?"),
+        detail: text(
+          "Cookies, caches and local storage are removed. Signed-in sites will ask you to "
+            + "sign in again. Nothing is sent anywhere."))
+    else { return }
+    maintenance?.clearBrowsingData()
+    refreshStatus()
+  }
+
+  @objc private func releaseHostLeaseAction() {
+    guard
+      confirmDestructive(
+        message: text("Release the host lease?"),
+        detail: text(
+          "Sessions open on this host are closed so another client can take it. Work in "
+            + "progress in those sessions is lost."))
+    else { return }
+    maintenance?.releaseHostLease()
+    refreshStatus()
+  }
+
+  private func confirmDestructive(message: String, detail: String) -> Bool {
+    let alert = NSAlert()
+    alert.messageText = message
+    alert.informativeText = detail
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: text("Continue"))
+    alert.addButton(withTitle: text("Cancel"))
+    return alert.runModal() == .alertFirstButtonReturn
+  }
 
   @objc private func showActivityLog() { activityWindowController.show() }
 

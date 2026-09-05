@@ -1566,6 +1566,29 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     window.displayIfNeeded()
   }
 
+  /// Re-establishes the layout viewport and forces a layout pass. An operator can
+  /// reach for this when a page has built its DOM but reports nothing observable,
+  /// which is what a hidden window used to cause.
+  public func forceRender() {
+    ensureLayoutViewport()
+    webView.needsLayout = true
+    webView.needsDisplay = true
+    webView.layoutSubtreeIfNeeded()
+    webView.displayIfNeeded()
+  }
+
+  /// Removes every website data record this profile holds: cookies, caches and local
+  /// storage. Signed-in origins are dropped with it, so the next run starts clean.
+  public func clearBrowsingData() async {
+    let store = webView.configuration.websiteDataStore
+    let types = WKWebsiteDataStore.allWebsiteDataTypes()
+    let records = await store.dataRecords(ofTypes: types)
+    await store.removeData(ofTypes: types, for: records)
+    for cookie in await store.httpCookieStore.allCookies() {
+      await store.httpCookieStore.deleteCookie(cookie)
+    }
+  }
+
   /// True once a human can actually see and act in the browser window.
   public var humanControlSurfaceIsPresented: Bool { browserWindowIsOnScreen }
 

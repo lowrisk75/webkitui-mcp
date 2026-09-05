@@ -226,6 +226,9 @@ public final class WebKitSessionRegistry {
 
   public var count: Int { sessions.count }
 
+  /// Every open session, so an operator can close them all and free the host lease.
+  public func openSessionHandles() -> [WebKitSessionHandle] { Array(sessions.keys) }
+
   public var existingHandle: WebKitSessionHandle? {
     sessions.keys.first
   }
