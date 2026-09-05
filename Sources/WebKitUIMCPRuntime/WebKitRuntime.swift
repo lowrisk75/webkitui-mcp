@@ -1479,6 +1479,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       window.collectionBehavior.remove(.moveToActiveSpace)
       window.collectionBehavior.insert(.stationary)
       window.collectionBehavior.insert(.ignoresCycle)
+      // Give up key status and drop back below everything. A parked window left key
+      // at normal level is still the app's front window, and a confirmation panel
+      // positioned against it lands off screen — the prompt is never seen and the
+      // request times out with no decision taken.
+      window.collectionBehavior.insert(.transient)
+      window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) - 1)
+      window.title = Self.localizedHandoff(
+        "WebkitUIMCP — Agent control", fallback: "WebkitUIMCP — Agent control")
+      window.resignKey()
+      window.resignMain()
     }
     if managesApplicationActivationPolicy {
       NSApplication.shared.setActivationPolicy(.accessory)

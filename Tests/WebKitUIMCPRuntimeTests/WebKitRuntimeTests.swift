@@ -396,6 +396,11 @@ struct WebKitRuntimeTests {
     try runtime.requestAgentResume()
     _ = try await runtime.resumeAfterHumanControl()
     #expect(!runtime.browserWindowIsOnScreen)
+    // The parked window must stop being the app's front window, or a confirmation
+    // panel positioned against it lands off screen and is never seen.
+    let parked = try #require(runtime.webView.window)
+    #expect(!parked.isKeyWindow)
+    #expect(parked.level.rawValue < NSWindow.Level.normal.rawValue)
   }
 
   @Test("Main-frame navigation audit distinguishes agent actions from web content")
