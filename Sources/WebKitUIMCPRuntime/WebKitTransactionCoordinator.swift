@@ -18,9 +18,19 @@ public final class WebKitTransactionCoordinator {
   private let runtime: WebKitRuntime
   private let ledger: TransactionalWriteLedger
 
-  public init(runtime: WebKitRuntime, ledger: TransactionalWriteLedger = .init()) {
+  /// How long a settled state is still accepted after the verification deadline. The
+  /// deadline decides when to stop waiting; it must not decide whether the write
+  /// happened. Reconciliation can prove a late postcondition, never authorise a replay.
+  private let reconciliationGrace: Duration
+
+  public init(
+    runtime: WebKitRuntime,
+    ledger: TransactionalWriteLedger = .init(),
+    reconciliationGrace: Duration = .seconds(3)
+  ) {
     self.runtime = runtime
     self.ledger = ledger
+    self.reconciliationGrace = reconciliationGrace
   }
 
   public func execute(
@@ -129,6 +139,20 @@ public final class WebKitTransactionCoordinator {
           try await Task.sleep(for: verificationPollInterval)
           continue
         }
+        // The deadline decides when to stop waiting, not whether the write happened.
+        // A page that settles a moment late was being reported unsatisfied while the
+        // very next observation showed the change — and a client that believes it
+        // failed retries, which on a menu closes what the first click opened. Read the
+        // page once more before concluding. Reconciliation can prove a late
+        // postcondition; it never authorises a replay.
+        if case .indeterminate = verification {
+          return WebKitTransactionResult(
+            action: action,
+            verification: try await reconcileUntilSettled(
+              idempotencyKey: plan.idempotencyKey,
+              fallbackObservation: transactionObservation,
+              pollInterval: verificationPollInterval))
+        }
         return WebKitTransactionResult(action: action, verification: verification)
       } catch is WebKitRuntimeError {
         let now = DispatchTime.now().uptimeNanoseconds
@@ -168,6 +192,27 @@ public final class WebKitTransactionCoordinator {
       .unsupportedDownload, .downloadHTTPFailure, .downloadFailed:
       .unknown
     }
+  }
+
+  /// Nine consecutive App Store Connect actions were reported unsatisfied while the
+  /// next observation showed every one had taken effect: a heavy single-page app can
+  /// settle just after a five second budget. A client that believes it failed retries,
+  /// and on a menu the second click undoes the first, so a false negative here is the
+  /// one failure in this system that can corrupt a remote page.
+  private func reconcileUntilSettled(
+    idempotencyKey: String,
+    fallbackObservation: TransactionObservation,
+    pollInterval: Duration
+  ) async throws -> TransactionVerification {
+    let deadline = ContinuousClock.now + reconciliationGrace
+    var verification = try await reconcileUncertainDispatch(
+      idempotencyKey: idempotencyKey, fallbackObservation: fallbackObservation)
+    while case .indeterminate = verification, ContinuousClock.now < deadline {
+      try await Task.sleep(for: pollInterval)
+      verification = try await reconcileUncertainDispatch(
+        idempotencyKey: idempotencyKey, fallbackObservation: fallbackObservation)
+    }
+    return verification
   }
 
   private func reconcileUncertainDispatch(
