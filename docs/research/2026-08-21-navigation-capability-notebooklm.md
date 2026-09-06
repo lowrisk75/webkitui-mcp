@@ -1,6 +1,6 @@
 # Navigation capability boundary — NotebookLM review (2026-08-21)
 
-Notebooks: `WebKITUI MPC` and the private opportunity notebook `LLM`.
+Notebooks: `WebKITUI MPC` and Kevin's opportunity notebook `LLM`.
 
 ## Source-supported
 

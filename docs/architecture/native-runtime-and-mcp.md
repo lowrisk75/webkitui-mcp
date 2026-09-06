@@ -69,10 +69,29 @@ The deterministic ten-tool surface is:
 
 `browser_session(operation: "profiles")` lists only `default`, the proven
 persistent data store used by this host. Opening accepts only that exact
-identifier; cookies, origins, and credentials are never listed. The official
+identifier. It advertises only executable policies (`auto`, `trusted_local`),
+reports unavailable policies separately, and lists the configured restricted
+origin without paths or queries. Authenticated origins remain an explicit empty
+list with `not_observable_without_inspecting_credentials_or_cookies`: WebKitUI
+does not inspect or expose cookies or credentials to infer login state. The official
 named-data-store enumeration API crashes in macOS 27 build 26A5416b, so UUID
 profiles fail closed rather than risking the native host. A live durable browser
 can be reused only with the same profile.
+
+`browser_session(operation: "status")` may omit `session_id`. It then reports
+the active holder's bounded client name/version, PID, lease age, inactivity and
+execution policy, including across the host lock. Competing `open` calls return
+the same privacy-safe holder record and a structured remediation. Optional
+`wait_timeout_ms` waits up to 60 seconds for the exclusive lease and never
+steals it. A disconnected durable client releases session ownership while the
+host-owned browser remains alive.
+
+`browser_session(operation: "client_handoff")` transfers an existing session
+to the requesting local client only after an exact native confirmation. The
+registry rechecks that the previous owner has no tool call in flight at the
+moment of transfer; otherwise it fails closed and asks the requester to retry.
+The previous client loses authority immediately, while cookies and credentials
+remain in the same host-owned data store and never cross MCP.
 
 `browser_read_text` returns bounded body text and rendered scrollable/log-like
 regions. Virtualized lines that are not currently in the DOM require an

@@ -2,9 +2,13 @@
 
 ## Safety boundary
 
-`browser_act` supports `click`, `submit`, bounded `fill`, Enter/Tab/Escape, blur, and input commit. `approval_mode=native` routes click/submit/key actions through public AppKit `NSEvent` handling after exact local confirmation. `approval_mode=mcp`, fill, blur, and commit remain untrusted JavaScript gestures. Fill accepts only non-password input/textarea controls, rejects input newlines, labels its bytes `MODEL_GENERATED`, and verifies the exact value through a semantic identity stable across observation leases.
+`browser_act` supports `click`, `submit`, bounded `fill`, Enter/Tab/Escape, blur, and input commit. `approval_mode=native` routes click/submit/key actions through public AppKit event handling and routes non-secret fill through native AppKit text insertion after exact local confirmation. A measured trusted DOM receipt is required. `approval_mode=mcp`, blur, and commit remain untrusted JavaScript gestures. Fill accepts only non-password input/textarea controls, rejects input newlines, labels its bytes `MODEL_GENERATED`, and verifies the exact value through a semantic identity stable across observation leases and controlled-input rerenders.
 
-The model supplies an observation ID, ephemeral element ID, idempotency key, and exact expected URL. None grants authority.
+Repeated controls may acquire a required `same_row_label` context anchor only when role/name/label alone are duplicated and that anchor uniquely identifies one candidate. Geometry remains corroborating evidence, never sole action authority.
+
+`browser_download` is a separate native-confirmed operation. A fresh observed control or an exact same-origin URL can trigger the request in the current persistent WebKit session, preserving its authenticated cookies without serializing them. Attachment responses become `WKDownload`; the user approves a save-panel destination, existing files are never overwritten, cross-origin redirects fail closed, and success requires an on-disk receipt with HTTP status, suggested/final filename, MIME type, byte count, SHA-256, and a decoded provisioning-profile UUID when present. The native panel shows the destination; its absolute path stays outside MCP.
+
+The model supplies either an observation ID plus ephemeral element ID or one exact same-origin download URL, together with an idempotency key and optional expected provisioning-profile UUID. None grants authority.
 
 ## Multi-round authorization
 

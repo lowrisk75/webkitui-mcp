@@ -33,8 +33,8 @@ struct WebKitUIMCPCLI {
 
           Native WebKit MCP server. Reads newline-delimited JSON-RPC from stdin and writes responses to stdout.
 
-          Commercial activation is optional for uses permitted directly by the BSL
-          Additional Use Grant. The license key is never exposed through MCP.
+          License commands exercise optional preview entitlement plumbing. They do
+          not gate capabilities or alter rights granted by MIT. Keys never enter MCP.
 
           doctor performs local, secret-free readiness checks. It never authenticates,
           opens a website, contacts the license service, or reads browser data.
@@ -64,10 +64,7 @@ struct WebKitUIMCPCLI {
   }
 
   private static func runDoctor() async {
-    let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-    let helperURL = executableURL.deletingLastPathComponent()
-      .appendingPathComponent("webkitui-mcp-confirm")
-    let helperAvailable = FileManager.default.isExecutableFile(atPath: helperURL.path)
+    let helperAvailable = NativeConfirmationHelperLocation.helperIsAvailable
 
     let context = LAContext()
     var authenticationError: NSError?
@@ -265,14 +262,44 @@ struct WebKitUIMCPCLI {
       let server = try WebKitMCPServer(
         maximumSessions: 1,
         enforceHostExclusiveSession: true,
-        transactionLedgerFactory: .durable()
+        transactionLedgerFactory: .durable(),
+        activityLog: .durable()
       )
+      // Going away silently is indistinguishable from crashing: the client sees an
+      // internal error on its next call and the tools vanish. Say so on the way out,
+      // and say when the file underneath us was rebuilt while we were running.
+      let executable = NativeConfirmationHelperLocation.executableURL
+      let startedAs = WebKitUIExecutableIdentity(at: executable)
+      @Sendable func announceShutdown(_ fallback: WebKitUIProcessLifetime.ShutdownReason) {
+        let replaced =
+          startedAs.map {
+            WebKitUIProcessLifetime.executableWasReplaced(since: $0, at: executable)
+          } ?? false
+        let notice = WebKitUIProcessLifetime.shutdownNotice(
+          reason: replaced ? .executableReplaced : fallback)
+        FileHandle.standardOutput.write(notice)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+      }
+      let termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+      termination.setEventHandler {
+        announceShutdown(.terminated)
+        Foundation.exit(EXIT_SUCCESS)
+      }
+      signal(SIGTERM, SIG_IGN)
+      termination.resume()
+      // A client that dies without closing the pipe would otherwise leave this
+      // server alive holding the single host lease, starving every other client.
+      let orphanWatch = WebKitUIProcessLifetime.exitWhenOrphaned {
+        announceShutdown(.clientGone)
+      }
+      defer { orphanWatch.cancel() }
       for try await line in FileHandle.standardInput.bytes.lines {
         if let response = await server.handle(Data(line.utf8)) {
           FileHandle.standardOutput.write(response)
           FileHandle.standardOutput.write(Data("\n".utf8))
         }
       }
+      announceShutdown(.clientGone)
       Foundation.exit(EXIT_SUCCESS)
     } catch {
       FileHandle.standardError.write(Data("webkitui-mcp stopped: \(error)\n".utf8))

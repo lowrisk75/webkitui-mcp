@@ -3,7 +3,7 @@
   "version": "0.6.0",
   "private": true,
   "description": "Retained TypeScript/Playwright prior-art fixtures. The supported WebKitUI MCP product is the native Swift/WKWebView implementation built with Swift Package Manager.",
-  "license": "BUSL-1.1",
+  "license": "MIT",
   "author": "LorisLabs",
   "type": "module",
   "scripts": {

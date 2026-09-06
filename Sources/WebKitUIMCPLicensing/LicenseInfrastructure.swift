@@ -61,15 +61,17 @@ public struct WebKitUIKeychainLicenseStore: WebKitUILicenseStoring {
 }
 
 public struct WebKitUILicenseHTTPAPI: WebKitUILicenseAPI {
+  static let maximumResponseBytes = 64 * 1_024
+
   private let baseURL: URL
   private let session: URLSession
 
   public init(
     baseURL: URL = URL(string: "https://license.lorislab.fr")!,
-    session: URLSession = .shared
+    session: URLSession? = nil
   ) {
     self.baseURL = baseURL
-    self.session = session
+    self.session = session ?? Self.ephemeralSession()
   }
 
   public func activate(
@@ -136,14 +138,25 @@ public struct WebKitUILicenseHTTPAPI: WebKitUILicenseAPI {
   private func post(path: String, body: [String: String]) async throws
     -> (body: [String: Any], status: Int)
   {
+    guard baseURL.scheme?.lowercased() == "https", baseURL.host != nil else {
+      throw WebKitUILicenseError.transport("license endpoint must use HTTPS")
+    }
     var request = URLRequest(url: baseURL.appending(path: path))
     request.httpMethod = "POST"
     request.timeoutInterval = 20
+    request.cachePolicy = .reloadIgnoringLocalCacheData
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
     do {
       let (data, rawResponse) = try await session.data(for: request)
       guard let response = rawResponse as? HTTPURLResponse else {
+        throw WebKitUILicenseError.invalidServerResponse
+      }
+      guard Self.sameHTTPSOrigin(response.url, baseURL),
+        data.count <= Self.maximumResponseBytes,
+        response.mimeType?.lowercased() == "application/json"
+      else {
         throw WebKitUILicenseError.invalidServerResponse
       }
       let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
@@ -165,6 +178,50 @@ public struct WebKitUILicenseHTTPAPI: WebKitUILicenseAPI {
       throw WebKitUILicenseError.transport(error.localizedDescription)
     }
   }
+
+  private static func ephemeralSession() -> URLSession {
+    URLSession(
+      configuration: ephemeralConfiguration(),
+      delegate: WebKitUILicenseNoRedirectDelegate(),
+      delegateQueue: nil)
+  }
+
+  static func ephemeralConfiguration() -> URLSessionConfiguration {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    configuration.urlCache = nil
+    configuration.httpCookieStorage = nil
+    configuration.httpShouldSetCookies = false
+    configuration.timeoutIntervalForRequest = 20
+    configuration.timeoutIntervalForResource = 20
+    configuration.httpMaximumConnectionsPerHost = 2
+    return configuration
+  }
+
+  static func sameHTTPSOrigin(_ candidate: URL?, _ expected: URL) -> Bool {
+    guard let candidate else { return false }
+    return candidate.scheme?.lowercased() == "https"
+      && candidate.host?.lowercased() == expected.host?.lowercased()
+      && effectivePort(candidate) == effectivePort(expected)
+  }
+
+  private static func effectivePort(_ url: URL) -> Int? {
+    url.port ?? (url.scheme?.lowercased() == "https" ? 443 : nil)
+  }
+}
+
+final class WebKitUILicenseNoRedirectDelegate: NSObject, URLSessionTaskDelegate,
+  @unchecked Sendable
+{
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    completionHandler(nil)
+  }
 }
 
 public struct WebKitUIRS256TokenVerifier: WebKitUILicenseTokenVerifying, @unchecked Sendable {
@@ -174,10 +231,43 @@ public struct WebKitUIRS256TokenVerifier: WebKitUILicenseTokenVerifying, @unchec
     self.publicKey = Self.makePublicKey(pem: pem)
   }
 
+  static let resourceBundleName = "WebKitUIMCP_WebKitUIMCPLicensing.bundle"
+  static let publicKeyResourceName = "lorislabs-license-public.pem"
+
+  /// Locations a packaged licence bundle can sit in, relative to the running
+  /// executable. Deliberately does not use `Bundle.module`: SPM's generated accessor
+  /// calls `fatalError` when the bundle is missing, and an MCP server that dies on a
+  /// licence resource is undiagnosable from the client.
+  public static func defaultSearchRoots() -> [URL] {
+    var roots: [URL] = []
+    if let resources = Bundle.main.resourceURL { roots.append(resources) }
+    roots.append(Bundle.main.bundleURL)
+    if let executable = Bundle.main.executableURL?.deletingLastPathComponent() {
+      roots.append(executable)
+      // A CLI installed in bin/ next to an app bundle's Resources/.
+      roots.append(executable.deletingLastPathComponent().appending(path: "Resources"))
+    }
+    return roots
+  }
+
+  /// Returns the packaged public key, or an empty string when no bundle is present.
+  /// An empty key yields a verifier that rejects every token, which is the correct
+  /// fail-closed outcome — and it never traps.
+  public static func bundledPublicKeyPEM(searchRoots: [URL] = defaultSearchRoots()) -> String {
+    for root in searchRoots {
+      let candidate =
+        root
+        .appending(path: resourceBundleName, directoryHint: .isDirectory)
+        .appending(path: publicKeyResourceName)
+      if let pem = try? String(contentsOf: candidate, encoding: .utf8), !pem.isEmpty {
+        return pem
+      }
+    }
+    return ""
+  }
+
   public static func bundled() -> Self {
-    let url = Bundle.module.url(forResource: "lorislabs-license-public", withExtension: "pem")
-    let pem = url.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
-    return Self(pem: pem)
+    Self(pem: bundledPublicKeyPEM())
   }
 
   public func verify(

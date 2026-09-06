@@ -6,8 +6,8 @@ Native WebKit actuation, stale-address recovery, transactional verification, and
 
 ## NotebookLM queries
 
-- Main private notebook: requested published measurements, implementation blind spots, and missed opportunities. One long blind-spot query was privacy-blocked; a short English reformulation succeeded.
-- Private opportunity notebook: requested unbuilt, measurable opportunities. Its answer supplied no citations, so it is retained only as conjectural brainstorming.
+- Main notebook `1c877ebb-8347-46e0-8c90-720098e01dc5`: requested published measurements, implementation blind spots, and missed opportunities. One long blind-spot query was privacy-blocked; a short English reformulation succeeded.
+- Opportunity notebook `ad5010b1-4c2b-4f3b-970c-24d5103655b4`: requested unbuilt, measurable opportunities. Its answer supplied no citations, so it is retained only as conjectural brainstorming.
 
 ## Source-verified
 

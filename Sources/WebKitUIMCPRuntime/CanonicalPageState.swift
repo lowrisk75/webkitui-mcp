@@ -46,10 +46,18 @@ extension WebKitPageObservation {
         entries.append(.init(key: elementKey(element, "@text"), value: value))
       }
       let role = element.role?.segments.map(\.text).joined().lowercased()
+      if role == "heading", let heading = element.accessibleName ?? element.text {
+        entries.append(.init(key: elementKey(element, "@heading"), value: heading))
+      }
       if role == "dialog" || role == "alertdialog",
         let dialogName = element.accessibleName ?? element.label ?? element.text
       {
         entries.append(.init(key: elementKey(element, "@dialog_name"), value: dialogName))
+      }
+      if role == "dialog" || role == "alertdialog" || role == "region",
+        let panelName = element.accessibleName ?? element.label ?? element.text
+      {
+        entries.append(.init(key: elementKey(element, "@panel_name"), value: panelName))
       }
       if element.visible, !element.sensitive,
         element.boundingBox.width > 0, element.boundingBox.height > 0,
@@ -74,6 +82,20 @@ extension WebKitPageObservation {
           value: try ProvenancedText(text: String(element.disabled), source: toolSource)
         )
       )
+      let validationState = try ProvenancedText(
+        text: element.validationState.rawValue, source: toolSource)
+      let validationAccepted = try ProvenancedText(
+        text: String(element.validationState != .invalid), source: toolSource)
+      entries.append(.init(key: elementKey(element, "@validation_state"), value: validationState))
+      entries.append(
+        .init(
+          key: elementKey(element, "@validation_accepted"), value: validationAccepted))
+      if let characterCount = element.characterCount {
+        entries.append(
+          .init(
+            key: elementKey(element, "@character_count"),
+            value: try ProvenancedText(text: String(characterCount), source: toolSource)))
+      }
       if let checked = element.checked {
         entries.append(
           .init(
@@ -116,6 +138,13 @@ extension WebKitPageObservation {
         }
         appendSemantic(
           "@enabled", try ProvenancedText(text: String(!element.disabled), source: toolSource))
+        appendSemantic("@validation_state", validationState)
+        appendSemantic("@validation_accepted", validationAccepted)
+        if let characterCount = element.characterCount {
+          appendSemantic(
+            "@character_count",
+            try ProvenancedText(text: String(characterCount), source: toolSource))
+        }
         for (name, value) in element.stateAttributes.sorted(by: { $0.key < $1.key }) {
           appendSemantic("@attribute:\(name)", value)
         }

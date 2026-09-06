@@ -2,7 +2,7 @@
 
 Notebook: **WebKITUI MPC**
 
-Notebook ID: private (redacted)
+Notebook ID: `1c877ebb-8347-46e0-8c90-720098e01dc5`
 
 This note records three short English queries made with explicit consent and
 `sensitivity: internal`. NotebookLM is treated as synthesis, not authority.

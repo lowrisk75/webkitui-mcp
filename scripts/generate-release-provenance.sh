@@ -8,6 +8,9 @@ fi
 
 workspace_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 output_dir=$1
+release_plist="$workspace_dir/Support/AquaApp/Info.plist"
+release_version=$(plutil -extract CFBundleShortVersionString raw "$release_plist")
+release_build=$(plutil -extract CFBundleVersion raw "$release_plist")
 manifest="$output_dir/SOURCE-MANIFEST.sha256"
 provenance="$output_dir/ReleaseProvenance.plist"
 inputs=$(mktemp /private/tmp/webkitui-provenance-inputs.XXXXXX)
@@ -19,6 +22,7 @@ mkdir -p "$output_dir"
 find \
   Package.swift package.json package-lock.json \
   README.md LICENSE LICENSING.md THIRD_PARTY_NOTICES.md \
+  docs/network-boundary.md docs/release-maintenance-policy.md \
   Sources Tests Support/AquaApp Support/Packaging scripts \
   \( -type f -o -type l \) ! -name '.DS_Store' -print0 \
   | LC_ALL=C sort -zu > "$inputs"
@@ -62,8 +66,8 @@ fi
 plutil -create xml1 "$provenance"
 plutil -insert SchemaVersion -integer 2 "$provenance"
 plutil -insert Product -string 'WebKitUI MCP' "$provenance"
-plutil -insert Version -string '0.6.0' "$provenance"
-plutil -insert Build -string '600' "$provenance"
+plutil -insert Version -string "$release_version" "$provenance"
+plutil -insert Build -string "$release_build" "$provenance"
 plutil -insert GitRevision -string "$revision" "$provenance"
 plutil -insert GitBranch -string "$branch" "$provenance"
 plutil -insert SourceTreeState -string "$tree_state" "$provenance"

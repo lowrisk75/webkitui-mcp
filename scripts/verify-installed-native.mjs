@@ -4,11 +4,11 @@ import assert from "node:assert/strict";
 import net from "node:net";
 
 const socketPath = process.argv[2];
-const expectedVersion = process.argv[3] ?? "0.6.0";
+const expectedVersion = process.argv[3];
 const timeoutMilliseconds = 10_000;
 
-if (!socketPath) {
-  throw new Error("usage: verify-installed-native.mjs <socket-path> [expected-version]");
+if (!socketPath || !expectedVersion) {
+  throw new Error("usage: verify-installed-native.mjs <socket-path> <expected-version>");
 }
 
 const metadata = {
@@ -112,6 +112,8 @@ try {
   assert.equal(secondDiscovery._meta["io.modelcontextprotocol/serverInfo"].version, expectedVersion);
 
   const expectedTools = [
+    "browser_download",
+    "browser_upload",
     "browser_act",
     "browser_capture",
     "browser_fill_siliconpass",
@@ -119,6 +121,7 @@ try {
     "browser_navigate",
     "browser_observe",
     "browser_read_text",
+    "browser_inspect_element",
     "browser_scroll",
     "element_scroll_into_view",
     "browser_session",
@@ -152,6 +155,16 @@ try {
   assert.equal(firstSession.profile_id, "default");
   assert.equal(secondSession.profile_id, "default");
 
+  // Closing the sockets leaves the browser session open, so the host lease is rewritten
+  // as unowned and stays taken until it times out. Every delivery therefore ended with a
+  // phantom lease and the next client had to wait or kill the broker — including the
+  // client about to test the fix that was just installed. Close the session, not just
+  // the pipe.
+  await tool(first, "browser_session", {
+    operation: "close",
+    session_id: firstSession.session_id,
+  });
+
   console.log(JSON.stringify({
     status: "verified",
     version: expectedVersion,
@@ -159,6 +172,7 @@ try {
     tools: expectedTools.length,
     profile: "default",
     sharedSession: true,
+    hostReleased: true,
   }, null, 2));
 } finally {
   first.close();

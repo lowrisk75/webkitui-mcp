@@ -4,8 +4,9 @@ Date: 2026-08-21
 
 ## Scope and notebook identity
 
-- Primary notebook: `WebKITUI MPC`, private ID redacted.
-- Opportunity notebook: `LLM`, private ID redacted, 295 sources reported (285 collected by
+- Primary notebook: `WebKITUI MPC`, id `1c877ebb-8347-46e0-8c90-720098e01dc5`.
+- Opportunity notebook supplied by Kevin: `LLM`, id
+  `ad5010b1-4c2b-4f3b-970c-24d5103655b4`, 295 sources reported (285 collected by
   the identity call).
 - Both identities were checked before asking questions. Answers were settled and
   cited, but NotebookLM remains a synthesis aid rather than primary proof.

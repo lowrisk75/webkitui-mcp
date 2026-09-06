@@ -1,4 +1,4 @@
-# Review of the Cloudflare Browser Run independent report — 2026-08-21
+# Review of Kevin's Cloudflare Browser Run independent report — 2026-08-21
 
 Source reviewed: `~/Downloads/Cloudflare Browser Run pour agents LLM — état de la preuve indépendante au 21 août 2026.md` (135 lines).
 

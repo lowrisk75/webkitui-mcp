@@ -27,7 +27,7 @@ Date: 2026-08-21
 
 ## Live node measurements
 
-Endpoint: private LAN host (redacted), 2026-08-21.
+Endpoint: `http://100.123.83.107:11434`, 2026-08-21.
 
 - `/api/tags`: `throttle-worker:latest`, Qwen3 4.0B, GGUF Q4_K_M,
   2,497,293,626 bytes, digest

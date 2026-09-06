@@ -103,6 +103,58 @@ struct TransactionalWriteTests {
     #expect(try wrongField.evaluate(in: observation) == .unsatisfied)
   }
 
+  @Test("Page URL and title fields support bounded partial matching")
+  func pageTextContainsPredicates() throws {
+    let urlKey = ObservationFieldKey(frameID: "main", elementID: "@page", field: "url")
+    let titleKey = ObservationFieldKey(frameID: "main", elementID: "@page", field: "title")
+    let observation = TransactionObservation(
+      state: try state(
+        generation: 4,
+        entries: [
+          (urlKey, try text("https://developer.apple.com/account/resources/identifiers/list")),
+          (titleKey, try text("Certificates, Identifiers & Profiles")),
+        ]),
+      completeness: .complete)
+
+    for (field, expected) in [
+      (ObservationTextField.url, "/identifiers/list"),
+      (ObservationTextField.title, "Identifiers & Profiles"),
+    ] {
+      let parameters = ObservationPredicate.containsParameters(of: expected)
+      let predicate = ObservationPredicate.anyEntryTextContainsDigest(
+        [field], parameters.digest, parameters.length, parameters.rolling)
+      #expect(try predicate.evaluate(in: observation) == .satisfied)
+    }
+    let initialURLDigest = ObservationPredicate.textDigest(
+      of: "https://developer.apple.com/account/resources/identifiers/list")
+    #expect(
+      try ObservationPredicate.entryTextNotDigest(urlKey, initialURLDigest)
+        .evaluate(in: observation) == .unsatisfied)
+    #expect(
+      try ObservationPredicate.entryTextNotDigest(
+        urlKey, ObservationPredicate.textDigest(of: "https://example.test/previous")
+      ).evaluate(in: observation) == .satisfied)
+  }
+
+  @Test("URL prefix proves the exact bounded prefix")
+  func pageURLPrefixPredicate() throws {
+    let urlKey = ObservationFieldKey(frameID: "main", elementID: "@page", field: "url")
+    let url = "https://play.google.com/console/u/0/developers/123/app-list"
+    let prefix = "https://play.google.com/console/"
+    let observation = TransactionObservation(
+      state: try state(generation: 5, entries: [(urlKey, try text(url))]),
+      completeness: .complete)
+
+    #expect(
+      try ObservationPredicate.entryTextPrefixDigest(
+        urlKey, ObservationPredicate.textDigest(of: prefix), prefix.utf8.count
+      ).evaluate(in: observation) == .satisfied)
+    #expect(
+      try ObservationPredicate.entryTextPrefixDigest(
+        urlKey, ObservationPredicate.textDigest(of: "https://example.test/"), 21
+      ).evaluate(in: observation) == .unsatisfied)
+  }
+
   @Test("Prepare checks capability and every precondition")
   func preparationFailsClosed() async throws {
     let authority = CapabilityAuthority()

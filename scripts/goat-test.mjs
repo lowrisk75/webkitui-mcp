@@ -1,8 +1,9 @@
+import { homedir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import path from "node:path";
 
-const serverEntry = "/Users/kevinnadjarian/GitHub/webkitui-mcp/dist/index.js";
+const serverEntry = `${homedir()}/GitHub/webkitui-mcp/dist/index.js`;
 
 async function callTool(client, name, args = {}) {
   const res = await client.callTool({ name, arguments: args });
