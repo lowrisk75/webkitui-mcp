@@ -1545,6 +1545,35 @@ struct WebKitRuntimeTests {
       "the click did not reach the control inside the frame")
   }
 
+  @Test("A page holding an unreadable frame says so as plainly as a truncated one")
+  func crossOriginFrameIsAnnouncedLoudly() async throws {
+    // Same-origin frames are readable now; cross-origin ones never will be. That is not
+    // the problem — being quiet about it is. An agent that reads a page as complete
+    // when part of it was never legible concludes things are absent that are on screen,
+    // which is exactly how a user was told a finished declaration was missing.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Mixed frames</title>
+      <style>html,body{margin:0} iframe{border:0;width:400px;height:120px}</style>
+      <button aria-label="Readable control">Outer</button>
+      <iframe srcdoc="&lt;button aria-label='Inner readable'&gt;In&lt;/button&gt;"></iframe>
+      <iframe src="data:text/html,&lt;button&gt;opaque&lt;/button&gt;"></iframe>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/mixed"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(150))
+
+    let observation = try await runtime.observe()
+    let names = observation.elements.compactMap { $0.accessibleName?.segments.first?.text }
+    #expect(names.contains("Readable control"))
+    #expect(names.contains("Inner readable"))
+
+    // The part that could not be read is counted and named as such.
+    #expect(observation.crossOriginFramesOpaque)
+    #expect(observation.unreadableFrameCount >= 1)
+    #expect(observation.isComplete == false)
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

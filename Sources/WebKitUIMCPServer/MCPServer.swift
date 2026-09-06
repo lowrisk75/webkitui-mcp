@@ -601,6 +601,8 @@ public final class WebKitMCPServer {
         // A computed property is not encoded, and this one must never be missing from
         // the payload a caller actually reads.
         observed["observation_is_partial"] = .bool(observation.isPartial)
+        observed["unreadable_frame_count"] = .int(Int64(observation.unreadableFrameCount))
+        observed["observation_is_complete"] = .bool(observation.isComplete)
         observed["file_picker_visible"] = .bool(runtime.isFilePickerVisible())
         return try toolResult(structured: .object(observed), modern: modern)
       case "browser_inspect_element":
@@ -3301,6 +3303,11 @@ public final class WebKitMCPServer {
       // Said plainly, because reading a partial observation as the whole page is how a
       // declaration that was on screen got reported to a user as missing.
       "observation_is_partial": .bool(observation.isPartial),
+      // Same-origin frames are read; a cross-origin one never can be. Said plainly,
+      // because a page read as complete when part of it was never legible is how an
+      // absence gets reported as a fact.
+      "unreadable_frame_count": .int(Int64(observation.unreadableFrameCount)),
+      "observation_is_complete": .bool(observation.isComplete),
       "elementOffset": .int(Int64(observation.elementOffset)),
       "nextElementOffset": observation.nextElementOffset.map { .int(Int64($0)) } ?? .null,
       "semanticTextTruncated": .bool(observation.semanticTextTruncated),

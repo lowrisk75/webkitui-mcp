@@ -224,6 +224,13 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// observation as the whole page concludes things are absent that are on screen —
   /// which is how a complete declaration was reported to a user as missing.
   public var isPartial: Bool { totalElementCount > elements.count }
+  /// Frames whose content could not be read at all. Same-origin frames are walked;
+  /// a cross-origin one never can be, and staying quiet about it is how a page gets
+  /// read as complete when part of it was never legible.
+  public let unreadableFrameCount: Int
+  /// Everything on this page was both returned and legible. Anything less has to be
+  /// said out loud, or an absence gets reported as a fact.
+  public var isComplete: Bool { !isPartial && unreadableFrameCount == 0 }
   public let semanticTextTruncated: Bool
   public let crossOriginFramesOpaque: Bool
   /// Controls the raw DOM renders, counted independently of the semantic matcher.
@@ -755,6 +762,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       elementOffset: elementOffset,
       nextElementOffset: elementOffset + elements.count < raw.totalElementCount
         ? elementOffset + elements.count : nil,
+      unreadableFrameCount: raw.crossOriginFrameCount,
       semanticTextTruncated: raw.semanticTextTruncated,
       crossOriginFramesOpaque: raw.crossOriginFrameCount > 0,
       renderedInteractiveCount: raw.renderedInteractiveCount,
@@ -3904,8 +3912,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           }
         };
       });
+    // Counted through the whole tree, frames nested inside readable frames included:
+    // an unreadable region one level down is exactly as invisible as one at the top.
     let crossOriginFrameCount = 0;
-    for (const frame of document.querySelectorAll('iframe')) {
+    for (const frame of deepQueryAll(document, 'iframe, frame')) {
       try { if (!frame.contentDocument) crossOriginFrameCount += 1; }
       catch { crossOriginFrameCount += 1; }
     }
