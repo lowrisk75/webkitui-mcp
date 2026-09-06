@@ -1451,6 +1451,34 @@ struct WebKitRuntimeTests {
     #expect(final.generation > 1)
   }
 
+  @Test("A navigation that lands somewhere else says so")
+  func navigationReportsARedirect() async throws {
+    // Play Console sends app-content and app-content/target-audience to app-list. The
+    // landing URL was reported truthfully, but nothing marked it as a redirect, so the
+    // real slugs had to be hunted by reading hrefs off an index page. Comparing two
+    // strings is the agent's job only if it is told there is a comparison to make.
+    let runtime = WebKitRuntime()
+    let arrival = try await runtime.loadHTML(
+      "<!doctype html><title>Landing</title><p>Arrived</p>",
+      baseURL: URL(string: "https://fixture.invalid/app-list"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    #expect(arrival.requestedURL == "https://fixture.invalid/app-list")
+    #expect(arrival.url == arrival.requestedURL)
+    #expect(arrival.redirected == false)
+
+    // Same shape as the console's: the destination is real, and it is not the one that
+    // was asked for.
+    let elsewhere = WebKitNavigationResult(
+      documentID: arrival.documentID,
+      url: "https://play.google.com/console/u/0/developers/1/app-list",
+      requestedURL: "https://play.google.com/console/u/0/developers/1/app-content",
+      readiness: arrival.readiness,
+      elapsedNanoseconds: 0,
+      mutationCount: 0)
+    #expect(elsewhere.redirected)
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

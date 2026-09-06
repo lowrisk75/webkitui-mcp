@@ -97,6 +97,11 @@ public enum PageReadiness: String, Codable, Equatable, Sendable {
 public struct WebKitNavigationResult: Codable, Equatable, Sendable {
   public let documentID: String
   public let url: String
+  /// Where the caller asked to go. A single-page console sends several real paths to a
+  /// dashboard, and the landing URL alone left an agent to notice the difference by
+  /// comparing strings it was never told to compare.
+  public let requestedURL: String
+  public var redirected: Bool { requestedURL != url }
   public let readiness: PageReadiness
   public let elapsedNanoseconds: UInt64
   public let mutationCount: UInt64
@@ -570,6 +575,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     return WebKitNavigationResult(
       documentID: documentID,
       url: agentSafeURLString(loadedURL) ?? "about:blank",
+      // loadHTML is asked for a base URL and lands on it, so the two agree by
+      // construction; the field exists for the request that does not.
+      requestedURL: baseURL.flatMap(agentSafeURLString) ?? "about:blank",
       readiness: readiness,
       elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
       mutationCount: state.mutationCount
@@ -2322,6 +2330,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     return WebKitNavigationResult(
       documentID: documentID,
       url: agentSafeURLString(loadedURL) ?? "about:blank",
+      requestedURL: request.url.flatMap(agentSafeURLString) ?? "about:blank",
       readiness: readiness,
       elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
       mutationCount: state.mutationCount

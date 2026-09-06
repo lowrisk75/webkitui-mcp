@@ -2472,6 +2472,10 @@ public final class WebKitMCPServer {
         )
       }
       var structured = try requireObject(.encoded(result), named: "navigation result")
+      // A computed property is not encoded, and an agent should not have to notice a
+      // redirect by diffing two strings it was never told to compare. Several real
+      // console paths land somewhere else entirely.
+      structured["redirected"] = .bool(result.redirected)
       if let delegationID = pending.goalDelegationID {
         structured["authorization"] = .object([
           "mode": .string("goal_delegation"),
