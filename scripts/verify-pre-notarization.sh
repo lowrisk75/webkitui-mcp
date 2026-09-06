@@ -139,5 +139,29 @@ done
 app_details=$(codesign -dv --verbose=4 "$app" 2>&1)
 printf '%s\n' "$app_details" | grep -q 'Sealed Resources version='
 
+# Every check above passed on a build whose confirmation helper died on launch:
+# AppKit throws on a window collection behavior naming two mutually exclusive
+# flags, so the panel never drew and no navigation could ever be approved. A
+# signature says nothing about whether the thing runs. Start it for real.
+confirmation_probe="$scratch_dir/confirmation-probe.json"
+cat > "$confirmation_probe" <<'PROBE'
+{"title":"Pre-notarization probe","message":"Destination: https://example.invalid/","approveLabel":"Navigate"}
+PROBE
+"$helper" --protocol-version 1 --request-stdin < "$confirmation_probe" \
+  >/dev/null 2>"$scratch_dir/confirmation-probe.err" &
+probe_pid=$!
+sleep 3
+if kill -0 "$probe_pid" 2>/dev/null; then
+  kill "$probe_pid" 2>/dev/null || true
+  wait "$probe_pid" 2>/dev/null || true
+else
+  wait "$probe_pid" 2>/dev/null
+  probe_status=$?
+  printf '%s\n' \
+    "confirmation helper exited with $probe_status instead of presenting a prompt:" >&2
+  cat "$scratch_dir/confirmation-probe.err" >&2
+  exit 1
+fi
+
 printf '%s\n' \
   "Pre-notarization verification passed for WebKitUI MCP $version ($build), Team $expected_team. No upload was performed."
