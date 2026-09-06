@@ -7,7 +7,7 @@
       "type": "application",
       "bom-ref": "pkg:generic/webkitui-mcp@0.6.1",
       "name": "WebKitUI MCP",
-      "version": "0.6.1",
+      "version": "0.6.4",
       "licenses": [
         {
           "license": {
