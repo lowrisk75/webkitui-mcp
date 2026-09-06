@@ -2,7 +2,7 @@
 
 ## Current license
 
-WebKitUI MCP 0.6.4 Developer Preview is licensed under the
+WebKitUI MCP 0.6.5 Developer Preview is licensed under the
 [Business Source License 1.1](LICENSE). The source is available to read, audit
 and modify. Production use is granted for personal noncommercial use, qualifying
 noncommercial organization use, and evaluation; commercial production use

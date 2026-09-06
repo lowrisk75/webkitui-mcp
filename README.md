@@ -139,6 +139,21 @@ codex mcp add webkitui-mcp -- "$HOME/.local/bin/webkitui-mcp"
 claude mcp add --scope user webkitui-mcp -- "$HOME/.local/bin/webkitui-mcp"
 ```
 
+Install the two together and leave them side by side. Before showing a
+confirmation the server checks the helper next to it, and what it can demand
+depends on how the server itself is signed:
+
+- a **notarized** server pins its Developer ID team and the exact identifier the
+  release script stamps, so nobody can drop a helper of their own beside it;
+- a server **built from source** is ad-hoc signed and has neither, so the check
+  can only require that the helper sits next to it under its own name. That
+  gives nothing away: whoever can write a helper beside an unsigned server can
+  replace that server too.
+
+Mixing the two is refused in both directions. If you re-sign one binary, re-sign
+the other with the same identity, or the confirmation will not appear and every
+navigation will fail closed.
+
 For authenticated sessions that must survive Codex conversation reconnects,
 build the self-contained app instead:
 
@@ -147,7 +162,7 @@ scripts/package-preview.sh dist
 scripts/verify-package-preview.sh dist
 ```
 
-Unzip `WebKitUI-MCP-0.6.4-preview.zip`, move `WebKitUI MCP.app` to the
+Unzip `WebKitUI-MCP-0.6.5-preview.zip`, move `WebKitUI MCP.app` to the
 Applications folder, and open it. In the status window:
 
 1. Enable **Launch at Login**. macOS may require approval in System Settings.
@@ -264,7 +279,7 @@ The first measured local lane uses 30 runs of the same deterministic fixture at 
 
 ## Licensing
 
-WebKitUI MCP 0.6.4 Developer Preview is available under the
+WebKitUI MCP 0.6.5 Developer Preview is available under the
 [Business Source License 1.1](LICENSE). The source is readable, auditable and
 modifiable; production use is granted for personal noncommercial, qualifying
 noncommercial organization and evaluation use, and commercial production use
