@@ -34,7 +34,8 @@ struct WebKitUIMCPCLI {
           Native WebKit MCP server. Reads newline-delimited JSON-RPC from stdin and writes responses to stdout.
 
           License commands exercise optional preview entitlement plumbing. They do
-          not gate capabilities or alter rights granted by MIT. Keys never enter MCP.
+          not gate capabilities or alter the rights the licence grants. Keys never
+          enter MCP.
 
           doctor performs local, secret-free readiness checks. It never authenticates,
           opens a website, contacts the license service, or reads browser data.
