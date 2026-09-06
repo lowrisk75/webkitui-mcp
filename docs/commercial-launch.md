@@ -1,5 +1,10 @@
 # WebKitUI MCP launch strategy
 
+> **Correction, 2026-09-06.** Ce document décrit une décision MIT qui a été
+> annulée. La licence effective est la **Business Source License 1.1**
+> (Change Date 2030-08-28, puis Apache 2.0). Voir `LICENSE` et `LICENSING.md`,
+> qui font foi. Le texte ci-dessous est conservé comme trace historique.
+
 Status: **superseded commercial-license plan; MIT Developer Preview selected**.
 
 WebKitUI MCP 0.6.1 Developer Preview is intended to launch free of charge under

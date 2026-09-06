@@ -1,5 +1,10 @@
 # WebKitUI MCP — FULL SOTA product plan
 
+> **Correction, 2026-09-06.** Ce document décrit une décision MIT qui a été
+> annulée. La licence effective est la **Business Source License 1.1**
+> (Change Date 2030-08-28, puis Apache 2.0). Voir `LICENSE` et `LICENSING.md`,
+> qui font foi. Le texte ci-dessous est conservé comme trace historique.
+
 Date: 2026-08-29
 Status: historical checkpoint; its commercial-license assumptions were
 superseded by the MIT 0.6.1 Developer Preview decision on 2026-09-03. Physical,
