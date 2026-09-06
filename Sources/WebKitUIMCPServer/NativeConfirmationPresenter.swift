@@ -190,15 +190,57 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
       FileManager.default.isExecutableFile(atPath: helper.path),
       let helperIdentity = validatedSigningIdentity(at: helper),
       let executableIdentity = validatedSigningIdentity(at: executable),
-      helperIdentity.team == executableIdentity.team,
-      helperIdentity.identifier == "com.lorislab.webkitui-mcp.confirm"
+      helperIsTrusted(
+        helperTeam: helperIdentity.team,
+        helperIdentifier: helperIdentity.identifier,
+        serverTeam: executableIdentity.team)
     else {
       return false
     }
     return true
   }
 
-  private static func validatedSigningIdentity(at url: URL) -> (team: String, identifier: String)? {
+  /// The identifier the release signing script stamps on the packaged helper.
+  nonisolated static let releaseHelperIdentifier = "com.lorislab.webkitui-mcp.confirm"
+
+  /// The identifier an unsigned `swift build` product carries: its own file name.
+  nonisolated static let sourceBuildHelperIdentifier = "webkitui-mcp-confirm"
+
+  /// Whether the helper sitting beside the server may be run.
+  ///
+  /// A notarized server pins both its team and the exact identifier the release script
+  /// stamps, and that is where this check has teeth: nobody can drop a helper of their own
+  /// next to it. A server built from source has neither — an ad-hoc signature carries no
+  /// team, and the identifier is just the file name — and demanding the release values
+  /// there made the documented source install refuse to show any confirmation at all, so
+  /// the product did nothing for everyone but the release signer. For such a server the
+  /// check can only assert co-location and the plain executable name, which gives nothing
+  /// away: whoever can write a helper beside an unsigned server can replace that server
+  /// too.
+  ///
+  /// What is never allowed is the mismatch — a signed server with a helper that is not its
+  /// own, or an unsigned helper smuggled in beside a signed one.
+  nonisolated static func helperIsTrusted(
+    helperTeam: String?,
+    helperIdentifier: String,
+    serverTeam: String?
+  ) -> Bool {
+    switch (helperTeam, serverTeam) {
+    case let (helper?, server?):
+      return helper == server && helperIdentifier == releaseHelperIdentifier
+    case (nil, nil):
+      return helperIdentifier == sourceBuildHelperIdentifier
+        || helperIdentifier == releaseHelperIdentifier
+    default:
+      return false
+    }
+  }
+
+  /// A source build is ad-hoc signed and carries no team, so demanding one made every
+  /// installation built from this repository refuse to show a confirmation at all. The
+  /// team is now optional here and compared by `verifyPackagedHelper`, which is where the
+  /// decision about what an absent team means belongs.
+  static func validatedSigningIdentity(at url: URL) -> (team: String?, identifier: String)? {
     var code: SecStaticCode?
     guard
       SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(), &code) == errSecSuccess,
@@ -217,17 +259,18 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
         code, SecCSFlags(rawValue: kSecCSSigningInformation),
         &information) == errSecSuccess,
       let values = information as? [CFString: Any],
-      let team = values[kSecCodeInfoTeamIdentifier] as? String,
       let identifier = values[kSecCodeInfoIdentifier] as? String,
-      !team.isEmpty,
       !identifier.isEmpty
     else {
       return nil
     }
+    let team = (values[kSecCodeInfoTeamIdentifier] as? String).flatMap {
+      $0.isEmpty ? nil : $0
+    }
     return (team, identifier)
   }
 
-  private static func verifyRunningHelper(_ processID: pid_t, matches helperURL: URL) -> Bool {
+  static func verifyRunningHelper(_ processID: pid_t, matches helperURL: URL) -> Bool {
     guard let expected = validatedSigningIdentity(at: helperURL) else { return false }
     var code: SecCode?
     guard
@@ -250,10 +293,12 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
       SecCodeCopySigningInformation(
         staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
       let values = information as? [CFString: Any],
-      let team = values[kSecCodeInfoTeamIdentifier] as? String,
       let identifier = values[kSecCodeInfoIdentifier] as? String
     else {
       return false
+    }
+    let team = (values[kSecCodeInfoTeamIdentifier] as? String).flatMap {
+      $0.isEmpty ? nil : $0
     }
     return team == expected.team && identifier == expected.identifier
   }
