@@ -54,7 +54,9 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     // and no entitlement changes that. What it does allow is staying on top: a
     // confirmation that hides behind the operator's terminal is one they never answer.
     panel.level = .modalPanel
-    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .moveToActiveSpace]
+    // canJoinAllSpaces and moveToActiveSpace are mutually exclusive; AppKit throws on
+    // the pair, which killed the helper before it drew anything.
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     panel.center()
 
     let root = NSVisualEffectView()
@@ -105,6 +107,10 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     detailsView.textContainer?.containerSize = NSSize(
       width: 0, height: CGFloat.greatestFiniteMagnitude)
     detailsView.setAccessibilityLabel(detailsAccessibilityLabel)
+    // Selectable text takes first responder and holds on to Tab, which is why the
+    // operator pressed Tab in a foreground window and nothing moved. Keeping it out of
+    // the explicit key view loop below is what stops that; VoiceOver still reaches the
+    // text through the accessibility tree.
 
     let detailsScroller = NSScrollView()
     detailsScroller.documentView = detailsView
@@ -159,6 +165,12 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
       approve.heightAnchor.constraint(equalToConstant: 34),
     ])
 
+    // An explicit two-button loop, rather than trusting whatever AppKit infers from a
+    // stack view wrapping a scroll view: Tab must always land on a button and nowhere
+    // else, and it must be verifiable by reading this rather than by trying it.
+    panel.autorecalculatesKeyViewLoop = false
+    cancel.nextKeyView = approve
+    approve.nextKeyView = cancel
     // Cancel, never Navigate: the first thing the keyboard reaches must be the refusal.
     panel.initialFirstResponder = cancel
   }

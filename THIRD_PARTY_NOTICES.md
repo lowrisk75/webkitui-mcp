@@ -1,6 +1,6 @@
 # Third-party notices
 
-WebKitUI MCP 0.6.2 Developer Preview is built from the Swift package in this
+WebKitUI MCP 0.6.3 Developer Preview is built from the Swift package in this
 repository and has no third-party Swift package dependency.
 
 The packaged native binaries dynamically use Apple platform frameworks shipped
