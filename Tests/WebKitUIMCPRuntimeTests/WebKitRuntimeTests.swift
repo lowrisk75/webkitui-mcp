@@ -1479,6 +1479,72 @@ struct WebKitRuntimeTests {
     #expect(elsewhere.redirected)
   }
 
+  @Test("Controls inside a same-origin frame are observed, not silently absent")
+  func sameOriginFrameContentIsObserved() async throws {
+    // On the Play Console app list the page says "1 - 1 of 1", the row is on screen,
+    // and neither browser_observe nor browser_read_text returns it. contentDocument
+    // appears exactly once in the runtime — to count frames, never to read one — so
+    // nothing inside any frame has ever been visible to the tool. An agent read that
+    // absence as an absent declaration and told the user the app risked rejection.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Framed</title>
+      <style>html,body{margin:0} iframe{border:0;width:600px;height:200px}</style>
+      <button aria-label="Outer control">Outer</button>
+      <iframe srcdoc="&lt;button aria-label='Inner control'&gt;Inner&lt;/button&gt;"></iframe>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/framed"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(120))
+
+    let observation = try await runtime.observe()
+    let names = observation.elements.compactMap { $0.accessibleName?.segments.first?.text }
+    #expect(names.contains("Outer control"))
+    #expect(names.contains("Inner control"), "a same-origin frame's controls were dropped")
+  }
+
+  @Test("A click inside a frame lands inside that frame")
+  func clickInsideAFrameLandsThere() async throws {
+    // Seeing into a frame is half the job. Geometry inside one is measured against that
+    // frame, so a native click computed from it would be dispatched at those numbers in
+    // the top-level window and land wherever the frame's offset happens to point.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Framed click</title>
+      <style>html,body{margin:0} #spacer{height:180px} iframe{border:0;width:600px;height:200px}</style>
+      <div id="spacer"></div>
+      <iframe id="f" srcdoc="
+        &lt;style&gt;body{margin:0}&lt;/style&gt;
+        &lt;div style='height:60px'&gt;&lt;/div&gt;
+        &lt;button aria-label='Inner action' onclick=&quot;this.setAttribute('aria-label','Inner done')&quot;&gt;Go&lt;/button&gt;
+      "></iframe>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/framed-click"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(150))
+
+    let observation = try await runtime.observe()
+    let inner = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Inner action" })
+    // Reported where a person sees it: below the spacer and the frame's own offset,
+    // not at the sixty pixels the frame measures internally.
+    #expect(inner.boundingBox.y > 200)
+
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: inner.elementID,
+      operation: .click,
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    #expect(result.trustedUserGesture)
+
+    let after = try await runtime.observe()
+    #expect(
+      after.elements.contains { $0.accessibleName?.segments.first?.text == "Inner done" },
+      "the click did not reach the control inside the frame")
+  }
+
   @Test("Open shadow DOM controls remain observable and actionable")
   func openShadowDOMControls() async throws {
     let runtime = WebKitRuntime()

@@ -3226,6 +3226,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         matches.push(...current.querySelectorAll(selector));
         for (const host of current.querySelectorAll('*')) {
           if (host.shadowRoot) roots.push(host.shadowRoot);
+          // A same-origin frame is part of the page a person sees. Skipping it made
+          // every control inside one invisible, which an agent reads as absent.
+          if (host.localName === 'iframe' || host.localName === 'frame') {
+            let inner = null;
+            try { inner = host.contentDocument; } catch { inner = null; }
+            if (inner) roots.push(inner);
+          }
         }
       }
       return matches;
@@ -3303,6 +3310,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         matches.push(...current.querySelectorAll(selector));
         for (const host of current.querySelectorAll('*')) {
           if (host.shadowRoot) roots.push(host.shadowRoot);
+          // A same-origin frame is part of the page a person sees. Skipping it made
+          // every control inside one invisible, which an agent reads as absent.
+          if (host.localName === 'iframe' || host.localName === 'frame') {
+            let inner = null;
+            try { inner = host.contentDocument; } catch { inner = null; }
+            if (inner) roots.push(inner);
+          }
         }
       }
       return matches;
@@ -3394,10 +3408,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // own click: Material paints the box in a sibling that covers it. Hit testing is
     // the only way to tell, and without it every radio on the page costs a failed
     // round trip reported as indeterminate.
-    const hitAtCentreOf = box => {
-      const x = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const y = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      let hit = document.elementFromPoint(x, y);
+    // Hit testing belongs to the document the element lives in, at that document's own
+    // coordinates. Asking the top-level document about a point measured inside a frame
+    // answers about whatever sits at those numbers in the outer page.
+    const hitAtCentreOfLocal = (node, box) => {
+      const owner = node?.ownerDocument ?? document;
+      const view = owner.defaultView ?? window;
+      const x = Math.min(view.innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const y = Math.min(view.innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      let hit = owner.elementFromPoint(x, y);
       while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
         const nested = hit.shadowRoot.elementFromPoint(x, y);
         if (!nested || nested === hit) break;
@@ -3414,7 +3433,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const receivesOwnEvents = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0)) return false;
-      return hitReaches(hitAtCentreOf(box), element);
+      return hitReaches(hitAtCentreOfLocal(element, box), element);
     };
     // An ordinal path from the document root. Structure is never identity — a recycled
     // row keeps its position while meaning changes — so this only ever separates
@@ -3435,6 +3454,38 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (steps.length >= 32) break;
       }
       return steps.reverse().join('/');
+    };
+    // Offset of an element's own frame within the top-level viewport. Geometry inside a
+    // frame is measured against that frame, so a click computed from it would land
+    // wherever that offset happens to be — usually somewhere else entirely.
+    const frameOffsetOf = element => {
+      let offsetX = 0;
+      let offsetY = 0;
+      let view = element?.ownerDocument?.defaultView ?? null;
+      let guard = 0;
+      while (view && view !== window && guard < 16) {
+        let host = null;
+        try { host = view.frameElement; } catch { host = null; }
+        if (!host) break;
+        const box = host.getBoundingClientRect();
+        offsetX += box.left;
+        offsetY += box.top;
+        view = host.ownerDocument?.defaultView ?? null;
+        guard += 1;
+      }
+      return { x: offsetX, y: offsetY };
+    };
+    // A rect in top-level viewport coordinates, whatever frame the element lives in.
+    const viewportRectOf = element => {
+      const box = element.getBoundingClientRect();
+      const offset = frameOffsetOf(element);
+      if (offset.x === 0 && offset.y === 0) return box;
+      return {
+        x: box.x + offset.x, y: box.y + offset.y,
+        left: box.left + offset.x, top: box.top + offset.y,
+        right: box.right + offset.x, bottom: box.bottom + offset.y,
+        width: box.width, height: box.height
+      };
     };
     const soleControl =
       'input, button, select, textarea, a[href], summary,'
@@ -3479,10 +3530,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
         return 'disabled';
       }
-      if (box.bottom <= 0 || box.right <= 0 || box.top >= innerHeight || box.left >= innerWidth) {
+      const visible = viewportRectOf(surface);
+      if (visible.bottom <= 0 || visible.right <= 0
+          || visible.top >= innerHeight || visible.left >= innerWidth) {
         return 'off_viewport';
       }
-      return hitReaches(hitAtCentreOf(box), element, surface) ? 'actionable' : 'covered';
+      return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
+        ? 'actionable' : 'covered';
     };
     const classTokens = element => collapse(element?.getAttribute?.('class'));
     const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
@@ -3717,6 +3771,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       .map(element => {
         const surface = controlSurfaceOf(element) || element;
         const actionability = actionabilityOf(element, surface);
+        // Reported where a person sees it, not where its own frame measures it.
+        const reportedBox = viewportRectOf(surface);
         // A control nobody can see is reported so the agent knows it exists and what it
         // is called. What is written inside it is a different matter: reading the value
         // of a box the user cannot see is exactly the leak the visibility filter was
@@ -3842,7 +3898,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           stableAttributes: stableAttributesOf(element, sensitive),
           visible: actionability !== 'no_layout_box' && actionability !== 'not_visible',
           actionability,
-          boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height }
+          boundingBox: {
+            x: reportedBox.x, y: reportedBox.y,
+            width: reportedBox.width, height: reportedBox.height
+          }
         };
       });
     let crossOriginFrameCount = 0;
@@ -3962,6 +4021,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         matches.push(...current.querySelectorAll(selector));
         for (const host of current.querySelectorAll('*')) {
           if (host.shadowRoot) roots.push(host.shadowRoot);
+          // A same-origin frame is part of the page a person sees. Skipping it made
+          // every control inside one invisible, which an agent reads as absent.
+          if (host.localName === 'iframe' || host.localName === 'frame') {
+            let inner = null;
+            try { inner = host.contentDocument; } catch { inner = null; }
+            if (inner) roots.push(inner);
+          }
         }
       }
       return matches;
@@ -4073,10 +4139,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // own click: Material paints the box in a sibling that covers it. Hit testing is
     // the only way to tell, and without it every radio on the page costs a failed
     // round trip reported as indeterminate.
-    const hitAtCentreOf = box => {
-      const x = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const y = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      let hit = document.elementFromPoint(x, y);
+    // Hit testing belongs to the document the element lives in, at that document's own
+    // coordinates. Asking the top-level document about a point measured inside a frame
+    // answers about whatever sits at those numbers in the outer page.
+    const hitAtCentreOfLocal = (node, box) => {
+      const owner = node?.ownerDocument ?? document;
+      const view = owner.defaultView ?? window;
+      const x = Math.min(view.innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const y = Math.min(view.innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      let hit = owner.elementFromPoint(x, y);
       while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
         const nested = hit.shadowRoot.elementFromPoint(x, y);
         if (!nested || nested === hit) break;
@@ -4093,7 +4164,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const receivesOwnEvents = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0)) return false;
-      return hitReaches(hitAtCentreOf(box), element);
+      return hitReaches(hitAtCentreOfLocal(element, box), element);
     };
     // An ordinal path from the document root. Structure is never identity — a recycled
     // row keeps its position while meaning changes — so this only ever separates
@@ -4114,6 +4185,38 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (steps.length >= 32) break;
       }
       return steps.reverse().join('/');
+    };
+    // Offset of an element's own frame within the top-level viewport. Geometry inside a
+    // frame is measured against that frame, so a click computed from it would land
+    // wherever that offset happens to be — usually somewhere else entirely.
+    const frameOffsetOf = element => {
+      let offsetX = 0;
+      let offsetY = 0;
+      let view = element?.ownerDocument?.defaultView ?? null;
+      let guard = 0;
+      while (view && view !== window && guard < 16) {
+        let host = null;
+        try { host = view.frameElement; } catch { host = null; }
+        if (!host) break;
+        const box = host.getBoundingClientRect();
+        offsetX += box.left;
+        offsetY += box.top;
+        view = host.ownerDocument?.defaultView ?? null;
+        guard += 1;
+      }
+      return { x: offsetX, y: offsetY };
+    };
+    // A rect in top-level viewport coordinates, whatever frame the element lives in.
+    const viewportRectOf = element => {
+      const box = element.getBoundingClientRect();
+      const offset = frameOffsetOf(element);
+      if (offset.x === 0 && offset.y === 0) return box;
+      return {
+        x: box.x + offset.x, y: box.y + offset.y,
+        left: box.left + offset.x, top: box.top + offset.y,
+        right: box.right + offset.x, bottom: box.bottom + offset.y,
+        width: box.width, height: box.height
+      };
     };
     const soleControl =
       'input, button, select, textarea, a[href], summary,'
@@ -4158,10 +4261,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
         return 'disabled';
       }
-      if (box.bottom <= 0 || box.right <= 0 || box.top >= innerHeight || box.left >= innerWidth) {
+      const visible = viewportRectOf(surface);
+      if (visible.bottom <= 0 || visible.right <= 0
+          || visible.top >= innerHeight || visible.left >= innerWidth) {
         return 'off_viewport';
       }
-      return hitReaches(hitAtCentreOf(box), element, surface) ? 'actionable' : 'covered';
+      return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
+        ? 'actionable' : 'covered';
     };
     const surfaceOf = element => controlSurfaceOf(element) || element;
     const directLabelledText = element => {
@@ -4346,7 +4452,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       .filter(criterion => !candidates.some(element => matchesCriterion(element, criterion)))
       .map(reportedFactName);
     const describe = element => {
-      const box = surfaceOf(element).getBoundingClientRect();
+      // The native dispatch computes a screen point from this, so it has to be in
+      // top-level coordinates or the click lands at the frame's offset instead.
+      const box = viewportRectOf(surfaceOf(element));
       let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
       if (!physicalIdentity) {
         physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
@@ -4543,7 +4651,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
-      const box = surface.getBoundingClientRect();
+      const box = viewportRectOf(surface);
       const tolerance = 0.5;
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
@@ -4553,14 +4661,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         && style.display !== 'none';
       const enabled = !element.matches(':disabled')
         && element.getAttribute('aria-disabled') !== 'true';
-      const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      let hit = document.elementFromPoint(centerX, centerY);
-      while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
-        const nested = hit.shadowRoot.elementFromPoint(centerX, centerY);
-        if (!nested || nested === hit) break;
-        hit = nested;
-      }
+      // box is in top-level coordinates for dispatch; hit testing needs the element's
+      // own document and its own coordinates, or a frame's content answers for the
+      // outer page.
+      let hit = hitAtCentreOfLocal(surface, surface.getBoundingClientRect());
       const composedContains = (ancestor, node) => {
         for (let cursor = node; cursor; cursor = composedParent(cursor)) {
           if (cursor === ancestor) return true;
@@ -4647,7 +4751,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
-      const box = surface.getBoundingClientRect();
+      const box = viewportRectOf(surface);
       const tolerance = 0.5;
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
@@ -4657,9 +4761,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         && style.display !== 'none' && Number(style.opacity) !== 0;
       const enabled = !element.matches(':disabled')
         && element.getAttribute('aria-disabled') !== 'true';
-      const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      const hit = document.elementFromPoint(centerX, centerY);
+      // Hit testing in the element's own document: box is in top-level coordinates so
+      // the dispatch lands correctly, but a frame answers only about its own points.
+      const hit = hitAtCentreOfLocal(surface, surface.getBoundingClientRect());
       const receivesEvents = Boolean(hit && (
         hit === element || element.contains(hit) || hit === surface || surface.contains(hit)
       ));
@@ -4686,7 +4790,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
-      const box = surface.getBoundingClientRect();
+      const box = viewportRectOf(surface);
       const tolerance = 0.5;
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
@@ -4721,7 +4825,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
-      const box = surface.getBoundingClientRect();
+      const box = viewportRectOf(surface);
       const tolerance = 0.5;
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
@@ -4785,9 +4889,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       const tolerance = 0.5;
       if (!['x', 'y', 'width', 'height'].every(key =>
           Math.abs(box[key] - expectedBox[key]) <= tolerance)) return false;
-      const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      const hit = document.elementFromPoint(centerX, centerY);
+      // This script stands alone and never leaves the top-level document: a credential
+      // field is only ever filled where the human confirmed it.
+      const centreX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const centreY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      const hit = document.elementFromPoint(centreX, centreY);
       return Boolean(hit && (hit === element || element.contains(hit)));
     };
     if (!stable(usernameElement, usernameExpectedBox, false)
