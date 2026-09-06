@@ -17,11 +17,11 @@ notarized_sha=1bf0814efb2d38644da6df209cce830137c1997410a54f8a18ee3190bbc43849
 installed_broker_sha=2c4a5fcd87dfbad74984c171e944e3bbf1d71383edf7167addc2c763c052f76d
 
 notarized_zip="$project_root/audit-output/notarized-v6-fa35c9f-d784ca69/WebKitUI-MCP-0.6.0-notarized.zip"
-installed_app="/Users/kevinnadjarian/Applications/WebKitUI MCP.app"
+installed_app="$HOME/Applications/WebKitUI MCP.app"
 installed_broker="$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker"
-broker_socket="/Users/kevinnadjarian/Library/Application Support/WebkitUIMCP/mcp.sock"
-worker_repo=${WEBKITUI_V6_WORKER_REPO:-/Users/kevinnadjarian/GitHub/throttle-license-worker}
-site_repo=${WEBKITUI_V6_SITE_REPO:-/Users/kevinnadjarian/GitHub/lorislab-website}
+broker_socket="$HOME/Library/Application Support/WebkitUIMCP/mcp.sock"
+worker_repo=${WEBKITUI_V6_WORKER_REPO:-$HOME/GitHub/throttle-license-worker}
+site_repo=${WEBKITUI_V6_SITE_REPO:-$HOME/GitHub/lorislab-website}
 
 gates=(
   local_artifact

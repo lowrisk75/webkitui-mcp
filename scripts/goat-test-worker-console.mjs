@@ -9,12 +9,14 @@
 // tracker is already listening. (Hiding the manifest before launch instead
 // races the service worker's eager top-level connect() against our tracker's
 // async CDP attach chain — confirmed empirically to lose that race.)
+import { homedir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { execSync } from "node:child_process";
 
-const serverEntry = "/Users/kevinnadjarian/GitHub/webkitui-mcp/dist/index.js";
-const extensionPath = "/Users/kevinnadjarian/GitHub/RGPD/dlp-endpoint/extension";
+const serverEntry = `${homedir()}/GitHub/webkitui-mcp/dist/index.js`;
+// Supplied by the operator: naming an unrelated private project here leaked it.
+const extensionPath = process.env.WEBKITUI_TEST_EXTENSION_PATH;
 
 async function callTool(client, name, args = {}) {
   const res = await client.callTool({ name, arguments: args });

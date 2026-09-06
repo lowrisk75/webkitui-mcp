@@ -4,15 +4,15 @@ set -euo pipefail
 project_root=${0:A:h:h}
 expected_version=$(plutil -extract CFBundleShortVersionString raw \
   "$project_root/Support/AquaApp/Info.plist")
-installed_app="/Users/kevinnadjarian/Applications/WebKitUI MCP.app"
+installed_app="$HOME/Applications/WebKitUI MCP.app"
 if [[ ! -d "$installed_app" ]]; then
-  installed_app="/Users/kevinnadjarian/Applications/WebkitUIMCP Aqua.app"
+  installed_app="$HOME/Applications/WebkitUIMCP Aqua.app"
 fi
 installed_app_confirm="$installed_app/Contents/MacOS/webkitui-mcp-confirm"
-installed_cli="/Users/kevinnadjarian/.local/bin/webkitui-mcp"
-installed_cli_confirm="/Users/kevinnadjarian/.local/bin/webkitui-mcp-confirm"
-installed_relay="/Users/kevinnadjarian/.local/bin/webkitui-mcp-relay"
-broker_socket="/Users/kevinnadjarian/Library/Application Support/WebkitUIMCP/mcp.sock"
+installed_cli="$HOME/.local/bin/webkitui-mcp"
+installed_cli_confirm="$HOME/.local/bin/webkitui-mcp-confirm"
+installed_relay="$HOME/.local/bin/webkitui-mcp-relay"
+broker_socket="$HOME/Library/Application Support/WebkitUIMCP/mcp.sock"
 
 cd "$project_root"
 

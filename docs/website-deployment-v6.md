@@ -22,7 +22,7 @@ Status: **validated locally — not deployed**
   `0423f13f072d7afb5c36b7d606c2c086e67e72d5`
 - Local additions: one homepage structured-data entry, one footer link and four
   sitemap URLs.
-- Dirty user changes in `/Users/kevinnadjarian/GitHub/lorislab-website` were
+- Dirty user changes in `~/GitHub/lorislab-website` were
   not copied, modified, committed or staged.
 - Deployment credential availability was checked without printing the secret.
 

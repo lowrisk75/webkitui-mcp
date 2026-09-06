@@ -76,7 +76,7 @@ expected before notarization.
 ## Signed local installation
 
 The signed candidate was installed recoverably at
-`/Users/kevinnadjarian/Applications/WebKitUI MCP.app` after backing up the
+`~/Applications/WebKitUI MCP.app` after backing up the
 running legacy app and plist to
 `/private/tmp/webkitui-0.6.0-pre-selfcontained-rollback.5nLk9M/`.
 

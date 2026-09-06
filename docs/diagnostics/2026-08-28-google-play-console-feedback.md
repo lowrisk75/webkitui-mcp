@@ -2,8 +2,9 @@
 
 ## Scope and external boundary
 
-The report came from persistent native profile `default`, Google Play developer
-`6316651857418272089`, app `4973846706155879193`. This remediation made no
+The report came from persistent native profile `default` against one Google Play
+developer account and one app. The exact account and app identifiers are the
+operator's and are deliberately not recorded here. This remediation made no
 Google Play request and did not replay any mutation. The reported external state
 remains evidence supplied by the operator, not fresh provider verification.
 
