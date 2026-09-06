@@ -143,3 +143,14 @@
 "Close this host's sessions so another client can open one." = "Ferme les sessions de cet hôte pour qu’un autre client puisse en ouvrir une.";
 "Release the host lease?" = "Libérer le bail d’hôte ?";
 "Sessions open on this host are closed so another client can take it. Work in progress in those sessions is lost." = "Les sessions ouvertes sur cet hôte sont fermées pour qu’un autre client puisse le prendre. Le travail en cours dans ces sessions est perdu.";
+
+"Host lease released" = "Bail d’hôte libéré";
+"The host lease is free" = "Le bail d’hôte est libre";
+"The lease was not released" = "Le bail n’a pas été libéré";
+"No client holds the browser host." = "Aucun client ne détient l’hôte du navigateur.";
+"The client that held it has stopped." = "Le client qui le détenait s’est arrêté.";
+"The client was asked to stop and has not. Quit it yourself." = "Le client a été prié de s’arrêter et ne l’a pas fait. Quittez-le vous-même.";
+"The recorded client is already gone." = "Le client enregistré a déjà disparu.";
+"The recorded process is not a WebKitUI client, so it was left alone." = "Le processus enregistré n’est pas un client WebKitUI ; il a été laissé tranquille.";
+"This host holds the lease itself." = "Cet hôte détient le bail lui-même.";
+"Sessions open on this host are closed, and the client holding the lease is asked to stop, so another client can take it. Work in progress in those sessions is lost." = "Les sessions ouvertes sur cet hôte sont fermées, et le client qui détient le bail est prié de s’arrêter, pour qu’un autre client puisse le prendre. Le travail en cours dans ces sessions est perdu.";

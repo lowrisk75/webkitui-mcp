@@ -22,6 +22,11 @@ private struct ConfirmationLocalizationAudit: Encodable {
 private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
   private let panel: NSPanel
   private var approved = false
+  /// Kept so the panel can hand keyboard focus to the safe default as it opens. With no
+  /// initial first responder the operator had to click the window before Tab did
+  /// anything, which put approval out of reach of a keyboard-only operator entirely
+  /// (found by the G5 physical pass, 2026-09-06).
+  private var cancelButton: NSButton?
 
   init(
     title: String,
@@ -45,6 +50,11 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     panel.backgroundColor = .windowBackgroundColor
     panel.minSize = NSSize(width: 560, height: 420)
     panel.maxSize = NSSize(width: 820, height: 680)
+    // macOS will not hand keyboard focus to a helper launched by a background broker,
+    // and no entitlement changes that. What it does allow is staying on top: a
+    // confirmation that hides behind the operator's terminal is one they never answer.
+    panel.level = .modalPanel
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .moveToActiveSpace]
     panel.center()
 
     let root = NSVisualEffectView()
@@ -114,6 +124,7 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     cancel.bezelColor = .controlAccentColor
     cancel.keyEquivalent = "\r"
     cancel.setAccessibilityHelp(subtitle)
+    cancelButton = cancel
     let approve = NSButton(title: approveLabel, target: self, action: #selector(approveAction))
     approve.bezelStyle = .rounded
     approve.contentTintColor = .controlAccentColor
@@ -147,15 +158,51 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
       cancel.heightAnchor.constraint(equalToConstant: 34),
       approve.heightAnchor.constraint(equalToConstant: 34),
     ])
+
+    // Cancel, never Navigate: the first thing the keyboard reaches must be the refusal.
+    panel.initialFirstResponder = cancel
   }
 
   func run() -> Bool {
+    // Activation has to come first. Ordering a window front from an app that is not yet
+    // active leaves the window visible but not key, so keystrokes go to whatever the
+    // operator was using before.
+    activate()
     panel.makeKeyAndOrderFront(nil)
     panel.orderFrontRegardless()
-    NSApplication.shared.activate(ignoringOtherApps: true)
+    if let cancelButton { panel.makeFirstResponder(cancelButton) }
+    // Since macOS 14 an application that is not already frontmost is frequently refused
+    // activation outright, and this helper is started by a background broker, so the
+    // first attempt is the one most likely to be refused. Keep asking briefly: a
+    // confirmation the operator cannot type into is a confirmation they cannot refuse
+    // without reaching for the mouse.
+    scheduleActivationRetries()
     NSApplication.shared.runModal(for: panel)
     panel.orderOut(nil)
     return approved
+  }
+
+  private func activate() {
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    NSRunningApplication.current.activate(options: [.activateAllWindows])
+  }
+
+  private func scheduleActivationRetries() {
+    // Activation is granted only when the system feels like it, so ask a few times and
+    // then stop pretending. What always works is the Dock bouncing until the operator
+    // looks, and the panel being on top when they do.
+    NSApplication.shared.requestUserAttention(.criticalRequest)
+    for attempt in 1...3 {
+      DispatchQueue.main.asyncAfter(deadline: .now() + Double(attempt) * 0.2) {
+        [weak self] in
+        guard let self, self.panel.isVisible, !self.panel.isKeyWindow else { return }
+        self.activate()
+        self.panel.makeKeyAndOrderFront(nil)
+        if let cancelButton = self.cancelButton {
+          self.panel.makeFirstResponder(cancelButton)
+        }
+      }
+    }
   }
 
   @objc private func cancelAction() {
@@ -201,7 +248,10 @@ private struct WebKitUIMCPConfirm {
     }
 
     let application = NSApplication.shared
-    application.setActivationPolicy(.accessory)
+    // .accessory cannot reliably become the frontmost, key application, so the panel
+    // opened without keyboard focus. A confirmation the operator must answer is exactly
+    // the case that warrants a real foreground app for the few seconds it is up.
+    application.setActivationPolicy(.regular)
     application.activate(ignoringOtherApps: true)
 
     let controller = ConfirmationPanelController(

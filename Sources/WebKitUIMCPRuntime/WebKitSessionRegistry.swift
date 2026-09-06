@@ -661,3 +661,101 @@ public final class WebKitSessionRegistry {
     )
   }
 }
+
+/// Releasing the host lease means dislodging whoever holds the `flock` on the lock file,
+/// and that is almost never this process: the lease is taken by a client CLI in its own
+/// process. Closing the sessions this host happens to know about therefore did nothing at
+/// all in the one situation the operator reaches for the button — a client that went away
+/// without letting go (found by the G5 physical pass, 2026-09-06).
+public enum HostLeaseEviction {
+  public enum Decision: Equatable, Sendable {
+    case noHolder
+    /// The record names this very process. Signalling it would kill the host the operator
+    /// is looking at.
+    case refusedSelf(Int32)
+    /// Recorded, but gone. Nothing to signal; the lock will be free already.
+    case refusedNotRunning(Int32)
+    /// A pid is only ever recycled onto some unrelated process, so the record on its own
+    /// is never licence to send a signal. The executable behind it has to match.
+    case refusedUnrecognisedExecutable(Int32, String?)
+    case terminate(Int32)
+  }
+
+  public enum Outcome: Equatable, Sendable {
+    case noHolder
+    case refused(Decision)
+    case evicted(Int32)
+    /// Signalled, and the lock is still held after the grace period.
+    case stillHeld(Int32)
+  }
+
+  static let recognisedExecutableNames: Set<String> = [
+    "webkitui-mcp", "webkitui-mcp-aqua-broker",
+  ]
+
+  /// Pure so the refusals can be tested without signalling anything.
+  public static func decide(
+    holder: WebKitControllerHolder?,
+    selfProcessID: Int32,
+    executablePath: String?,
+    processIsRunning: Bool
+  ) -> Decision {
+    guard let holder, holder.processID > 0 else { return .noHolder }
+    let pid = holder.processID
+    guard pid != selfProcessID else { return .refusedSelf(pid) }
+    guard processIsRunning else { return .refusedNotRunning(pid) }
+    guard let executablePath,
+      recognisedExecutableNames.contains((executablePath as NSString).lastPathComponent)
+    else {
+      return .refusedUnrecognisedExecutable(pid, executablePath)
+    }
+    return .terminate(pid)
+  }
+
+  /// The lease record is only readable through the private lease type, and a default
+  /// argument in a public signature cannot name it.
+  public static func currentHolder(lockFileURL: URL?) -> WebKitControllerHolder? {
+    HostControllerLease.existingHolderIfBusy(lockFileURL: lockFileURL)
+  }
+
+  public static func executablePath(of processID: Int32) -> String? {
+    var buffer = [CChar](repeating: 0, count: 4_096)
+    let written = proc_pidpath(processID, &buffer, UInt32(buffer.count))
+    guard written > 0 else { return nil }
+    return String(cString: buffer)
+  }
+
+  /// SIGTERM only. A lease holder that ignores it is reported as still holding rather than
+  /// killed outright: losing a peer's unsaved work is the operator's call, not ours.
+  public static func evict(
+    lockFileURL: URL? = nil,
+    graceSeconds: Double = 3,
+    selfProcessID: Int32 = getpid(),
+    holderLookup: (URL?) -> WebKitControllerHolder? = currentHolder(lockFileURL:),
+    executablePathLookup: (Int32) -> String? = executablePath(of:),
+    processIsRunning: (Int32) -> Bool = WebKitControllerHolder.isProcessRunning,
+    terminate: (Int32) -> Void = { _ = kill($0, SIGTERM) },
+    sleep: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }
+  ) -> Outcome {
+    let holder = holderLookup(lockFileURL)
+    let decision = decide(
+      holder: holder,
+      selfProcessID: selfProcessID,
+      executablePath: holder.flatMap { executablePathLookup($0.processID) },
+      processIsRunning: holder.map { processIsRunning($0.processID) } ?? false)
+    switch decision {
+    case .noHolder: return .noHolder
+    case .refusedSelf, .refusedNotRunning, .refusedUnrecognisedExecutable:
+      return .refused(decision)
+    case .terminate(let pid):
+      terminate(pid)
+      var waited = 0.0
+      while waited < graceSeconds {
+        sleep(0.1)
+        waited += 0.1
+        if holderLookup(lockFileURL) == nil { return .evicted(pid) }
+      }
+      return holderLookup(lockFileURL) == nil ? .evicted(pid) : .stillHeld(pid)
+    }
+  }
+}
