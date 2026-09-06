@@ -10,7 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const serverEntry = "/Users/kevinnadjarian/GitHub/webkitui-mcp/dist/index.js";
+const serverEntry = `${homedir()}/GitHub/webkitui-mcp/dist/index.js`;
 let pass = 0;
 let fail = 0;
 
@@ -108,7 +108,7 @@ async function section3_errorPaths() {
   assert(badTab.isError && badTab.text.includes("Unknown tabId"), "switch_tab with bogus id gives clean error");
 
   const badHeadless = await callTool(client, "webkitui_launch", {
-    loadExtensionPath: "/Users/kevinnadjarian/GitHub/RGPD/dlp-endpoint/extension",
+    loadExtensionPath: process.env.WEBKITUI_TEST_EXTENSION_PATH,
     headless: true,
   });
   assert(badHeadless.isError && badHeadless.text.includes("headless"), "headless=true + extension throws clean error");

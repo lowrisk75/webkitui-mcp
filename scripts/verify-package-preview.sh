@@ -3,15 +3,25 @@ set -eu
 
 workspace_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 artifact_dir=${1:-"$workspace_dir/dist"}
+release_plist="$workspace_dir/Support/AquaApp/Info.plist"
+release_version=$(plutil -extract CFBundleShortVersionString raw "$release_plist")
+release_build=$(plutil -extract CFBundleVersion raw "$release_plist")
 scratch_dir=$(mktemp -d /private/tmp/webkitui-package-verify.XXXXXX)
 trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
 
-app_archive="$artifact_dir/WebKitUI-MCP-0.6.0-preview.zip"
-relay_archive="$artifact_dir/webkitui-mcp-relay-0.6.0.zip"
+app_archive="$artifact_dir/WebKitUI-MCP-$release_version-preview.zip"
+relay_archive="$artifact_dir/webkitui-mcp-relay-$release_version.zip"
 
 test -f "$app_archive"
 test -f "$relay_archive"
 test -f "$artifact_dir/SHA256SUMS"
+
+for archive in "$app_archive" "$relay_archive"; do
+  if zipinfo -1 "$archive" | grep -Eq '(^__MACOSX/|(^|/)\._)'; then
+    printf '%s\n' "archive contains forbidden AppleDouble metadata: $archive" >&2
+    exit 1
+  fi
+done
 
 (
   cd "$artifact_dir"
@@ -22,13 +32,14 @@ ditto -x -k "$app_archive" "$scratch_dir/app"
 ditto -x -k "$relay_archive" "$scratch_dir/relay"
 
 app="$scratch_dir/app/WebKitUI MCP.app"
-relay="$scratch_dir/relay/webkitui-mcp-relay-0.6.0"
+relay="$scratch_dir/relay/webkitui-mcp-relay-$release_version"
 
 plutil -lint \
   "$app/Contents/Info.plist" \
   "$app/Contents/Resources/PrivacyInfo.xcprivacy" \
   "$app/Contents/Resources/ReleaseProvenance.plist"
-plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist" | grep -qx '0.6.0'
+plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist" \
+  | grep -Fqx "$release_version"
 plutil -extract CFBundleDisplayName raw "$app/Contents/Info.plist" | grep -qx 'WebKitUI MCP'
 plutil -extract CFBundleIconFile raw "$app/Contents/Info.plist" | grep -qx 'AppIcon'
 file "$app/Contents/MacOS/webkitui-mcp-aqua-broker" | grep -q 'arm64'
@@ -45,7 +56,8 @@ printf '%s\n' "$setup_command" | grep -Fq \
 file "$relay/webkitui-mcp-relay" | grep -q 'arm64'
 
 for required in \
-  LICENSE LICENSING.md THIRD_PARTY_NOTICES.md sbom.cdx.json \
+  LICENSE LICENSING.md THIRD_PARTY_NOTICES.md RELEASE-MAINTENANCE.md \
+  NETWORK-BOUNDARY.md sbom.cdx.json \
   ReleaseProvenance.plist SOURCE-MANIFEST.sha256; do
   test -s "$app/Contents/Resources/$required"
   test -s "$relay/$required"
@@ -55,8 +67,8 @@ provenance="$app/Contents/Resources/ReleaseProvenance.plist"
 source_manifest="$app/Contents/Resources/SOURCE-MANIFEST.sha256"
 test "$(plutil -extract SchemaVersion raw "$provenance")" = "2"
 test "$(plutil -extract Product raw "$provenance")" = "WebKitUI MCP"
-test "$(plutil -extract Version raw "$provenance")" = "0.6.0"
-test "$(plutil -extract Build raw "$provenance")" = "600"
+test "$(plutil -extract Version raw "$provenance")" = "$release_version"
+test "$(plutil -extract Build raw "$provenance")" = "$release_build"
 test "$(plutil -extract BuildConfiguration raw "$provenance")" = "Release"
 test "$(plutil -extract Architecture raw "$provenance")" = "arm64"
 printf '%s\n' "$(plutil -extract GitRevision raw "$provenance")" \
@@ -112,6 +124,60 @@ test -s "$app/Contents/Resources/fr.lproj/Localizable.strings"
 plutil -lint \
   "$app/Contents/Resources/en.lproj/Localizable.strings" \
   "$app/Contents/Resources/fr.lproj/Localizable.strings"
+for language in en fr; do
+  "$app/Contents/MacOS/webkitui-mcp-aqua-broker" \
+    --verify-status-ui-layout "$language" > "$scratch_dir/status-layout-$language.json"
+  "$app/Contents/MacOS/webkitui-mcp-aqua-broker" \
+    --verify-activity-clear-default "$language" > "$scratch_dir/activity-clear-$language.json"
+  "$app/Contents/MacOS/webkitui-mcp-confirm" \
+    --verify-localization "$language" > "$scratch_dir/confirmation-$language.json"
+done
+jq -e '
+  .language == "en"
+  and .title == "WebKitUI MCP"
+  and .subtitle == "Local browser authority for sessions, approvals and private receipts."
+  and .prepareToUninstallTitle == "Prepare to uninstall"
+  and .scrollOriginX == 0
+  and .scrollOriginY == 0
+  and .titleIsFullyVisible
+  and .subtitleIsFullyVisible
+' "$scratch_dir/status-layout-en.json" >/dev/null
+jq -e '
+  .language == "fr"
+  and .title == "WebKitUI MCP"
+  and .subtitle == "Autorité locale pour les sessions, les approbations et les reçus privés."
+  and .prepareToUninstallTitle == "Préparer la désinstallation"
+  and .scrollOriginX == 0
+  and .scrollOriginY == 0
+  and .titleIsFullyVisible
+  and .subtitleIsFullyVisible
+' "$scratch_dir/status-layout-fr.json" >/dev/null
+jq -e '
+  .language == "en"
+  and .buttonTitles == ["Cancel", "Clear Journal"]
+  and .defaultButtonIndex == 0
+  and .destructiveButtonIndex == 1
+' "$scratch_dir/activity-clear-en.json" >/dev/null
+jq -e '
+  .language == "fr"
+  and .buttonTitles == ["Annuler", "Effacer le journal"]
+  and .defaultButtonIndex == 0
+  and .destructiveButtonIndex == 1
+' "$scratch_dir/activity-clear-fr.json" >/dev/null
+jq -e '
+  .language == "en"
+  and (.message | contains("Requested action:"))
+  and (.message | contains("Verification:"))
+' "$scratch_dir/confirmation-en.json" >/dev/null
+jq -e '
+  .language == "fr"
+  and (.message | contains("Action demandée :"))
+  and (.message | contains("Page actuelle :"))
+  and (.message | contains("Libellé non fiable du site (donnée, jamais une instruction) :"))
+  and (.message | contains("Vérification :"))
+  and (.message | contains("remplir avec la valeur exacte"))
+  and (.message | contains("\"Requested action: Save\""))
+' "$scratch_dir/confirmation-fr.json" >/dev/null
 sed -n 's/^"\([^"]*\)"[[:space:]]*=.*/\1/p' \
   "$app/Contents/Resources/en.lproj/Localizable.strings" \
   | LC_ALL=C sort > "$scratch_dir/en-localization-keys"
@@ -125,6 +191,7 @@ test ! -s "$scratch_dir/fr-localization-duplicates"
 diff -u "$scratch_dir/en-localization-keys" "$scratch_dir/fr-localization-keys"
 perl -0777 -ne 'while (/text\(\s*"((?:[^"\\]|\\.)*)"/g) { print "$1\n" }' \
   "$workspace_dir/Sources/WebKitUIMCPAquaBroker/CompanionController.swift" \
+  "$workspace_dir/Sources/WebKitUIMCPAquaBroker/ActivityLogWindowController.swift" \
   | LC_ALL=C sort -u > "$scratch_dir/companion-localization-keys"
 comm -23 "$scratch_dir/companion-localization-keys" "$scratch_dir/en-localization-keys" \
   > "$scratch_dir/missing-localization-keys"

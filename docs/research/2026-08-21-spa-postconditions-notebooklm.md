@@ -1,6 +1,6 @@
 # SPA write postconditions — NotebookLM review (2026-08-21)
 
-Notebook: `WebKITUI MPC` (private notebook ID redacted).
+Notebook: `WebKITUI MPC` (`1c877ebb-8347-46e0-8c90-720098e01dc5`).
 
 ## Source-supported
 

@@ -7,6 +7,17 @@ import WebKitUIMCPCore
 @Suite("WebKit transactional coordinator", .serialized)
 @MainActor
 struct WebKitTransactionCoordinatorTests {
+  @Test("A target-not-actionable result is uncertain and must be reconciled")
+  func targetNotActionableIsUncertain() {
+    #expect(
+      WebKitTransactionCoordinator.dispatchOutcome(for: .targetNotActionable).rawValue
+        == DispatchOutcome.unknown.rawValue)
+    #expect(
+      WebKitTransactionCoordinator.dispatchOutcome(for: .targetNotUnique(2, pinned: "detached"))
+        .rawValue
+        == DispatchOutcome.notDispatched.rawValue)
+  }
+
   @Test("A dispatched click is successful only after its postcondition")
   func verifiedClick() async throws {
     let runtime = WebKitRuntime()
@@ -83,6 +94,65 @@ struct WebKitTransactionCoordinatorTests {
       return
     }
     #expect(receipt.phase == .verified)
+    #expect(receipt.postconditionEvidence.map(\.result) == [.satisfied])
+  }
+
+  @Test("A postcondition that becomes true just after the deadline is not called false")
+  func lateButTruePostconditionIsVerified() async throws {
+    // Reported from the App Store Connect session: nine consecutive actions, all
+    // dispatched with a trusted gesture, all indeterminate with unsatisfied evidence —
+    // while the next observation showed every one of them had taken effect. A client
+    // that believes it failed retries, and on a menu the second click undoes the first.
+    // A late measurement is still a measurement.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <button aria-label="Ajouter" onclick="
+        setTimeout(() => this.setAttribute('aria-label', 'Ajouté'), 700)">Ajouter</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let origin = SecurityOrigin(scheme: "https", host: "fixture.invalid")
+    func provenanced(_ text: String) throws -> ProvenancedText {
+      try ProvenancedText(
+        text: text,
+        source: ProvenanceSource(
+          classification: .firstPartySiteContent, documentID: observation.documentID,
+          frameID: "main", securityOrigin: origin))
+    }
+    let nameKey = ObservationFieldKey(frameID: "main", elementID: "e1", field: "@accessible_name")
+    let plan = try TransactionalWritePlan(
+      idempotencyKey: "asc-add-1",
+      target: observation.elements[0].locatorRecipe,
+      requiredCapability: .activateElement,
+      inputProvenance: [.userIntent],
+      expectedOrigin: origin,
+      preconditions: [
+        .entryValueDigest(nameKey, try ObservationPredicate.digest(of: try provenanced("Ajouter")))
+      ],
+      postconditions: [
+        .entryValueDigest(nameKey, try ObservationPredicate.digest(of: try provenanced("Ajouté")))
+      ],
+      // Deliberately shorter than the page takes: the deadline must not decide the
+      // verdict on its own.
+      verificationTimeoutNanoseconds: 200_000_000
+    )
+    let authority = CapabilityAuthority()
+    let handle = await authority.issue(
+      CapabilityScope(
+        actions: [.activateElement], origins: [origin],
+        acceptedInputProvenance: [.userIntent],
+        expiresAt: Date().addingTimeInterval(60)))
+
+    let result = try await WebKitTransactionCoordinator(runtime: runtime).execute(
+      plan: plan, operation: .click, observation: observation,
+      capabilityAuthority: authority, capabilityHandle: handle)
+
+    guard case .verified(let receipt) = result.verification else {
+      Issue.record("a state that did change was reported as \(result.verification)")
+      return
+    }
     #expect(receipt.postconditionEvidence.map(\.result) == [.satisfied])
   }
 

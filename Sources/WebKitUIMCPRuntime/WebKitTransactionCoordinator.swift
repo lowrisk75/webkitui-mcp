@@ -6,14 +6,31 @@ public struct WebKitTransactionResult: Sendable {
   public let verification: TransactionVerification
 }
 
+public enum WebKitTransactionExecutionError: Error, Sendable {
+  case uncertainDispatch(
+    verification: TransactionVerification,
+    underlyingDescription: String
+  )
+}
+
 @MainActor
 public final class WebKitTransactionCoordinator {
   private let runtime: WebKitRuntime
   private let ledger: TransactionalWriteLedger
 
-  public init(runtime: WebKitRuntime, ledger: TransactionalWriteLedger = .init()) {
+  /// How long a settled state is still accepted after the verification deadline. The
+  /// deadline decides when to stop waiting; it must not decide whether the write
+  /// happened. Reconciliation can prove a late postcondition, never authorise a replay.
+  private let reconciliationGrace: Duration
+
+  public init(
+    runtime: WebKitRuntime,
+    ledger: TransactionalWriteLedger = .init(),
+    reconciliationGrace: Duration = .seconds(3)
+  ) {
     self.runtime = runtime
     self.ledger = ledger
+    self.reconciliationGrace = reconciliationGrace
   }
 
   public func execute(
@@ -73,19 +90,20 @@ public final class WebKitTransactionCoordinator {
         monotonicNowNanoseconds: dispatchedAtNanoseconds
       )
     } catch let error as WebKitRuntimeError {
-      let knownNotDispatched: Bool
-      switch error {
-      case .staleObservation, .unknownElement, .targetNotUnique, .targetNotActionable,
-        .targetGeometryChanged, .sensitiveInputRequiresHuman:
-        knownNotDispatched = true
-      default:
-        knownNotDispatched = false
-      }
+      let outcome = Self.dispatchOutcome(for: error)
       _ = try await ledger.recordDispatchOutcome(
         idempotencyKey: plan.idempotencyKey,
-        outcome: knownNotDispatched ? .notDispatched : .unknown,
+        outcome: outcome,
         monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
       )
+      if outcome.rawValue == DispatchOutcome.unknown.rawValue {
+        let verification = try await reconcileUncertainDispatch(
+          idempotencyKey: plan.idempotencyKey,
+          fallbackObservation: transactionObservation)
+        throw WebKitTransactionExecutionError.uncertainDispatch(
+          verification: verification,
+          underlyingDescription: String(describing: error))
+      }
       throw error
     } catch {
       _ = try await ledger.recordDispatchOutcome(
@@ -93,7 +111,12 @@ public final class WebKitTransactionCoordinator {
         outcome: .unknown,
         monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
       )
-      throw error
+      let verification = try await reconcileUncertainDispatch(
+        idempotencyKey: plan.idempotencyKey,
+        fallbackObservation: transactionObservation)
+      throw WebKitTransactionExecutionError.uncertainDispatch(
+        verification: verification,
+        underlyingDescription: String(describing: type(of: error)))
     }
 
     let (verificationDeadline, overflow) = dispatchedAtNanoseconds.addingReportingOverflow(
@@ -103,7 +126,7 @@ public final class WebKitTransactionCoordinator {
 
     while true {
       do {
-        let latest = try await runtime.observe()
+        let latest = try await runtime.observe(hydrationTimeout: .zero)
         let verification = try await ledger.verify(
           idempotencyKey: plan.idempotencyKey,
           observation: TransactionObservation(
@@ -115,6 +138,20 @@ public final class WebKitTransactionCoordinator {
         if case .pending = verification {
           try await Task.sleep(for: verificationPollInterval)
           continue
+        }
+        // The deadline decides when to stop waiting, not whether the write happened.
+        // A page that settles a moment late was being reported unsatisfied while the
+        // very next observation showed the change — and a client that believes it
+        // failed retries, which on a menu closes what the first click opened. Read the
+        // page once more before concluding. Reconciliation can prove a late
+        // postcondition; it never authorises a replay.
+        if case .indeterminate = verification {
+          return WebKitTransactionResult(
+            action: action,
+            verification: try await reconcileUntilSettled(
+              idempotencyKey: plan.idempotencyKey,
+              fallbackObservation: transactionObservation,
+              pollInterval: verificationPollInterval))
         }
         return WebKitTransactionResult(action: action, verification: verification)
       } catch is WebKitRuntimeError {
@@ -139,10 +176,70 @@ public final class WebKitTransactionCoordinator {
     try await ledger.receipt(idempotencyKey: idempotencyKey)
   }
 
+  static func dispatchOutcome(for error: WebKitRuntimeError) -> DispatchOutcome {
+    switch error {
+    case .staleObservation, .unknownElement, .targetNotUnique, .targetNotFound,
+      .operationUnsupportedForControl,
+      .targetGeometryChanged, .sensitiveInputRequiresHuman, .handoffSurfaceUnavailable:
+      .notDispatched
+    case .targetNotActionable, .nativeGestureReceiptUnavailable,
+      .webContentProcessTerminated, .malformedInstrumentationResult, .noDocument,
+      .navigationFailed, .navigationTimedOut, .networkBoundaryDenied,
+      .unsupportedURLScheme, .crossOriginRedirectRequiresHuman,
+      .invalidQuietWindow, .invalidCredentialOrigin, .invalidCredentialBinding,
+      .invalidCredentialSecret, .humanControlActive, .authenticationOriginRequiresHuman,
+      .noPendingCrossOriginNavigation, .invalidControlTransition,
+      .downloadInProgress, .downloadCancelled, .downloadReceiptTimedOut,
+      .unsupportedDownload, .downloadHTTPFailure, .downloadFailed:
+      .unknown
+    }
+  }
+
+  /// Nine consecutive App Store Connect actions were reported unsatisfied while the
+  /// next observation showed every one had taken effect: a heavy single-page app can
+  /// settle just after a five second budget. A client that believes it failed retries,
+  /// and on a menu the second click undoes the first, so a false negative here is the
+  /// one failure in this system that can corrupt a remote page.
+  private func reconcileUntilSettled(
+    idempotencyKey: String,
+    fallbackObservation: TransactionObservation,
+    pollInterval: Duration
+  ) async throws -> TransactionVerification {
+    let deadline = ContinuousClock.now + reconciliationGrace
+    var verification = try await reconcileUncertainDispatch(
+      idempotencyKey: idempotencyKey, fallbackObservation: fallbackObservation)
+    while case .indeterminate = verification, ContinuousClock.now < deadline {
+      try await Task.sleep(for: pollInterval)
+      verification = try await reconcileUncertainDispatch(
+        idempotencyKey: idempotencyKey, fallbackObservation: fallbackObservation)
+    }
+    return verification
+  }
+
+  private func reconcileUncertainDispatch(
+    idempotencyKey: String,
+    fallbackObservation: TransactionObservation
+  ) async throws -> TransactionVerification {
+    do {
+      let current = try await runtime.observe(hydrationTimeout: .zero)
+      return try await ledger.reconcile(
+        idempotencyKey: idempotencyKey,
+        observation: TransactionObservation(
+          state: try current.canonicalState(), completeness: .complete),
+        monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    } catch {
+      return try await ledger.reconcile(
+        idempotencyKey: idempotencyKey,
+        observation: TransactionObservation(
+          state: fallbackObservation.state, completeness: .partial),
+        monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    }
+  }
+
   /// Re-observes an indeterminate write and may prove its postcondition later.
   /// It never dispatches or retries the action.
   public func reconcile(idempotencyKey: String) async throws -> TransactionVerification {
-    let observation = try await runtime.observe()
+    let observation = try await runtime.observe(hydrationTimeout: .zero)
     return try await ledger.reconcile(
       idempotencyKey: idempotencyKey,
       observation: TransactionObservation(

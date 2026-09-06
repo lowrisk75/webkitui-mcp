@@ -6,12 +6,21 @@ public struct PinnedProxyMetrics: Codable, Equatable, Sendable {
   public var acceptedConnections = 0
   public var blockedConnections = 0
   public var pinnedHosts = 0
+  public var timedOutConnections = 0
+}
+
+struct PinnedSOCKSTimeouts: Sendable {
+  var handshake: TimeInterval = 10
+  var connect: TimeInterval = 15
+  var idle: TimeInterval = 120
 }
 
 public final class PinnedSOCKSProxy: @unchecked Sendable {
   private let queue = DispatchQueue(label: "WebKitUIMCP.PinnedSOCKSProxy")
   private let listener: NWListener
   private let resolver: @Sendable (String) throws -> ResolvedPublicAddress
+  private let maximumActiveConnections: Int
+  fileprivate let timeouts: PinnedSOCKSTimeouts
   private var pins: [String: String] = [:]
   private var metrics = PinnedProxyMetrics()
   private var activeConnections: [ObjectIdentifier: SOCKSConnection] = [:]
@@ -22,13 +31,25 @@ public final class PinnedSOCKSProxy: @unchecked Sendable {
     try self.init { try policy.resolve($0) }
   }
 
-  init(resolver: @escaping @Sendable (String) throws -> ResolvedPublicAddress) throws {
+  init(
+    maximumActiveConnections: Int = 64,
+    timeouts: PinnedSOCKSTimeouts = PinnedSOCKSTimeouts(),
+    resolver: @escaping @Sendable (String) throws -> ResolvedPublicAddress
+  ) throws {
+    precondition(maximumActiveConnections > 0)
     self.resolver = resolver
+    self.maximumActiveConnections = maximumActiveConnections
+    self.timeouts = timeouts
     let parameters = NWParameters.tcp
     parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
     listener = try NWListener(using: parameters)
     listener.newConnectionHandler = { [weak self] connection in
       guard let self else {
+        connection.cancel()
+        return
+      }
+      guard self.activeConnections.count < self.maximumActiveConnections else {
+        self.metrics.blockedConnections += 1
         connection.cancel()
         return
       }
@@ -77,6 +98,7 @@ public final class PinnedSOCKSProxy: @unchecked Sendable {
 
   fileprivate func recordAccepted() { metrics.acceptedConnections += 1 }
   fileprivate func recordBlocked() { metrics.blockedConnections += 1 }
+  fileprivate func recordTimedOut() { metrics.timedOutConnections += 1 }
   fileprivate func release(_ connection: SOCKSConnection) {
     activeConnections.removeValue(forKey: ObjectIdentifier(connection))
   }
@@ -90,6 +112,8 @@ private final class SOCKSConnection: @unchecked Sendable {
   private var state: State = .greeting
   private var buffer = Data()
   private var queue: DispatchQueue!
+  private var remote: NWConnection?
+  private var timeoutTimer: DispatchSourceTimer?
 
   init(client: NWConnection, proxy: PinnedSOCKSProxy) {
     self.client = client
@@ -102,6 +126,7 @@ private final class SOCKSConnection: @unchecked Sendable {
       if case .failed = state { self?.close() }
     }
     client.start(queue: queue)
+    armTimeout(after: proxy.timeouts.handshake)
     receiveHandshake()
   }
 
@@ -142,6 +167,7 @@ private final class SOCKSConnection: @unchecked Sendable {
       }
       guard let request = parseRequest() else { return receiveHandshake() }
       state = .connecting
+      armTimeout(after: proxy.timeouts.connect)
       connect(host: request.host, port: request.port, trailing: request.trailing)
     default: break
     }
@@ -196,12 +222,14 @@ private final class SOCKSConnection: @unchecked Sendable {
       }
       guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return reject(method: false) }
       let remote = NWConnection(host: NWEndpoint.Host(address), port: endpointPort, using: .tcp)
+      self.remote = remote
       remote.stateUpdateHandler = { [weak self, weak remote] remoteState in
         guard let self, let remote else { return }
         switch remoteState {
         case .ready:
           self.proxy.recordAccepted()
           self.state = .relaying
+          self.armTimeout(after: self.proxy.timeouts.idle)
           self.client.send(
             content: Data([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
             completion: .contentProcessed { [weak self, weak remote] error in
@@ -237,6 +265,7 @@ private final class SOCKSConnection: @unchecked Sendable {
       guard let data, !data.isEmpty else {
         return self.relay(from: source, to: destination, peer: peer)
       }
+      self.armTimeout(after: self.proxy.timeouts.idle)
       destination.send(
         content: data,
         completion: .contentProcessed { [weak self] sendError in
@@ -263,8 +292,24 @@ private final class SOCKSConnection: @unchecked Sendable {
   private func close(remote: NWConnection? = nil) {
     guard state != .closed else { return }
     state = .closed
+    timeoutTimer?.cancel()
+    timeoutTimer = nil
     client.cancel()
-    remote?.cancel()
+    (remote ?? self.remote)?.cancel()
+    self.remote = nil
     proxy.release(self)
+  }
+
+  private func armTimeout(after interval: TimeInterval) {
+    timeoutTimer?.cancel()
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + .milliseconds(max(1, Int(interval * 1_000))))
+    timer.setEventHandler { [weak self] in
+      guard let self, self.state != .closed else { return }
+      self.proxy.recordTimedOut()
+      self.close()
+    }
+    timeoutTimer = timer
+    timer.resume()
   }
 }

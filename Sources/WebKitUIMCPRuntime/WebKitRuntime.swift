@@ -1,6 +1,8 @@
 import AppKit
 import CryptoKit
 import Foundation
+import OSLog
+import Security
 import WebKit
 import WebKitUIMCPCore
 
@@ -16,10 +18,25 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case invalidQuietWindow
   case staleObservation
   case unknownElement
-  case targetNotUnique(Int)
+  /// Carries why addressing by the identity the observation handed out did not settle
+  /// it, because that is what tells a client whether to re-observe or look again.
+  case targetNotUnique(Int, pinned: String)
   case targetNotActionable
   case targetGeometryChanged
+  /// Nothing matched the address at all. Carries the required facts whose removal would
+  /// have matched, which names what changed under the observation.
+  case targetNotFound([String])
+  /// The control exists and can be reached, but this operation is not one it accepts.
+  /// Carries its role and the route that does work, because target_not_actionable was
+  /// also what an overlay and a disabled button returned.
+  case operationUnsupportedForControl(role: String, alternative: String)
   case sensitiveInputRequiresHuman
+  case downloadInProgress
+  case downloadCancelled
+  case downloadReceiptTimedOut(started: Bool)
+  case unsupportedDownload(httpStatus: Int?)
+  case downloadHTTPFailure(status: Int)
+  case downloadFailed(String)
   case invalidCredentialOrigin
   case invalidCredentialBinding
   case invalidCredentialSecret
@@ -28,6 +45,8 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case noPendingCrossOriginNavigation
   case invalidControlTransition
   case nativeGestureReceiptUnavailable
+  /// A handoff was requested but no window a human could act in could be shown.
+  case handoffSurfaceUnavailable
 }
 
 public enum AuthenticationUIClassification: String, Codable, Equatable, Sendable {
@@ -49,12 +68,14 @@ public struct AuthenticationEnvironmentSnapshot: Codable, Equatable, Sendable {
   public let pinnedProxyConfigured: Bool
   public let contentBlockingConfigured: Bool
   public let customProcessPoolConfigured: Bool
+  public let webAuthnAnyRelyingPartyEntitlementConfigured: Bool
 }
 
 public enum InteractionControlState: String, Codable, Equatable, Sendable {
   case agentControlled = "agent_controlled"
   case handoffRequested = "handoff_requested"
   case humanControlled = "human_controlled"
+  case humanStepCompleted = "human_step_completed"
   case resumeRequested = "resume_requested"
   case freshlyReobserved = "freshly_reobserved"
 }
@@ -76,9 +97,31 @@ public enum PageReadiness: String, Codable, Equatable, Sendable {
 public struct WebKitNavigationResult: Codable, Equatable, Sendable {
   public let documentID: String
   public let url: String
+  /// Where the caller asked to go. A single-page console sends several real paths to a
+  /// dashboard, and the landing URL alone left an agent to notice the difference by
+  /// comparing strings it was never told to compare.
+  public let requestedURL: String
+  public var redirected: Bool { requestedURL != url }
   public let readiness: PageReadiness
   public let elapsedNanoseconds: UInt64
   public let mutationCount: UInt64
+}
+
+public enum WebKitNavigationActor: String, Codable, Equatable, Sendable {
+  case agentNavigation = "agent_navigation"
+  case agentAction = "agent_action"
+  case human
+  case webContent = "web_content"
+  case unattributed
+}
+
+public struct WebKitNavigationAuditEvent: Codable, Equatable, Sendable {
+  public let fromOrigin: String?
+  public let toOrigin: String?
+  public let actor: WebKitNavigationActor
+  public let navigationType: String
+  public let allowed: Bool
+  public let monotonicNanoseconds: UInt64
 }
 
 public struct ObservedBoundingBox: Codable, Equatable, Sendable {
@@ -86,6 +129,33 @@ public struct ObservedBoundingBox: Codable, Equatable, Sendable {
   public let y: Double
   public let width: Double
   public let height: Double
+}
+
+public enum ObservedContextAnchorKind: String, Codable, Equatable, Sendable {
+  case fieldsetLegend = "fieldset_legend"
+  case labelledRegion = "labelled_region"
+  case nearestHeading = "nearest_heading"
+  case previousSibling = "previous_sibling"
+  case sameRowLabel = "same_row_label"
+}
+
+public struct ObservedContextAnchor: Codable, Equatable, Sendable {
+  public let kind: ObservedContextAnchorKind
+  public let text: ProvenancedText
+}
+
+public enum LocatorQualityStatus: String, Codable, Equatable, Sendable {
+  case unique
+  case ambiguous
+  case insufficient
+}
+
+public struct LocatorQuality: Codable, Equatable, Sendable {
+  public let status: LocatorQualityStatus
+  public let candidateCount: Int
+  public let candidateCountIsLowerBound: Bool
+  public let facts: [String]
+  public let recommendedAction: String?
 }
 
 public struct WebKitObservedElement: Codable, Equatable, Sendable {
@@ -96,6 +166,8 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let label: ProvenancedText?
   public let text: ProvenancedText?
   public let value: ProvenancedText?
+  public let validationState: ObservedValidationState
+  public let characterCount: Int?
   public let sensitive: Bool
   public let submitsForm: Bool
   public let disabled: Bool
@@ -103,9 +175,37 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let selected: Bool?
   public let selectedOption: ProvenancedText?
   public let stateAttributes: [String: ProvenancedText]
+  public let contextAnchors: [ObservedContextAnchor]
+  public let stableAttributes: [String: ProvenancedText]
   public let visible: Bool
+  public let actionability: ObservedActionability
+  public var actionable: Bool { actionability == .actionable }
   public let boundingBox: ObservedBoundingBox
   public let locatorRecipe: LocatorRecipe
+  public let locatorQuality: LocatorQuality
+}
+
+/// Why a control can or cannot be acted on, decided during observation so an agent
+/// never has to spend a failed dispatch to find out. `locatorQuality` answers whether
+/// the address is unique; it was read as whether the target can be clicked.
+public enum ObservedActionability: String, Codable, Equatable, Sendable {
+  case actionable
+  /// Laid out but collapsed to nothing. Reported because the only exit from a form can
+  /// be one of these, but no click can reach it.
+  case noLayoutBox = "no_layout_box"
+  case notVisible = "not_visible"
+  case disabled
+  /// Scrolled out of the viewport. Recoverable with element_scroll_into_view.
+  case offViewport = "off_viewport"
+  /// Another element occupies the target's own centre, which is how Material paints a
+  /// checkbox over its input.
+  case covered
+}
+
+public enum ObservedValidationState: String, Codable, Equatable, Sendable {
+  case valid
+  case invalid
+  case notApplicable = "not_applicable"
 }
 
 public struct WebKitPageObservation: Codable, Equatable, Sendable {
@@ -120,8 +220,42 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let totalElementCount: Int
   public let elementOffset: Int
   public let nextElementOffset: Int?
+  /// The page held more than this observation returned. An agent that reads a partial
+  /// observation as the whole page concludes things are absent that are on screen —
+  /// which is how a complete declaration was reported to a user as missing.
+  public var isPartial: Bool { totalElementCount > elements.count }
+  /// Frames whose content could not be read at all. Same-origin frames are walked;
+  /// a cross-origin one never can be, and staying quiet about it is how a page gets
+  /// read as complete when part of it was never legible.
+  public let unreadableFrameCount: Int
+  /// Everything on this page was both returned and legible. Anything less has to be
+  /// said out loud, or an absence gets reported as a fact.
+  public var isComplete: Bool { !isPartial && unreadableFrameCount == 0 }
   public let semanticTextTruncated: Bool
   public let crossOriginFramesOpaque: Bool
+  /// Controls the raw DOM renders, counted independently of the semantic matcher.
+  public let renderedInteractiveCount: Int
+  /// Rendered controls dropped only because an ancestor is aria-hidden or inert.
+  /// A page that paints its controls and marks them hidden leaves an empty tree for
+  /// a reason the caller must be able to see.
+  /// The interface language the page declares. A postcondition written against an
+  /// English label fails silently on a French console, and nothing said which it was.
+  public let documentLanguage: String?
+  public let ariaHiddenDropCount: Int
+  /// Controls dropped only because nothing up their row has a layout box. They cannot
+  /// be clicked, but the only exit from a form can be one of them, so they are named
+  /// rather than silently withheld.
+  public let unrenderedControlCount: Int
+  public let unrenderedControlNames: [String]
+  /// Controls present in the walked tree before any layout filter.
+  public let rawControlCount: Int
+  /// True when a reported control sits under a fully transparent ancestor. The tree
+  /// is usable, but nothing under it is visible to a person right now.
+  public let obscuredByAncestorOpacity: Bool
+  public let documentElementCount: Int
+  public let bodyTextLength: Int
+  /// One control described in full, so an empty tree can be diagnosed in one look.
+  public let firstControlProbe: String
   public let capturedAtMonotonicNanoseconds: UInt64
 }
 
@@ -130,7 +264,15 @@ public struct WebKitCapture: Sendable {
   public let width: Int
   public let height: Int
   public let backingScaleFactor: Double
+  /// True only when the page actually has layered content that a snapshot can drop.
+  /// It used to be hardcoded true, so it warned about nothing and meant nothing.
   public let compositorEffectsMayBeMissing: Bool
+  /// What the page was showing when the shutter opened, so an image that disagrees
+  /// with the page is detectable instead of believed. A capture is the one tool that
+  /// looks like ground truth; it has to be checkable.
+  public let topLayerElementCount: Int
+  public let modalPresent: Bool
+  public let renderedInteractiveCount: Int
 }
 
 public struct WebKitScrollResult: Codable, Equatable, Sendable {
@@ -182,6 +324,35 @@ public struct WebKitActionResult: Codable, Equatable, Sendable {
   public let actionMonotonicNanoseconds: UInt64
 }
 
+public struct WebKitDownloadReceipt: Codable, Equatable, Sendable {
+  public let httpStatus: Int?
+  public let suggestedFilename: String
+  public let filename: String
+  public let mimeType: String?
+  public let byteCount: UInt64
+  public let sha256: String
+  public let provisioningProfileUUID: String?
+}
+
+/// Records who chose the files a file panel returned. `agentConfirmed` means the
+/// selection was armed by an approved MCP call; `humanPanel` means a person picked
+/// the files in the native open panel.
+public enum WebKitFileUploadSelectionMode: String, Codable, Equatable, Sendable {
+  case agentConfirmed = "agent_confirmed"
+  case humanPanel = "human_panel"
+}
+
+public struct WebKitFileUploadReceipt: Codable, Equatable, Sendable {
+  public let filenames: [String]
+  public let byteCounts: [UInt64]
+  public let sha256: [String]
+  public let fileCount: Int
+  public let selectionMode: WebKitFileUploadSelectionMode
+  public let selectedByHuman: Bool
+  public let localPathsExposed: Bool
+  public let monotonicNanoseconds: UInt64
+}
+
 public struct FormSubmissionAuditEvent: Codable, Equatable, Sendable {
   public let payloadHMAC: String
   public let httpMethod: String
@@ -195,6 +366,15 @@ public struct WebContentTerminationEvent: Codable, Equatable, Sendable {
   public let documentID: String
   public let observationID: String?
   public let monotonicNanoseconds: UInt64
+}
+
+/// AppKit keeps titled windows on a display, which would drag the offscreen layout
+/// host back into view. Declining the constraint is what lets the window stay parked
+/// outside every screen while WebKit still lays its content out.
+private final class UnconstrainedWindow: NSWindow {
+  override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+    frameRect
+  }
 }
 
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
@@ -213,13 +393,18 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 }
 
 @MainActor
-public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDelegate, WKUIDelegate,
+  WKScriptMessageHandler
+{
   public let webView: WKWebView
 
   private let instrumentationWorld: WKContentWorld
+  private let managesApplicationActivationPolicy: Bool
   private var documentID = UUID().uuidString
   private var observationGeneration: UInt64 = 0
   private var navigationFailure: WebKitRuntimeError?
+  private var armedNavigationActor: (actor: WebKitNavigationActor, expiresAt: UInt64)?
+  private var navigationAuditEvents: [WebKitNavigationAuditEvent] = []
   private var processTerminated = false
   private var latestObservationID: String?
   private var latestTargets: [String: ObservedTargetRecord] = [:]
@@ -227,6 +412,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   private var controlState: InteractionControlState = .agentControlled
   private var handoffEvents: [HandoffAuditEvent] = []
   private var browserWindow: NSWindow?
+  private weak var humanControlInstruction: NSTextField?
+  private weak var humanControlCompletionButton: NSButton?
   private var topLevelOriginLock: SecurityOrigin?
   private let formAuditKey = SymmetricKey(size: .bits256)
   private var formSubmissionEvents: [FormSubmissionAuditEvent] = []
@@ -234,10 +421,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   private var lastCommittedHTTPURL: URL?
   private var authenticationUIClassification: AuthenticationUIClassification?
   private var restrictedAuthenticationFrameOrigin: String?
+  private var restrictedWebAuthnOrigin: String?
   private var pendingCrossOriginNavigationRequest: URLRequest?
   private let egressProxy: PinnedSOCKSProxy?
   private var armedNativeGestureTokens: Set<String> = []
-  private var nativeGestureReceipts: [String: NativeGestureReceipt] = [:]
+  private var nativeGestureReceipts: [String: [NativeGestureReceipt]] = [:]
+  private let downloadDestinationProvider: (@MainActor @Sendable (String) async -> URL?)?
+  private let uploadSelectionProvider: (@MainActor @Sendable (Bool, Bool) async -> [URL]?)?
+  private var lastUploadReceipt: WebKitFileUploadReceipt?
+  private var armedUploadSelection: [URL]?
+  private var filePickerVisible = false
+  private var downloadContinuation: CheckedContinuation<WebKitDownloadReceipt, any Error>?
+  private var downloadExpectedOrigin: SecurityOrigin?
+  private var downloadDestination: URL?
+  private var downloadMIMEType: String?
+  private var downloadHTTPStatus: Int?
+  private var downloadSuggestedFilename: String?
+  private var downloadExpectedProvisioningProfileUUID: String?
+  private var downloadStarted = false
+  private var downloadActionVerified = false
+  private var completedDownloadReceipt: WebKitDownloadReceipt?
+  private var activeDownload: WKDownload?
+  private var downloadTimeoutTask: Task<Void, Never>?
 
   public override convenience init() {
     self.init(websiteDataStore: .default())
@@ -253,8 +458,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     self.init(websiteDataStore: protectedWebsiteDataStore, egressProxy: proxy)
   }
 
-  init(websiteDataStore: WKWebsiteDataStore, egressProxy: PinnedSOCKSProxy?) {
+  init(
+    websiteDataStore: WKWebsiteDataStore,
+    egressProxy: PinnedSOCKSProxy?,
+    managesApplicationActivationPolicy: Bool = true,
+    downloadDestinationProvider: (@MainActor @Sendable (String) async -> URL?)? = nil,
+    uploadSelectionProvider:
+      (@MainActor @Sendable (Bool, Bool) async -> [URL]?)? = nil
+  ) {
     self.egressProxy = egressProxy
+    self.managesApplicationActivationPolicy = managesApplicationActivationPolicy
+    self.downloadDestinationProvider = downloadDestinationProvider
+    self.uploadSelectionProvider = uploadSelectionProvider
     let configuration = WKWebViewConfiguration()
     let contentController = WKUserContentController()
     let world = WKContentWorld.world(name: "WebKitUIMCP.Instrumentation")
@@ -275,11 +490,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       configuration: configuration
     )
     super.init()
+    // A WKWebView that belongs to no window can lay out to nothing: the DOM is
+    // built and readable while every control reports a zero-sized box, so the
+    // semantic tree comes back empty on a page that is perfectly loaded. Measured
+    // on Play Console: 690 elements, 35 controls, 764 characters of text, zero
+    // rendered. Hosting the view in an offscreen window from the start gives the
+    // engine a real viewport without ever showing anything.
+    _ = makeBrowserWindow()
     contentController.add(
       WeakScriptMessageHandler(target: self),
       contentWorld: world,
       name: Self.nativeGestureMessageHandlerName)
     webView.navigationDelegate = self
+    webView.uiDelegate = self
     _ = makeBrowserWindow()
   }
 
@@ -348,15 +571,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     try requireAgentControl()
     try validate(quietWindow: quietWindow)
     resetForNavigation()
+    armNavigationActor(.agentNavigation)
     let started = DispatchTime.now().uptimeNanoseconds
     webView.loadHTMLString(html, baseURL: baseURL)
     let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
+    if readiness == .deadlineReached { webView.stopLoading() }
     let state = try await instrumentationState()
     await refreshAuthenticationUIClassification()
     let loadedURL = webView.url ?? baseURL
     return WebKitNavigationResult(
       documentID: documentID,
       url: agentSafeURLString(loadedURL) ?? "about:blank",
+      // loadHTML is asked for a base URL and lands on it, so the two agree by
+      // construction; the field exists for the request that does not.
+      requestedURL: baseURL.flatMap(agentSafeURLString) ?? "about:blank",
       readiness: readiness,
       elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
       mutationCount: state.mutationCount
@@ -366,9 +594,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   public func observe(
     maximumElements: Int = 200,
     elementOffset: Int = 0,
-    maximumFieldCharacters: Int = 512,
+    maximumFieldCharacters: Int = 4_096,
     roles: [String] = [],
-    nameContains: String? = nil
+    nameContains: String? = nil,
+    hydrationTimeout: Duration = .seconds(30)
   ) async throws -> WebKitPageObservation {
     try requireObservationControl()
     guard maximumElements > 0, elementOffset >= 0, maximumFieldCharacters > 0 else {
@@ -380,28 +609,41 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       of: "__MAXIMUM_ELEMENTS__",
       with: String(maximumElements)
     )
-    guard
-      let json = try await webView.callAsyncJavaScript(
-        script,
-        arguments: [
-          "roleFilters": roles.map { $0.lowercased() },
-          "nameFilter": nameContains?.lowercased() ?? "",
-          "elementOffset": elementOffset,
-          "maximumFieldCharacters": maximumFieldCharacters,
-        ],
-        in: nil,
-        contentWorld: instrumentationWorld
-      ) as? String,
-      let data = json.data(using: .utf8)
-    else {
-      throw WebKitRuntimeError.malformedInstrumentationResult
+    let arguments: [String: Any] = [
+      "roleFilters": roles.map { $0.lowercased() },
+      "nameFilter": nameContains?.lowercased() ?? "",
+      "elementOffset": elementOffset,
+      "maximumFieldCharacters": maximumFieldCharacters,
+    ]
+    func captureRawObservation() async throws -> RawObservation {
+      guard
+        let json = try await webView.callAsyncJavaScript(
+          script, arguments: arguments, in: nil, contentWorld: instrumentationWorld) as? String,
+        let data = json.data(using: .utf8),
+        let decoded = try? JSONDecoder().decode(RawObservation.self, from: data)
+      else { throw WebKitRuntimeError.malformedInstrumentationResult }
+      return decoded
     }
 
-    let raw: RawObservation
-    do {
-      raw = try JSONDecoder().decode(RawObservation.self, from: data)
-    } catch {
-      throw WebKitRuntimeError.malformedInstrumentationResult
+    let hydrationDeadline = ContinuousClock.now + hydrationTimeout
+    ensureLayoutViewport()
+    webView.layoutSubtreeIfNeeded()
+    var raw = try await captureRawObservation()
+    while raw.transientLoading, ContinuousClock.now < hydrationDeadline {
+      // WKWebView can be idle while a single-page app is still showing its
+      // loading shell. Keep this observation alive until hydration completes.
+      try await Task.sleep(for: .milliseconds(100))
+      webView.needsLayout = true
+      webView.layoutSubtreeIfNeeded()
+      raw = try await captureRawObservation()
+    }
+    if raw.elements.isEmpty, raw.unfilteredCandidateCount > 0 {
+      // A foreground/layout transition can leave WebKit geometry stale for one
+      // turn. Refresh locally instead of requiring a human handoff as a cache bust.
+      webView.needsLayout = true
+      webView.layoutSubtreeIfNeeded()
+      try await Task.sleep(for: .milliseconds(50))
+      raw = try await captureRawObservation()
     }
 
     let (nextGeneration, overflow) = observationGeneration.addingReportingOverflow(1)
@@ -428,8 +670,25 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       securityOrigin: origin
     )
 
+    let recipes = try raw.elements.enumerated().map { index, element in
+      let elementID = "e\(index + 1)"
+      return try locatorRecipe(
+        for: element,
+        peers: raw.elements,
+        elementID: elementID,
+        observationID: observationID,
+        generation: nextGeneration)
+    }
+    let candidates = raw.elements.map(locatorCandidate)
+    let candidateCountIsLowerBound = raw.totalElementCount > raw.elements.count
     let elements = try raw.elements.enumerated().map { index, element in
       let elementID = "e\(index + 1)"
+      let recipe = recipes[index]
+      let resolution = LocatorResolver.resolve(recipe: recipe, candidates: candidates)
+      let quality = locatorQuality(
+        recipe: recipe,
+        candidateCount: resolution.finalCandidateCount,
+        candidateCountIsLowerBound: candidateCountIsLowerBound)
       return try WebKitObservedElement(
         elementID: elementID,
         tag: ProvenancedText(text: element.tag, source: pageSource),
@@ -442,6 +701,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         value: try element.value.map {
           try ProvenancedText(text: $0, source: enteredDataSource)
         },
+        validationState: ObservedValidationState(rawValue: element.validationState)
+          ?? .notApplicable,
+        characterCount: element.characterCount,
         sensitive: element.sensitive,
         submitsForm: element.submitsForm,
         disabled: element.disabled,
@@ -453,14 +715,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         stateAttributes: try element.stateAttributes.mapValues {
           try ProvenancedText(text: $0, source: pageSource)
         },
+        contextAnchors: try element.contextAnchors.compactMap { anchor in
+          guard let kind = ObservedContextAnchorKind(rawValue: anchor.kind) else { return nil }
+          return ObservedContextAnchor(
+            kind: kind,
+            text: try ProvenancedText(text: anchor.text, source: pageSource))
+        },
+        stableAttributes: try element.stableAttributes.mapValues {
+          try ProvenancedText(text: $0, source: pageSource)
+        },
         visible: element.visible,
+        actionability: ObservedActionability(rawValue: element.actionability) ?? .actionable,
         boundingBox: element.boundingBox,
-        locatorRecipe: try locatorRecipe(
-          for: element,
-          elementID: elementID,
-          observationID: observationID,
-          generation: nextGeneration
-        )
+        locatorRecipe: recipe,
+        locatorQuality: quality
       )
     }
     latestObservationID = observationID
@@ -474,7 +742,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
             boundingBox: rawElement.boundingBox,
             sensitive: rawElement.sensitive,
             disabled: rawElement.disabled,
-            observedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
+            observedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            observedCandidateCount: element.locatorQuality.candidateCount
           )
         )
       }
@@ -493,8 +762,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       elementOffset: elementOffset,
       nextElementOffset: elementOffset + elements.count < raw.totalElementCount
         ? elementOffset + elements.count : nil,
+      unreadableFrameCount: raw.crossOriginFrameCount,
       semanticTextTruncated: raw.semanticTextTruncated,
       crossOriginFramesOpaque: raw.crossOriginFrameCount > 0,
+      renderedInteractiveCount: raw.renderedInteractiveCount,
+      documentLanguage: raw.documentLanguage,
+      ariaHiddenDropCount: raw.ariaHiddenDropCount,
+      unrenderedControlCount: raw.unrenderedControlCount,
+      unrenderedControlNames: raw.unrenderedControlNames,
+      rawControlCount: raw.rawControlCount,
+      obscuredByAncestorOpacity: raw.obscuredByAncestorOpacity,
+      documentElementCount: raw.documentElementCount,
+      bodyTextLength: raw.bodyTextLength,
+      firstControlProbe: raw.firstControlProbe,
       capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
     )
     rememberRecoverableURL(URL(string: raw.url) ?? webView.url)
@@ -526,11 +806,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     let resolution = try await resolveTarget(
       criteria: criteria, scrollIntoView: true)
     guard resolution.count == 1 else {
-      throw WebKitRuntimeError.targetNotUnique(resolution.count)
+      throw WebKitRuntimeError.targetNotUnique(
+        resolution.count, pinned: resolution.pinnedState ?? "not_requested")
     }
     return try await performScroll(
       source: Self.nearestScrollStateSource,
-      arguments: ["criteria": criteria]
+      arguments: [
+        "criteria": criteria, "physicalIdentity": "", "expectedCandidateCount": 0,
+      ]
     )
   }
 
@@ -567,13 +850,30 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     else {
       throw WebKitRuntimeError.malformedInstrumentationResult
     }
+    let onScreen = try await captureDOMState()
     return WebKitCapture(
       pngData: png,
       width: bitmap.pixelsWide,
       height: bitmap.pixelsHigh,
       backingScaleFactor: Double(bitmap.pixelsWide) / webView.bounds.width,
-      compositorEffectsMayBeMissing: true
+      compositorEffectsMayBeMissing: onScreen.topLayerElementCount > 0
+        || onScreen.compositedLayerCount > 0,
+      topLayerElementCount: onScreen.topLayerElementCount,
+      modalPresent: onScreen.modalPresent,
+      renderedInteractiveCount: onScreen.renderedInteractiveCount
     )
+  }
+
+  /// Read at snapshot time, so the two describe the same instant.
+  private func captureDOMState() async throws -> RawCaptureDOMState {
+    guard
+      let json = try await webView.callAsyncJavaScript(
+        Self.captureStateSource, arguments: [:], in: nil, contentWorld: instrumentationWorld
+      ) as? String,
+      let data = json.data(using: .utf8),
+      let state = try? JSONDecoder().decode(RawCaptureDOMState.self, from: data)
+    else { throw WebKitRuntimeError.malformedInstrumentationResult }
+    return state
   }
 
   public func addressingCounterSnapshot() -> AddressingCounterSnapshot {
@@ -789,8 +1089,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   ) async throws -> LocatorResolution {
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
     guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    // The transaction refuses before dispatch on this count, so it has to resolve the
+    // same way the dispatch does. Without the identity and the population it saw four
+    // identical buttons and stopped, while the actuation path would have reached the
+    // right one — the write was refused by its own preflight.
     let resolution = try await resolveTarget(
-      criteria: locatorCriteria(recipe, expectedEnabled: !target.disabled), scrollIntoView: false)
+      criteria: locatorCriteria(recipe, expectedEnabled: !target.disabled),
+      scrollIntoView: false,
+      physicalIdentity: target.physicalIdentity,
+      expectedCandidateCount: target.observedCandidateCount)
     return LocatorResolution(
       recipeElementID: elementID,
       evaluations: (0..<resolution.count).map {
@@ -817,10 +1124,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
 
     let criteria = locatorCriteria(target.recipe, expectedEnabled: !target.disabled)
-    let first = try await resolveTarget(criteria: criteria, scrollIntoView: true)
-    try recordCardinality(first.count, target: target)
+    let first = try await resolveTarget(
+      criteria: criteria, scrollIntoView: true, physicalIdentity: target.physicalIdentity,
+      expectedCandidateCount: target.observedCandidateCount)
+    try recordCardinality(
+      first.count, target: target, eliminatedBy: first.eliminatedBy ?? [],
+      pinnedState: first.pinnedState ?? "not_requested")
     guard let firstCandidate = first.candidate else {
-      throw WebKitRuntimeError.targetNotUnique(first.count)
+      if first.count == 0 {
+        throw WebKitRuntimeError.targetNotFound(first.eliminatedBy ?? [])
+      }
+      throw WebKitRuntimeError.targetNotUnique(
+        first.count, pinned: first.pinnedState ?? "not_requested")
     }
     try await Task.sleep(for: stabilityInterval)
 
@@ -845,46 +1160,80 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       value = nil
     }
 
+    armNavigationActor(.agentAction)
     let second: RawActionResolution
     if dispatchMode == .nativeAppKit, operationName == "click" {
       second = try await resolveAndPerformNativeClick(
-        criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox)
+        criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount,
+        expectedBoundingBox: firstCandidate.boundingBox)
     } else if dispatchMode == .nativeAppKit, operationName == "press_key", let value {
       second = try await resolveAndPerformNativeKey(
-        criteria: criteria, expectedBoundingBox: firstCandidate.boundingBox, key: value)
+        criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount,
+        expectedBoundingBox: firstCandidate.boundingBox, key: value)
+    } else if dispatchMode == .nativeAppKit, operationName == "fill", let value {
+      second = try await resolveAndPerformNativeFill(
+        criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount,
+        expectedBoundingBox: firstCandidate.boundingBox, value: value)
     } else {
       second = try await resolveAndPerform(
         criteria: criteria,
+        physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount,
         expectedBoundingBox: firstCandidate.boundingBox,
         operation: operationName,
         value: value
       )
     }
-    try recordCardinality(second.count, target: target)
+    try recordCardinality(
+      second.count, target: target, eliminatedBy: second.eliminatedBy ?? [],
+      pinnedState: second.pinnedState ?? "not_requested")
     guard let candidate = second.candidate else {
-      throw WebKitRuntimeError.targetNotUnique(second.count)
+      if second.count == 0 {
+        throw WebKitRuntimeError.targetNotFound(second.eliminatedBy ?? [])
+      }
+      throw WebKitRuntimeError.targetNotUnique(
+        second.count, pinned: second.pinnedState ?? "not_requested")
     }
 
     let physicalIdentity: EvidenceComparison =
       candidate.physicalIdentity == target.physicalIdentity ? .same : .different
     let geometry: EvidenceComparison = candidate.geometryStable ? .same : .different
     let actionTime = DispatchTime.now().uptimeNanoseconds
-    let attempt = try AddressingAttempt(
-      observationID: observationID,
-      locatorRecipeID: elementID,
-      observationGeneration: target.recipe.observationGeneration,
-      actionGeneration: observationGeneration,
-      observationMonotonicNanoseconds: target.observedAtMonotonicNanoseconds,
-      actionMonotonicNanoseconds: actionTime,
-      finalCandidateCount: second.count,
-      semanticComparison: .same,
-      physicalIdentity: physicalIdentity,
-      geometryComparison: geometry
-    )
+    // A telemetry enum must never surface as this API's error. The only constructible
+    // failure here is a generation that moved backwards, which means the document was
+    // replaced between observation and action: that is a stale observation, and the
+    // caller is told so.
+    let attempt: AddressingAttempt
+    do {
+      attempt = try AddressingAttempt(
+        observationID: observationID,
+        locatorRecipeID: elementID,
+        observationGeneration: target.recipe.observationGeneration,
+        actionGeneration: observationGeneration,
+        observationMonotonicNanoseconds: target.observedAtMonotonicNanoseconds,
+        actionMonotonicNanoseconds: actionTime,
+        finalCandidateCount: second.count,
+        semanticComparison: .same,
+        physicalIdentity: physicalIdentity,
+        geometryComparison: geometry
+      )
+    } catch {
+      throw WebKitRuntimeError.staleObservation
+    }
     let outcome = AddressingClassifier.classify(attempt)
     addressingCounters.record(outcome)
 
     guard candidate.geometryStable else { throw WebKitRuntimeError.targetGeometryChanged }
+    if let role = candidate.unsupportedOperationRole {
+      throw WebKitRuntimeError.operationUnsupportedForControl(
+        role: role,
+        alternative:
+          "A \(role) does not accept typed input. Click it to open its options, then click "
+          + "the option you want.")
+    }
     guard candidate.actionable, candidate.dispatched else {
       throw WebKitRuntimeError.targetNotActionable
     }
@@ -894,17 +1243,231 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       dispatched: true,
       trustedUserGesture: candidate.trustedUserGesture,
       dispatchMode: dispatchMode == .nativeAppKit
-        && (operationName == "click" || operationName == "press_key")
+        && (operationName == "click" || operationName == "press_key" || operationName == "fill")
         ? .nativeAppKit : .javascript,
       actionMonotonicNanoseconds: actionTime
     )
     if controlState == .freshlyReobserved {
       transition(to: .agentControlled, observationID: observationID)
     }
+    if armedNavigationActor?.actor == .agentAction {
+      armedNavigationActor = nil
+    }
     return result
   }
 
   public func interactionControlState() -> InteractionControlState { controlState }
+
+  public func latestNavigationAuditEvent() -> WebKitNavigationAuditEvent? {
+    navigationAuditEvents.last
+  }
+
+  public func navigationAuditEventCount() -> Int { navigationAuditEvents.count }
+
+  /// Hosts this session's data store holds credential-bearing storage for, so a
+  /// client can tell whether a profile is already signed in to an origin. Host names
+  /// only: cookie names, values, paths and expiries never leave the store.
+  public func authenticatedOrigins() async -> [String] {
+    let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+    // Only the domain leaves this function. Names, values, paths and expiries stay
+    // inside the store.
+    let hosts = cookies.map { cookie -> String in
+      let domain = cookie.domain
+      return domain.hasPrefix(".") ? String(domain.dropFirst()) : domain
+    }
+    return Set(hosts.filter { !$0.isEmpty }).sorted()
+  }
+
+  public func latestFileUploadReceipt() -> WebKitFileUploadReceipt? {
+    lastUploadReceipt
+  }
+
+  public func isFilePickerVisible() -> Bool { filePickerVisible }
+
+  /// Arms a single-use file-panel selection. The next panel this runtime opens
+  /// consumes it; the selection is spent whether or not it passed validation, so an
+  /// approved selection can never satisfy a second panel opened by the site.
+  public func armUploadSelection(_ urls: [URL]) {
+    armedUploadSelection = urls
+  }
+
+  public func hasArmedUploadSelection() -> Bool { armedUploadSelection != nil }
+
+  /// Discards an armed selection that no panel consumed.
+  public func disarmUploadSelection() {
+    armedUploadSelection = nil
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    runOpenPanelWith parameters: WKOpenPanelParameters,
+    initiatedByFrame frame: WKFrameInfo
+  ) async -> [URL]? {
+    filePickerVisible = true
+    defer { filePickerVisible = false }
+    let selectionMode: WebKitFileUploadSelectionMode
+    let selectedURLs: [URL]?
+    if let armed = armedUploadSelection {
+      // Spent unconditionally: a rejected or partial selection must not survive
+      // into a second panel.
+      armedUploadSelection = nil
+      selectionMode = .agentConfirmed
+      selectedURLs = armed
+    } else if let uploadSelectionProvider {
+      selectionMode = .agentConfirmed
+      selectedURLs = await uploadSelectionProvider(
+        parameters.allowsMultipleSelection, parameters.allowsDirectories)
+    } else {
+      selectionMode = .humanPanel
+      let panel = NSOpenPanel()
+      panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+      panel.canChooseDirectories = false
+      panel.canChooseFiles = true
+      panel.resolvesAliases = true
+      panel.message =
+        "Choose the exact local file. Its name, size, and SHA-256 will be returned to the MCP client; its local path and contents will not."
+      panel.prompt = "Choose"
+      let response: NSApplication.ModalResponse
+      if let window = browserWindow, browserWindowIsOnScreen {
+        response = await withCheckedContinuation { continuation in
+          panel.beginSheetModal(for: window) { continuation.resume(returning: $0) }
+        }
+      } else {
+        NSApp.activate()
+        response = await withCheckedContinuation { continuation in
+          panel.begin { continuation.resume(returning: $0) }
+        }
+      }
+      selectedURLs = response == .OK ? panel.urls : nil
+    }
+    guard let selectedURLs, !selectedURLs.isEmpty, selectedURLs.count <= 10 else {
+      lastUploadReceipt = nil
+      return nil
+    }
+
+    var filenames: [String] = []
+    var byteCounts: [UInt64] = []
+    var digests: [String] = []
+    for url in selectedURLs {
+      guard let filename = Self.safeUploadFilename(url.lastPathComponent) else {
+        lastUploadReceipt = nil
+        return nil
+      }
+      guard url.isFileURL,
+        let values = try? url.resourceValues(forKeys: [
+          .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
+        ]),
+        values.isRegularFile == true, values.isSymbolicLink != true,
+        let size = values.fileSize, (0...52_428_800).contains(size),
+        let data = try? Data(contentsOf: url, options: [.mappedIfSafe])
+      else {
+        lastUploadReceipt = nil
+        return nil
+      }
+      filenames.append(filename)
+      byteCounts.append(UInt64(data.count))
+      digests.append(
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
+    }
+    lastUploadReceipt = WebKitFileUploadReceipt(
+      filenames: filenames,
+      byteCounts: byteCounts,
+      sha256: digests,
+      fileCount: selectedURLs.count,
+      selectionMode: selectionMode,
+      selectedByHuman: selectionMode == .humanPanel,
+      localPathsExposed: false,
+      monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    return selectedURLs
+  }
+
+  public func download(
+    observationID: String,
+    elementID: String,
+    expectedProvisioningProfileUUID: String? = nil,
+    timeout: Duration = .seconds(120)
+  ) async throws -> WebKitDownloadReceipt {
+    try requireAgentControl()
+    guard downloadContinuation == nil else { throw WebKitRuntimeError.downloadInProgress }
+    guard let currentURL = webView.url, let origin = navigationOrigin(for: currentURL) else {
+      throw WebKitRuntimeError.noDocument
+    }
+    return try await beginDownloadRequest(
+      origin: origin,
+      expectedProvisioningProfileUUID: expectedProvisioningProfileUUID,
+      timeout: timeout
+    ) {
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        do {
+          _ = try await self.perform(
+            observationID: observationID,
+            elementID: elementID,
+            operation: .click,
+            dispatchMode: .nativeAppKit)
+          self.downloadActionVerified = true
+          if let receipt = self.completedDownloadReceipt {
+            self.finishDownload(.success(receipt))
+          }
+        } catch {
+          self.finishDownload(.failure(error))
+        }
+      }
+    }
+  }
+
+  public func download(
+    url: URL,
+    expectedProvisioningProfileUUID: String? = nil,
+    timeout: Duration = .seconds(120)
+  ) async throws -> WebKitDownloadReceipt {
+    try requireAgentControl()
+    guard downloadContinuation == nil else { throw WebKitRuntimeError.downloadInProgress }
+    guard let currentURL = webView.url, let origin = navigationOrigin(for: currentURL) else {
+      throw WebKitRuntimeError.noDocument
+    }
+    guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+      throw WebKitRuntimeError.unsupportedURLScheme
+    }
+    guard navigationOrigin(for: url) == origin else {
+      throw WebKitRuntimeError.networkBoundaryDenied
+    }
+    return try await beginDownloadRequest(
+      origin: origin,
+      expectedProvisioningProfileUUID: expectedProvisioningProfileUUID,
+      timeout: timeout
+    ) {
+      downloadActionVerified = true
+      webView.load(URLRequest(url: url))
+    }
+  }
+
+  private func beginDownloadRequest(
+    origin: SecurityOrigin,
+    expectedProvisioningProfileUUID: String?,
+    timeout: Duration,
+    trigger: () -> Void
+  ) async throws -> WebKitDownloadReceipt {
+    try await withCheckedThrowingContinuation { continuation in
+      downloadContinuation = continuation
+      downloadExpectedOrigin = origin
+      downloadDestination = nil
+      downloadMIMEType = nil
+      downloadHTTPStatus = nil
+      downloadSuggestedFilename = nil
+      downloadExpectedProvisioningProfileUUID = expectedProvisioningProfileUUID
+      downloadStarted = false
+      downloadActionVerified = false
+      completedDownloadReceipt = nil
+      downloadTimeoutTask = Task { @MainActor [weak self] in
+        try? await Task.sleep(for: timeout)
+        guard let self else { return }
+        self.finishDownload(
+          .failure(WebKitRuntimeError.downloadReceiptTimedOut(started: self.downloadStarted)))
+      }
+      trigger()
+    }
+  }
 
   public func userContentController(
     _ userContentController: WKUserContentController,
@@ -918,8 +1481,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       let eventType = body["eventType"] as? String,
       let trusted = body["trusted"] as? Bool
     else { return }
-    nativeGestureReceipts[token] = NativeGestureReceipt(
-      physicalIdentity: physicalIdentity, eventType: eventType, trusted: trusted)
+    nativeGestureReceipts[token, default: []].append(
+      NativeGestureReceipt(
+        physicalIdentity: physicalIdentity, eventType: eventType, trusted: trusted))
   }
 
   public func authenticationRestrictionStatus() -> AuthenticationRestrictionStatus? {
@@ -931,6 +1495,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     )
   }
 
+  /// Returns the exact private URL only to the in-process compatibility
+  /// presenter. Callers must never serialize, log, or place it in an MCP
+  /// confirmation; paths and queries may contain authentication state.
+  public func privateFullBrowserHandoffURL() throws -> URL {
+    guard
+      authenticationRestrictionStatus()?.classification == .fullBrowserRequired,
+      let url = webView.url ?? lastCommittedHTTPURL,
+      url.scheme?.lowercased() == "https",
+      url.host != nil
+    else { throw WebKitRuntimeError.authenticationOriginRequiresHuman("unavailable") }
+    return url
+  }
+
   public func authenticationEnvironmentSnapshot() -> AuthenticationEnvironmentSnapshot {
     AuthenticationEnvironmentSnapshot(
       persistentWebsiteDataStore: webView.configuration.websiteDataStore.isPersistent,
@@ -939,7 +1516,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         !(webView.configuration.applicationNameForUserAgent?.isEmpty ?? true),
       pinnedProxyConfigured: egressProxy != nil,
       contentBlockingConfigured: false,
-      customProcessPoolConfigured: false
+      customProcessPoolConfigured: false,
+      webAuthnAnyRelyingPartyEntitlementConfigured:
+        Self.webAuthnAnyRelyingPartyEntitlementConfigured()
     )
   }
 
@@ -986,25 +1565,65 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
     topLevelOriginLock = nil
-    if presentWindow { presentHumanControlWindow() }
     transition(to: .humanControlled, observationID: nil)
+    if presentWindow {
+      presentHumanControlWindow()
+      // Fail closed rather than delegate to a human who has nothing to act in: the
+      // step would wait forever on a control that was never presented.
+      guard humanControlSurfaceIsPresented else {
+        throw WebKitRuntimeError.handoffSurfaceUnavailable
+      }
+    }
+  }
+
+  public func markHumanStepCompleted() throws {
+    guard controlState == .humanControlled else {
+      throw WebKitRuntimeError.invalidControlTransition
+    }
+    transition(to: .humanStepCompleted, observationID: nil)
+  }
+
+  public func humanStepCompletionMonotonicNanoseconds() -> UInt64? {
+    handoffEvents.last(where: { $0.to == .humanStepCompleted })?.monotonicNanoseconds
   }
 
   public func requestAgentResume() throws {
-    guard controlState == .humanControlled else {
+    guard controlState == .humanControlled || controlState == .humanStepCompleted else {
       throw WebKitRuntimeError.invalidControlTransition
     }
     if let origin = restrictedAuthenticationOrigin() {
       throw WebKitRuntimeError.authenticationOriginRequiresHuman(origin)
     }
     if let window = browserWindow {
-      window.orderOut(nil)
+      // Give the page its whole viewport back. The handoff bar is 54 points tall and
+      // was never removed, so a page kept laying out against a viewport that short for
+      // the rest of the session — a dialog opened afterwards came back with every
+      // element crushed to a fraction of a pixel against that edge, and reported as
+      // covered. The bar belongs to the human's turn, not to the agent's.
+      attachWebView(to: window)
+      // Return to the offscreen layout host rather than hiding outright: WebKit stops
+      // laying the page out for a window that was ordered out, and the next
+      // observation would come back empty.
+      window.setFrameOrigin(NSPoint(x: -32_000, y: -32_000))
+      window.orderFrontRegardless()
       window.ignoresMouseEvents = true
       window.collectionBehavior.remove(.moveToActiveSpace)
       window.collectionBehavior.insert(.stationary)
       window.collectionBehavior.insert(.ignoresCycle)
+      // Give up key status and drop back below everything. A parked window left key
+      // at normal level is still the app's front window, and a confirmation panel
+      // positioned against it lands off screen — the prompt is never seen and the
+      // request times out with no decision taken.
+      window.collectionBehavior.insert(.transient)
+      window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) - 1)
+      window.title = Self.localizedHandoff(
+        "WebkitUIMCP — Agent control", fallback: "WebkitUIMCP — Agent control")
+      window.resignKey()
+      window.resignMain()
     }
-    NSApplication.shared.setActivationPolicy(.accessory)
+    if managesApplicationActivationPolicy {
+      NSApplication.shared.setActivationPolicy(.accessory)
+    }
     topLevelOriginLock = (webView.url ?? lastCommittedHTTPURL).flatMap {
       navigationOrigin(for: $0)
     }
@@ -1012,7 +1631,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   }
 
   private func makeBrowserWindow() -> NSWindow {
-    let window = NSWindow(
+    let window = UnconstrainedWindow(
       contentRect: .init(x: 0, y: 0, width: 1280, height: 800),
       styleMask: [.titled, .closable, .miniaturizable, .resizable],
       backing: .buffered,
@@ -1026,30 +1645,93 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     return window
   }
 
+  /// WebKit does not lay out a view whose window was never ordered in, so a page can
+  /// build its whole DOM while every control reports a zero-sized box. Ordering the
+  /// window in at coordinates outside every screen gives the engine a real viewport
+  /// and shows the user nothing.
+  /// A window ordered in for layout may still sit outside every display. Anything a
+  /// person must actually see — a file panel, the handoff window — must key off this,
+  /// never off `isVisible`, which is true for the offscreen layout host.
+  var browserWindowIsOnScreen: Bool {
+    guard let window = browserWindow, window.isVisible else { return false }
+    return NSScreen.screens.contains { $0.frame.intersects(window.frame) }
+  }
+
+  private func ensureLayoutViewport() {
+    let window = browserWindow ?? makeBrowserWindow()
+    guard !window.isVisible else { return }
+    window.ignoresMouseEvents = true
+    window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) - 1)
+    window.collectionBehavior.insert([.stationary, .ignoresCycle, .transient])
+    window.setFrameOrigin(NSPoint(x: -32_000, y: -32_000))
+    window.orderFrontRegardless()
+    webView.needsLayout = true
+    webView.layoutSubtreeIfNeeded()
+  }
+
   private func presentHumanControlWindow() {
     let application = NSApplication.shared
     WebKitNativeApplicationMenu.install(on: application)
-    application.finishLaunching()
-    application.setActivationPolicy(.regular)
+    if managesApplicationActivationPolicy {
+      application.finishLaunching()
+      application.setActivationPolicy(.regular)
+    }
     application.applicationIconImage = Self.humanControlApplicationIcon()
     let window = browserWindow ?? makeBrowserWindow()
     if webView.url == nil, lastCommittedHTTPURL == nil, !webView.isLoading {
       webView.loadHTMLString(Self.emptyHandoffDocument, baseURL: nil)
     }
-    window.title = "WebkitUIMCP — Human control"
+    window.title = Self.localizedHandoff(
+      "WebkitUIMCP — Human control", fallback: "WebkitUIMCP — Human control")
     window.ignoresMouseEvents = false
     window.collectionBehavior.remove(.stationary)
     window.collectionBehavior.remove(.ignoresCycle)
     window.collectionBehavior.insert(.moveToActiveSpace)
     webView.isHidden = false
     webView.alphaValue = 1
-    attachWebView(to: window)
+    attachHumanControlView(to: window)
+    // The window is parked outside every display so pages lay out without being
+    // shown. Handing control to a human must undo that, or the user is asked to act
+    // in a window that is nowhere on screen.
+    window.level = .normal
+    window.collectionBehavior.remove(.transient)
+    window.setFrame(
+      NSRect(origin: .zero, size: window.frame.size), display: false)
+    window.center()
     window.makeKeyAndOrderFront(nil)
     window.orderFrontRegardless()
-    application.activate(ignoringOtherApps: true)
+    if managesApplicationActivationPolicy {
+      application.activate(ignoringOtherApps: true)
+    }
     window.makeFirstResponder(webView)
     window.displayIfNeeded()
   }
+
+  /// Re-establishes the layout viewport and forces a layout pass. An operator can
+  /// reach for this when a page has built its DOM but reports nothing observable,
+  /// which is what a hidden window used to cause.
+  public func forceRender() {
+    ensureLayoutViewport()
+    webView.needsLayout = true
+    webView.needsDisplay = true
+    webView.layoutSubtreeIfNeeded()
+    webView.displayIfNeeded()
+  }
+
+  /// Removes every website data record this profile holds: cookies, caches and local
+  /// storage. Signed-in origins are dropped with it, so the next run starts clean.
+  public func clearBrowsingData() async {
+    let store = webView.configuration.websiteDataStore
+    let types = WKWebsiteDataStore.allWebsiteDataTypes()
+    let records = await store.dataRecords(ofTypes: types)
+    await store.removeData(ofTypes: types, for: records)
+    for cookie in await store.httpCookieStore.allCookies() {
+      await store.httpCookieStore.deleteCookie(cookie)
+    }
+  }
+
+  /// True once a human can actually see and act in the browser window.
+  public var humanControlSurfaceIsPresented: Bool { browserWindowIsOnScreen }
 
   private static let emptyHandoffDocument = """
     <!doctype html>
@@ -1084,6 +1766,108 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     webView.layoutSubtreeIfNeeded()
   }
 
+  private func attachHumanControlView(to window: NSWindow) {
+    webView.removeFromSuperview()
+    window.contentViewController = nil
+    let root = NSView()
+    let bar = NSVisualEffectView()
+    bar.material = .headerView
+    bar.blendingMode = .withinWindow
+    bar.state = .active
+    let instruction = NSTextField(
+      labelWithString: Self.localizedHandoff(
+        "Complete the private step, then return control explicitly.",
+        fallback: "Complete the private step, then return control explicitly."))
+    instruction.textColor = .secondaryLabelColor
+    instruction.setAccessibilityIdentifier("webkitui.handoff.status")
+    let done = NSButton(
+      title: Self.localizedHandoff(
+        "Done — Return Control", fallback: "Done — Return Control"),
+      target: self,
+      action: #selector(completeHumanStep))
+    done.bezelStyle = .rounded
+    done.bezelColor = .controlAccentColor
+    done.setAccessibilityIdentifier("webkitui.handoff.done")
+    done.setAccessibilityHelp(
+      Self.localizedHandoff(
+        "Marks the private step complete so the requesting agent can resume this session.",
+        fallback:
+          "Marks the private step complete so the requesting agent can resume this session."))
+    let controls = NSStackView(views: [instruction, done])
+    controls.orientation = .horizontal
+    controls.alignment = .centerY
+    controls.distribution = .fill
+    controls.spacing = 12
+    controls.translatesAutoresizingMaskIntoConstraints = false
+    webView.translatesAutoresizingMaskIntoConstraints = false
+    bar.translatesAutoresizingMaskIntoConstraints = false
+    root.addSubview(webView)
+    root.addSubview(bar)
+    bar.addSubview(controls)
+    window.contentView = root
+    humanControlInstruction = instruction
+    humanControlCompletionButton = done
+    NSLayoutConstraint.activate([
+      webView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+      webView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+      webView.topAnchor.constraint(equalTo: root.topAnchor),
+      webView.bottomAnchor.constraint(equalTo: bar.topAnchor),
+      bar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+      bar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+      bar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+      bar.heightAnchor.constraint(equalToConstant: 54),
+      controls.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 16),
+      controls.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -16),
+      controls.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+    ])
+  }
+
+  @objc private func completeHumanStep() {
+    do {
+      try markHumanStepCompleted()
+      humanControlInstruction?.stringValue =
+        Self.localizedHandoff(
+          "Private step complete. Waiting for the requesting agent to resume.",
+          fallback: "Private step complete. Waiting for the requesting agent to resume.")
+      humanControlInstruction?.textColor = .systemGreen
+      humanControlCompletionButton?.title = Self.localizedHandoff(
+        "Ready — Waiting for Agent", fallback: "Ready — Waiting for Agent")
+      humanControlCompletionButton?.isEnabled = false
+      humanControlCompletionButton?.setAccessibilityLabel(
+        Self.localizedHandoff(
+          "Private step complete; waiting for the requesting agent",
+          fallback: "Private step complete; waiting for the requesting agent"))
+      if let button = humanControlCompletionButton {
+        NSAccessibility.post(element: button, notification: .valueChanged)
+      }
+      Self.handoffLogger.notice("Human handoff completion accepted")
+    } catch {
+      humanControlInstruction?.stringValue =
+        Self.localizedHandoff(
+          "Control could not be returned. Keep this window open and try again.",
+          fallback: "Control could not be returned. Keep this window open and try again.")
+      humanControlInstruction?.textColor = .systemRed
+      humanControlCompletionButton?.title = Self.localizedHandoff(
+        "Try Again — Return Control", fallback: "Try Again — Return Control")
+      humanControlCompletionButton?.isEnabled = true
+      humanControlCompletionButton?.setAccessibilityLabel(
+        Self.localizedHandoff(
+          "Return control failed; try again", fallback: "Return control failed; try again"))
+      if let button = humanControlCompletionButton {
+        NSAccessibility.post(element: button, notification: .valueChanged)
+      }
+      Self.handoffLogger.error(
+        "Human handoff completion rejected: \(String(describing: error), privacy: .public)")
+    }
+  }
+
+  private static let handoffLogger = Logger(
+    subsystem: "com.lorislab.webkitui-mcp", category: "human-handoff")
+
+  private static func localizedHandoff(_ key: String, fallback: String) -> String {
+    Bundle.main.localizedString(forKey: key, value: fallback, table: nil)
+  }
+
   private static func humanControlApplicationIcon() -> NSImage? {
     NSImage(
       systemSymbolName: "globe.americas.fill",
@@ -1111,6 +1895,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           quietWindow: .milliseconds(300)
         )
       }
+      // Restoring the view is not the same as the page knowing about it. Observing
+      // before WebKit has propagated the new size measures everything against the
+      // viewport the human's turn left behind.
+      await awaitViewportSettled()
       return try await observe(maximumElements: maximumElements)
     } catch {
       if controlState == .resumeRequested {
@@ -1118,6 +1906,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         transition(to: .humanControlled, observationID: nil)
       }
       throw error
+    }
+  }
+
+  /// Waits, briefly and boundedly, for the page's own viewport to agree with the view
+  /// it lives in. Never fails: a page that cannot answer is observed anyway, and the
+  /// observation still reports what it measured.
+  private func awaitViewportSettled(timeout: Duration = .milliseconds(500)) async {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+      let expected = webView.bounds.height
+      guard expected > 0 else { return }
+      let reported =
+        (try? await webView.evaluateJavaScript("window.innerHeight")) as? Double
+      if let reported, abs(reported - expected) < 1 { return }
+      webView.needsLayout = true
+      webView.layoutSubtreeIfNeeded()
+      try? await Task.sleep(for: .milliseconds(20))
     }
   }
 
@@ -1202,7 +2007,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         authenticationUIClassification = .fullBrowserRequired
       }
     }
-    guard let lockedOrigin = topLevelOriginLock else { return .allow }
+    if let expectedOrigin = downloadExpectedOrigin {
+      guard let targetURL = navigationAction.request.url,
+        navigationOrigin(for: targetURL) == expectedOrigin
+      else {
+        finishDownload(.failure(WebKitRuntimeError.networkBoundaryDenied))
+        return .cancel
+      }
+      if navigationAction.shouldPerformDownload { return .download }
+    }
+    guard let lockedOrigin = topLevelOriginLock else {
+      recordNavigationAudit(navigationAction, allowed: true)
+      return .allow
+    }
     guard navigationAction.targetFrame?.isMainFrame == true else {
       return navigationAction.targetFrame == nil ? .cancel : .allow
     }
@@ -1219,16 +2036,65 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         fromOrigin: Self.sanitizedOrigin(lockedOrigin),
         toOrigin: targetOrigin.map(Self.sanitizedOrigin) ?? "unavailable"
       )
+      recordNavigationAudit(navigationAction, allowed: false)
       return .cancel
     }
+    recordNavigationAudit(navigationAction, allowed: true)
     return .allow
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    decidePolicyFor navigationResponse: WKNavigationResponse
+  ) async -> WKNavigationResponsePolicy {
+    guard downloadContinuation != nil else { return .allow }
+    guard let responseURL = navigationResponse.response.url,
+      let expectedOrigin = downloadExpectedOrigin,
+      navigationOrigin(for: responseURL) == expectedOrigin
+    else {
+      finishDownload(.failure(WebKitRuntimeError.networkBoundaryDenied))
+      return .cancel
+    }
+    let disposition =
+      (navigationResponse.response as? HTTPURLResponse)?
+      .value(forHTTPHeaderField: "Content-Disposition")?.lowercased() ?? ""
+    if let response = navigationResponse.response as? HTTPURLResponse {
+      downloadHTTPStatus = response.statusCode
+      guard (200...299).contains(response.statusCode) else {
+        finishDownload(
+          .failure(WebKitRuntimeError.downloadHTTPFailure(status: response.statusCode)))
+        return .cancel
+      }
+    }
+    if !navigationResponse.canShowMIMEType || disposition.contains("attachment") {
+      return .download
+    }
+    finishDownload(
+      .failure(WebKitRuntimeError.unsupportedDownload(httpStatus: downloadHTTPStatus)))
+    return .cancel
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    navigationAction: WKNavigationAction,
+    didBecome download: WKDownload
+  ) {
+    beginDownload(download)
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    navigationResponse: WKNavigationResponse,
+    didBecome download: WKDownload
+  ) {
+    beginDownload(download)
   }
 
   public func webView(
     _ webView: WKWebView,
     didStartProvisionalNavigation navigation: WKNavigation!
   ) {
-    resetForNavigation()
+    if downloadContinuation == nil { resetForNavigation() }
   }
 
   public func webView(
@@ -1236,7 +2102,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     didFail navigation: WKNavigation!,
     withError error: any Error
   ) {
-    if navigationFailure == nil {
+    if navigationFailure == nil && !(downloadStarted && Self.isDownloadCancellation(error)) {
       navigationFailure = Self.sanitizedNavigationFailure(error)
     }
   }
@@ -1246,9 +2112,210 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     didFailProvisionalNavigation navigation: WKNavigation!,
     withError error: any Error
   ) {
-    if navigationFailure == nil {
+    if navigationFailure == nil && !(downloadStarted && Self.isDownloadCancellation(error)) {
       navigationFailure = Self.sanitizedNavigationFailure(error)
     }
+  }
+
+  public func download(
+    _ download: WKDownload,
+    decideDestinationUsing response: URLResponse,
+    suggestedFilename: String,
+    completionHandler: @escaping @MainActor (URL?) -> Void
+  ) {
+    guard download === activeDownload, downloadContinuation != nil else {
+      completionHandler(nil)
+      return
+    }
+    downloadMIMEType = response.mimeType
+    downloadHTTPStatus = (response as? HTTPURLResponse)?.statusCode ?? downloadHTTPStatus
+    downloadSuggestedFilename = Self.safeSuggestedFilename(suggestedFilename)
+    Task { @MainActor [weak self] in
+      guard let self else {
+        completionHandler(nil)
+        return
+      }
+      let proposed = await self.proposedDownloadDestination(suggestedFilename: suggestedFilename)
+      guard let proposed else {
+        completionHandler(nil)
+        self.finishDownload(.failure(WebKitRuntimeError.downloadCancelled))
+        return
+      }
+      let destination = Self.collisionSafeDestination(for: proposed)
+      self.downloadDestination = destination
+      completionHandler(destination)
+    }
+  }
+
+  public func downloadDidFinish(_ download: WKDownload) {
+    guard download === activeDownload, let destination = downloadDestination else { return }
+    do {
+      let data = try Data(contentsOf: destination, options: .mappedIfSafe)
+      let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+      let profileUUID = Self.provisioningProfileUUID(from: data)
+      if let expected = downloadExpectedProvisioningProfileUUID,
+        profileUUID?.localizedCaseInsensitiveCompare(expected) != .orderedSame
+      {
+        finishDownload(
+          .failure(WebKitRuntimeError.downloadFailed("provisioning_profile_uuid_mismatch")))
+        return
+      }
+      let receipt = WebKitDownloadReceipt(
+        httpStatus: downloadHTTPStatus,
+        suggestedFilename: downloadSuggestedFilename ?? destination.lastPathComponent,
+        filename: destination.lastPathComponent,
+        mimeType: downloadMIMEType,
+        byteCount: UInt64(data.count),
+        sha256: digest,
+        provisioningProfileUUID: profileUUID)
+      if downloadActionVerified {
+        finishDownload(.success(receipt))
+      } else {
+        completedDownloadReceipt = receipt
+      }
+    } catch {
+      finishDownload(.failure(WebKitRuntimeError.downloadFailed("integrity_receipt_unavailable")))
+    }
+  }
+
+  public func download(
+    _ download: WKDownload,
+    didFailWithError error: any Error,
+    resumeData: Data?
+  ) {
+    guard download === activeDownload else { return }
+    if let destination = downloadDestination {
+      try? FileManager.default.removeItem(at: destination)
+    }
+    finishDownload(.failure(WebKitRuntimeError.downloadFailed(Self.sanitizedError(error))))
+  }
+
+  public func download(
+    _ download: WKDownload,
+    decidedPolicyForHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest
+  ) async -> WKDownload.RedirectPolicy {
+    guard download === activeDownload,
+      let expectedOrigin = downloadExpectedOrigin,
+      let url = request.url,
+      navigationOrigin(for: url) == expectedOrigin
+    else { return .cancel }
+    return .allow
+  }
+
+  private func beginDownload(_ download: WKDownload) {
+    guard downloadContinuation != nil else {
+      download.cancel { _ in }
+      return
+    }
+    downloadStarted = true
+    activeDownload = download
+    download.delegate = self
+    navigationFailure = nil
+  }
+
+  private func proposedDownloadDestination(suggestedFilename: String) async -> URL? {
+    let filename = Self.safeSuggestedFilename(suggestedFilename)
+    if let downloadDestinationProvider {
+      return await downloadDestinationProvider(filename)
+    }
+    let panel = NSSavePanel()
+    panel.title = "Save Browser Download"
+    panel.prompt = "Save"
+    panel.canCreateDirectories = true
+    panel.nameFieldStringValue = filename
+    return panel.runModal() == .OK ? panel.url : nil
+  }
+
+  private func finishDownload(_ result: Result<WebKitDownloadReceipt, any Error>) {
+    guard let continuation = downloadContinuation else { return }
+    if case .failure = result, let downloadDestination {
+      try? FileManager.default.removeItem(at: downloadDestination)
+    }
+    downloadTimeoutTask?.cancel()
+    downloadTimeoutTask = nil
+    downloadContinuation = nil
+    downloadExpectedOrigin = nil
+    downloadDestination = nil
+    downloadMIMEType = nil
+    downloadHTTPStatus = nil
+    downloadSuggestedFilename = nil
+    downloadExpectedProvisioningProfileUUID = nil
+    downloadStarted = false
+    downloadActionVerified = false
+    completedDownloadReceipt = nil
+    activeDownload = nil
+    continuation.resume(with: result)
+  }
+
+  private static func safeSuggestedFilename(_ value: String) -> String {
+    let component = URL(fileURLWithPath: value).lastPathComponent
+      .filter { !$0.isNewline && !$0.isASCII || ($0.asciiValue.map { $0 >= 32 } ?? false) }
+    return component.isEmpty || component == "." || component == ".." ? "download" : component
+  }
+
+  private static func safeUploadFilename(_ value: String) -> String? {
+    guard !value.isEmpty, value.count <= 255, value != ".", value != ".." else { return nil }
+    let bidiControls: Set<UInt32> = [
+      0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+      0x2066, 0x2067, 0x2068, 0x2069,
+    ]
+    let rejected = CharacterSet.controlCharacters.union(.illegalCharacters)
+    guard
+      value.unicodeScalars.allSatisfy({
+        !rejected.contains($0) && !bidiControls.contains($0.value)
+      })
+    else { return nil }
+    return value
+  }
+
+  static func provisioningProfileUUID(from data: Data) -> String? {
+    if let value = propertyListUUID(from: data) { return value }
+    guard !data.isEmpty else { return nil }
+    var decoder: CMSDecoder?
+    guard CMSDecoderCreate(&decoder) == errSecSuccess, let decoder else { return nil }
+    let updateStatus = data.withUnsafeBytes { bytes in
+      CMSDecoderUpdateMessage(decoder, bytes.baseAddress!, bytes.count)
+    }
+    guard updateStatus == errSecSuccess,
+      CMSDecoderFinalizeMessage(decoder) == errSecSuccess
+    else { return nil }
+    var content: CFData?
+    guard CMSDecoderCopyContent(decoder, &content) == errSecSuccess, let content else { return nil }
+    return propertyListUUID(from: content as Data)
+  }
+
+  private static func propertyListUUID(from data: Data) -> String? {
+    guard
+      let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+      let dictionary = plist as? [String: Any],
+      let uuid = dictionary["UUID"] as? String,
+      !uuid.isEmpty
+    else { return nil }
+    return uuid
+  }
+
+  private static func collisionSafeDestination(for requested: URL) -> URL {
+    guard FileManager.default.fileExists(atPath: requested.path) else { return requested }
+    let directory = requested.deletingLastPathComponent()
+    let extensionName = requested.pathExtension
+    let stem = requested.deletingPathExtension().lastPathComponent
+    for index in 2...10_000 {
+      let name = extensionName.isEmpty ? "\(stem) \(index)" : "\(stem) \(index).\(extensionName)"
+      let candidate = directory.appendingPathComponent(name, isDirectory: false)
+      if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+    }
+    return directory.appendingPathComponent("\(UUID().uuidString)-\(requested.lastPathComponent)")
+  }
+
+  private static func isDownloadCancellation(_ error: any Error) -> Bool {
+    let error = error as NSError
+    return error.domain == WKError.errorDomain && error.code == 102
+  }
+
+  private static func sanitizedError(_ error: any Error) -> String {
+    let error = error as NSError
+    return "\(error.domain) code=\(error.code)"
   }
 
   private func load(
@@ -1258,9 +2325,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   ) async throws -> WebKitNavigationResult {
     try validate(quietWindow: quietWindow)
     resetForNavigation()
+    armNavigationActor(.agentNavigation)
     let started = DispatchTime.now().uptimeNanoseconds
     webView.load(request)
     let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
+    if readiness == .deadlineReached { webView.stopLoading() }
     let state = try await instrumentationState()
     await refreshAuthenticationUIClassification()
     rememberRecoverableURL(webView.url ?? request.url)
@@ -1269,6 +2338,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     return WebKitNavigationResult(
       documentID: documentID,
       url: agentSafeURLString(loadedURL) ?? "about:blank",
+      requestedURL: request.url.flatMap(agentSafeURLString) ?? "about:blank",
       readiness: readiness,
       elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
       mutationCount: state.mutationCount
@@ -1330,22 +2400,33 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private func resolveTarget(
     criteria: [[String: String]],
-    scrollIntoView: Bool
+    scrollIntoView: Bool,
+    physicalIdentity: String = "",
+    expectedCandidateCount: Int = 0
   ) async throws -> RawActionResolution {
     try await actionScript(
       source: Self.resolveSource,
-      arguments: ["criteria": criteria, "scrollIntoView": scrollIntoView]
+      arguments: [
+        "criteria": criteria,
+        "physicalIdentity": physicalIdentity,
+        "expectedCandidateCount": expectedCandidateCount,
+        "scrollIntoView": scrollIntoView,
+      ]
     )
   }
 
   private func resolveAndPerform(
     criteria: [[String: String]],
+    physicalIdentity: String,
+    expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
     operation: String,
     value: String?
   ) async throws -> RawActionResolution {
     var arguments: [String: Any] = [
       "criteria": criteria,
+      "physicalIdentity": physicalIdentity,
+      "expectedCandidateCount": expectedCandidateCount,
       "expectedBox": [
         "x": expectedBoundingBox.x,
         "y": expectedBoundingBox.y,
@@ -1360,6 +2441,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private func resolveAndPerformNativeClick(
     criteria: [[String: String]],
+    physicalIdentity: String,
+    expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox
   ) async throws -> RawActionResolution {
     let token = UUID().uuidString
@@ -1372,6 +2455,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       source: Self.armNativeClickSource,
       arguments: [
         "criteria": criteria,
+        "physicalIdentity": physicalIdentity,
+        "expectedCandidateCount": expectedCandidateCount,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
       ])
@@ -1381,9 +2466,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     try dispatchNativeMouseClick(at: candidate.boundingBox)
     let deadline = ContinuousClock.now + .seconds(1)
     while ContinuousClock.now < deadline {
-      if let receipt = nativeGestureReceipts[token],
-        receipt.physicalIdentity == candidate.physicalIdentity,
-        receipt.eventType == "click"
+      if let receipt = nativeGestureReceipt(
+        token: token, physicalIdentity: candidate.physicalIdentity, eventType: "click")
       {
         return RawActionResolution(
           count: armed.count,
@@ -1393,8 +2477,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
             geometryStable: candidate.geometryStable,
             actionable: candidate.actionable,
             dispatched: true,
-            trustedUserGesture: receipt.trusted
-          ))
+            trustedUserGesture: receipt.trusted,
+            unsupportedOperationRole: nil
+          ),
+          eliminatedBy: nil, pinnedState: nil)
       }
       try await Task.sleep(for: .milliseconds(10))
     }
@@ -1427,6 +2513,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private func resolveAndPerformNativeKey(
     criteria: [[String: String]],
+    physicalIdentity: String,
+    expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
     key: String
   ) async throws -> RawActionResolution {
@@ -1443,6 +2531,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       source: Self.armNativeKeySource,
       arguments: [
         "criteria": criteria,
+        "physicalIdentity": physicalIdentity,
+        "expectedCandidateCount": expectedCandidateCount,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
         "expectedKey": key,
@@ -1453,9 +2543,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     let expectedReceiptEvent = key == "Tab" ? "blur" : "keydown"
     let deadline = ContinuousClock.now + .seconds(1)
     while ContinuousClock.now < deadline {
-      if let receipt = nativeGestureReceipts[token],
-        receipt.physicalIdentity == candidate.physicalIdentity,
-        receipt.eventType == expectedReceiptEvent
+      if let receipt = nativeGestureReceipt(
+        token: token, physicalIdentity: candidate.physicalIdentity,
+        eventType: expectedReceiptEvent)
       {
         return RawActionResolution(
           count: armed.count,
@@ -1465,12 +2555,89 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
             geometryStable: candidate.geometryStable,
             actionable: candidate.actionable,
             dispatched: true,
-            trustedUserGesture: receipt.trusted
-          ))
+            trustedUserGesture: receipt.trusted,
+            unsupportedOperationRole: nil
+          ),
+          eliminatedBy: nil, pinnedState: nil)
       }
       try await Task.sleep(for: .milliseconds(10))
     }
     throw WebKitRuntimeError.nativeGestureReceiptUnavailable
+  }
+
+  private func resolveAndPerformNativeFill(
+    criteria: [[String: String]],
+    physicalIdentity: String,
+    expectedCandidateCount: Int,
+    expectedBoundingBox: ObservedBoundingBox,
+    value: String
+  ) async throws -> RawActionResolution {
+    guard let window = webView.window, window.makeFirstResponder(webView) else {
+      throw WebKitRuntimeError.targetNotActionable
+    }
+    let token = UUID().uuidString
+    armedNativeGestureTokens.insert(token)
+    defer {
+      armedNativeGestureTokens.remove(token)
+      nativeGestureReceipts.removeValue(forKey: token)
+    }
+    let armed = try await actionScript(
+      source: Self.armNativeFillSource,
+      arguments: [
+        "criteria": criteria,
+        "physicalIdentity": physicalIdentity,
+        "expectedCandidateCount": expectedCandidateCount,
+        "expectedBox": Self.boxDictionary(expectedBoundingBox),
+        "token": token,
+      ])
+    guard armed.count == 1, let candidate = armed.candidate else { return armed }
+    guard candidate.geometryStable, candidate.actionable else { return armed }
+
+    webView.insertText(value)
+    let deadline = ContinuousClock.now + .seconds(1)
+    while ContinuousClock.now < deadline {
+      if let inputReceipt = nativeGestureReceipt(
+        token: token, physicalIdentity: candidate.physicalIdentity, eventType: "input")
+      {
+        // Commit within the same confirmed action. A later action can address
+        // a framework replacement node and leave validation state untouched.
+        try dispatchNativeKey("Tab")
+        let commitDeadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < commitDeadline {
+          if let commitReceipt = nativeGestureReceipt(
+            token: token, physicalIdentity: candidate.physicalIdentity,
+            eventType: "commit_keydown")
+          {
+            return RawActionResolution(
+              count: armed.count,
+              candidate: RawActionCandidate(
+                physicalIdentity: candidate.physicalIdentity,
+                boundingBox: candidate.boundingBox,
+                geometryStable: candidate.geometryStable,
+                actionable: candidate.actionable,
+                dispatched: true,
+                trustedUserGesture: inputReceipt.trusted && commitReceipt.trusted,
+                unsupportedOperationRole: nil
+              ),
+              eliminatedBy: nil, pinnedState: nil)
+          }
+          try await Task.sleep(for: .milliseconds(10))
+        }
+        throw WebKitRuntimeError.nativeGestureReceiptUnavailable
+      }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw WebKitRuntimeError.nativeGestureReceiptUnavailable
+  }
+
+  private func nativeGestureReceipt(
+    token: String,
+    physicalIdentity: String,
+    eventType: String
+  ) -> NativeGestureReceipt? {
+    nativeGestureReceipts[token]?.first {
+      $0.physicalIdentity == physicalIdentity && $0.eventType == eventType
+    }
   }
 
   private func dispatchNativeKey(_ key: String) throws {
@@ -1535,10 +2702,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     return result
   }
 
-  private func recordCardinality(_ count: Int, target: ObservedTargetRecord) throws {
+  private func recordCardinality(
+    _ count: Int, target: ObservedTargetRecord, eliminatedBy: [String] = [],
+    pinnedState: String = "not_requested"
+  ) throws {
     guard count != 1 else { return }
     let now = DispatchTime.now().uptimeNanoseconds
-    let attempt = try AddressingAttempt(
+    // Measuring a failure must never replace it. An attempt that cannot be recorded
+    // — a document replaced under us moves the generation backwards — is dropped,
+    // and the caller still learns why addressing failed.
+    if let attempt = try? AddressingAttempt(
       observationID: target.recipe.observationID,
       locatorRecipeID: target.recipe.elementID,
       observationGeneration: target.recipe.observationGeneration,
@@ -1549,9 +2722,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       semanticComparison: .unknown,
       physicalIdentity: .unknown,
       geometryComparison: .unknown
-    )
-    addressingCounters.record(AddressingClassifier.classify(attempt))
-    throw WebKitRuntimeError.targetNotUnique(count)
+    ) {
+      addressingCounters.record(AddressingClassifier.classify(attempt))
+    }
+    if count == 0 { throw WebKitRuntimeError.targetNotFound(eliminatedBy) }
+    throw WebKitRuntimeError.targetNotUnique(count, pinned: pinnedState)
   }
 
   private func requireAgentControl() throws {
@@ -1562,7 +2737,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   }
 
   private func requireObservationControl() throws {
-    guard controlState != .handoffRequested, controlState != .humanControlled else {
+    guard
+      controlState != .handoffRequested,
+      controlState != .humanControlled,
+      controlState != .humanStepCompleted
+    else {
       throw WebKitRuntimeError.humanControlActive
     }
     try requireNonAuthenticationOrigin()
@@ -1594,9 +2773,56 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     processTerminated = false
     authenticationUIClassification = nil
     restrictedAuthenticationFrameOrigin = nil
+    restrictedWebAuthnOrigin = nil
     pendingCrossOriginNavigationRequest = nil
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
+  }
+
+  private func armNavigationActor(_ actor: WebKitNavigationActor) {
+    let now = DispatchTime.now().uptimeNanoseconds
+    let (expiry, overflow) = now.addingReportingOverflow(2_000_000_000)
+    armedNavigationActor = (actor, overflow ? UInt64.max : expiry)
+  }
+
+  private func recordNavigationAudit(
+    _ action: WKNavigationAction,
+    allowed: Bool
+  ) {
+    guard action.targetFrame?.isMainFrame == true else { return }
+    let now = DispatchTime.now().uptimeNanoseconds
+    let actor: WebKitNavigationActor
+    if controlState == .humanControlled || controlState == .humanStepCompleted {
+      actor = .human
+    } else if let armedNavigationActor, now <= armedNavigationActor.expiresAt {
+      actor = armedNavigationActor.actor
+    } else if action.sourceFrame.isMainFrame {
+      actor = .webContent
+    } else {
+      actor = .unattributed
+    }
+    armedNavigationActor = nil
+    let navigationType: String
+    switch action.navigationType {
+    case .linkActivated: navigationType = "link_activated"
+    case .formSubmitted: navigationType = "form_submitted"
+    case .backForward: navigationType = "back_forward"
+    case .reload: navigationType = "reload"
+    case .formResubmitted: navigationType = "form_resubmitted"
+    case .other: navigationType = "other"
+    @unknown default: navigationType = "unknown"
+    }
+    navigationAuditEvents.append(
+      WebKitNavigationAuditEvent(
+        fromOrigin: webView.url.flatMap(Self.sanitizedOrigin(for:)),
+        toOrigin: action.request.url.flatMap(Self.sanitizedOrigin(for:)),
+        actor: actor,
+        navigationType: navigationType,
+        allowed: allowed,
+        monotonicNanoseconds: now))
+    if navigationAuditEvents.count > 128 {
+      navigationAuditEvents.removeFirst(navigationAuditEvents.count - 128)
+    }
   }
 
   private func navigationOrigin(for url: URL) -> SecurityOrigin? {
@@ -1617,7 +2843,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     {
       return Self.sanitizedOrigin(for: url)
     }
-    return restrictedAuthenticationFrameOrigin
+    return restrictedAuthenticationFrameOrigin ?? restrictedWebAuthnOrigin
   }
 
   private func agentSafeURLString(_ url: URL?) -> String? {
@@ -1649,8 +2875,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   }
 
   private func refreshAuthenticationUIClassification() async {
-    guard restrictedAuthenticationOrigin() != nil else {
-      authenticationUIClassification = nil
+    restrictedWebAuthnOrigin = nil
+    if let url = webView.url ?? lastCommittedHTTPURL,
+      url.scheme?.lowercased() == "https",
+      url.host?.lowercased() == "dash.cloudflare.com",
+      url.path == "/two-factor"
+    {
+      restrictedWebAuthnOrigin = Self.sanitizedOrigin(for: url)
+      authenticationUIClassification = .fullBrowserRequired
       return
     }
     guard
@@ -1663,7 +2895,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       let data = json.data(using: .utf8),
       let state = try? JSONDecoder().decode(RawAuthenticationUIState.self, from: data)
     else {
-      authenticationUIClassification = .humanHandoffRequired
+      authenticationUIClassification =
+        restrictedAuthenticationOrigin() == nil ? nil : .humanHandoffRequired
+      return
+    }
+    if state.hasWebAuthnControl,
+      !Self.webAuthnAnyRelyingPartyEntitlementConfigured(),
+      let url = webView.url ?? lastCommittedHTTPURL
+    {
+      restrictedWebAuthnOrigin = Self.sanitizedOrigin(for: url)
+      authenticationUIClassification = .fullBrowserRequired
+      return
+    }
+    guard restrictedAuthenticationOrigin() != nil else {
+      authenticationUIClassification = nil
       return
     }
     if Self.requiresFullBrowserBackend(
@@ -1702,6 +2947,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       let childHost = URL(string: restrictedFrameOrigin)?.host?.lowercased()
     else { return false }
     return fullBrowserAuthenticationParents[parentHost]?.contains(childHost) == true
+  }
+
+  private static func webAuthnAnyRelyingPartyEntitlementConfigured() -> Bool {
+    guard
+      let task = SecTaskCreateFromSelf(nil),
+      let value = SecTaskCopyValueForEntitlement(
+        task,
+        "com.apple.developer.web-browser.public-key-credential" as CFString,
+        nil
+      )
+    else { return false }
+    return (value as? Bool) == true
   }
 
   private func rememberRecoverableURL(_ url: URL?) {
@@ -1763,6 +3020,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private func locatorRecipe(
     for element: RawElement,
+    peers: [RawElement],
     elementID: String,
     observationID: String,
     generation: UInt64
@@ -1790,6 +3048,49 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           comparison: .whitespaceCollapsed
         )
       )
+    }
+    let basePeerCount = peers.filter {
+      $0.role == element.role
+        && $0.accessibleName == element.accessibleName
+        && $0.label == element.label
+    }.count
+    let uniquelyIdentifyingAnchor = element.contextAnchors.first { anchor in
+      guard basePeerCount > 1 else { return false }
+      guard !anchor.text.isEmpty else { return false }
+      let matchingPeers = peers.filter { peer in
+        peer.role == element.role
+          && peer.accessibleName == element.accessibleName
+          && peer.label == element.label
+          && peer.contextAnchors.contains(where: {
+            $0.kind == anchor.kind && $0.text == anchor.text
+          })
+      }
+      return matchingPeers.count == 1
+    }
+    for anchor in element.contextAnchors where !anchor.text.isEmpty {
+      clauses.append(
+        .init(
+          fact: .contextAnchor(anchor.kind),
+          expectedValue: anchor.text,
+          strength: element.accessibleName == nil && element.label == nil
+            || (anchor.kind == uniquelyIdentifyingAnchor?.kind
+              && anchor.text == uniquelyIdentifyingAnchor?.text)
+            ? .required : .corroborating,
+          comparison: .whitespaceCollapsed))
+    }
+    for name in ["href", "data-testid", "id", "name", "title"] {
+      guard let value = element.stableAttributes[name], !value.isEmpty else { continue }
+      let strongIdentity = ["href", "data-testid", "id"].contains(name)
+      clauses.append(
+        .init(
+          fact: .stableAttribute(name),
+          expectedValue: value,
+          strength: strongIdentity ? .required : .corroborating,
+          comparison: .exact))
+    }
+    if !element.domPath.isEmpty {
+      clauses.append(
+        .init(fact: .domPath, expectedValue: element.domPath, strength: .corroborating))
     }
     if clauses.isEmpty {
       clauses.append(
@@ -1821,6 +3122,71 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     )
   }
 
+  private func locatorCandidate(_ element: RawElement) -> LocatorCandidate {
+    var facts: [LocatorFact: String] = [.stableAttribute("tag"): element.tag]
+    if let role = element.role { facts[.role] = role }
+    if let name = element.accessibleName { facts[.accessibleName] = name }
+    if let label = element.label { facts[.label] = label }
+    if let text = element.text { facts[.value] = text }
+    for anchor in element.contextAnchors { facts[.contextAnchor(anchor.kind)] = anchor.text }
+    for (name, value) in element.stableAttributes {
+      facts[.stableAttribute(name)] = value
+    }
+    return LocatorCandidate(candidateID: element.physicalIdentity, facts: facts)
+  }
+
+  private func locatorQuality(
+    recipe: LocatorRecipe,
+    candidateCount: Int,
+    candidateCountIsLowerBound: Bool
+  ) -> LocatorQuality {
+    let required = recipe.clauses.filter { $0.strength == .required }
+    let facts = required.map { clause -> String in
+      switch clause.fact {
+      case .role: "role"
+      case .accessibleName: "accessible_name"
+      case .label: "label"
+      case .contextAnchor(let kind): "context_anchor:\(kind)"
+      case .stableAttribute(let name): "stable_attribute:\(name)"
+      case .framePath: "frame_path"
+      case .value: "value"
+      case .domPath: "dom_path"
+      }
+    }.sorted()
+    let hasStrongIdentity = required.contains { clause in
+      switch clause.fact {
+      case .accessibleName, .label, .contextAnchor: true
+      case .stableAttribute(let name): name != "tag"
+      default: false
+      }
+    }
+    let status: LocatorQualityStatus
+    let recommended: String?
+    if !hasStrongIdentity || candidateCount == 0 {
+      status = .insufficient
+      recommended = "contextual_reobserve_or_handoff"
+    } else if candidateCount == 1, candidateCountIsLowerBound {
+      // Truncation is a caveat on the verdict, not a replacement for it. Forcing every
+      // element to insufficient because the page was long left the one field meant to
+      // say whether a target is unambiguous saying nothing on exactly the pages where
+      // that mattered. The lower-bound flag carries the honesty.
+      status = .unique
+      recommended = "observation_is_partial_page_further_to_confirm_uniqueness"
+    } else if candidateCount > 1 {
+      status = .ambiguous
+      recommended = "inspect_or_contextual_reobserve"
+    } else {
+      status = .unique
+      recommended = nil
+    }
+    return LocatorQuality(
+      status: status,
+      candidateCount: candidateCount,
+      candidateCountIsLowerBound: candidateCountIsLowerBound,
+      facts: facts,
+      recommendedAction: recommended)
+  }
+
   private static func securityOrigin(from url: URL?) -> SecurityOrigin? {
     guard let url, let scheme = url.scheme, let host = url.host else { return nil }
     return SecurityOrigin(scheme: scheme, host: host, port: url.port)
@@ -1832,6 +3198,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         mutationCount: 0,
         readyState: document.readyState,
         nodeIDs: new WeakMap(),
+        // The reverse direction, so an element observed a moment ago can be acted on by
+        // the identity it was given rather than re-derived from a name it may not have.
+        nodesByID: new Map(),
         nextNodeID: 1
       };
       Object.defineProperty(globalThis, '__webkituiState', {
@@ -1856,19 +3225,50 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private static let authenticationUIStateSource = """
     const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+    const deepQueryAll = (root, selector) => {
+      const matches = [];
+      const roots = [root];
+      for (let index = 0; index < roots.length; index += 1) {
+        const current = roots[index];
+        matches.push(...current.querySelectorAll(selector));
+        for (const host of current.querySelectorAll('*')) {
+          if (host.shadowRoot) roots.push(host.shadowRoot);
+          // A same-origin frame is part of the page a person sees. Skipping it made
+          // every control inside one invisible, which an agent reads as absent.
+          if (host.localName === 'iframe' || host.localName === 'frame') {
+            let inner = null;
+            try { inner = host.contentDocument; } catch { inner = null; }
+            if (inner) roots.push(inner);
+          }
+        }
+      }
+      return matches;
+    };
+    let obscuredByAncestorOpacity = false;
     const isRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
         return false;
       }
-      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
         if (cursor.hidden || cursor.inert
             || collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
           return false;
         }
         const style = getComputedStyle(cursor);
         if (style.display === 'none' || style.visibility === 'hidden'
-            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+            || style.visibility === 'collapse') {
+          return false;
+        }
+        // A transparent ancestor is reported, not dropped. A single-page app whose
+        // entrance animation never ran leaves its whole tree at opacity 0 while the
+        // controls are laid out and interactive; dropping them makes the page look
+        // empty. Every write still passes an exact human confirmation, and the
+        // observation says the target is obscured.
+        if (Number(style.opacity) === 0 && cursor !== element) {
+          obscuredByAncestorOpacity = true;
+        } else if (Number(style.opacity) === 0) {
           return false;
         }
       }
@@ -1881,10 +3281,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       'input[autocomplete="new-password"]',
       'input[autocomplete="one-time-code"]'
     ].join(',');
-    const authenticationControls = Array.from(document.querySelectorAll(authenticationSelector));
-    const forms = Array.from(document.querySelectorAll('form'));
+    const authenticationControls = deepQueryAll(document, authenticationSelector);
+    const webAuthnText = /(?:security key|passkey|yubikey|clé de sécurité|clé d’accès|cle de securite|cle d'acces)/i;
+    const webAuthnControls = deepQueryAll(document,
+      'a, button, h1, h2, h3, [role="button"], [role="heading"], input[autocomplete~="webauthn"]'
+    ).filter(element => {
+      if (element.matches('input[autocomplete~="webauthn"]')) return true;
+      return webAuthnText.test(collapse(
+        element.getAttribute('aria-label') || element.textContent || element.value));
+    });
+    const bodyHasWebAuthnText = webAuthnText.test(collapse(document.body?.innerText));
+    const forms = deepQueryAll(document, 'form');
     const formHasOnlyInvisibleControls = forms.some(form => {
-      const controls = Array.from(form.querySelectorAll('input, select, textarea, button'));
+      const controls = deepQueryAll(form, 'input, select, textarea, button');
       return controls.length > 0 && !controls.some(isRendered);
     });
     return JSON.stringify({
@@ -1893,12 +3302,38 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         document.querySelector('[role="progressbar"], progress, [aria-busy="true"]')),
       hasVisibleAuthenticationControl: authenticationControls.some(isRendered),
       hasInvisibleAuthenticationControl:
-        authenticationControls.some(element => !isRendered(element)) || formHasOnlyInvisibleControls
+        authenticationControls.some(element => !isRendered(element)) || formHasOnlyInvisibleControls,
+      hasWebAuthnControl: webAuthnControls.some(isRendered) || bodyHasWebAuthnText
     });
     """
 
   private static let observationSource = """
     const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+    const deepQueryAll = (root, selector) => {
+      const matches = [];
+      const roots = [root];
+      for (let index = 0; index < roots.length; index += 1) {
+        const current = roots[index];
+        matches.push(...current.querySelectorAll(selector));
+        for (const host of current.querySelectorAll('*')) {
+          if (host.shadowRoot) roots.push(host.shadowRoot);
+          // A same-origin frame is part of the page a person sees. Skipping it made
+          // every control inside one invisible, which an agent reads as absent.
+          if (host.localName === 'iframe' || host.localName === 'frame') {
+            let inner = null;
+            try { inner = host.contentDocument; } catch { inner = null; }
+            if (inner) roots.push(inner);
+          }
+        }
+      }
+      return matches;
+    };
+    const labelledNode = (element, id) => {
+      const root = element?.getRootNode?.();
+      return (typeof root?.getElementById === 'function' ? root.getElementById(id) : null)
+        || document.getElementById(id);
+    };
     let semanticTextTruncated = false;
     const bounded = value => {
       if (value === null || value === undefined) return null;
@@ -1907,19 +3342,37 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       semanticTextTruncated = true;
       return text.slice(0, maximumFieldCharacters);
     };
+    const boundedFieldValue = value => {
+      if (value === null || value === undefined) return null;
+      const text = String(value).normalize('NFC').replace(/\\r\\n?/g, '\\n');
+      if (text.length <= maximumFieldCharacters) return text;
+      semanticTextTruncated = true;
+      return text.slice(0, maximumFieldCharacters);
+    };
+    let obscuredByAncestorOpacity = false;
     const isRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
         return false;
       }
-      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
         if (cursor.hidden || cursor.inert
             || collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
           return false;
         }
         const style = getComputedStyle(cursor);
         if (style.display === 'none' || style.visibility === 'hidden'
-            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+            || style.visibility === 'collapse') {
+          return false;
+        }
+        // A transparent ancestor is reported, not dropped. A single-page app whose
+        // entrance animation never ran leaves its whole tree at opacity 0 while the
+        // controls are laid out and interactive; dropping them makes the page look
+        // empty. Every write still passes an exact human confirmation, and the
+        // observation says the target is obscured.
+        if (Number(style.opacity) === 0 && cursor !== element) {
+          obscuredByAncestorOpacity = true;
+        } else if (Number(style.opacity) === 0) {
           return false;
         }
       }
@@ -1930,11 +3383,190 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     const sensitiveAutocomplete = new Set([
       'current-password', 'new-password', 'one-time-code', 'webauthn'
     ]);
-    const styledControlSurface = element => {
+    // A Material-style control renders in two halves: the real input, given no size
+    // or clipped away, and the painted box beside it marked aria-hidden. Neither half
+    // survives a visibility filter on its own, so the form observes as a group with no
+    // children and cannot be filled at all. Stand the pair up as one unit, addressed by
+    // the visible half. The walk stops at the first ancestor owning a second control,
+    // so a surface is never shared between two checkboxes.
+    const hiddenControlSurface = element => {
       if (!(element instanceof HTMLInputElement)
           || !['checkbox', 'radio'].includes(element.type)) return null;
       const labels = element.labels ? Array.from(element.labels) : [];
-      return labels.find(isRendered) || null;
+      const label = labels.find(isRendered);
+      if (label) return label;
+      const labelledBy = collapse(element.getAttribute('aria-labelledby'));
+      for (const id of labelledBy.split(/\\s+/).slice(0, 8).filter(Boolean)) {
+        const node = labelledNode(element, id);
+        if (node && isRendered(node)) return node;
+      }
+      // Climb to the outermost ancestor that still owns this one control and nothing
+      // else interactive: that is the labelled row, which carries both the visible text
+      // and the click handler. The tight wrapper around the input holds neither — it is
+      // the painted box, and its text is empty.
+      let widest = null;
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        if (isRendered(cursor)) widest = cursor;
+      }
+      return widest;
+    };
+    // A control can be rendered, sized and enabled and still be unable to receive its
+    // own click: Material paints the box in a sibling that covers it. Hit testing is
+    // the only way to tell, and without it every radio on the page costs a failed
+    // round trip reported as indeterminate.
+    // Hit testing belongs to the document the element lives in, at that document's own
+    // coordinates. Asking the top-level document about a point measured inside a frame
+    // answers about whatever sits at those numbers in the outer page.
+    const hitAtCentreOfLocal = (node, box) => {
+      const owner = node?.ownerDocument ?? document;
+      const view = owner.defaultView ?? window;
+      const x = Math.min(view.innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const y = Math.min(view.innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      let hit = owner.elementFromPoint(x, y);
+      while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        const nested = hit.shadowRoot.elementFromPoint(x, y);
+        if (!nested || nested === hit) break;
+        hit = nested;
+      }
+      return hit;
+    };
+    const hitReaches = (hit, ...targets) => {
+      for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
+        if (targets.includes(cursor)) return true;
+      }
+      return false;
+    };
+    const receivesOwnEvents = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return false;
+      return hitReaches(hitAtCentreOfLocal(element, box), element);
+    };
+    // An ordinal path from the document root. Structure is never identity — a recycled
+    // row keeps its position while meaning changes — so this only ever separates
+    // candidates that already satisfy every identity clause. Without it, twenty-two
+    // checkboxes that carry no name, no id and no distinguishing attribute have exactly
+    // one address between them.
+    const domPathOf = element => {
+      const steps = [];
+      for (let node = element; node && node.nodeType === 1; node = composedParent(node)) {
+        const parent = composedParent(node);
+        if (!parent) { steps.push(node.localName); break; }
+        let index = 0;
+        for (const sibling of parent.children) {
+          if (sibling === node) break;
+          if (sibling.localName === node.localName) index += 1;
+        }
+        steps.push(node.localName + '[' + index + ']');
+        if (steps.length >= 32) break;
+      }
+      return steps.reverse().join('/');
+    };
+    // Offset of an element's own frame within the top-level viewport. Geometry inside a
+    // frame is measured against that frame, so a click computed from it would land
+    // wherever that offset happens to be — usually somewhere else entirely.
+    const frameOffsetOf = element => {
+      let offsetX = 0;
+      let offsetY = 0;
+      let view = element?.ownerDocument?.defaultView ?? null;
+      let guard = 0;
+      while (view && view !== window && guard < 16) {
+        let host = null;
+        try { host = view.frameElement; } catch { host = null; }
+        if (!host) break;
+        const box = host.getBoundingClientRect();
+        offsetX += box.left;
+        offsetY += box.top;
+        view = host.ownerDocument?.defaultView ?? null;
+        guard += 1;
+      }
+      return { x: offsetX, y: offsetY };
+    };
+    // A rect in top-level viewport coordinates, whatever frame the element lives in.
+    const viewportRectOf = element => {
+      const box = element.getBoundingClientRect();
+      const offset = frameOffsetOf(element);
+      if (offset.x === 0 && offset.y === 0) return box;
+      return {
+        x: box.x + offset.x, y: box.y + offset.y,
+        left: box.left + offset.x, top: box.top + offset.y,
+        right: box.right + offset.x, bottom: box.bottom + offset.y,
+        width: box.width, height: box.height
+      };
+    };
+    const soleControl =
+      'input, button, select, textarea, a[href], summary,'
+      + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
+    const controlSurfaceOf = element => {
+      const fallback = hiddenControlSurface(element);
+      if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
+      return isRendered(element) ? element : fallback;
+    };
+    // A control that borrows a surface for its geometry borrows its label with it.
+    // Play's checkboxes carry no aria-label and no aria-labelledby — the visible text
+    // is a sibling — so without this they are exposed and anonymous, their locator
+    // holds role and nothing else, and every act on them fails as not unique.
+    const borrowedLabel = element => {
+      const surface = controlSurfaceOf(element);
+      if (surface === element) return null;
+      if (surface) {
+        return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
+      }
+      // Nothing rendered to borrow from. A control that cannot be clicked must still be
+      // nameable, or the agent cannot report what it is unable to reach.
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        const text = collapse(cursor.textContent);
+        // Bounded inline: this helper is shared with the action script, which has no
+        // bounded(). Reaching this branch there threw a ReferenceError that no fixture
+        // exercised and the first real page found on the first click.
+        if (text) return text.length > 512 ? text.slice(0, 512) : text;
+      }
+      return null;
+    };
+    // Why a control cannot be acted on, decided once and reported before the agent
+    // spends a round trip finding out. locatorQuality answers "is this the only match";
+    // it was read as "can I click this", and nothing answered that question.
+    const actionabilityOf = (element, surface) => {
+      const box = surface.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return 'no_layout_box';
+      const style = getComputedStyle(surface);
+      if (style.visibility === 'hidden' || style.display === 'none') return 'not_visible';
+      if (element.disabled
+          || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
+        return 'disabled';
+      }
+      const visible = viewportRectOf(surface);
+      if (visible.bottom <= 0 || visible.right <= 0
+          || visible.top >= innerHeight || visible.left >= innerWidth) {
+        return 'off_viewport';
+      }
+      return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
+        ? 'actionable' : 'covered';
+    };
+    const classTokens = element => collapse(element?.getAttribute?.('class'));
+    const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
+    const hasSelectedToken = element =>
+      /(^|[\\s_-])(active|current|selected)($|[\\s_-])/i.test(classTokens(element));
+    const isPointerControl = element => {
+      if (!['a', 'div', 'li', 'span'].includes(element.localName) || !isRendered(element)) {
+        return false;
+      }
+      if (getComputedStyle(element).cursor !== 'pointer') return false;
+      const name = collapse(element.getAttribute('aria-label') || element.innerText);
+      if (!name || name.length > maximumFieldCharacters) return false;
+      return !Array.from(element.children).some(child =>
+        isRendered(child) && getComputedStyle(child).cursor === 'pointer'
+        && collapse(child.getAttribute('aria-label') || child.innerText) === name);
+    };
+    const hasImplicitTabSemantics = element => {
+      if (element.hasAttribute('aria-selected')) return true;
+      const parent = composedParent(element);
+      return isPointerControl(element)
+        && (collapse(parent?.getAttribute?.('role')).toLowerCase() === 'tablist'
+          || hasTabToken(element) || hasTabToken(parent));
     };
     const looksOpaque = value => {
       const text = String(value ?? '');
@@ -1946,19 +3578,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     const roleOf = element => {
       const explicit = collapse(element.getAttribute('role'));
       if (explicit) return explicit;
+      if (hasImplicitTabSemantics(element)) return 'tab';
       if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
       if (element.localName === 'button') return 'button';
+      if (/^h[1-6]$/.test(element.localName)) return 'heading';
+      if (element.localName === 'table') return 'table';
+      if (element.localName === 'tr') return 'row';
+      if (element.localName === 'th') return 'columnheader';
+      if (element.localName === 'td') return 'cell';
       if (element.localName === 'select') return 'combobox';
       if (element.localName === 'textarea') return 'textbox';
       if (element.localName === 'summary') return 'button';
       if (element.localName === 'input') {
         const type = collapse(element.type).toLowerCase();
+        if (type === 'search') return 'searchbox';
         if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
         if (type === 'checkbox') return 'checkbox';
         if (type === 'radio') return 'radio';
         if (type === 'range') return 'slider';
         return 'textbox';
       }
+      if (isPointerControl(element)) return 'button';
       return null;
     };
     const labelOf = element => {
@@ -1967,22 +3607,168 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       }
       const labelledBy = collapse(element.getAttribute('aria-labelledby'));
       if (labelledBy) {
-        return collapse(labelledBy.split(/\\s+/).map(id => document.getElementById(id)?.innerText).join(' ')) || null;
+        return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
+      }
+      return borrowedLabel(element);
+    };
+    const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
+      || collapse(element.getAttribute('placeholder'))
+      || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
+      || collapse(element.innerText) || null;
+    const directLabelledText = element => {
+      const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
+      if (!labelledBy) return null;
+      return collapse(labelledBy.split(/\\s+/)
+        .slice(0, 8)
+        .map(id => labelledNode(element, id)?.innerText)
+        .join(' ')) || null;
+    };
+    const safeContextValue = value => {
+      const text = collapse(value);
+      if (!text || looksOpaque(text) || sensitiveLabelTerm.test(text)) return null;
+      return bounded(text);
+    };
+    const sameRowLabelOf = element => {
+      const row = element.closest(
+        'tr, [role="row"], li, [data-row], [class~="row"], [class*="form-row"], [class*="capability"]');
+      if (!row) return null;
+      const labelled = Array.from(row.querySelectorAll(
+        'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
+      const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
+      for (const candidate of candidates) {
+        if (candidate === element || candidate.contains(element) || !isRendered(candidate)) continue;
+        const text = safeContextValue(
+          candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
+        if (text && text !== safeContextValue(nameOf(element))) return text;
       }
       return null;
     };
-    const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
-      || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
-      || collapse(element.innerText) || null;
+    const contextAnchorsOf = element => {
+      const anchors = [];
+      const fieldset = element.closest('fieldset');
+      const legend = fieldset?.querySelector(':scope > legend');
+      const legendText = safeContextValue(legend?.innerText);
+      if (legendText) anchors.push({ kind: 'fieldset_legend', text: legendText });
+
+      const region = element.closest(
+        'section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
+      const regionText = safeContextValue(
+        region?.getAttribute('aria-label') || directLabelledText(region));
+      if (regionText) anchors.push({ kind: 'labelled_region', text: regionText });
+
+      const structural = element.closest('section, article, nav, main, form, fieldset')
+        || document.body;
+      const headings = Array.from(
+        structural.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]'));
+      const heading = headings.filter(candidate =>
+        candidate !== element
+        && Boolean(candidate.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+      ).pop();
+      const headingText = safeContextValue(heading?.innerText || heading?.getAttribute('aria-label'));
+      if (headingText) anchors.push({ kind: 'nearest_heading', text: headingText });
+
+      let sibling = element.previousElementSibling;
+      while (sibling && !isRendered(sibling)) sibling = sibling.previousElementSibling;
+      const siblingText = safeContextValue(sibling?.innerText || sibling?.textContent);
+      if (siblingText) anchors.push({ kind: 'previous_sibling', text: siblingText });
+      const rowLabel = sameRowLabelOf(element);
+      if (rowLabel) anchors.unshift({ kind: 'same_row_label', text: rowLabel });
+      return anchors.slice(0, 5);
+    };
+    const sanitizedHref = element => {
+      if (!element.hasAttribute('href')) return null;
+      try {
+        const url = new URL(element.getAttribute('href'), document.baseURI);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+        const query = keys.length
+          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+        return bounded(`${url.origin}${url.pathname}${query}`);
+      } catch { return null; }
+    };
+    const stableAttributesOf = (element, sensitive) => {
+      if (sensitive) return {};
+      const attributes = {};
+      const href = sanitizedHref(element);
+      if (href && !looksOpaque(href)) attributes.href = href;
+      for (const name of ['id', 'name', 'title', 'data-testid']) {
+        const value = collapse(element.getAttribute(name));
+        if (!value || value.length > maximumFieldCharacters || looksOpaque(value)
+            || sensitiveIdentifierTerm.test(value)) continue;
+        attributes[name] = bounded(value);
+      }
+      return attributes;
+    };
     const selector = [
       'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
-      '[role]', '[contenteditable="true"]', '[tabindex]'
+      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+      'table', 'tr', 'th', 'td',
+      '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true"]', '[tabindex]'
     ].join(',');
     const allowedRoles = new Set(Array.isArray(roleFilters) ? roleFilters : []);
     const wantedName = collapse(nameFilter).toLowerCase();
-    const matchingElements = Array.from(document.querySelectorAll(selector))
+    const semanticElements = deepQueryAll(document, selector);
+    const pointerElements = deepQueryAll(document, 'a:not([href]), div, li, span')
+      .filter(isPointerControl);
+    // Diagnostic: how many otherwise-matching controls are dropped only because an
+    // ancestor is aria-hidden or inert. A page that renders its controls and marks
+    // them hidden leaves the tree empty for a reason worth reporting.
+    let ariaHiddenDropCount = 0;
+    // A control with no layout box anywhere up its row cannot be clicked, so reporting
+    // it as actionable would be a lie. Reporting nothing at all is worse: the only exit
+    // from a form can be one of these, and an agent that cannot see it concludes the
+    // page is complete instead of handing over to a human.
+    let unrenderedControlCount = 0;
+    const unrenderedControlNames = [];
+    const unrenderedControlName = element =>
+      collapse(element.getAttribute('aria-label')) || labelOf(element);
+    // Laid out but collapsed to nothing is not the same as deliberately hidden. The
+    // only exit from a Play form is a control like this — the "none of these features"
+    // option that keeps Next disabled — so it is reported with the truth about why it
+    // cannot be clicked, rather than dropped as if it did not exist.
+    const hiddenOnlyByGeometry = element => {
+      const box = element.getBoundingClientRect();
+      if (box.width > 0 && box.height > 0) return false;
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+        if (cursor.hidden || cursor.inert
+            || collapse(cursor.getAttribute?.('aria-hidden')).toLowerCase() === 'true') {
+          return false;
+        }
+        const style = getComputedStyle(cursor);
+        if (style.display === 'none' || style.visibility === 'hidden'
+            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+          return false;
+        }
+      }
+      return element.matches(soleControl);
+    };
+    const hiddenOnlyBySemantics = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return false;
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+        if (cursor.inert
+            || collapse(cursor.getAttribute && cursor.getAttribute('aria-hidden')).toLowerCase()
+              === 'true') {
+          return true;
+        }
+      }
+      return false;
+    };
+    const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
       .filter(element => {
-        if (!isRendered(element) && !styledControlSurface(element)) return false;
+        if (!controlSurfaceOf(element)) {
+          if (hiddenOnlyBySemantics(element)) {
+            ariaHiddenDropCount += 1;
+            return false;
+          }
+          if (!hiddenOnlyByGeometry(element)) return false;
+          unrenderedControlCount += 1;
+          const name = unrenderedControlName(element);
+          if (name && unrenderedControlNames.length < 10
+              && !unrenderedControlNames.includes(name)) {
+            unrenderedControlNames.push(name);
+          }
+        }
         const role = collapse(roleOf(element)).toLowerCase();
         if (allowedRoles.size > 0 && !allowedRoles.has(role)) return false;
         const name = collapse(nameOf(element)).toLowerCase();
@@ -1991,7 +3777,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     const elements = matchingElements
       .slice(elementOffset, elementOffset + __MAXIMUM_ELEMENTS__)
       .map(element => {
-        const surface = isRendered(element) ? element : styledControlSurface(element);
+        const surface = controlSurfaceOf(element) || element;
+        const actionability = actionabilityOf(element, surface);
+        // Reported where a person sees it, not where its own frame measures it.
+        const reportedBox = viewportRectOf(surface);
+        // A control nobody can see is reported so the agent knows it exists and what it
+        // is called. What is written inside it is a different matter: reading the value
+        // of a box the user cannot see is exactly the leak the visibility filter was
+        // there to prevent.
+        const withheldForInvisibility =
+          actionability === 'no_layout_box' || actionability === 'not_visible';
         const box = surface.getBoundingClientRect();
         const rawValue = typeof element.value === 'string' ? element.value : null;
         const autocomplete = collapse(element.getAttribute('autocomplete')).toLowerCase();
@@ -2001,25 +3796,63 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         ].map(collapse).join(' ');
         const labelMetadata = [element.getAttribute('aria-label'), labelOf(element)]
           .map(collapse).join(' ');
+        const bundleIdentifierMetadata = /(?:^|[^a-z0-9])bundle(?:[ _-]*(?:id|identifier))?(?:$|[^a-z0-9])/i
+          .test(`${identifierMetadata} ${labelMetadata}`);
+        const publicReverseDNSIdentifier = bundleIdentifierMetadata
+          && /^[A-Za-z0-9][A-Za-z0-9-]*(?:\\.[A-Za-z0-9][A-Za-z0-9-]*){2,}$/.test(rawValue ?? '');
         const sensitive = (element instanceof HTMLInputElement && element.type === 'password')
           || autocompleteTokens.some(token => sensitiveAutocomplete.has(token))
           || sensitiveIdentifierTerm.test(identifierMetadata)
           || sensitiveLabelTerm.test(labelMetadata)
-          || (!(element instanceof HTMLSelectElement) && looksOpaque(rawValue));
+          || (!(element instanceof HTMLSelectElement) && looksOpaque(rawValue)
+            && !publicReverseDNSIdentifier);
         const editable = !element.disabled && !element.readOnly;
         let observableValue = null;
         if (!sensitive && editable && element instanceof HTMLSelectElement) {
           observableValue = collapse(
             Array.from(element.selectedOptions).map(option => option.textContent).join(' ')) || null;
         } else if (!sensitive && editable && element instanceof HTMLTextAreaElement) {
-          observableValue = rawValue !== null && rawValue.length <= 1024 ? rawValue : null;
+          observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
         } else if (!sensitive && editable && element instanceof HTMLInputElement
                    && ['text', 'search', 'email', 'tel', 'url', 'number'].includes(element.type)) {
-          observableValue = rawValue !== null && rawValue.length <= 1024 ? rawValue : null;
+          observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
+        } else if (!sensitive && editable && element.isContentEditable) {
+          // WebKit's own editing leaves a trailing newline in a contenteditable's text.
+          // Reported verbatim it makes every exact-text postcondition fail on a write
+          // that landed perfectly.
+          const editableValue = (element.textContent ?? '').replace(/\\s+$/, '');
+          observableValue = editableValue.length <= maximumFieldCharacters ? editableValue : null;
         }
         const selectedLabel = element instanceof HTMLSelectElement
           ? collapse(Array.from(element.selectedOptions).map(option => option.textContent).join(' '))
           : null;
+        const isEditableField = element instanceof HTMLInputElement
+          || element instanceof HTMLTextAreaElement || element.isContentEditable;
+        const characterCount = !sensitive && isEditableField
+          ? String(element.isContentEditable ? (element.textContent ?? '') : (rawValue ?? '')).length
+          : null;
+        const ariaInvalid = collapse(element.getAttribute('aria-invalid')).toLowerCase();
+        const invalidByARIA = ['true', 'grammar', 'spelling'].includes(ariaInvalid);
+        const invalidByConstraint = Boolean(element.willValidate && element.validity
+          && !element.validity.valid);
+        const validationReferenceIDs = [
+          ...collapse(element.getAttribute('aria-errormessage')).split(/\\s+/),
+          ...collapse(element.getAttribute('aria-describedby')).split(/\\s+/)
+        ].filter(Boolean);
+        const invalidByVisibleMessage = validationReferenceIDs.some(id => {
+          const node = labelledNode(element, id);
+          if (!node || !isRendered(node) || !collapse(node.textContent)) return false;
+          if (collapse(element.getAttribute('aria-errormessage')).split(/\\s+/).includes(id)) {
+            return true;
+          }
+          const metadata = `${node.id} ${node.className ?? ''} ${node.getAttribute('role') ?? ''}`;
+          return /error|invalid|alert/i.test(metadata) || node.hasAttribute('aria-live');
+        });
+        let validationState = 'not_applicable';
+        if (invalidByARIA || invalidByConstraint || invalidByVisibleMessage) {
+          validationState = 'invalid';
+        }
+        else if (element.willValidate || ariaInvalid === 'false') validationState = 'valid';
         const checked = (element instanceof HTMLInputElement
           && ['checkbox', 'radio'].includes(element.type))
           ? Boolean(element.checked)
@@ -2028,10 +3861,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         const selected = element instanceof HTMLOptionElement
           ? Boolean(element.selected)
           : (element.hasAttribute('aria-selected')
-            ? collapse(element.getAttribute('aria-selected')).toLowerCase() === 'true' : null);
+            ? collapse(element.getAttribute('aria-selected')).toLowerCase() === 'true'
+            : (roleOf(element) === 'tab'
+              ? (element.hasAttribute('aria-current') || hasSelectedToken(element)) : null));
         const stateAttributes = {};
         for (const name of [
-          'aria-checked', 'aria-selected', 'aria-disabled', 'aria-expanded', 'data-state', 'open'
+          'aria-checked', 'aria-selected', 'aria-current', 'aria-disabled', 'aria-expanded',
+          'data-state', 'open'
         ]) {
           if (element.hasAttribute(name)) stateAttributes[name] = element.getAttribute(name) ?? '';
         }
@@ -2039,6 +3875,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         if (!physicalIdentity) {
           physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
           globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
+          globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
         }
         return {
           physicalIdentity,
@@ -2046,8 +3883,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           role: roleOf(element),
           accessibleName: bounded(nameOf(element)),
           label: bounded(labelOf(element)),
-          text: sensitive ? null : bounded(selectedLabel || collapse(element.innerText) || null),
-          value: bounded(observableValue),
+          text: sensitive || withheldForInvisibility
+            ? null : bounded(selectedLabel || collapse(element.innerText) || null),
+          value: withheldForInvisibility ? null : boundedFieldValue(observableValue),
+          validationState,
+          characterCount: withheldForInvisibility ? null : characterCount,
           sensitive,
           submitsForm: Boolean(
             (element instanceof HTMLButtonElement
@@ -2058,18 +3898,101 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
           checked,
           selected,
-          selectedOption: bounded(selectedLabel || null),
+          selectedOption: withheldForInvisibility ? null : bounded(selectedLabel || null),
           stateAttributes: Object.fromEntries(
             Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
-          visible: true,
-          boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height }
+          contextAnchors: sensitive ? [] : contextAnchorsOf(element),
+          domPath: domPathOf(element),
+          stableAttributes: stableAttributesOf(element, sensitive),
+          visible: actionability !== 'no_layout_box' && actionability !== 'not_visible',
+          actionability,
+          boundingBox: {
+            x: reportedBox.x, y: reportedBox.y,
+            width: reportedBox.width, height: reportedBox.height
+          }
         };
       });
+    // Counted through the whole tree, frames nested inside readable frames included:
+    // an unreadable region one level down is exactly as invisible as one at the top.
     let crossOriginFrameCount = 0;
-    for (const frame of document.querySelectorAll('iframe')) {
+    for (const frame of deepQueryAll(document, 'iframe, frame')) {
       try { if (!frame.contentDocument) crossOriginFrameCount += 1; }
       catch { crossOriginFrameCount += 1; }
     }
+    const visibleLoadingIndicators = deepQueryAll(
+      document, '[aria-busy="true"], [role="progressbar"], progress'
+    ).some(isRendered);
+    const loadingShellText = collapse(document.body?.innerText);
+    // Counted from the raw DOM, not the semantic matcher: a page whose matcher finds
+    // nothing may still be fully rendered, and must not be mistaken for a shell that
+    // has not painted its controls yet.
+    const rawControls = deepQueryAll(
+      document, 'button, a[href], input, select, textarea, [role="button"]');
+    const renderedInteractiveCount = rawControls.filter(isRendered).length;
+    // Separates "not in this tree" from "in the tree but not laid out": the first
+    // means the script is walking the wrong document, the second a layout problem.
+    const rawControlCount = rawControls.length;
+    const documentElementCount = document.querySelectorAll('*').length;
+    // One control described in full: enough to tell a layout problem from a filter
+    // problem without another round trip.
+    const probe = rawControls[0];
+    let firstControlProbe = 'none';
+    if (probe) {
+      const box = probe.getBoundingClientRect();
+      const style = getComputedStyle(probe);
+      firstControlProbe = [
+        probe.tagName.toLowerCase(),
+        'w=' + Math.round(box.width), 'h=' + Math.round(box.height),
+        'rects=' + probe.getClientRects().length,
+        'display=' + style.display, 'visibility=' + style.visibility,
+        'opacity=' + style.opacity,
+        'offsetParent=' + (probe.offsetParent ? 'yes' : 'no'),
+        'connected=' + probe.isConnected,
+        'docW=' + document.documentElement.clientWidth,
+        'docH=' + document.documentElement.clientHeight,
+        'innerW=' + window.innerWidth, 'innerH=' + window.innerHeight
+      ].join(' ');
+      // Which ancestor disqualifies it, and on which property.
+      let reason = 'accepted';
+      for (let cursor = probe; cursor; cursor = composedParent(cursor)) {
+        const tag = cursor.tagName ? cursor.tagName.toLowerCase() : String(cursor.nodeName);
+        if (cursor.hidden) { reason = 'hidden@' + tag; break; }
+        if (cursor.inert) { reason = 'inert@' + tag; break; }
+        if (cursor.getAttribute
+            && collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
+          reason = 'aria-hidden@' + tag; break;
+        }
+        const cs = getComputedStyle(cursor);
+        if (!cs) { reason = 'no-style@' + tag; break; }
+        if (cs.display === 'none') { reason = 'display-none@' + tag; break; }
+        if (cs.visibility === 'hidden' || cs.visibility === 'collapse') {
+          reason = 'visibility-' + cs.visibility + '@' + tag; break;
+        }
+        if (Number(cs.opacity) === 0) { reason = 'opacity0@' + tag; break; }
+      }
+      firstControlProbe += ' | ' + reason;
+    }
+    const bodyTextLength = (document.body?.innerText || '').length;
+    // The entire visible text of the document is one short loading phrase. A shell that
+    // has already painted a menu button still says only this, and requiring zero
+    // controls handed such a page over as complete — the agent then read an empty form.
+    // The bound is deliberately tight: Play's rendered app list keeps the same phrase at
+    // the top of its text and must stay ready, so anything that says more than the
+    // phrase alone is a page, not a shell. Being wrong the other way costs a stall on
+    // every observation.
+    const bodyIsOnlyTheLoadingPhrase =
+      /^(loading|chargement)\\b/i.test(loadingShellText) && loadingShellText.length <= 32;
+    const transientLoading = bodyIsOnlyTheLoadingPhrase || (
+      matchingElements.length === 0 && (
+        visibleLoadingIndicators
+        // Anchored on the start, not the whole body: a loading shell usually renders
+        // its navigation labels too, so requiring the entire text to be the phrase
+        // never matched a real single-page app. Zero matching controls is what makes
+        // this safe — a hydrated page with controls is never treated as loading.
+        || (renderedInteractiveCount === 0
+          && /^(loading|chargement)\\b/i.test(loadingShellText))
+      )
+    );
     return JSON.stringify({
       url: location.href,
       title: document.title,
@@ -2077,6 +4000,21 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       mutationCount: globalThis.__webkituiState?.mutationCount ?? 0,
       crossOriginFrameCount,
       totalElementCount: matchingElements.length,
+      unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
+      renderedInteractiveCount,
+      documentLanguage: bounded(
+        collapse(document.documentElement.getAttribute('lang'))
+          || collapse(document.body?.getAttribute('lang'))
+          || null),
+      ariaHiddenDropCount,
+      unrenderedControlCount,
+      unrenderedControlNames,
+      rawControlCount,
+      obscuredByAncestorOpacity,
+      documentElementCount,
+      bodyTextLength,
+      firstControlProbe,
+      transientLoading,
       semanticTextTruncated,
       elements
     });
@@ -2084,54 +4022,326 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
 
   private static let actionHelpers = """
     const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+    const deepQueryAll = (root, selector) => {
+      const matches = [];
+      const roots = [root];
+      for (let index = 0; index < roots.length; index += 1) {
+        const current = roots[index];
+        matches.push(...current.querySelectorAll(selector));
+        for (const host of current.querySelectorAll('*')) {
+          if (host.shadowRoot) roots.push(host.shadowRoot);
+          // A same-origin frame is part of the page a person sees. Skipping it made
+          // every control inside one invisible, which an agent reads as absent.
+          if (host.localName === 'iframe' || host.localName === 'frame') {
+            let inner = null;
+            try { inner = host.contentDocument; } catch { inner = null; }
+            if (inner) roots.push(inner);
+          }
+        }
+      }
+      return matches;
+    };
+    const labelledNode = (element, id) => {
+      const root = element?.getRootNode?.();
+      return (typeof root?.getElementById === 'function' ? root.getElementById(id) : null)
+        || document.getElementById(id);
+    };
     const labelOf = element => {
       if (element.labels && element.labels.length) {
         return collapse(Array.from(element.labels).map(label => label.innerText).join(' ')) || null;
       }
       const labelledBy = collapse(element.getAttribute('aria-labelledby'));
       if (labelledBy) {
-        return collapse(labelledBy.split(/\\s+/).map(id => document.getElementById(id)?.innerText).join(' ')) || null;
+        return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
       }
-      return null;
+      return borrowedLabel(element);
+    };
+    const classTokens = element => collapse(element?.getAttribute?.('class'));
+    const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
+    const isPointerControl = element => {
+      if (!['a', 'div', 'li', 'span'].includes(element.localName)) return false;
+      if (getComputedStyle(element).cursor !== 'pointer') return false;
+      const name = collapse(element.getAttribute('aria-label') || element.innerText);
+      if (!name) return false;
+      return !Array.from(element.children).some(child =>
+        isRendered(child) && getComputedStyle(child).cursor === 'pointer'
+        && collapse(child.getAttribute('aria-label') || child.innerText) === name);
+    };
+    const hasImplicitTabSemantics = element => {
+      if (element.hasAttribute('aria-selected')) return true;
+      const parent = composedParent(element);
+      return isPointerControl(element)
+        && (collapse(parent?.getAttribute?.('role')).toLowerCase() === 'tablist'
+          || hasTabToken(element) || hasTabToken(parent));
     };
     const roleOf = element => {
       const explicit = collapse(element.getAttribute('role'));
       if (explicit) return explicit;
+      if (hasImplicitTabSemantics(element)) return 'tab';
       if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
       if (element.localName === 'button') return 'button';
+      if (/^h[1-6]$/.test(element.localName)) return 'heading';
+      if (element.localName === 'table') return 'table';
+      if (element.localName === 'tr') return 'row';
+      if (element.localName === 'th') return 'columnheader';
+      if (element.localName === 'td') return 'cell';
       if (element.localName === 'select') return 'combobox';
       if (element.localName === 'textarea') return 'textbox';
       if (element.localName === 'summary') return 'button';
       if (element.localName === 'input') {
         const type = collapse(element.type).toLowerCase();
+        if (type === 'search') return 'searchbox';
         if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
         if (type === 'checkbox') return 'checkbox';
         if (type === 'radio') return 'radio';
         if (type === 'range') return 'slider';
         return 'textbox';
       }
+      if (isPointerControl(element)) return 'button';
       return null;
     };
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
+      || collapse(element.getAttribute('placeholder'))
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
       || collapse(element.innerText) || null;
+    let obscuredByAncestorOpacity = false;
     const isRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
-      for (let cursor = element; cursor; cursor = cursor.parentElement) {
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
         const style = getComputedStyle(cursor);
         if (cursor.hidden || cursor.inert || style.display === 'none'
             || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
       }
       return true;
     };
-    const surfaceOf = element => {
-      if (isRendered(element)) return element;
-      if (element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)) {
-        const labels = element.labels ? Array.from(element.labels) : [];
-        return labels.find(isRendered) || element;
+    // A Material-style control renders in two halves: the real input, given no size
+    // or clipped away, and the painted box beside it marked aria-hidden. Neither half
+    // survives a visibility filter on its own, so the form observes as a group with no
+    // children and cannot be filled at all. Stand the pair up as one unit, addressed by
+    // the visible half. The walk stops at the first ancestor owning a second control,
+    // so a surface is never shared between two checkboxes.
+    const hiddenControlSurface = element => {
+      if (!(element instanceof HTMLInputElement)
+          || !['checkbox', 'radio'].includes(element.type)) return null;
+      const labels = element.labels ? Array.from(element.labels) : [];
+      const label = labels.find(isRendered);
+      if (label) return label;
+      const labelledBy = collapse(element.getAttribute('aria-labelledby'));
+      for (const id of labelledBy.split(/\\s+/).slice(0, 8).filter(Boolean)) {
+        const node = labelledNode(element, id);
+        if (node && isRendered(node)) return node;
       }
-      return element;
+      // Climb to the outermost ancestor that still owns this one control and nothing
+      // else interactive: that is the labelled row, which carries both the visible text
+      // and the click handler. The tight wrapper around the input holds neither — it is
+      // the painted box, and its text is empty.
+      let widest = null;
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        if (isRendered(cursor)) widest = cursor;
+      }
+      return widest;
+    };
+    // A control can be rendered, sized and enabled and still be unable to receive its
+    // own click: Material paints the box in a sibling that covers it. Hit testing is
+    // the only way to tell, and without it every radio on the page costs a failed
+    // round trip reported as indeterminate.
+    // Hit testing belongs to the document the element lives in, at that document's own
+    // coordinates. Asking the top-level document about a point measured inside a frame
+    // answers about whatever sits at those numbers in the outer page.
+    const hitAtCentreOfLocal = (node, box) => {
+      const owner = node?.ownerDocument ?? document;
+      const view = owner.defaultView ?? window;
+      const x = Math.min(view.innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const y = Math.min(view.innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      let hit = owner.elementFromPoint(x, y);
+      while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+        const nested = hit.shadowRoot.elementFromPoint(x, y);
+        if (!nested || nested === hit) break;
+        hit = nested;
+      }
+      return hit;
+    };
+    const hitReaches = (hit, ...targets) => {
+      for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
+        if (targets.includes(cursor)) return true;
+      }
+      return false;
+    };
+    const receivesOwnEvents = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return false;
+      return hitReaches(hitAtCentreOfLocal(element, box), element);
+    };
+    // An ordinal path from the document root. Structure is never identity — a recycled
+    // row keeps its position while meaning changes — so this only ever separates
+    // candidates that already satisfy every identity clause. Without it, twenty-two
+    // checkboxes that carry no name, no id and no distinguishing attribute have exactly
+    // one address between them.
+    const domPathOf = element => {
+      const steps = [];
+      for (let node = element; node && node.nodeType === 1; node = composedParent(node)) {
+        const parent = composedParent(node);
+        if (!parent) { steps.push(node.localName); break; }
+        let index = 0;
+        for (const sibling of parent.children) {
+          if (sibling === node) break;
+          if (sibling.localName === node.localName) index += 1;
+        }
+        steps.push(node.localName + '[' + index + ']');
+        if (steps.length >= 32) break;
+      }
+      return steps.reverse().join('/');
+    };
+    // Offset of an element's own frame within the top-level viewport. Geometry inside a
+    // frame is measured against that frame, so a click computed from it would land
+    // wherever that offset happens to be — usually somewhere else entirely.
+    const frameOffsetOf = element => {
+      let offsetX = 0;
+      let offsetY = 0;
+      let view = element?.ownerDocument?.defaultView ?? null;
+      let guard = 0;
+      while (view && view !== window && guard < 16) {
+        let host = null;
+        try { host = view.frameElement; } catch { host = null; }
+        if (!host) break;
+        const box = host.getBoundingClientRect();
+        offsetX += box.left;
+        offsetY += box.top;
+        view = host.ownerDocument?.defaultView ?? null;
+        guard += 1;
+      }
+      return { x: offsetX, y: offsetY };
+    };
+    // A rect in top-level viewport coordinates, whatever frame the element lives in.
+    const viewportRectOf = element => {
+      const box = element.getBoundingClientRect();
+      const offset = frameOffsetOf(element);
+      if (offset.x === 0 && offset.y === 0) return box;
+      return {
+        x: box.x + offset.x, y: box.y + offset.y,
+        left: box.left + offset.x, top: box.top + offset.y,
+        right: box.right + offset.x, bottom: box.bottom + offset.y,
+        width: box.width, height: box.height
+      };
+    };
+    const soleControl =
+      'input, button, select, textarea, a[href], summary,'
+      + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
+    const controlSurfaceOf = element => {
+      const fallback = hiddenControlSurface(element);
+      if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
+      return isRendered(element) ? element : fallback;
+    };
+    // A control that borrows a surface for its geometry borrows its label with it.
+    // Play's checkboxes carry no aria-label and no aria-labelledby — the visible text
+    // is a sibling — so without this they are exposed and anonymous, their locator
+    // holds role and nothing else, and every act on them fails as not unique.
+    const borrowedLabel = element => {
+      const surface = controlSurfaceOf(element);
+      if (surface === element) return null;
+      if (surface) {
+        return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
+      }
+      // Nothing rendered to borrow from. A control that cannot be clicked must still be
+      // nameable, or the agent cannot report what it is unable to reach.
+      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+        if (cursor === document.body || cursor === document.documentElement) break;
+        if (deepQueryAll(cursor, soleControl).length !== 1) break;
+        const text = collapse(cursor.textContent);
+        // Bounded inline: this helper is shared with the action script, which has no
+        // bounded(). Reaching this branch there threw a ReferenceError that no fixture
+        // exercised and the first real page found on the first click.
+        if (text) return text.length > 512 ? text.slice(0, 512) : text;
+      }
+      return null;
+    };
+    // Why a control cannot be acted on, decided once and reported before the agent
+    // spends a round trip finding out. locatorQuality answers "is this the only match";
+    // it was read as "can I click this", and nothing answered that question.
+    const actionabilityOf = (element, surface) => {
+      const box = surface.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0)) return 'no_layout_box';
+      const style = getComputedStyle(surface);
+      if (style.visibility === 'hidden' || style.display === 'none') return 'not_visible';
+      if (element.disabled
+          || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
+        return 'disabled';
+      }
+      const visible = viewportRectOf(surface);
+      if (visible.bottom <= 0 || visible.right <= 0
+          || visible.top >= innerHeight || visible.left >= innerWidth) {
+        return 'off_viewport';
+      }
+      return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
+        ? 'actionable' : 'covered';
+    };
+    const surfaceOf = element => controlSurfaceOf(element) || element;
+    const directLabelledText = element => {
+      const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
+      if (!labelledBy) return null;
+      return collapse(labelledBy.split(/\\s+/)
+        .slice(0, 8)
+        .map(id => labelledNode(element, id)?.innerText)
+        .join(' ')) || null;
+    };
+    const sameRowLabelOf = element => {
+      const row = element.closest(
+        'tr, [role="row"], li, [data-row], [class~="row"], [class*="form-row"], [class*="capability"]');
+      if (!row) return null;
+      const labelled = Array.from(row.querySelectorAll(
+        'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
+      const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
+      for (const candidate of candidates) {
+        if (candidate === element || candidate.contains(element) || !isRendered(candidate)) continue;
+        const text = collapse(
+          candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
+        if (text && text !== collapse(nameOf(element))) return text;
+      }
+      return null;
+    };
+    const contextAnchorOf = (element, kind) => {
+      if (kind === 'same_row_label') return sameRowLabelOf(element);
+      if (kind === 'fieldset_legend') {
+        return collapse(element.closest('fieldset')?.querySelector(':scope > legend')?.innerText)
+          || null;
+      }
+      if (kind === 'labelled_region') {
+        const region = element.closest(
+          'section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
+        return collapse(region?.getAttribute('aria-label') || directLabelledText(region)) || null;
+      }
+      if (kind === 'nearest_heading') {
+        const structural = element.closest('section, article, nav, main, form, fieldset')
+          || document.body;
+        const headings = Array.from(
+          structural.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]'));
+        const heading = headings.filter(candidate =>
+          candidate !== element
+          && Boolean(candidate.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+        ).pop();
+        return collapse(heading?.innerText || heading?.getAttribute('aria-label')) || null;
+      }
+      if (kind === 'previous_sibling') {
+        let sibling = element.previousElementSibling;
+        while (sibling && !isRendered(sibling)) sibling = sibling.previousElementSibling;
+        return collapse(sibling?.innerText || sibling?.textContent) || null;
+      }
+      return null;
+    };
+    const sanitizedHref = element => {
+      if (!element.hasAttribute('href')) return null;
+      try {
+        const url = new URL(element.getAttribute('href'), document.baseURI);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+        const query = keys.length
+          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+        return `${url.origin}${url.pathname}${query}`;
+      } catch { return null; }
     };
     const factValue = (element, criterion) => {
       switch (criterion.fact) {
@@ -2139,9 +4349,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         case 'accessibleName': return nameOf(element);
         case 'label': return labelOf(element);
         case 'text': return collapse(element.innerText) || null;
-        case 'stableAttribute': return criterion.argument === 'tag'
-          ? element.localName : element.getAttribute(criterion.argument);
-        case 'contextAnchor': return collapse(element.closest(criterion.argument)?.innerText) || null;
+        case 'stableAttribute':
+          if (criterion.argument === 'tag') return element.localName;
+          if (criterion.argument === 'href') return sanitizedHref(element);
+          return collapse(element.getAttribute(criterion.argument)) || null;
+        case 'contextAnchor': return contextAnchorOf(element, criterion.argument);
+        case 'domPath': return domPathOf(element);
         case 'enabled': return String(
           !(element.disabled || element.getAttribute('aria-disabled') === 'true'));
         default: return null;
@@ -2157,22 +4370,111 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     };
     const selector = [
       'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
-      '[role]', '[contenteditable="true"]', '[tabindex]'
+      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+      'table', 'tr', 'th', 'td',
+      '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true"]', '[tabindex]'
     ].join(',');
-    const matches = Array.from(document.querySelectorAll(selector)).filter(element =>
-      criteria.every(criterion => matchesCriterion(element, criterion))
+    const candidates = Array.from(new Set([
+      ...deepQueryAll(document, selector),
+      ...deepQueryAll(document, 'a:not([href]), div, li, span').filter(isPointerControl)
+    ]));
+    const reportedFactNames = {
+      role: 'role', accessibleName: 'accessible_name', label: 'label',
+      contextAnchor: 'context_anchor', stableAttribute: 'stable_attribute',
+      framePath: 'frame_path', text: 'value', domPath: 'dom_path', enabled: 'enabled'
+    };
+    const reportedFactName = criterion => {
+      const base = reportedFactNames[criterion.fact] || criterion.fact;
+      return criterion.argument ? base + ':' + criterion.argument : base;
+    };
+    // Required clauses decide what the target is. Corroborating ones were filtering just
+    // as hard whenever they had a value, which made "corroborating" a lie and let a
+    // single structural fact pick an element on its own — the exact thing a DOM path
+    // must never be allowed to do.
+    const requiredCriteria = criteria.filter(criterion => criterion.strength === 'required');
+    const locatorMatches = candidates.filter(element =>
+      requiredCriteria.every(criterion => matchesCriterion(element, criterion))
     );
+    // The observation handed out this element's identity and browser_act was given it
+    // back. Re-deriving the target from a name the element may not have throws that
+    // away: twenty-two anonymous checkboxes are one address each, and every one of them
+    // resolved to twenty-two candidates. The identity is the disambiguation.
+    // It is not a licence to skip the locator. A virtual list recycles its rows, so the
+    // pinned node still has to satisfy every required clause, or it is not the element
+    // that was observed and this falls back to addressing by meaning.
+    // When the pin does not save an ambiguous address, the reason decides what the
+    // client should do, and guessing it from the outside costs a round trip each time.
+    let pinnedState = 'not_requested';
+    const pinnedNode = (() => {
+      if (typeof physicalIdentity !== 'string' || !physicalIdentity) return null;
+      const reference = globalThis.__webkituiState?.nodesByID?.get(physicalIdentity);
+      if (!reference) { pinnedState = 'absent_from_registry'; return null; }
+      const node = typeof reference.deref === 'function' ? reference.deref() : null;
+      if (!node) { pinnedState = 'collected'; return null; }
+      if (!node.isConnected) { pinnedState = 'detached'; return null; }
+      const failed = criteria
+        .filter(criterion => criterion.strength === 'required')
+        .filter(criterion => !matchesCriterion(node, criterion))
+        .map(reportedFactName);
+      if (failed.length > 0) {
+        pinnedState = 'clause_mismatch:' + failed.join(',');
+        return null;
+      }
+      pinnedState = 'used';
+      return node;
+    })();
+    // Identity clauses say what the target is; when several elements are the same
+    // thing, the corroborating clauses say which one. Refusing at that point left
+    // twenty-two identical checkboxes permanently unreachable, while the observation
+    // had already recorded exactly what separates them. This can only ever narrow a set
+    // that already satisfies every required clause, so it cannot promote a wrong
+    // element — and if it does not land on exactly one, the ambiguity stands.
+    const narrowed = (() => {
+      if (locatorMatches.length <= 1) return locatorMatches;
+      // Position only means something while the set it indexes is the same set. If a row
+      // has been added or removed since the observation, the eighth checkbox is no
+      // longer the eighth thing the user saw, and picking by structure would silently
+      // tick the wrong box — worse than refusing. Same population, or no narrowing.
+      if (locatorMatches.length !== expectedCandidateCount) return locatorMatches;
+      const corroborating = criteria.filter(criterion => criterion.strength !== 'required');
+      if (corroborating.length === 0) return locatorMatches;
+      const singled = clauses => {
+        const exact = locatorMatches.filter(element =>
+          clauses.every(criterion => matchesCriterion(element, criterion)));
+        return exact.length === 1 ? exact : null;
+      };
+      // All of them first: agreement across every corroborating fact is the strongest
+      // evidence available. But one volatile fact — a neighbouring label that moved, a
+      // caption that changed — must not veto the rest, so fall back to position alone,
+      // which is the one corroborator guaranteed to single out a member of a set that
+      // has not itself changed.
+      const byEverything = singled(corroborating);
+      if (byEverything) return byEverything;
+      const positional = corroborating.filter(criterion => criterion.fact === 'domPath');
+      return (positional.length > 0 ? singled(positional) : null) ?? locatorMatches;
+    })();
+    const matches = pinnedNode ? [pinnedNode] : narrowed;
+    // Zero matches is an absence, not an ambiguity. A client told "not unique" goes
+    // looking for a second candidate that does not exist; what it needs is which
+    // required fact stopped matching, because that is usually one re-observation away.
+    const eliminatedBy = matches.length > 0 ? [] : criteria
+      .filter(criterion => criterion.strength === 'required')
+      .filter(criterion => !candidates.some(element => matchesCriterion(element, criterion)))
+      .map(reportedFactName);
     const describe = element => {
-      const box = surfaceOf(element).getBoundingClientRect();
+      // The native dispatch computes a screen point from this, so it has to be in
+      // top-level coordinates or the click lands at the frame's offset instead.
+      const box = viewportRectOf(surfaceOf(element));
       let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
       if (!physicalIdentity) {
         physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
         globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
+        globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
       }
       return {
         physicalIdentity,
         boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height },
-        geometryStable: true,
+        geometryStable: false,
         actionable: false,
         dispatched: false,
         trustedUserGesture: false
@@ -2184,21 +4486,83 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
       if (element && scrollIntoView) surfaceOf(element).scrollIntoView({ block: 'center', inline: 'center' });
-      return JSON.stringify({ count: matches.length, candidate: element ? describe(element) : null });
+      return JSON.stringify({
+        count: matches.length, candidate: element ? describe(element) : null, eliminatedBy,
+        pinnedState });
       """
 
-  private static let scrollStateSource = """
-    const root = document.scrollingElement || document.documentElement;
-    const maximumY = Math.max(0, root.scrollHeight - innerHeight);
+  private static let captureStateSource = """
+    const inTopLayer = Array.from(
+      document.querySelectorAll('dialog[open], :popover-open')).length;
+    const modal = Array.from(document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"]'))
+      .some(node => {
+        const box = node.getBoundingClientRect();
+        return box.width > 0 && box.height > 0;
+      });
+    // Layers a snapshot can render separately from the page, and therefore drop.
+    let composited = 0;
+    for (const node of document.querySelectorAll('*')) {
+      const style = getComputedStyle(node);
+      if (style.position === 'fixed' || style.willChange === 'transform'
+          || (style.transform && style.transform !== 'none')) {
+        const box = node.getBoundingClientRect();
+        if (box.width > 0 && box.height > 0) composited += 1;
+      }
+      if (composited > 64) break;
+    }
+    const interactive = Array.from(document.querySelectorAll(
+      'button, a[href], input, select, textarea, [role="button"]')).filter(node => {
+        const box = node.getBoundingClientRect();
+        return box.width > 0 && box.height > 0;
+      }).length;
     return JSON.stringify({
-      x: scrollX,
-      y: scrollY,
-      viewportWidth: innerWidth,
-      viewportHeight: innerHeight,
-      documentWidth: root.scrollWidth,
-      documentHeight: root.scrollHeight,
-      reachedTop: scrollY <= 0,
-      reachedBottom: scrollY >= maximumY - 1,
+      topLayerElementCount: inTopLayer,
+      modalPresent: modal,
+      compositedLayerCount: composited,
+      renderedInteractiveCount: interactive
+    });
+    """
+
+  /// Which element the page really scrolls in. A single-page app commonly scrolls a
+  /// pane while the document itself is fixed, so scrolling the document moved nothing
+  /// and then reported the bottom had been reached — the tool said it had finished a
+  /// job it had not started.
+  private static let scrollerSource = """
+    const documentRoot = document.scrollingElement || document.documentElement;
+    const documentScrolls = documentRoot.scrollHeight > documentRoot.clientHeight + 1;
+    const paneScroller = () => {
+      let best = null;
+      let bestArea = 0;
+      for (const node of document.querySelectorAll('*')) {
+        const style = getComputedStyle(node);
+        const scrollable = ['auto', 'scroll', 'overlay'].includes(style.overflowY);
+        if (!scrollable) continue;
+        if (node.scrollHeight <= node.clientHeight + 1) continue;
+        const box = node.getBoundingClientRect();
+        const area = box.width * box.height;
+        if (area > bestArea) { best = node; bestArea = area; }
+      }
+      return best;
+    };
+    const scroller = documentScrolls ? documentRoot : (paneScroller() ?? documentRoot);
+    const scrollerIsDocument = scroller === documentRoot;
+    """
+
+  private static let scrollStateSource = """
+    const viewportHeight = scrollerIsDocument ? innerHeight : scroller.clientHeight;
+    const viewportWidth = scrollerIsDocument ? innerWidth : scroller.clientWidth;
+    const offsetY = scrollerIsDocument ? scrollY : scroller.scrollTop;
+    const offsetX = scrollerIsDocument ? scrollX : scroller.scrollLeft;
+    const maximumY = Math.max(0, scroller.scrollHeight - viewportHeight);
+    return JSON.stringify({
+      x: offsetX,
+      y: offsetY,
+      viewportWidth,
+      viewportHeight,
+      documentWidth: scroller.scrollWidth,
+      documentHeight: scroller.scrollHeight,
+      reachedTop: offsetY <= 0,
+      reachedBottom: offsetY >= maximumY - 1,
       observationInvalidated: true
     });
     """
@@ -2240,9 +4604,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       });
       """
 
-  private static let pageScrollSource = """
-    scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' });
-    """ + scrollStateSource
+  private static let pageScrollSource =
+    scrollerSource + """
+      if (scrollerIsDocument) {
+        scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' });
+      } else {
+        scroller.scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' });
+      }
+      """ + scrollStateSource
 
   private static let textSnapshotSource = """
     const collapseLines = value => String(value ?? '')
@@ -2289,10 +4658,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   private static let performSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
-      const box = surface.getBoundingClientRect();
+      const box = viewportRectOf(surface);
       const tolerance = 0.5;
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
@@ -2302,16 +4671,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         && style.display !== 'none';
       const enabled = !element.matches(':disabled')
         && element.getAttribute('aria-disabled') !== 'true';
-      const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      const hit = document.elementFromPoint(centerX, centerY);
+      // box is in top-level coordinates for dispatch; hit testing needs the element's
+      // own document and its own coordinates, or a frame's content answers for the
+      // outer page.
+      let hit = hitAtCentreOfLocal(surface, surface.getBoundingClientRect());
+      const composedContains = (ancestor, node) => {
+        for (let cursor = node; cursor; cursor = composedParent(cursor)) {
+          if (cursor === ancestor) return true;
+        }
+        return false;
+      };
       const receivesEvents = Boolean(hit && (
-        hit === element || element.contains(hit) || hit === surface || surface.contains(hit)
+        composedContains(element, hit) || composedContains(surface, hit)
       ));
       const editable = operation !== 'fill' || (
         (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
           || element.isContentEditable) && !element.readOnly
       );
+      // A control that cannot be typed into is not the same failure as one behind an
+      // overlay or a disabled one, and target_not_actionable was all three.
+      if (!editable) candidate.unsupportedOperationRole = roleOf(element) || element.localName;
       candidate.actionable = visible && enabled && receivesEvents && editable
         && candidate.geometryStable && element.isConnected;
       if (candidate.actionable && operation === 'click') {
@@ -2344,7 +4723,22 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         const listener = event => { trusted = event.isTrusted; };
         element.addEventListener('input', listener, { capture: true, once: true });
         if (element.isContentEditable) {
-          element.textContent = value;
+          // A framework editor keeps its own model and only trusts input events.
+          // Assigning textContent went behind its back: the node changed, the model did
+          // not, and the field stayed visibly empty while the write reported half a
+          // success. Select the contents and let the editor perform the insertion.
+          element.focus({ preventScroll: true });
+          const selection = getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          // execCommand is the only route WebKit exposes that drives its own editing
+          // pipeline, so the editor sees the beforeinput and input it is listening for.
+          // Raising those events by hand as well would deliver the text twice.
+          if (!document.execCommand('insertText', false, value)) {
+            element.textContent = value;
+          }
         } else {
           const prototype = element instanceof HTMLTextAreaElement
             ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -2356,7 +4750,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         candidate.trustedUserGesture = trusted;
         candidate.dispatched = true;
       }
-      return JSON.stringify({ count: matches.length, candidate });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
       """
 
   private static let nativeGestureMessageHandlerName = "webkituiNativeGesture"
@@ -2364,10 +4758,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
   private static let armNativeClickSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
-      const box = surface.getBoundingClientRect();
+      const box = viewportRectOf(surface);
       const tolerance = 0.5;
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
@@ -2377,9 +4771,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
         && style.display !== 'none' && Number(style.opacity) !== 0;
       const enabled = !element.matches(':disabled')
         && element.getAttribute('aria-disabled') !== 'true';
-      const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      const hit = document.elementFromPoint(centerX, centerY);
+      // Hit testing in the element's own document: box is in top-level coordinates so
+      // the dispatch lands correctly, but a frame answers only about its own points.
+      const hit = hitAtCentreOfLocal(surface, surface.getBoundingClientRect());
       const receivesEvents = Boolean(hit && (
         hit === element || element.contains(hit) || hit === surface || surface.contains(hit)
       ));
@@ -2397,16 +4791,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           surface.addEventListener('click', report, { capture: true, once: true });
         }
       }
-      return JSON.stringify({ count: matches.length, candidate });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
       """
 
   private static let armNativeKeySource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
-      if (!element) return JSON.stringify({ count: matches.length, candidate: null });
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
       const candidate = describe(element);
       const surface = surfaceOf(element);
-      const box = surface.getBoundingClientRect();
+      const box = viewportRectOf(surface);
       const tolerance = 0.5;
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
@@ -2432,7 +4826,51 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
           }, { capture: true, once: true });
         }
       }
-      return JSON.stringify({ count: matches.length, candidate });
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
+      """
+
+  private static let armNativeFillSource =
+    actionHelpers + """
+      const element = matches.length === 1 ? matches[0] : null;
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
+      const candidate = describe(element);
+      const surface = surfaceOf(element);
+      const box = viewportRectOf(surface);
+      const tolerance = 0.5;
+      candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
+        Math.abs(box[key] - expectedBox[key]) <= tolerance
+      );
+      const editable = element instanceof HTMLInputElement
+        || element instanceof HTMLTextAreaElement || element.isContentEditable;
+      const enabled = !element.matches(':disabled') && !element.readOnly
+        && element.getAttribute('aria-disabled') !== 'true';
+      candidate.actionable = editable && enabled && candidate.geometryStable
+        && element.isConnected && typeof element.focus === 'function';
+      if (candidate.actionable) {
+        element.focus({ preventScroll: true });
+        if (typeof element.select === 'function') {
+          element.select();
+        } else if (element.isContentEditable) {
+          const selection = getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+        const physicalIdentity = candidate.physicalIdentity;
+        element.addEventListener('input', event => {
+          globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
+            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+          });
+        }, { capture: true, once: true });
+        document.addEventListener('keydown', event => {
+          if (event.key !== 'Tab') return;
+          globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
+            token, physicalIdentity, eventType: 'commit_keydown', trusted: event.isTrusted
+          });
+        }, { capture: true, once: true });
+      }
+      return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
       """
 
   private static func boxDictionary(_ box: ObservedBoundingBox) -> [String: Double] {
@@ -2461,9 +4899,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKScriptMessag
       const tolerance = 0.5;
       if (!['x', 'y', 'width', 'height'].every(key =>
           Math.abs(box[key] - expectedBox[key]) <= tolerance)) return false;
-      const centerX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const centerY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      const hit = document.elementFromPoint(centerX, centerY);
+      // This script stands alone and never leaves the top-level document: a credential
+      // field is only ever filled where the human confirmed it.
+      const centreX = Math.min(innerWidth - 1, Math.max(0, box.left + box.width / 2));
+      const centreY = Math.min(innerHeight - 1, Math.max(0, box.top + box.height / 2));
+      const hit = document.elementFromPoint(centreX, centreY);
       return Boolean(hit && (hit === element || element.contains(hit)));
     };
     if (!stable(usernameElement, usernameExpectedBox, false)
@@ -2539,6 +4979,18 @@ private struct RawObservation: Decodable {
   let mutationCount: UInt64
   let crossOriginFrameCount: Int
   let totalElementCount: Int
+  let unfilteredCandidateCount: Int
+  let transientLoading: Bool
+  let renderedInteractiveCount: Int
+  let documentLanguage: String?
+  let ariaHiddenDropCount: Int
+  let unrenderedControlCount: Int
+  let unrenderedControlNames: [String]
+  let rawControlCount: Int
+  let obscuredByAncestorOpacity: Bool
+  let documentElementCount: Int
+  let bodyTextLength: Int
+  let firstControlProbe: String
   let semanticTextTruncated: Bool
   let elements: [RawElement]
 }
@@ -2548,6 +5000,7 @@ private struct RawAuthenticationUIState: Decodable {
   let hasProgressIndicator: Bool
   let hasVisibleAuthenticationControl: Bool
   let hasInvisibleAuthenticationControl: Bool
+  let hasWebAuthnControl: Bool
 }
 
 private struct RawElement: Decodable {
@@ -2558,6 +5011,8 @@ private struct RawElement: Decodable {
   let label: String?
   let text: String?
   let value: String?
+  let validationState: String
+  let characterCount: Int?
   let sensitive: Bool
   let submitsForm: Bool
   let disabled: Bool
@@ -2565,8 +5020,17 @@ private struct RawElement: Decodable {
   let selected: Bool?
   let selectedOption: String?
   let stateAttributes: [String: String]
+  let contextAnchors: [RawContextAnchor]
+  let domPath: String
+  let stableAttributes: [String: String]
   let visible: Bool
+  let actionability: String
   let boundingBox: ObservedBoundingBox
+}
+
+private struct RawContextAnchor: Decodable {
+  let kind: String
+  let text: String
 }
 
 private struct ObservedTargetRecord {
@@ -2576,11 +5040,23 @@ private struct ObservedTargetRecord {
   let sensitive: Bool
   let disabled: Bool
   let observedAtMonotonicNanoseconds: UInt64
+  /// How many candidates the address matched when it was handed out. Structure can
+  /// separate identical controls only while the set it indexes is unchanged.
+  let observedCandidateCount: Int
+}
+
+private struct RawCaptureDOMState: Decodable {
+  let topLayerElementCount: Int
+  let modalPresent: Bool
+  let compositedLayerCount: Int
+  let renderedInteractiveCount: Int
 }
 
 private struct RawActionResolution: Decodable {
   let count: Int
   let candidate: RawActionCandidate?
+  let eliminatedBy: [String]?
+  let pinnedState: String?
 }
 
 private struct RawActionCandidate: Decodable {
@@ -2590,6 +5066,7 @@ private struct RawActionCandidate: Decodable {
   let actionable: Bool
   let dispatched: Bool
   let trustedUserGesture: Bool
+  let unsupportedOperationRole: String?
 }
 
 private struct NativeGestureReceipt {

@@ -1,6 +1,6 @@
 # Addressing core — NotebookLM review (2026-08-21)
 
-Notebook: **WebKITUI MPC** (private notebook ID redacted).
+Notebook: **WebKITUI MPC** (`1c877ebb-8347-46e0-8c90-720098e01dc5`).
 
 Three short English questions were sent with explicit `dataConsent: true` and
 `sensitivity: internal`: prior measurements, contract blind spots, and feasible

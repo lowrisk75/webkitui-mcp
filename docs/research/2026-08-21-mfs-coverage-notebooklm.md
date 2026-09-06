@@ -14,9 +14,9 @@ Date: 2026-08-21
   - `origin`: `DeepSearsh/inbox/deep-research-report-2.md`
   - SHA-256:
     `79caa0fe0f2e7d377f9acd9659a29db81a472a268cfb09b4b13b8ebac49300b9`
-- NotebookLM `WebKITUI MPC`, private ID redacted:
+- NotebookLM `WebKITUI MPC`, id `1c877ebb-8347-46e0-8c90-720098e01dc5`:
   definitions, implementation blind spots, missed opportunities.
-- NotebookLM `LLM`, private ID redacted:
+- NotebookLM `LLM`, id `ad5010b1-4c2b-4f3b-970c-24d5103655b4`:
   missed-opportunity counter-audit.
 
 ## Measured or defined by the primary paper
