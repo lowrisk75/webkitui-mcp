@@ -165,9 +165,17 @@ struct WebKitUIMCPAquaBroker {
           else { return }
           Task { @MainActor in await runtime.clearBrowsingData() }
         },
-        releaseHostLease: { [weak registry] in
-          guard let registry else { return }
-          for handle in registry.openSessionHandles() { try? registry.close(handle) }
+        releaseHostLease: { [weak registry] report in
+          // Sessions this host owns first, so a lease held by the host itself goes away.
+          if let registry {
+            for handle in registry.openSessionHandles() { try? registry.close(handle) }
+          }
+          // Then whoever actually holds the lock, which is normally a client in its own
+          // process and was never reachable from the registry above.
+          DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = HostLeaseEviction.evict()
+            Task { @MainActor in report(outcome) }
+          }
         }
       )
       for descriptor in sockets.descriptors {

@@ -495,11 +495,53 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
       confirmDestructive(
         message: text("Release the host lease?"),
         detail: text(
-          "Sessions open on this host are closed so another client can take it. Work in "
-            + "progress in those sessions is lost."))
+          "Sessions open on this host are closed, and the client holding the lease is "
+            + "asked to stop, so another client can take it. Work in progress in those "
+            + "sessions is lost."))
     else { return }
-    maintenance?.releaseHostLease()
+    maintenance?.releaseHostLease { [weak self] outcome in
+      guard let self else { return }
+      self.refreshStatus()
+      self.reportLeaseRelease(outcome)
+    }
     refreshStatus()
+  }
+
+  /// The button used to succeed silently while changing nothing. Say what happened.
+  private func reportLeaseRelease(_ outcome: HostLeaseEviction.Outcome) {
+    let alert = NSAlert()
+    switch outcome {
+    case .noHolder:
+      alert.messageText = text("The host lease is free")
+      alert.informativeText = text("No client holds the browser host.")
+    case .evicted(let pid):
+      alert.messageText = text("Host lease released")
+      alert.informativeText = text("The client that held it has stopped.")
+        + " (pid \(pid))"
+    case .stillHeld(let pid):
+      alert.alertStyle = .warning
+      alert.messageText = text("The lease was not released")
+      alert.informativeText =
+        text("The client was asked to stop and has not. Quit it yourself.")
+        + " (pid \(pid))"
+    case .refused(let decision):
+      alert.alertStyle = .warning
+      alert.messageText = text("The lease was not released")
+      switch decision {
+      case .refusedSelf:
+        alert.informativeText = text("This host holds the lease itself.")
+      case .refusedNotRunning:
+        alert.informativeText = text("The recorded client is already gone.")
+      case .refusedUnrecognisedExecutable(let pid, _):
+        alert.informativeText =
+          text("The recorded process is not a WebKitUI client, so it was left alone.")
+          + " (pid \(pid))"
+      case .noHolder, .terminate:
+        alert.informativeText = text("No client holds the browser host.")
+      }
+    }
+    alert.addButton(withTitle: text("OK"))
+    alert.runModal()
   }
 
   private func confirmDestructive(message: String, detail: String) -> Bool {

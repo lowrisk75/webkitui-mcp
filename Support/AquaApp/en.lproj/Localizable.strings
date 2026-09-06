@@ -143,3 +143,14 @@
 "Close this host's sessions so another client can open one." = "Close this host's sessions so another client can open one.";
 "Release the host lease?" = "Release the host lease?";
 "Sessions open on this host are closed so another client can take it. Work in progress in those sessions is lost." = "Sessions open on this host are closed so another client can take it. Work in progress in those sessions is lost.";
+
+"Host lease released" = "Host lease released";
+"The host lease is free" = "The host lease is free";
+"The lease was not released" = "The lease was not released";
+"No client holds the browser host." = "No client holds the browser host.";
+"The client that held it has stopped." = "The client that held it has stopped.";
+"The client was asked to stop and has not. Quit it yourself." = "The client was asked to stop and has not. Quit it yourself.";
+"The recorded client is already gone." = "The recorded client is already gone.";
+"The recorded process is not a WebKitUI client, so it was left alone." = "The recorded process is not a WebKitUI client, so it was left alone.";
+"This host holds the lease itself." = "This host holds the lease itself.";
+"Sessions open on this host are closed, and the client holding the lease is asked to stop, so another client can take it. Work in progress in those sessions is lost." = "Sessions open on this host are closed, and the client holding the lease is asked to stop, so another client can take it. Work in progress in those sessions is lost.";
