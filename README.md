@@ -265,10 +265,12 @@ The first measured local lane uses 30 runs of the same deterministic fixture at 
 ## Licensing
 
 WebKitUI MCP 0.6.1 Developer Preview is available under the
-[MIT License](LICENSE), including commercial use, modification and
-redistribution subject to that license's notice requirement. No purchase or
-activation is required. See [`LICENSING.md`](LICENSING.md) for the exact scope,
-third-party boundary and treatment of earlier revisions.
+[Business Source License 1.1](LICENSE). The source is readable, auditable and
+modifiable; production use is granted for personal noncommercial, qualifying
+noncommercial organization and evaluation use, and commercial production use
+requires an agreement with the Licensor. This version converts to Apache 2.0 on
+2030-08-28. See [`LICENSING.md`](LICENSING.md) for the exact scope, third-party
+boundary and treatment of earlier revisions.
 
 ## Safety
 
