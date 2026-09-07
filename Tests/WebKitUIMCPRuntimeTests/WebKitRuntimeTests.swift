@@ -2543,6 +2543,15 @@ struct WebKitRuntimeTests {
     _ = try await runtime.resumeAfterHumanControl()
   }
 
+  @Test("WebKit's fraudulent-site warning is on for every runtime")
+  func fraudulentWebsiteWarningIsEnabled() {
+    // The agent steers the browser onto pages nobody chose by hand, so the one
+    // reputation check that costs no privacy — WebKit's own hashed Safe Browsing
+    // lookup — has to be on. It is off by default on a bare configuration.
+    let runtime = WebKitRuntime()
+    #expect(runtime.webView.configuration.preferences.isFraudulentWebsiteWarningEnabled)
+  }
+
   @Test("Session handles are bounded and unforgeable")
   func sessions() throws {
     let registry = try WebKitSessionRegistry(maximumSessions: 1)

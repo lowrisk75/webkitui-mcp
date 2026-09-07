@@ -483,6 +483,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     )
     configuration.userContentController = contentController
     configuration.websiteDataStore = websiteDataStore
+    // The agent lands on pages nobody picked by hand. WebKit's own fraudulent-site
+    // check is the one reputation lookup that sends hashed prefixes rather than URLs,
+    // so it stays on by decision, not by default; a denylist evaluated before the
+    // confirmation is the place for anything stricter.
+    configuration.preferences.isFraudulentWebsiteWarningEnabled = true
 
     self.instrumentationWorld = world
     self.webView = WKWebView(
