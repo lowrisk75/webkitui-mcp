@@ -25,8 +25,35 @@ xcrun swift-format lint --strict --recursive Sources Tests Package.swift
 # Explicitly serialize Swift Testing. WKWebView test processes are reliable in
 # isolation but can return noDocument when several suites create WebContent
 # processes concurrently on a loaded developer Mac.
-swift test -c debug --no-parallel --skip hostExclusiveSession
-swift test -c release --no-parallel --skip hostExclusiveSession
+# A Swift Testing bundle that exits mid-run — a nested event loop stopped the main
+# run loop, and the async entry point calls exit(0) when that returns — prints no
+# summary and returns success. `swift test` passed that straight through, so this
+# gate said "verified" over a bundle that had run a hundred tests out of 141 and a
+# failure that never got the chance to show (2026-09-07). Every bundle has to
+# account for itself: one summary line each, none of them a failure.
+run_tests() {
+  local log
+  log=$(mktemp "${TMPDIR:-/tmp}/webkitui-swift-test.XXXXXX")
+  swift test "$@" 2>&1 | tee "$log"
+  # XCTest bundles report through swift test's own exit status; the summary line
+  # exists only for Swift Testing, so count the targets that use it.
+  local bundles summaries
+  bundles=$(grep -rl '^import Testing' Tests --include='*.swift' | cut -d/ -f2 | sort -u | wc -l | tr -d ' ')
+  summaries=$(grep -c 'Test run with' "$log" || true)
+  if [[ "$summaries" != "$bundles" ]]; then
+    print -u2 "swift test $*: $summaries of $bundles test bundles reported a summary"
+    rm -f "$log"
+    exit 1
+  fi
+  if grep -q 'Test run with .* failed' "$log"; then
+    print -u2 "swift test $*: a test bundle reported failures"
+    rm -f "$log"
+    exit 1
+  fi
+  rm -f "$log"
+}
+run_tests -c debug --no-parallel --skip hostExclusiveSession
+run_tests -c release --no-parallel --skip hostExclusiveSession
 
 # The installed binaries must be the ones this source builds. `swift build
 # --show-bin-path` prints a path without building, so an install script that asks for
