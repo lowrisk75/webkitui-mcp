@@ -226,7 +226,7 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     serverTeam: String?
   ) -> Bool {
     switch (helperTeam, serverTeam) {
-    case let (helper?, server?):
+    case (let helper?, let server?):
       return helper == server && helperIdentifier == releaseHelperIdentifier
     case (nil, nil):
       return helperIdentifier == sourceBuildHelperIdentifier
