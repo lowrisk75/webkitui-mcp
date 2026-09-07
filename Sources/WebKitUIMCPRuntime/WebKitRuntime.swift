@@ -1250,9 +1250,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if controlState == .freshlyReobserved {
       transition(to: .agentControlled, observationID: observationID)
     }
-    if armedNavigationActor?.actor == .agentAction {
-      armedNavigationActor = nil
-    }
+    // The armed actor is not cleared here. WebKit delivers the navigation policy callback
+    // for a click on its own schedule, and on a loaded Mac that was after this call had
+    // returned: the audit then filed the agent's own navigation as web content. The arm
+    // is consumed by the first main-frame navigation and expires on its own otherwise.
     return result
   }
 
