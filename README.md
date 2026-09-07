@@ -154,6 +154,26 @@ Mixing the two is refused in both directions. If you re-sign one binary, re-sign
 the other with the same identity, or the confirmation will not appear and every
 navigation will fail closed.
 
+### Keyboard behaviour of the confirmation
+
+The confirmation takes keyboard focus the moment it opens, so keystrokes meant
+for a terminal can land on it. Two preferences, shared by a source build and
+the notarized app, decide what the keyboard may do:
+
+```bash
+# Return presses Cancel once the panel has been up for 1 s (default).
+defaults write com.lorislab.webkitui-mcp ConfirmationKeyboardDefault cancel
+# No key presses any button; click, or Tab to a button first.
+defaults write com.lorislab.webkitui-mcp ConfirmationKeyboardDefault none
+# Delay before Return means Cancel, 0 to 5 seconds (default 1).
+defaults write com.lorislab.webkitui-mcp ConfirmationArmingDelaySeconds -float 2
+```
+
+Before the delay passes nothing has focus, so Return and Space press nothing.
+Approve is never a keyboard default and cannot be made one. No per-project or
+per-session auto-approval exists; the design constraints for one are recorded
+in `docs/research/2026-09-01-goal-delegation-and-browser-addressing-sota.md`.
+
 For authenticated sessions that must survive Codex conversation reconnects,
 build the self-contained app instead:
 

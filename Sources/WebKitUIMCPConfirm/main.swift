@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import WebKitUIMCPConfirmPolicy
 
 private struct NativeConfirmationRequest: Decodable {
   let title: String
@@ -21,6 +22,7 @@ private struct ConfirmationLocalizationAudit: Encodable {
 @MainActor
 private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
   private let panel: NSPanel
+  private let policy: ConfirmationKeyboardPolicy
   private var approved = false
   /// Kept so the panel can hand keyboard focus to the safe default as it opens. With no
   /// initial first responder the operator had to click the window before Tab did
@@ -34,8 +36,10 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     details: String,
     detailsAccessibilityLabel: String,
     cancelLabel: String,
-    approveLabel: String
+    approveLabel: String,
+    policy: ConfirmationKeyboardPolicy
   ) {
+    self.policy = policy
     panel = NSPanel(
       contentRect: NSRect(x: 0, y: 0, width: 660, height: 500),
       styleMask: [.titled, .closable, .fullSizeContentView],
@@ -128,7 +132,10 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     let cancel = NSButton(title: cancelLabel, target: self, action: #selector(cancelAction))
     cancel.bezelStyle = .rounded
     cancel.bezelColor = .controlAccentColor
-    cancel.keyEquivalent = "\r"
+    // Return is bound to Cancel only by armKeyboard, after the arming delay. The panel
+    // steals focus the instant it opens, so the Return the operator was about to type
+    // into their terminal used to refuse an action they had not yet seen.
+    cancel.keyEquivalent = ""
     cancel.setAccessibilityHelp(subtitle)
     cancelButton = cancel
     let approve = NSButton(title: approveLabel, target: self, action: #selector(approveAction))
@@ -172,6 +179,7 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     cancel.nextKeyView = approve
     approve.nextKeyView = cancel
     // Cancel, never Navigate: the first thing the keyboard reaches must be the refusal.
+    // Tab starts here; nothing is focused before then, so a stray Space presses nothing.
     panel.initialFirstResponder = cancel
   }
 
@@ -182,7 +190,8 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     activate()
     panel.makeKeyAndOrderFront(nil)
     panel.orderFrontRegardless()
-    if let cancelButton { panel.makeFirstResponder(cancelButton) }
+    panel.makeFirstResponder(nil)
+    scheduleKeyboardArming()
     // Since macOS 14 an application that is not already frontmost is frequently refused
     // activation outright, and this helper is started by a background broker, so the
     // first attempt is the one most likely to be refused. Keep asking briefly: a
@@ -210,10 +219,25 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
         guard let self, self.panel.isVisible, !self.panel.isKeyWindow else { return }
         self.activate()
         self.panel.makeKeyAndOrderFront(nil)
-        if let cancelButton = self.cancelButton {
-          self.panel.makeFirstResponder(cancelButton)
-        }
       }
+    }
+  }
+
+  private func scheduleKeyboardArming() {
+    guard policy.keyboardDefault == .cancel else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + policy.armingDelaySeconds) {
+      [weak self] in
+      self?.armKeyboard()
+    }
+  }
+
+  /// Once the operator has had a moment to see the panel, Return means Cancel and the
+  /// Cancel button holds focus so Tab and Space behave as before.
+  private func armKeyboard() {
+    guard panel.isVisible, let cancelButton else { return }
+    cancelButton.keyEquivalent = "\r"
+    if panel.firstResponder === panel {
+      panel.makeFirstResponder(cancelButton)
     }
   }
 
@@ -272,7 +296,8 @@ private struct WebKitUIMCPConfirm {
       details: localizedDetails(request.message, bundle: .main),
       detailsAccessibilityLabel: text("Exact requested action"),
       cancelLabel: text("Cancel"),
-      approveLabel: text(request.approveLabel))
+      approveLabel: text(request.approveLabel),
+      policy: ConfirmationKeyboardPolicy.stored())
     let approved = controller.run()
     Foundation.exit(approved ? EXIT_SUCCESS : 2)
   }
