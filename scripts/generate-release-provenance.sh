@@ -24,7 +24,7 @@ find \
   README.md LICENSE LICENSING.md THIRD_PARTY_NOTICES.md \
   docs/network-boundary.md docs/release-maintenance-policy.md \
   Sources Tests Support/AquaApp Support/Packaging scripts \
-  \( -type f -o -type l \) ! -name '.DS_Store' -print0 \
+  \( -type f -o -type l \) ! -name '.DS_Store' ! -name '*.pyc' ! -path '*/__pycache__/*' -print0 \
   | LC_ALL=C sort -zu > "$inputs"
 
 : > "$manifest"

@@ -62,20 +62,44 @@ run_tests -c release --no-parallel --skip hostExclusiveSession
 # defect that had already been fixed.
 swift build -c release --arch arm64 >/dev/null
 release_bin=$(swift build -c release --arch arm64 --show-bin-path)
-for tool in webkitui-mcp webkitui-mcp-confirm webkitui-mcp-relay; do
-  installed_path="$HOME/.local/bin/$tool"
-  [[ -x "$installed_path" ]] || { print -u2 "missing installed $tool"; exit 1; }
-  # Signing rewrites the code directory, so compare the machine code itself, which it
-  # leaves untouched.
+verify_installed_executable() {
+  local tool=$1 installed_path=$2 built_text installed_text
+  [[ -x "$installed_path" ]] || { print -u2 "missing installed executable: $installed_path"; exit 1; }
+  # Signing rewrites the code directory, so compare machine code instead of the
+  # signed file hash. The sealed source manifest is checked separately below.
   built_text=$(otool -s __TEXT __text "$release_bin/$tool" | tail -n +3 | shasum -a 256 | cut -d' ' -f1)
   installed_text=$(otool -s __TEXT __text "$installed_path" | tail -n +3 | shasum -a 256 | cut -d' ' -f1)
   if [[ "$built_text" != "$installed_text" ]]; then
-    print -u2 "installed $tool is not built from this source"
+    print -u2 "installed executable is not built from this source: $installed_path"
     print -u2 "  built:     $built_text"
     print -u2 "  installed: $installed_text"
     exit 1
   fi
+}
+for tool in webkitui-mcp webkitui-mcp-confirm webkitui-mcp-relay; do
+  verify_installed_executable "$tool" "$HOME/.local/bin/$tool"
 done
+for tool in webkitui-mcp-aqua-broker webkitui-mcp-confirm webkitui-mcp-relay; do
+  verify_installed_executable "$tool" "$installed_app/Contents/MacOS/$tool"
+done
+
+# Version strings and valid signatures alone also accept an older app rebuilt
+# under the same version. Bind its sealed source manifest to today's source.
+(
+  manifest_scratch=$(mktemp -d "${TMPDIR:-/tmp}/webkitui-installed-provenance.XXXXXX")
+  trap 'rm -rf "$manifest_scratch"' EXIT HUP INT TERM
+  "$project_root/scripts/generate-release-provenance.sh" "$manifest_scratch" >/dev/null
+  installed_manifest="$installed_app/Contents/Resources/SOURCE-MANIFEST.sha256"
+  installed_provenance="$installed_app/Contents/Resources/ReleaseProvenance.plist"
+  test -s "$installed_manifest"
+  test -s "$installed_provenance"
+  manifest_sha=$(shasum -a 256 "$installed_manifest" | cut -d' ' -f1)
+  test "$manifest_sha" = "$(plutil -extract SourceManifestSHA256 raw "$installed_provenance")"
+  if ! cmp -s "$manifest_scratch/SOURCE-MANIFEST.sha256" "$installed_manifest"; then
+    print -u2 "installed app source manifest differs from current release inputs"
+    exit 1
+  fi
+)
 
 test -x "$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker"
 test -x "$installed_app_confirm"

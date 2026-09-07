@@ -7,12 +7,15 @@ release_plist="$workspace_dir/Support/AquaApp/Info.plist"
 release_version=$(plutil -extract CFBundleShortVersionString raw "$release_plist")
 scratch_dir=$(mktemp -d /private/tmp/webkitui-package.XXXXXX)
 trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
+# Optional explicit Swift cache for space-constrained local packaging. Changed
+# inputs are still rebuilt and provenance checked; default builds stay isolated.
+build_dir=${2:-"$scratch_dir/build"}
 
 cd "$workspace_dir"
 mkdir -p "$scratch_dir/provenance-before" "$scratch_dir/provenance-after"
 scripts/generate-release-provenance.sh "$scratch_dir/provenance-before" >/dev/null
-swift build -c release --arch arm64 --scratch-path "$scratch_dir/build"
-release_dir=$(swift build -c release --arch arm64 --scratch-path "$scratch_dir/build" --show-bin-path)
+swift build -c release --arch arm64 --scratch-path "$build_dir"
+release_dir=$(swift build -c release --arch arm64 --scratch-path "$build_dir" --show-bin-path)
 scripts/generate-release-provenance.sh "$scratch_dir/provenance-after" >/dev/null
 cmp "$scratch_dir/provenance-before/SOURCE-MANIFEST.sha256" \
   "$scratch_dir/provenance-after/SOURCE-MANIFEST.sha256"

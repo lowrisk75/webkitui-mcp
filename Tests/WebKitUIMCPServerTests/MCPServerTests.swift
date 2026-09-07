@@ -1107,6 +1107,10 @@ struct MCPServerTests {
     #expect(result["isError"] == nil)
     let structured = try object(result["structuredContent"])
     #expect(structured["status"] == .string("safari_compatibility_handoff_started"))
+    #expect(structured["safari_control_supported"] == .bool(false))
+    #expect(structured["mcp_resume_supported"] == .bool(false))
+    #expect(structured["manual_web_completion_required"] == .bool(true))
+    #expect(try string(structured["instructions"]).contains("cannot observe or control Safari"))
     #expect(structured["origin"] == .string("https://dash.cloudflare.com"))
     #expect(structured["handoff_backend"] == .string("safari"))
     #expect(structured["opened"] == .bool(true))
@@ -3009,6 +3013,25 @@ struct MCPServerTests {
     let completedState = try object(try object(completed["result"])["structuredContent"])
     #expect(completedState["human_step_completed"] == .bool(true))
     #expect(completedState["ready_for_resume_request"] == .bool(true))
+
+    // A client can correct an invalid observation option without losing the
+    // human-completed handoff. Only a valid resume request consumes the token.
+    for (offset, option) in [
+      ["compact": JSONValue.string("invalid")],
+      ["maximum_elements": JSONValue.int(0)],
+      ["maximum_elements": JSONValue.int(2_001)],
+    ].enumerated() {
+      var arguments: [String: JSONValue] = [
+        "operation": .string("handoff_resume"), "session_id": .string(sessionID),
+        "resume_token": .string(token),
+      ]
+      arguments.merge(option) { _, new in new }
+      let invalid = try await toolCall(
+        reconnectedServer, id: Int64(40 + offset), name: "browser_session", arguments: arguments)
+      #expect(try object(invalid["error"])["code"] == .int(-32602))
+      #expect(registry.handoffResumeCapabilityIsActive(token, for: handle))
+      #expect(runtime.interactionControlState() == .humanStepCompleted)
+    }
 
     let resumed = try await toolCall(
       reconnectedServer, id: 5, name: "browser_session",

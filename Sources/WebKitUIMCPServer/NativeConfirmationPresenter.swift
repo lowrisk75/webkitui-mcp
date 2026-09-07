@@ -101,6 +101,7 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     let input = Pipe()
     process.executableURL = helperURL
     process.arguments = Self.helperArguments
+    process.environment = Self.helperEnvironment(from: ProcessInfo.processInfo.environment)
     process.standardInput = input
     process.standardOutput = FileHandle.nullDevice
     process.standardError = FileHandle.nullDevice
@@ -135,6 +136,15 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     if process.terminationStatus == 2 { return .declined }
     if process.terminationStatus == 3 { return .cancelled }
     return .failed
+  }
+
+  /// The UI helper needs user preferences and locale, not the host's service
+  /// credentials or dynamic-loader configuration.
+  static func helperEnvironment(from parent: [String: String]) -> [String: String] {
+    let allowed = Set(["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"])
+    var environment = parent.filter { allowed.contains($0.key) }
+    environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    return environment
   }
 
   func cancel() {
