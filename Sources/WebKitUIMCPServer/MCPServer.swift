@@ -1567,12 +1567,18 @@ public final class WebKitMCPServer {
         "selected_backend": .string(sessionBackends[handle] ?? "native_webkit"),
         "handoff_backend": .string("safari"),
         "opened": .bool(true),
+        "safari_control_supported": .bool(false),
+        "mcp_resume_supported": .bool(false),
+        "manual_web_completion_required": .bool(true),
         "session_transfer_supported": .bool(false),
         "cookie_transfer_supported": .bool(false),
         "credential_transfer_supported": .bool(false),
         "credentials_exposed_to_mcp": .bool(false),
         "instructions": .string(
-          "Complete passkey or security-key authentication in Safari. WebKitUI remains fail-closed on the restricted origin."
+          "Continue and finish the workflow manually in Safari. This operation only opens Safari: "
+            + "WebKitUI cannot observe or control Safari, and authentication there does not "
+            + "resume this MCP session. The native WebKit session remains restricted. "
+            + "Do not retry handoff_resume expecting a Safari session transfer."
         ),
       ]),
       modern: modern)
@@ -2129,9 +2135,6 @@ public final class WebKitMCPServer {
             "Wait until the user selects Done — Return Control in the native WebKit window."),
         ]), modern: modern)
     }
-    guard registry.consumeHandoffResumeCapability(token, for: handle) else {
-      throw MCPServerError.invalidParams("resume_token is unknown, expired, or session-mismatched")
-    }
     // The handoff is the only escape hatch left when a control cannot be actuated, so
     // its observation has to fit. It used to return 500 elements with every field, which
     // is hundreds of thousands of characters on a real console page: past the client's
@@ -2146,6 +2149,11 @@ public final class WebKitMCPServer {
     let maximumElements = try boundedInteger(
       arguments["maximum_elements"], defaultValue: 150, range: 1...2_000,
       name: "maximum_elements")
+    // Reject malformed requests before consuming the one-use capability. There is
+    // no suspension between consumption and the transition to agent control.
+    guard registry.consumeHandoffResumeCapability(token, for: handle) else {
+      throw MCPServerError.invalidParams("resume_token is unknown, expired, or session-mismatched")
+    }
     try runtime.requestAgentResume()
     let observation = try await runtime.resumeAfterHumanControl(
       maximumElements: maximumElements)

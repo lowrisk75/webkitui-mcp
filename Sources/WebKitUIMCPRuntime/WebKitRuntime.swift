@@ -483,6 +483,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     )
     configuration.userContentController = contentController
     configuration.websiteDataStore = websiteDataStore
+    // The agent lands on pages nobody picked by hand. WebKit's own fraudulent-site
+    // check is the one reputation lookup that sends hashed prefixes rather than URLs,
+    // so it stays on by decision, not by default; a denylist evaluated before the
+    // confirmation is the place for anything stricter.
+    configuration.preferences.isFraudulentWebsiteWarningEnabled = true
 
     self.instrumentationWorld = world
     self.webView = WKWebView(
@@ -1250,9 +1255,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if controlState == .freshlyReobserved {
       transition(to: .agentControlled, observationID: observationID)
     }
-    if armedNavigationActor?.actor == .agentAction {
-      armedNavigationActor = nil
-    }
+    // The armed actor is not cleared here. WebKit delivers the navigation policy callback
+    // for a click on its own schedule, and on a loaded Mac that was after this call had
+    // returned: the audit then filed the agent's own navigation as web content. The arm
+    // is consumed by the first main-frame navigation and expires on its own otherwise.
     return result
   }
 

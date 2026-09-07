@@ -189,13 +189,19 @@ uniq -d "$scratch_dir/fr-localization-keys" > "$scratch_dir/fr-localization-dupl
 test ! -s "$scratch_dir/en-localization-duplicates"
 test ! -s "$scratch_dir/fr-localization-duplicates"
 diff -u "$scratch_dir/en-localization-keys" "$scratch_dir/fr-localization-keys"
-perl -0777 -ne 'while (/text\(\s*"((?:[^"\\]|\\.)*)"/g) { print "$1\n" }' \
+# Join adjacent Swift string literals before comparing their localization keys.
+# Formatting a long literal across lines must not turn a valid key into a prefix.
+perl -0777 -ne 'while (/text\(\s*((?:"(?:[^"\\]|\\.)*"\s*\+\s*)*"(?:[^"\\]|\\.)*")/g) { $expression = $1; $key = ""; while ($expression =~ /"((?:[^"\\]|\\.)*)"/g) { $key .= $1; } print "$key\n"; }' \
   "$workspace_dir/Sources/WebKitUIMCPAquaBroker/CompanionController.swift" \
   "$workspace_dir/Sources/WebKitUIMCPAquaBroker/ActivityLogWindowController.swift" \
   | LC_ALL=C sort -u > "$scratch_dir/companion-localization-keys"
 comm -23 "$scratch_dir/companion-localization-keys" "$scratch_dir/en-localization-keys" \
   > "$scratch_dir/missing-localization-keys"
-test ! -s "$scratch_dir/missing-localization-keys"
+if [ -s "$scratch_dir/missing-localization-keys" ]; then
+  printf '%s\n' "missing companion localization keys:" >&2
+  cat "$scratch_dir/missing-localization-keys" >&2
+  exit 1
+fi
 test -s "$app/Contents/Resources/AppIcon.icns"
 file "$app/Contents/Resources/AppIcon.icns" | grep -q 'Mac OS X icon'
 test -s \

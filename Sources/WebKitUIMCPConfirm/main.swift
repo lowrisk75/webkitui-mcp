@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import WebKitUIMCPConfirmPolicy
 
 private struct NativeConfirmationRequest: Decodable {
   let title: String
@@ -19,14 +20,89 @@ private struct ConfirmationLocalizationAudit: Encodable {
 }
 
 @MainActor
+private final class ConfirmationButton: NSButton {
+  // This confirmation must remain keyboard-operable even when macOS limits
+  // ordinary Tab navigation to text fields and lists. Keep native Tab/Space handling.
+  override var acceptsFirstResponder: Bool { isEnabled && !isHiddenOrHasHiddenAncestor }
+  override var canBecomeKeyView: Bool { acceptsFirstResponder }
+  var focusDidChange: (@MainActor () -> Void)?
+
+  override func becomeFirstResponder() -> Bool {
+    let accepted = super.becomeFirstResponder()
+    if accepted { focusDidChange?() }
+    return accepted
+  }
+}
+
+/// A closable panel closes on Escape the instant it opens, and AppKit offers no way to
+/// delay that from the outside. Escape is the key an operator working in a terminal
+/// reaches for most, so it is swallowed until the same arming delay that governs Return
+/// has passed (reported 2026-09-07).
+@MainActor
+private final class GuardedConfirmationPanel: NSPanel {
+  var cancelKeysAreArmed: @MainActor (TimeInterval) -> Bool = { _ in false }
+  var cancelFromKeyboard: @MainActor () -> Void = {}
+
+  override var canBecomeKey: Bool { true }
+  override var canBecomeMain: Bool { false }
+
+  override func keyDown(with event: NSEvent) {
+    if focusInitialButtonForTab(event) { return }
+    // Handle Escape explicitly rather than relying on modal-panel close behavior.
+    if event.keyCode == 53 {
+      if cancelKeysAreArmed(event.timestamp) { cancelFromKeyboard() }
+      return
+    }
+    super.keyDown(with: event)
+  }
+
+  /// In none mode no timer selects a button. The window itself receives the
+  /// first Tab, so explicitly enter the button loop without activating a button.
+  private func focusInitialButtonForTab(_ event: NSEvent) -> Bool {
+    guard event.keyCode == 48,
+      event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+      firstResponder == nil || firstResponder === self,
+      let initialFirstResponder
+    else { return false }
+    return makeFirstResponder(initialFirstResponder)
+  }
+
+  override func cancelOperation(_ sender: Any?) {
+    guard let event = NSApplication.shared.currentEvent,
+      cancelKeysAreArmed(event.timestamp)
+    else { return }
+    cancelFromKeyboard()
+  }
+
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    if focusInitialButtonForTab(event) { return true }
+    if event.keyCode == 53 {
+      if cancelKeysAreArmed(event.timestamp) { cancelFromKeyboard() }
+      return true
+    }
+    if [36, 76].contains(event.keyCode), !cancelKeysAreArmed(event.timestamp) { return true }
+    return super.performKeyEquivalent(with: event)
+  }
+}
+
+@MainActor
 private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
-  private let panel: NSPanel
+  private let panel: GuardedConfirmationPanel
+  private let policy: ConfirmationKeyboardPolicy
   private var approved = false
   /// Kept so the panel can hand keyboard focus to the safe default as it opens. With no
   /// initial first responder the operator had to click the window before Tab did
   /// anything, which put approval out of reach of a keyboard-only operator entirely
   /// (found by the G5 physical pass, 2026-09-06).
   private var cancelButton: NSButton?
+  private var keyboardPresentedAt: TimeInterval?
+  private var presentationCompleted = false
+
+  private var cancelKeysAreArmed: Bool {
+    guard let keyboardPresentedAt else { return false }
+    return policy.cancelKeysAreArmed(
+      elapsedSeconds: ProcessInfo.processInfo.systemUptime - keyboardPresentedAt)
+  }
 
   init(
     title: String,
@@ -34,14 +110,20 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     details: String,
     detailsAccessibilityLabel: String,
     cancelLabel: String,
-    approveLabel: String
+    approveLabel: String,
+    policy: ConfirmationKeyboardPolicy
   ) {
-    panel = NSPanel(
+    self.policy = policy
+    panel = GuardedConfirmationPanel(
       contentRect: NSRect(x: 0, y: 0, width: 660, height: 500),
-      styleMask: [.titled, .closable, .fullSizeContentView],
+      styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel],
       backing: .buffered,
       defer: false)
     super.init()
+    panel.cancelKeysAreArmed = { [weak self] timestamp in
+      self?.cancelKeysAreArmed(at: timestamp) ?? false
+    }
+    panel.cancelFromKeyboard = { [weak self] in self?.cancelAction() }
     panel.delegate = self
     panel.title = "WebKitUI MCP"
     panel.titleVisibility = .hidden
@@ -50,10 +132,11 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     panel.backgroundColor = .windowBackgroundColor
     panel.minSize = NSSize(width: 560, height: 420)
     panel.maxSize = NSSize(width: 820, height: 680)
-    // macOS will not hand keyboard focus to a helper launched by a background broker,
-    // and no entitlement changes that. What it does allow is staying on top: a
-    // confirmation that hides behind the operator's terminal is one they never answer.
+    // A nonactivating panel can receive keyboard input while the caller remains
+    // the active application. It does not need a separate foreground/Dock app.
     panel.level = .modalPanel
+    panel.becomesKeyOnlyIfNeeded = false
+    panel.hidesOnDeactivate = false
     // canJoinAllSpaces and moveToActiveSpace are mutually exclusive; AppKit throws on
     // the pair, which killed the helper before it drew anything.
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -125,13 +208,20 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     detailsScroller.layer?.borderColor = NSColor.separatorColor.cgColor
     detailsScroller.translatesAutoresizingMaskIntoConstraints = false
 
-    let cancel = NSButton(title: cancelLabel, target: self, action: #selector(cancelAction))
+    let cancel = ConfirmationButton(
+      title: cancelLabel, target: self, action: #selector(cancelAction))
     cancel.bezelStyle = .rounded
     cancel.bezelColor = .controlAccentColor
-    cancel.keyEquivalent = "\r"
+    // Return is bound to Cancel only by armKeyboard, after the arming delay. The panel
+    // steals focus the instant it opens, so the Return the operator was about to type
+    // into their terminal used to refuse an action they had not yet seen.
+    cancel.keyEquivalent = ""
     cancel.setAccessibilityHelp(subtitle)
     cancelButton = cancel
-    let approve = NSButton(title: approveLabel, target: self, action: #selector(approveAction))
+    cancel.focusDidChange = { [weak self] in self?.keyboardDiagnostic("focus_cancel") }
+    let approve = ConfirmationButton(
+      title: approveLabel, target: self, action: #selector(approveAction))
+    approve.focusDidChange = { [weak self] in self?.keyboardDiagnostic("focus_approve") }
     approve.bezelStyle = .rounded
     approve.contentTintColor = .controlAccentColor
     let spacer = NSView()
@@ -167,69 +257,129 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
 
     // An explicit two-button loop, rather than trusting whatever AppKit infers from a
     // stack view wrapping a scroll view: Tab must always land on a button and nowhere
-    // else, and it must be verifiable by reading this rather than by trying it.
+    // else. Physical Tab/Shift-Tab and Space acceptance remains a release gate.
     panel.autorecalculatesKeyViewLoop = false
     cancel.nextKeyView = approve
     approve.nextKeyView = cancel
     // Cancel, never Navigate: the first thing the keyboard reaches must be the refusal.
+    // Tab starts here; nothing is focused before then, so a stray Space presses nothing.
     panel.initialFirstResponder = cancel
   }
 
   func run() -> Bool {
-    // Activation has to come first. Ordering a window front from an app that is not yet
-    // active leaves the window visible but not key, so keystrokes go to whatever the
-    // operator was using before.
-    activate()
-    panel.makeKeyAndOrderFront(nil)
-    panel.orderFrontRegardless()
-    if let cancelButton { panel.makeFirstResponder(cancelButton) }
-    // Since macOS 14 an application that is not already frontmost is frequently refused
-    // activation outright, and this helper is started by a background broker, so the
-    // first attempt is the one most likely to be refused. Keep asking briefly: a
-    // confirmation the operator cannot type into is a confirmation they cannot refuse
-    // without reaching for the mouse.
-    scheduleActivationRetries()
-    NSApplication.shared.runModal(for: panel)
+    // This helper is its own application, not a modal child of an already-running
+    // AppKit app. Present on its normal event loop after launch has completed.
+    DispatchQueue.main.async { [self] in
+      panel.makeKeyAndOrderFront(nil)
+      panel.orderFrontRegardless()
+      panel.makeFirstResponder(nil)
+      panel.displayIfNeeded()
+      // Becoming key can precede the initial layout/draw. Do not spend the
+      // protection delay while the user is still waiting for the window to paint.
+      DispatchQueue.main.async { [self] in
+        presentationCompleted = true
+        beginKeyboardArmingWhenFocused()
+      }
+    }
+    NSApplication.shared.run()
     panel.orderOut(nil)
     return approved
   }
 
-  private func activate() {
-    NSApplication.shared.activate(ignoringOtherApps: true)
-    NSRunningApplication.current.activate(options: [.activateAllWindows])
+  func windowDidBecomeKey(_ notification: Notification) {
+    beginKeyboardArmingWhenFocused()
   }
 
-  private func scheduleActivationRetries() {
-    // Activation is granted only when the system feels like it, so ask a few times and
-    // then stop pretending. What always works is the Dock bouncing until the operator
-    // looks, and the panel being on top when they do.
-    NSApplication.shared.requestUserAttention(.criticalRequest)
-    for attempt in 1...3 {
-      DispatchQueue.main.asyncAfter(deadline: .now() + Double(attempt) * 0.2) {
-        [weak self] in
-        guard let self, self.panel.isVisible, !self.panel.isKeyWindow else { return }
-        self.activate()
-        self.panel.makeKeyAndOrderFront(nil)
-        if let cancelButton = self.cancelButton {
-          self.panel.makeFirstResponder(cancelButton)
-        }
-      }
+  private func beginKeyboardArmingWhenFocused() {
+    guard presentationCompleted, keyboardPresentedAt == nil, panel.isKeyWindow else {
+      return
+    }
+    keyboardPresentedAt = ProcessInfo.processInfo.systemUptime
+    keyboardDiagnostic("arming_started")
+    scheduleKeyboardArming()
+  }
+
+  private func scheduleKeyboardArming() {
+    guard policy.keyboardDefault == .cancel else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + policy.armingDelaySeconds) {
+      [weak self] in
+      self?.armKeyboard()
+    }
+  }
+
+  /// Once the operator has had a moment to see the panel, Return means Cancel, Escape
+  /// closes it again, and the Cancel button holds focus so Tab and Space behave as
+  /// before.
+  private func armKeyboard() {
+    guard panel.isVisible, cancelKeysAreArmed, let cancelButton else { return }
+    cancelButton.keyEquivalent = "\r"
+    keyboardDiagnostic("armed")
+    if panel.firstResponder === panel {
+      panel.makeFirstResponder(cancelButton)
     }
   }
 
   @objc private func cancelAction() {
+    if let event = NSApplication.shared.currentEvent, event.type == .keyDown,
+      [36, 53, 76].contains(event.keyCode), !cancelKeysAreArmed(at: event.timestamp)
+    {
+      return
+    }
+    keyboardDiagnostic("cancel")
     approved = false
-    NSApplication.shared.stopModal()
+    NSApplication.shared.stop(nil)
   }
 
   @objc private func approveAction() {
+    keyboardDiagnostic("approve")
     approved = true
-    NSApplication.shared.stopModal()
+    NSApplication.shared.stop(nil)
+  }
+
+  func windowShouldClose(_ sender: NSWindow) -> Bool {
+    if let event = NSApplication.shared.currentEvent, event.type == .keyDown,
+      event.keyCode == 53
+    {
+      return cancelKeysAreArmed(at: event.timestamp)
+    }
+    return true
   }
 
   func windowWillClose(_ notification: Notification) {
+    keyboardDiagnostic("window_close")
     approved = false
-    NSApplication.shared.abortModal()
+    NSApplication.shared.stop(nil)
+  }
+
+  private func cancelKeysAreArmed(at timestamp: TimeInterval) -> Bool {
+    let allowed =
+      keyboardPresentedAt.map {
+        policy.cancelKeysAreArmed(eventTimestamp: timestamp, presentedAt: $0)
+      } ?? false
+    keyboardDiagnostic("keyboard_gate", eventTimestamp: timestamp, allowed: allowed)
+    return allowed
+  }
+
+  /// Opt-in local probe metadata only: never records request text or typed content.
+  private func keyboardDiagnostic(
+    _ phase: String, eventTimestamp: TimeInterval? = nil, allowed: Bool? = nil
+  ) {
+    guard ProcessInfo.processInfo.environment["WEBKITUI_CONFIRM_KEYBOARD_DIAGNOSTICS"] == "1"
+    else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    var fields: [String: Any] = [
+      "phase": phase, "delay_seconds": policy.armingDelaySeconds,
+      "mode": policy.keyboardDefault.rawValue, "key_window": panel.isKeyWindow,
+    ]
+    if let start = keyboardPresentedAt {
+      fields["handled_after_seconds"] = now - start
+      if let eventTimestamp { fields["pressed_after_seconds"] = eventTimestamp - start }
+    }
+    if let allowed { fields["allowed"] = allowed }
+    if var data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]) {
+      data.append(0x0A)
+      try? FileHandle.standardError.write(contentsOf: data)
+    }
   }
 }
 
@@ -260,11 +410,14 @@ private struct WebKitUIMCPConfirm {
     }
 
     let application = NSApplication.shared
-    // .accessory cannot reliably become the frontmost, key application, so the panel
-    // opened without keyboard focus. A confirmation the operator must answer is exactly
-    // the case that warrants a real foreground app for the few seconds it is up.
-    application.setActivationPolicy(.regular)
-    application.activate(ignoringOtherApps: true)
+    // Keyboard ownership belongs to the nonactivating panel, not a foreground app.
+    // The helper must not create a generic executable icon in the Dock.
+    application.setActivationPolicy(.accessory)
+    if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+      let icon = NSImage(contentsOf: iconURL)
+    {
+      application.applicationIconImage = icon
+    }
 
     let controller = ConfirmationPanelController(
       title: text(request.title),
@@ -272,7 +425,8 @@ private struct WebKitUIMCPConfirm {
       details: localizedDetails(request.message, bundle: .main),
       detailsAccessibilityLabel: text("Exact requested action"),
       cancelLabel: text("Cancel"),
-      approveLabel: text(request.approveLabel))
+      approveLabel: text(request.approveLabel),
+      policy: ConfirmationKeyboardPolicy.stored())
     let approved = controller.run()
     Foundation.exit(approved ? EXIT_SUCCESS : 2)
   }

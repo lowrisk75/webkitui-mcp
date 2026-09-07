@@ -67,7 +67,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - `browser_download` converts authenticated attachment responses to `WKDownload` from either a fresh observed control or a protected same-origin URL fallback. It requires exact native confirmation plus a save-panel destination, never overwrites an existing file, and succeeds only after an on-disk receipt reports the HTTP status, suggested/final filename, MIME type, byte count, SHA-256, and decoded provisioning-profile UUID when available. Cookies, headers, and the absolute local destination path stay outside MCP.
 - macOS file inputs use WebKit's native open-panel delegate. Selected regular files are bounded to 10 files and 50 MiB each; receipts may expose filenames, byte counts and SHA-256 values, but never local paths or file contents. A file-selection receipt is not provider acceptance: the action's independent postcondition must still verify the uploaded preview or saved state.
 - Fill dispatches normal `input`/`change` events, so site handlers may autosave or cause server effects. It is destructive and human-confirmed; password controls require local human handoff.
-- `approval_mode: "native"` sends confirmed click/submit and Enter/Tab/Escape through public AppKit `NSEvent` handling on the freshly re-resolved `WKWebView` target. An isolated message handler must observe the matching DOM event with `event.isTrusted == true` before the receipt reports trust. Missing/mismatched receipts fail indeterminate; no flag is synthesized. `approval_mode: "mcp"`, fill, blur, and commit remain JavaScript-dispatched and report untrusted.
+- `approval_mode: "native"` sends confirmed click/submit and Enter/Tab/Escape through public AppKit `NSEvent` handling on the freshly re-resolved `WKWebView` target. An isolated message handler must observe the matching DOM event with `event.isTrusted == true` before the receipt reports trust. Missing/mismatched receipts fail indeterminate; no flag is synthesized. `approval_mode: "mcp"`, blur, and commit remain JavaScript-dispatched and report untrusted. Native public-text fill reports trust only when its matching AppKit insertion receipt is observed.
 - Action results separately expose `confirmation_mode`, `dispatch_mode`, and `trusted_gesture_state`. Native confirmation alone never establishes event trust.
 - `browser_read_text` reads only currently rendered virtualized lines. Use bounded scroll plus another read for additional ranges.
 - No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim.
@@ -75,8 +75,9 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Some identity providers require a complete browser surface and do not render
   inside an app-embedded `WKWebView`. The exact App Store Connect to Apple
   Account embedding returns `full_browser_required` with an internal
-  `safari_compatibility` requirement. That backend is not exposed as a second
-  MCP and currently fails closed until available. WebKitUI never copies cookies,
+  `safari_compatibility` requirement. `compatibility_start` opens Safari after confirmation, but provides no Safari
+  observation/control and no automatic return to this MCP after login. Complete
+  the entire blocked workflow manually in the external browser. WebKitUI never copies cookies,
   passkeys, AutoFill data, or credentials between backends.
 - `takeSnapshot` may omit GPU-composited effects.
 - No exactly-once or rollback claim for an uncooperative website.
@@ -154,6 +155,31 @@ Mixing the two is refused in both directions. If you re-sign one binary, re-sign
 the other with the same identity, or the confirmation will not appear and every
 navigation will fail closed.
 
+### Keyboard behaviour of the confirmation
+
+The confirmation uses a nonactivating panel: it can receive keyboard input while
+the caller remains the active application, without adding a separate helper icon
+to the Dock. Two preferences, shared by a source build and the notarized app,
+decide what the keyboard may do:
+
+```bash
+# Return cancels and Escape closes after 1 s of initial keyboard focus (default).
+defaults write com.lorislab.webkitui-mcp ConfirmationKeyboardDefault cancel
+# Return/Escape have no default action; click, or Tab to a button then Space.
+defaults write com.lorislab.webkitui-mcp ConfirmationKeyboardDefault none
+# Arming delay for Return/Escape, 0 to 5 seconds (default 1).
+defaults write com.lorislab.webkitui-mcp ConfirmationArmingDelaySeconds -float 2
+```
+
+The arming delay starts after the initial display and key-window acquisition.
+Queued Return/Escape input is checked against its original event timestamp. Initially no button has focus:
+stray Return/Space press nothing, and Escape
+is ignored until armed. Deliberately selecting a button with Tab and Space or
+clicking still works. In `none` mode Escape stays disabled.
+Approve is never a keyboard default and cannot be made one. No per-project or
+per-session auto-approval exists; the design constraints for one are recorded
+in `docs/research/2026-09-01-goal-delegation-and-browser-addressing-sota.md`.
+
 For authenticated sessions that must survive Codex conversation reconnects,
 build the self-contained app instead:
 
@@ -162,7 +188,7 @@ scripts/package-preview.sh dist
 scripts/verify-package-preview.sh dist
 ```
 
-Unzip `WebKitUI-MCP-0.6.5-preview.zip`, move `WebKitUI MCP.app` to the
+Unzip `WebKitUI-MCP-0.6.6-preview.zip`, move `WebKitUI MCP.app` to the
 Applications folder, and open it. In the status window:
 
 1. Enable **Launch at Login**. macOS may require approval in System Settings.
@@ -279,7 +305,7 @@ The first measured local lane uses 30 runs of the same deterministic fixture at 
 
 ## Licensing
 
-WebKitUI MCP 0.6.5 Developer Preview is available under the
+WebKitUI MCP 0.6.6 Developer Preview is available under the
 [Business Source License 1.1](LICENSE). The source is readable, auditable and
 modifiable; production use is granted for personal noncommercial, qualifying
 noncommercial organization and evaluation use, and commercial production use
@@ -290,3 +316,7 @@ boundary and treatment of earlier revisions.
 ## Safety
 
 The model cannot mint capability handles. Page content never becomes trusted policy. Password values are omitted from observations. Unknown dispatch is indeterminate and is never automatically retried. No commit, push, deployment, or external account mutation is performed by the project itself.
+
+Navigation actor attribution uses the first main-frame navigation within two
+seconds of an action. It is diagnostic evidence, not proof of causality or
+authorization: autonomous or more delayed navigation can be misattributed.

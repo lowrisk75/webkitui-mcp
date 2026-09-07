@@ -42,7 +42,11 @@ let package = Package(
       name: "WebKitUIMCPCLI",
       dependencies: ["WebKitUIMCPLicensing", "WebKitUIMCPRuntime", "WebKitUIMCPServer"]
     ),
-    .executableTarget(name: "WebKitUIMCPConfirm"),
+    .target(name: "WebKitUIMCPConfirmPolicy"),
+    .executableTarget(
+      name: "WebKitUIMCPConfirm",
+      dependencies: ["WebKitUIMCPConfirmPolicy"]
+    ),
     .executableTarget(
       name: "WebKitUIMCPAquaBroker",
       dependencies: [
@@ -58,6 +62,10 @@ let package = Package(
     .executableTarget(
       name: "CredentialBrokerPhysicalValidation",
       dependencies: ["WebKitUIMCPRuntime", "WebKitUIMCPServer"]
+    ),
+    .testTarget(
+      name: "WebKitUIMCPConfirmPolicyTests",
+      dependencies: ["WebKitUIMCPConfirmPolicy"]
     ),
     .testTarget(
       name: "WebKitUIMCPCoreTests",

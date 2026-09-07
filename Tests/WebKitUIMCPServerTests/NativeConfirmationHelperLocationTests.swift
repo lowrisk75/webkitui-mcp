@@ -5,6 +5,22 @@ import Testing
 
 @Suite("Native confirmation helper location")
 struct NativeConfirmationHelperLocationTests {
+  @Test("The UI helper excludes service secrets and loader injection from its environment")
+  @MainActor
+  func helperEnvironmentIsMinimal() {
+    let environment = NativeBrowserConfirmationPresenter.helperEnvironment(from: [
+      "HOME": "/fixture/home", "TMPDIR": "/fixture/tmp", "LANG": "fr_FR.UTF-8",
+      "PATH": "/fixture/untrusted-bin", "DYLD_INSERT_LIBRARIES": "/fixture/injection",
+      "LD_PRELOAD": "/fixture/injection", "SERVICE_TOKEN": "fictional-marker",
+      "UNRELATED_SETTING": "fictional-setting",
+    ])
+    #expect(
+      environment == [
+        "HOME": "/fixture/home", "TMPDIR": "/fixture/tmp", "LANG": "fr_FR.UTF-8",
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+      ])
+  }
+
   @Test("The executable is resolved absolutely, never from what the caller typed")
   func executableIsAbsolute() {
     // doctor used CommandLine.arguments[0]. Invoked by bare name through PATH

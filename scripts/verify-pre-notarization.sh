@@ -155,8 +155,11 @@ if kill -0 "$probe_pid" 2>/dev/null; then
   kill "$probe_pid" 2>/dev/null || true
   wait "$probe_pid" 2>/dev/null || true
 else
-  wait "$probe_pid" 2>/dev/null
-  probe_status=$?
+  if wait "$probe_pid" 2>/dev/null; then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
   printf '%s\n' \
     "confirmation helper exited with $probe_status instead of presenting a prompt:" >&2
   cat "$scratch_dir/confirmation-probe.err" >&2

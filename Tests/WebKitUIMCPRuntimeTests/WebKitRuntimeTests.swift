@@ -96,6 +96,18 @@ final class FormFixtureServer: @unchecked Sendable {
 @Suite("Native WebKit runtime", .serialized)
 @MainActor
 struct WebKitRuntimeTests {
+  /// `performClick` flashes the button through a nested event loop on the main thread.
+  /// A `CFRunLoopStop` posted for that inner loop can land on the outer one instead,
+  /// and the outer loop is Swift Testing's async main entry, which calls `exit(0)` the
+  /// moment `CFRunLoopRun` returns: the bundle stopped after about a hundred tests with
+  /// no summary and a zero exit status, so `swift test` reported success on a run it
+  /// never finished (traced with lldb, 2026-09-07). Sending the action directly keeps
+  /// the same target/action path without the inner loop.
+  private func pressWithoutNestedEventLoop(_ button: NSButton) throws {
+    let action = try #require(button.action)
+    #expect(button.sendAction(action, to: button.target))
+  }
+
   private func makeWindowHandoffRuntime() -> WebKitRuntime {
     // Swift Testing runs in a command-line host. Repeatedly transforming that
     // host between regular and accessory activation policies can terminate the
@@ -493,6 +505,37 @@ struct WebKitRuntimeTests {
     }
     #expect(scripted.latestNavigationAuditEvent()?.actor == .webContent)
     #expect(scripted.latestNavigationAuditEvent()?.navigationType == "other")
+  }
+
+  @Test("A navigation the agent caused is still attributed to it after the action call returned")
+  func navigationAttributionSurvivesTheActionReturning() async throws {
+    // The audit flagged agent-caused navigations as web content whenever WebKit
+    // delivered the policy callback after perform() had returned, which is a matter of
+    // scheduling: on a loaded Mac the full-suite gate saw exactly that. A click whose
+    // navigation is deferred by the page makes the ordering deterministic.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<button onclick=\"setTimeout(() => { location.href = '/agent-next' }, 150)\">Next</button>",
+      baseURL: URL(string: "https://fixture.invalid/start"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let button = try #require(observation.elements.first)
+    let before = runtime.navigationAuditEventCount()
+
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: button.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    #expect(runtime.navigationAuditEventCount() == before, "the navigation had not started yet")
+
+    for _ in 0..<fixtureSettlementPolls where runtime.navigationAuditEventCount() == before {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    let event = try #require(runtime.latestNavigationAuditEvent())
+    #expect(event.actor == .agentAction, "attributed to \(event.actor)")
+    #expect(event.toOrigin == "https://fixture.invalid")
   }
 
   @Test("A Material checkbox hidden behind an aria-hidden box stays addressable")
@@ -1178,6 +1221,8 @@ struct WebKitRuntimeTests {
       #expect(count == 21)
       #expect(pinned == "detached", "the reason was reported as \(pinned)")
     }
+    // The refusal is an ambiguity the operator can act on, so it is counted as one.
+    #expect(runtime.addressingCounterSnapshot().addressNowAmbiguous == 1)
     let after = try await runtime.observe()
     #expect(
       after.elements.allSatisfy { $0.checked != true },
@@ -2426,7 +2471,7 @@ struct WebKitRuntimeTests {
         of: NSTextField.self,
         accessibilityIdentifier: "webkitui.handoff.status",
         in: contentView))
-    done.performClick(nil)
+    try pressWithoutNestedEventLoop(done)
     #expect(runtime.interactionControlState() == .humanStepCompleted)
     #expect(!done.isEnabled)
     #expect(done.title == "Ready — Waiting for Agent")
@@ -2458,7 +2503,7 @@ struct WebKitRuntimeTests {
         in: contentView))
 
     try runtime.markHumanStepCompleted()
-    done.performClick(nil)
+    try pressWithoutNestedEventLoop(done)
 
     #expect(done.isEnabled)
     #expect(done.title == "Try Again — Return Control")
@@ -2496,6 +2541,15 @@ struct WebKitRuntimeTests {
 
     try runtime.requestAgentResume()
     _ = try await runtime.resumeAfterHumanControl()
+  }
+
+  @Test("WebKit's fraudulent-site warning is on for every runtime")
+  func fraudulentWebsiteWarningIsEnabled() {
+    // The agent steers the browser onto pages nobody chose by hand, so the one
+    // reputation check that costs no privacy — WebKit's own hashed Safe Browsing
+    // lookup — has to be on. It is off by default on a bare configuration.
+    let runtime = WebKitRuntime()
+    #expect(runtime.webView.configuration.preferences.isFraudulentWebsiteWarningEnabled)
   }
 
   @Test("Session handles are bounded and unforgeable")
@@ -3170,26 +3224,35 @@ struct WebKitRuntimeTests {
     #expect(observation.elements[0].role?.segments.first?.text == "button")
   }
 
-  @Test("Ambiguous fresh resolution aborts and increments its exact counter")
-  func ambiguityFailsClosed() async throws {
+  @Test("Identical controls on an unchanged page resolve by position")
+  func identicalControlsResolveByPosition() async throws {
+    // Until f402416 two identical buttons were always targetNotUnique(2). Position now
+    // separates them while the set it indexes is the set the observation saw; a moved
+    // population is refused and counted in changedPopulationRefusesPositionalNarrowing.
+    // This test did not run for the two days that rule was landing: the bundle exited
+    // before reaching it, so its old expectation went stale unnoticed.
     let runtime = WebKitRuntime()
     _ = try await runtime.loadHTML(
-      "<button>Save</button><button>Save</button>",
+      "<button onclick='this.dataset.state=\"clicked\"'>Save</button>"
+        + "<button onclick='this.dataset.state=\"clicked\"'>Save</button>",
       baseURL: URL(string: "https://fixture.invalid/"),
       timeout: fixtureNavigationTimeout,
       quietWindow: .milliseconds(40)
     )
     let observation = try await runtime.observe()
+    #expect(observation.elements[0].locatorQuality.candidateCount == 2)
 
-    await #expect(throws: WebKitRuntimeError.targetNotUnique(2, pinned: "used")) {
-      try await runtime.perform(
-        observationID: observation.observationID,
-        elementID: "e1",
-        operation: .click,
-        stabilityInterval: .milliseconds(10)
-      )
-    }
-    #expect(runtime.addressingCounterSnapshot().addressNowAmbiguous == 1)
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: "e1",
+      operation: .click,
+      stabilityInterval: .milliseconds(10)
+    )
+    #expect(result.dispatched)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "clicked")
+    #expect(after.elements[1].stateAttributes["data-state"] == nil)
+    #expect(runtime.addressingCounterSnapshot().addressNowAmbiguous == 0)
   }
 
   @Test("Enabled state disambiguates otherwise identical controls")

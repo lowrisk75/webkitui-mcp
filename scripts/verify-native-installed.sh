@@ -25,8 +25,35 @@ xcrun swift-format lint --strict --recursive Sources Tests Package.swift
 # Explicitly serialize Swift Testing. WKWebView test processes are reliable in
 # isolation but can return noDocument when several suites create WebContent
 # processes concurrently on a loaded developer Mac.
-swift test -c debug --no-parallel --skip hostExclusiveSession
-swift test -c release --no-parallel --skip hostExclusiveSession
+# A Swift Testing bundle that exits mid-run — a nested event loop stopped the main
+# run loop, and the async entry point calls exit(0) when that returns — prints no
+# summary and returns success. `swift test` passed that straight through, so this
+# gate said "verified" over a bundle that had run a hundred tests out of 141 and a
+# failure that never got the chance to show (2026-09-07). Every bundle has to
+# account for itself: one summary line each, none of them a failure.
+run_tests() {
+  local log
+  log=$(mktemp "${TMPDIR:-/tmp}/webkitui-swift-test.XXXXXX")
+  swift test "$@" 2>&1 | tee "$log"
+  # XCTest bundles report through swift test's own exit status; the summary line
+  # exists only for Swift Testing, so count the targets that use it.
+  local bundles summaries
+  bundles=$(grep -rl '^import Testing' Tests --include='*.swift' | cut -d/ -f2 | sort -u | wc -l | tr -d ' ')
+  summaries=$(grep -c 'Test run with' "$log" || true)
+  if [[ "$summaries" != "$bundles" ]]; then
+    print -u2 "swift test $*: $summaries of $bundles test bundles reported a summary"
+    rm -f "$log"
+    exit 1
+  fi
+  if grep -q 'Test run with .* failed' "$log"; then
+    print -u2 "swift test $*: a test bundle reported failures"
+    rm -f "$log"
+    exit 1
+  fi
+  rm -f "$log"
+}
+run_tests -c debug --no-parallel --skip hostExclusiveSession
+run_tests -c release --no-parallel --skip hostExclusiveSession
 
 # The installed binaries must be the ones this source builds. `swift build
 # --show-bin-path` prints a path without building, so an install script that asks for
@@ -35,20 +62,44 @@ swift test -c release --no-parallel --skip hostExclusiveSession
 # defect that had already been fixed.
 swift build -c release --arch arm64 >/dev/null
 release_bin=$(swift build -c release --arch arm64 --show-bin-path)
-for tool in webkitui-mcp webkitui-mcp-confirm webkitui-mcp-relay; do
-  installed_path="$HOME/.local/bin/$tool"
-  [[ -x "$installed_path" ]] || { print -u2 "missing installed $tool"; exit 1; }
-  # Signing rewrites the code directory, so compare the machine code itself, which it
-  # leaves untouched.
+verify_installed_executable() {
+  local tool=$1 installed_path=$2 built_text installed_text
+  [[ -x "$installed_path" ]] || { print -u2 "missing installed executable: $installed_path"; exit 1; }
+  # Signing rewrites the code directory, so compare machine code instead of the
+  # signed file hash. The sealed source manifest is checked separately below.
   built_text=$(otool -s __TEXT __text "$release_bin/$tool" | tail -n +3 | shasum -a 256 | cut -d' ' -f1)
   installed_text=$(otool -s __TEXT __text "$installed_path" | tail -n +3 | shasum -a 256 | cut -d' ' -f1)
   if [[ "$built_text" != "$installed_text" ]]; then
-    print -u2 "installed $tool is not built from this source"
+    print -u2 "installed executable is not built from this source: $installed_path"
     print -u2 "  built:     $built_text"
     print -u2 "  installed: $installed_text"
     exit 1
   fi
+}
+for tool in webkitui-mcp webkitui-mcp-confirm webkitui-mcp-relay; do
+  verify_installed_executable "$tool" "$HOME/.local/bin/$tool"
 done
+for tool in webkitui-mcp-aqua-broker webkitui-mcp-confirm webkitui-mcp-relay; do
+  verify_installed_executable "$tool" "$installed_app/Contents/MacOS/$tool"
+done
+
+# Version strings and valid signatures alone also accept an older app rebuilt
+# under the same version. Bind its sealed source manifest to today's source.
+(
+  manifest_scratch=$(mktemp -d "${TMPDIR:-/tmp}/webkitui-installed-provenance.XXXXXX")
+  trap 'rm -rf "$manifest_scratch"' EXIT HUP INT TERM
+  "$project_root/scripts/generate-release-provenance.sh" "$manifest_scratch" >/dev/null
+  installed_manifest="$installed_app/Contents/Resources/SOURCE-MANIFEST.sha256"
+  installed_provenance="$installed_app/Contents/Resources/ReleaseProvenance.plist"
+  test -s "$installed_manifest"
+  test -s "$installed_provenance"
+  manifest_sha=$(shasum -a 256 "$installed_manifest" | cut -d' ' -f1)
+  test "$manifest_sha" = "$(plutil -extract SourceManifestSHA256 raw "$installed_provenance")"
+  if ! cmp -s "$manifest_scratch/SOURCE-MANIFEST.sha256" "$installed_manifest"; then
+    print -u2 "installed app source manifest differs from current release inputs"
+    exit 1
+  fi
+)
 
 test -x "$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker"
 test -x "$installed_app_confirm"

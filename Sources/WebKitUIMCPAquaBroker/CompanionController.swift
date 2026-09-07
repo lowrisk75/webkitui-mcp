@@ -516,7 +516,8 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
       alert.informativeText = text("No client holds the browser host.")
     case .evicted(let pid):
       alert.messageText = text("Host lease released")
-      alert.informativeText = text("The client that held it has stopped.")
+      alert.informativeText =
+        text("The client that held it has stopped.")
         + " (pid \(pid))"
     case .stillHeld(let pid):
       alert.alertStyle = .warning

@@ -11,6 +11,5 @@ struct WebKitUIMaintenanceActions {
   /// Reports what actually happened. The previous signature could not say that it had
   /// done nothing, which is exactly what it did whenever another process held the lease.
   /// Asynchronous because eviction waits out a grace period the main thread must not.
-  let releaseHostLease:
-    (@escaping @MainActor @Sendable (HostLeaseEviction.Outcome) -> Void) -> Void
+  let releaseHostLease: (@escaping @MainActor @Sendable (HostLeaseEviction.Outcome) -> Void) -> Void
 }
