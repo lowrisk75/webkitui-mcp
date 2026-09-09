@@ -64,6 +64,23 @@ struct CapabilityClaimsCoherenceTests {
     }
   }
 
+  /// A regression pin, green from the day it was written. Its job is to fail later: the
+  /// two claims above were removed from prose that had been correct once, so prose that
+  /// is correct now is not evidence it will stay so.
+  @Test("The README still says the WKFormInfo gate does not fire")
+  func inertGateStaysDocumented() throws {
+    let readme = try Self.text("README.md")
+    // e86f737 implemented a submission gate that WebKit never calls. Describing it as a
+    // live second gate would be the same class of false claim as the ones this suite
+    // exists to keep out, and the more tempting one, because the code is really there.
+    #expect(
+      readme.contains("does not fire") || readme.contains("untriggered"),
+      "README no longer says the WKFormInfo gate is inert")
+    #expect(
+      readme.contains("26A5416b"),
+      "README no longer names a build the callback was measured absent on")
+  }
+
   @Test("The README makes no claim the research refuted")
   func refutedClaimsAreAbsent() throws {
     let readme = try Self.text("README.md")
