@@ -21,6 +21,14 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Human confirmation before every exposed click and open-world navigation.
   Navigation defaults to a server-owned native macOS dialog so a client cannot
   silently decline the round trip; MCP multi-round navigation remains opt-in.
+- The confirmation names the origin a submit control's data would reach, computed
+  server-side from the freshly re-resolved element rather than from its accessible
+  name, and says so explicitly when that origin differs from the page the operator is
+  on. A submit button's `formaction` overrides its form's `action`, so a control whose
+  accessible name reads harmlessly can post elsewhere.
+- Confirmations are counted in a rolling 60-second window. From the fifth, the dialog
+  states how many have been requested; the twentieth is refused instead of presented,
+  because a dialog a human clicks twenty times in a row has stopped being a gate.
 - Legacy MCP clients receive the same exact-action authority boundary through a
   server-owned native macOS confirmation dialog; the model cannot supply or
   forge the approval value.
@@ -70,7 +78,11 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - `approval_mode: "native"` sends confirmed click/submit and Enter/Tab/Escape through public AppKit `NSEvent` handling on the freshly re-resolved `WKWebView` target. An isolated message handler must observe the matching DOM event with `event.isTrusted == true` before the receipt reports trust. Missing/mismatched receipts fail indeterminate; no flag is synthesized. `approval_mode: "mcp"`, blur, and commit remain JavaScript-dispatched and report untrusted. Native public-text fill reports trust only when its matching AppKit insertion receipt is observed.
 - Action results separately expose `confirmation_mode`, `dispatch_mode`, and `trusted_gesture_state`. Native confirmation alone never establishes event trust.
 - `browser_read_text` reads only currently rendered virtualized lines. Use bounded scroll plus another read for additional ranges.
-- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim.
+- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim. A gate an agent can step around is not a gate: one JavaScript-evaluation call would do anything the confirmation exists to authorize one action at a time. Browserbase's MCP server also refuses JavaScript, so refusing it is not distinctive on its own; the combination surveyed for and not found elsewhere on 2026-09-09 is no JavaScript tool *and* a per-action gate *and* a real authenticated session.
+- No multiple tabs and no new-window handling. One session holds one exclusive host lease, which is what lets an approval refer to an unambiguous page.
+- No subresource or XHR request inspection. It is possible and it is not offered. `WKWebsiteDataStore.proxyConfigurations` is public from macOS 14 and is Apple DTS's own recommendation for reading a `WKWebView`'s request contents, and a bundled `WKWebExtension` with the `webRequest` permission is public from macOS 15.4. Neither is free: the proxy route needs a trusted root certificate to see inside HTTPS, and the extension route reports no headers and cannot block. What is reported instead is narrow — the download receipt's HTTP status, and the egress proxy's accepted, blocked, pinned and timed-out connection counts. A main-frame navigation result carries no HTTP status today, and the proxy does not name the hosts it allowed or refused.
+- Native AppKit dispatch is not a distinguishing feature and is not claimed as one. `safaridriver` dispatches `NSEvent` through `[window sendEvent:]` exactly as this does, and the WebDriver specification requires every conformant driver to produce trusted events. What differs is the measurement: an action whose trusted DOM receipt is missing or mismatched fails indeterminate here, where Playwright's hit-target interceptor treats an absent event as success.
+- The `WKFormInfo` submission gate is implemented, unit-tested, and does not fire. WebKit did not call `webView(_:willSubmitForm:submissionHandler:)` on either macOS 27.0 build measured here, `26A5416b` and `26A5419a` — not for `submit()`, not for `requestSubmit()`, and not for a native trusted-gesture click. It is therefore not a second live gate and must not be read as one; it will decide if WebKit begins delivering the callback. The live defence against a submit control that posts to another site is the destination line in the confirmation.
 - Cross-origin frame contents are opaque.
 - Some identity providers require a complete browser surface and do not render
   inside an app-embedded `WKWebView`. The exact App Store Connect to Apple
@@ -86,6 +98,50 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - This is a bounded website-traffic control, not a complete process egress
   sandbox. The exact tested transports, exclusions and safe-use rule are in
   [`docs/network-boundary.md`](docs/network-boundary.md).
+
+## Compared with the Safari MCP server
+
+Apple's Safari MCP server ships inside `safaridriver` and is started with
+`safaridriver --mcp`; Apple's own help text for the flag reads "Run as an MCP (Model
+Context Protocol) server using stdio transport." It exposes seventeen tools — page
+content, screenshots, network requests, console logs, JavaScript evaluation, DOM
+interaction, viewport and media emulation, tab management. It needs two settings in two
+different panes: "Show features for web developers" in Safari > Settings > Advanced, and
+"Allow remote automation and external agents" in Safari > Settings > Developer. Apple's
+floor is Safari 27 beta or Safari Technology Preview 247 or later, and Apple documents
+Safari 27 beta on macOS 26 and macOS Sequoia as well as macOS 27, so it is not a macOS 27
+requirement.
+
+Apple aims it at web developers: it "gives your agent the ability to know how your code
+actually renders in the browser", and both sets of release notes file it under
+WebDriver > New Features. Apple also states it "runs entirely on your local machine and
+makes no network calls of its own" and that it "does not have access to your personal
+information in Safari (e.g. AutoFill or other browser activity)". For developing a site
+it is the better tool, it is included with Safari and Apple lists no separate price, and
+this project does not compete with it.
+
+The difference is what happens when the site is not yours and you are signed in to it:
+
+| | Safari MCP server | WebKitUI MCP |
+| --- | --- | --- |
+| Purpose | inspect and debug a site you are developing | act on a site you are signed in to |
+| Approval | no confirmation step is documented, and none of the seventeen tools requests one | native macOS confirmation before every exposed click and open-world navigation |
+| Tool annotations | none: every tool carries only `name`, `description` and `inputSchema`, so a client gets no signal separating page reading from JavaScript evaluation | `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint` on every tool |
+| JavaScript evaluation | exposed as a tool | absent, with no CDP or coordinate fallback |
+| Session | Apple's WebDriver documentation states automation windows are "isolated from normal browsing windows, user settings, and preferences" and that a session "always starts from a clean slate" | its own `WKWebView` and its own persistent profile, which is what authenticated work requires |
+| Protocol | reports `2024-11-05` | `2026-07-28`, the current revision |
+| Network detail | full request inspection, including headers, body and timing | no per-request inspection: the download receipt's HTTP status, and the egress proxy's connection counts without host names |
+| Verification | inspection tools | an explicit postcondition per action, plus separate `confirmation_mode`, `dispatch_mode` and `trusted_gesture_state` |
+
+The isolation wording above is Apple's WebDriver documentation, about automation sessions
+generally. Apple has published no equivalent statement about the MCP server itself.
+
+Both can be installed at once, and for most developers both should be.
+
+Two things this project will not say about Apple's server, because Apple does not: that
+it cannot reach your cookies or your logged-in sessions — Apple's MCP post names AutoFill
+and "other browser activity" only — and that Apple states there is no confirmation step.
+The absence is documented; a denial is not.
 
 ## Build and test
 

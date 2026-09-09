@@ -27,6 +27,18 @@ part of the public-only egress guarantee. Do not load an untrusted page when
 complete private-network isolation depends on blocking those channels; use an
 OS-enforced network sandbox or isolated machine instead.
 
+It also does not offer, and does not claim:
+
+- Per-subresource or XHR request inspection. This is not offered, and it is not
+  impossible: `WKWebsiteDataStore.proxyConfigurations` is public from macOS 14 and is
+  Apple DTS's own recommendation for reading a `WKWebView`'s request contents, and a
+  bundled `WKWebExtension` with the `webRequest` permission is public from macOS 15.4.
+  Neither is free — the proxy route needs a trusted root certificate to see inside
+  HTTPS, and the extension route reports no headers and cannot block. Until one is
+  adopted, the only HTTP status this product reports is the download receipt's, and the
+  pinned proxy reports accepted, blocked, pinned and timed-out connection counts without
+  naming the hosts it allowed or refused.
+
 The lower-level `WebKitRuntime(websiteDataStore:)` initializer is deliberately
 unprotected for fixtures and embedding and must never be described as protected
 egress. Marketing, support and release notes may claim only the mechanisms and

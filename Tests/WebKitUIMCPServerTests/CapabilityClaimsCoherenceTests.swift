@@ -50,4 +50,32 @@ struct CapabilityClaimsCoherenceTests {
     }
     #expect(offenders.isEmpty, "tracked files contradict the refusal claim: \(offenders)")
   }
+
+  private static func text(_ relativePath: String) throws -> String {
+    try String(
+      contentsOf: projectRoot.appendingPathComponent(relativePath), encoding: .utf8)
+  }
+
+  @Test("The README names every capability this product refuses, and why")
+  func refusalsAreDocumented() throws {
+    let readme = try Self.text("README.md")
+    for refusal in ["arbitrary JavaScript", "raw CDP escape hatch", "subresource", "tabs"] {
+      #expect(readme.contains(refusal), "README no longer explains refusing: \(refusal)")
+    }
+  }
+
+  @Test("The README makes no claim the research refuted")
+  func refutedClaimsAreAbsent() throws {
+    let readme = try Self.text("README.md")
+    // Each of these was published and is false. safaridriver dispatches NSEvent through
+    // [window sendEvent:] exactly as this does; Claude in Chrome shipped per-action
+    // approval first; Browserbase exposes six tools with no evaluate; and WebKit does
+    // expose subresource inspection, through proxyConfigurations and WKWebExtension.
+    for claim in [
+      "only MCP browser", "first to", "unique in", "no API for inspecting",
+      "hashed prefixes",
+    ] {
+      #expect(!readme.contains(claim), "README makes a refuted claim: \(claim)")
+    }
+  }
 }
