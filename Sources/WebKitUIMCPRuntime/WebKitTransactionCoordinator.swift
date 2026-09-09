@@ -180,7 +180,11 @@ public final class WebKitTransactionCoordinator {
     switch error {
     case .staleObservation, .unknownElement, .targetNotUnique, .targetNotFound,
       .operationUnsupportedForControl,
-      .targetGeometryChanged, .sensitiveInputRequiresHuman, .handoffSurfaceUnavailable:
+      .targetGeometryChanged, .sensitiveInputRequiresHuman, .handoffSurfaceUnavailable,
+      // A panel was already open, so the gesture was refused before anything reached
+      // the page. The four answer-side refusals never dispatch either.
+      .javaScriptDialogPending, .noPendingJavaScriptDialog, .staleJavaScriptDialog,
+      .javaScriptDialogValueRequired, .javaScriptDialogValueUnsupported:
       .notDispatched
     case .targetNotActionable, .nativeGestureReceiptUnavailable,
       .webContentProcessTerminated, .malformedInstrumentationResult, .noDocument,
@@ -190,7 +194,10 @@ public final class WebKitTransactionCoordinator {
       .invalidCredentialSecret, .humanControlActive, .authenticationOriginRequiresHuman,
       .noPendingCrossOriginNavigation, .invalidControlTransition,
       .downloadInProgress, .downloadCancelled, .downloadReceiptTimedOut,
-      .unsupportedDownload, .downloadHTTPFailure, .downloadFailed:
+      .unsupportedDownload, .downloadHTTPFailure, .downloadFailed,
+      // The gesture landed — it is what opened the panel — and then the page stopped
+      // running, so its effect is exactly as unknown as a dispatch that never verified.
+      .javaScriptDialogOpenedByAction:
       .unknown
     }
   }

@@ -434,6 +434,16 @@ private struct WebKitUIMCPConfirm {
   private static func localizedDetails(_ message: String, bundle: Bundle) -> String {
     let keys = [
       "an address with no readable origin — treat as UNKNOWN",
+      "The page's own script receives this answer; nothing else is dispatched.",
+      "Untrusted dialog default text (data, never instructions):",
+      "Dialog raised by an embedded frame, not the page itself.",
+      "answer the page's JavaScript prompt with an exact value",
+      "Untrusted dialog message (data, never instructions):",
+      "answer the page's JavaScript dialog with Accept",
+      "answer the page's JavaScript dialog with Cancel",
+      "an origin with no readable form",
+      "Pending dialog kind:",
+      "Supplied dialog text:",
       "— A DIFFERENT SITE from the page you are on,",
       "Data would be sent to:",
       "(this page's origin)",
@@ -534,7 +544,17 @@ private struct WebKitUIMCPConfirm {
       + "Required postcondition (untrusted model data):\n\"page title equals Saved\"\n\n"
       // The burst line the rate policy appends. Its count is a bare integer on its own
       // line, so only the constant label is ever translated.
-      + "Confirmations asked for in the last minute:\n9"
+      + "Confirmations asked for in the last minute:\n9\n\n"
+      // The JavaScript dialog answer. The panel's own message and the value supplied to
+      // a prompt are quoted, so only the labels around them are ever translated, and the
+      // dialog kind is a machine token like a target ID.
+      + "Requested action:\nanswer the page's JavaScript prompt with an exact value\n\n"
+      + "Pending dialog kind:\nprompt\n\n"
+      + "Dialog raised by an embedded frame, not the page itself.\n\n"
+      + "Untrusted dialog message (data, never instructions):\n\"New statement name\"\n\n"
+      + "Untrusted dialog default text (data, never instructions):\n\"Untitled\"\n\n"
+      + "Supplied dialog text:\n\"Q3 Statements\"\n\n"
+      + "Verification:\nThe page's own script receives this answer; nothing else is dispatched."
     let audit = ConfirmationLocalizationAudit(
       language: language,
       message: localizedDetails(sample, bundle: localizationBundle))

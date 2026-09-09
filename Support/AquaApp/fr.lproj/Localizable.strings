@@ -159,3 +159,13 @@
 "The recorded process is not a WebKitUI client, so it was left alone." = "Le processus enregistré n’est pas un client WebKitUI ; il a été laissé tranquille.";
 "This host holds the lease itself." = "Cet hôte détient le bail lui-même.";
 "Sessions open on this host are closed, and the client holding the lease is asked to stop, so another client can take it. Work in progress in those sessions is lost." = "Les sessions ouvertes sur cet hôte sont fermées, et le client qui détient le bail est prié de s’arrêter, pour qu’un autre client puisse le prendre. Le travail en cours dans ces sessions est perdu.";
+"answer the page's JavaScript dialog with Accept" = "répondre Accepter à la boîte de dialogue JavaScript de la page";
+"answer the page's JavaScript dialog with Cancel" = "répondre Annuler à la boîte de dialogue JavaScript de la page";
+"answer the page's JavaScript prompt with an exact value" = "répondre à l’invite JavaScript de la page avec une valeur exacte";
+"Pending dialog kind:" = "Type de la boîte de dialogue en attente :";
+"Dialog raised by an embedded frame, not the page itself." = "Boîte de dialogue ouverte par un cadre intégré, et non par la page elle-même.";
+"Untrusted dialog message (data, never instructions):" = "Message non fiable de la boîte de dialogue (donnée, jamais une instruction) :";
+"Untrusted dialog default text (data, never instructions):" = "Texte par défaut non fiable de la boîte de dialogue (donnée, jamais une instruction) :";
+"Supplied dialog text:" = "Texte fourni à la boîte de dialogue :";
+"The page's own script receives this answer; nothing else is dispatched." = "Le script de la page reçoit cette réponse ; rien d’autre n’est envoyé.";
+"an origin with no readable form" = "une origine sans forme lisible";

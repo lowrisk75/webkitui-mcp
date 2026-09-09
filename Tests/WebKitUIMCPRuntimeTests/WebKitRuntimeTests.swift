@@ -165,6 +165,21 @@ private final class StubNavigationAction: WKNavigationAction {
   override var shouldPerformDownload: Bool { false }
 }
 
+/// A JavaScript panel is opened by the page, on its own schedule, so every wait for one
+/// is bounded: a panel that never arrives has to fail a test rather than hang the bundle
+/// with no `Test run with` summary.
+@MainActor
+private func awaitPendingDialog(
+  on runtime: WebKitRuntime,
+  polls: Int = 200
+) async -> WebKitPendingJavaScriptDialog? {
+  for _ in 0..<polls {
+    if let dialog = runtime.pendingJavaScriptDialog() { return dialog }
+    try? await Task.sleep(for: .milliseconds(20))
+  }
+  return nil
+}
+
 @Suite("Native WebKit runtime", .serialized)
 @MainActor
 struct WebKitRuntimeTests {
@@ -3539,5 +3554,121 @@ struct WebKitRuntimeTests {
       ])
     let encoded = String(decoding: try JSONEncoder().encode(events), as: UTF8.self)
     #expect(!encoded.contains("private"))
+  }
+  @Test("A page waiting on confirm() reports the pending dialog as untrusted site content")
+  func pendingJavaScriptDialogIsObserved() async throws {
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      javaScriptDialogAnswerTimeout: .seconds(5))
+    _ = try await runtime.loadHTML(
+      "<title>Invoices</title><button id='b'>Delete</button>",
+      baseURL: URL(string: "https://fixture.invalid/invoices"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+    // Opened from a timer rather than from the awaited script itself: `confirm()`
+    // suspends the page's script inside the call, so a script that calls it directly
+    // can never return its own result.
+    _ = try await runtime.webView.evaluateJavaScript(
+      "setTimeout(() => { window.__answer = confirm('Delete invoice 1471?') }, 0)")
+
+    let dialog = try #require(
+      await awaitPendingDialog(on: runtime), "no JavaScript dialog was ever reported")
+    #expect(dialog.kind == .confirm)
+    #expect(dialog.message.segments.map(\.text).joined() == "Delete invoice 1471?")
+    #expect(dialog.message.classifications == [.firstPartySiteContent])
+    #expect(dialog.defaultText == nil)
+
+    let page = try await runtime.observe()
+    #expect(page.pendingDialog?.dialogID == dialog.dialogID)
+    #expect(page.pendingDialog?.kind == .confirm)
+    // A suspended page cannot be read at all, so an observation of one must never
+    // report itself as a complete reading of the page.
+    #expect(!page.isComplete)
+
+    // Never leave a suspended page behind: an unanswered panel would be carried into
+    // whatever runs next.
+    _ = try runtime.answerJavaScriptDialog(dialogID: dialog.dialogID, accept: false)
+  }
+
+  @Test("Acting while a JavaScript dialog is pending names the dialog and dispatches nothing")
+  func actingIsRefusedWhileJavaScriptDialogIsPending() async throws {
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      javaScriptDialogAnswerTimeout: .seconds(5))
+    _ = try await runtime.loadHTML(
+      """
+      <title>Ledger</title>
+      <button id="unrelated" onclick="window.__clicks = (window.__clicks ?? 0) + 1">Export</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/ledger"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+    let page = try await runtime.observe()
+    let target = try #require(page.elements.first)
+    _ = try await runtime.webView.evaluateJavaScript(
+      "setTimeout(() => { window.__answer = confirm('Post the journal entry?') }, 0)")
+    let dialog = try #require(
+      await awaitPendingDialog(on: runtime), "no JavaScript dialog was ever reported")
+
+    do {
+      _ = try await runtime.perform(
+        observationID: page.observationID,
+        elementID: target.elementID,
+        operation: .click,
+        stabilityInterval: .milliseconds(10))
+      Issue.record("a click was dispatched while a JavaScript dialog was pending")
+    } catch WebKitRuntimeError.javaScriptDialogPending(let kind, let dialogID) {
+      #expect(kind == "confirm")
+      #expect(dialogID == dialog.dialogID)
+    }
+
+    _ = try runtime.answerJavaScriptDialog(dialogID: dialog.dialogID, accept: false)
+    // Read the page only after the panel is answered: while it is open the page's
+    // script is suspended, so this read would block on the dialog it is checking.
+    let clicks = try await runtime.webView.evaluateJavaScript("window.__clicks ?? 0") as? Int
+    #expect(clicks == 0, "the refused click reached the page anyway")
+  }
+
+  @Test("An unanswered JavaScript dialog resolves indeterminate and leaves the runtime usable")
+  func unansweredJavaScriptDialogResolvesIndeterminate() async throws {
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      javaScriptDialogAnswerTimeout: .milliseconds(600))
+    _ = try await runtime.loadHTML(
+      "<title>Ledger</title><p>ready</p>",
+      baseURL: URL(string: "https://fixture.invalid/ledger"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+    _ = try await runtime.webView.evaluateJavaScript(
+      "setTimeout(() => { window.__answer = confirm('Post the journal entry?') }, 0)")
+    _ = try #require(
+      await awaitPendingDialog(on: runtime), "no JavaScript dialog was ever reported")
+
+    var record: WebKitJavaScriptDialogRecord?
+    for _ in 0..<250 {
+      if let candidate = runtime.latestJavaScriptDialogRecord() {
+        record = candidate
+        break
+      }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    let resolved = try #require(record, "the dialog never resolved on its own")
+    #expect(resolved.outcome == .unansweredTimeout)
+    #expect(!resolved.valueSupplied)
+    #expect(runtime.pendingJavaScriptDialog() == nil)
+
+    // The site is released so the process cannot wedge, and it does read Cancel — but
+    // the recorded outcome says nobody answered, which is the fact that used to be lost.
+    let answer = try await runtime.webView.evaluateJavaScript("window.__answer") as? Bool
+    #expect(answer == false)
+    let page = try await runtime.observe()
+    #expect(page.pendingDialog == nil)
+    #expect(page.title.segments.map(\.text).joined() == "Ledger")
   }
 }

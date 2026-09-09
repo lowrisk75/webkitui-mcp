@@ -104,6 +104,32 @@ private final class SafariCompatibilityPresenterStub: SafariCompatibilityPresent
   }
 }
 
+/// A panel is opened by the page on its own schedule, and the page's script only
+/// resumes once the panel is answered. Both waits are bounded so a panel that never
+/// arrives, or an answer that never reaches the site, fails a test instead of hanging
+/// the bundle with no `Test run with` summary.
+@MainActor
+private func awaitPendingDialogID(on runtime: WebKitRuntime, polls: Int = 200) async -> String? {
+  for _ in 0..<polls {
+    if let dialog = runtime.pendingJavaScriptDialog() { return dialog.dialogID }
+    try? await Task.sleep(for: .milliseconds(20))
+  }
+  return nil
+}
+
+@MainActor
+private func awaitPageDialogAnswer(on runtime: WebKitRuntime, polls: Int = 200) async -> Any? {
+  for _ in 0..<polls {
+    if let answer = try? await runtime.webView.evaluateJavaScript(
+      "window.__answer === undefined ? null : window.__answer"), !(answer is NSNull)
+    {
+      return answer
+    }
+    try? await Task.sleep(for: .milliseconds(20))
+  }
+  return nil
+}
+
 @Suite("MCP 2026-07-28 wire server", .serialized)
 @MainActor
 struct MCPServerTests {
@@ -3749,6 +3775,125 @@ struct MCPServerTests {
       if text == label { return try string(fields["elementID"]) }
     }
     throw TestError.wrongType
+  }
+
+  /// Loads a page that is ready, then makes it wait on one JavaScript panel opened from
+  /// a timer. The panel cannot be opened from the awaited script itself: `confirm()` and
+  /// `prompt()` suspend the page inside the call.
+  private func sessionWaitingOnJavaScriptDialog(
+    _ script: String,
+    responses: [Bool]
+  ) async throws -> (
+    handle: WebKitSessionHandle, runtime: WebKitRuntime, server: WebKitMCPServer,
+    presenter: ConfirmationPresenterStub, dialogID: String
+  ) {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      "<title>Invoices</title><p>ready</p>", baseURL: URL(string: "https://example.test/invoices"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: responses)
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    _ = try await runtime.webView.evaluateJavaScript(script)
+    let dialogID = try #require(
+      await awaitPendingDialogID(on: runtime), "no JavaScript dialog was ever reported")
+    return (handle, runtime, server, presenter, dialogID)
+  }
+
+  @Test("A confirmed dialog accept makes the page's own confirm() return true")
+  func confirmedJavaScriptDialogAccept() async throws {
+    let session = try await sessionWaitingOnJavaScriptDialog(
+      "setTimeout(() => { window.__answer = confirm('Delete invoice 1471?') }, 0)",
+      responses: [true])
+
+    let answered = try await toolCall(
+      session.server, id: 1, name: "browser_act",
+      arguments: [
+        "session_id": .string(session.handle.rawValue.uuidString),
+        "operation": .string("dialog_accept"),
+        "dialog_id": .string(session.dialogID),
+        "idempotency_key": .string("dialog-accept-once"),
+      ])
+    let structured = try object(try object(answered["result"])["structuredContent"])
+    #expect(structured["dialog_outcome"] == .string("accepted"))
+    #expect(structured["dialog_kind"] == .string("confirm"))
+    #expect(session.presenter.requests.count == 1, "the native dialog was never asked for")
+    #expect(session.presenter.requests[0].message.contains("Delete invoice 1471?"))
+
+    #expect(await awaitPageDialogAnswer(on: session.runtime) as? Bool == true)
+    #expect(session.runtime.pendingJavaScriptDialog() == nil)
+  }
+
+  @Test("A confirmed dialog dismiss makes the page's own confirm() return false")
+  func confirmedJavaScriptDialogDismiss() async throws {
+    let session = try await sessionWaitingOnJavaScriptDialog(
+      "setTimeout(() => { window.__answer = confirm('Delete invoice 1471?') }, 0)",
+      responses: [true])
+
+    let answered = try await toolCall(
+      session.server, id: 1, name: "browser_act",
+      arguments: [
+        "session_id": .string(session.handle.rawValue.uuidString),
+        "operation": .string("dialog_dismiss"),
+        "dialog_id": .string(session.dialogID),
+        "idempotency_key": .string("dialog-dismiss-once"),
+      ])
+    let structured = try object(try object(answered["result"])["structuredContent"])
+    #expect(structured["dialog_outcome"] == .string("dismissed"))
+    #expect(await awaitPageDialogAnswer(on: session.runtime) as? Bool == false)
+  }
+
+  @Test("A confirmed prompt accept supplies the exact value the page reads back")
+  func confirmedJavaScriptPromptAcceptsExactValue() async throws {
+    let session = try await sessionWaitingOnJavaScriptDialog(
+      "setTimeout(() => { window.__answer = prompt('New statement name', 'Untitled') }, 0)",
+      responses: [true])
+    #expect(
+      session.runtime.pendingJavaScriptDialog()?.defaultText?.segments.map(\.text).joined()
+        == "Untitled")
+
+    let answered = try await toolCall(
+      session.server, id: 1, name: "browser_act",
+      arguments: [
+        "session_id": .string(session.handle.rawValue.uuidString),
+        "operation": .string("dialog_accept_value"),
+        "dialog_id": .string(session.dialogID),
+        "value": .string("Q3 Statements"),
+        "idempotency_key": .string("dialog-prompt-once"),
+      ])
+    let structured = try object(try object(answered["result"])["structuredContent"])
+    #expect(structured["dialog_outcome"] == .string("accepted"))
+    #expect(structured["dialog_kind"] == .string("prompt"))
+    #expect(structured["dialog_value_supplied"] == .bool(true))
+    // The operator has to read the exact string that will be handed to the site.
+    #expect(session.presenter.requests[0].message.contains("Q3 Statements"))
+    #expect(await awaitPageDialogAnswer(on: session.runtime) as? String == "Q3 Statements")
+  }
+
+  @Test("A declined dialog confirmation leaves the dialog pending and answers nothing")
+  func declinedJavaScriptDialogConfirmationAnswersNothing() async throws {
+    let session = try await sessionWaitingOnJavaScriptDialog(
+      "setTimeout(() => { window.__answer = confirm('Delete invoice 1471?') }, 0)",
+      responses: [false])
+
+    let refused = try await toolCall(
+      session.server, id: 1, name: "browser_act",
+      arguments: [
+        "session_id": .string(session.handle.rawValue.uuidString),
+        "operation": .string("dialog_accept"),
+        "dialog_id": .string(session.dialogID),
+        "idempotency_key": .string("dialog-declined-once"),
+      ])
+    #expect(try object(refused["result"])["isError"] == .bool(true))
+    let structured = try object(try object(refused["result"])["structuredContent"])
+    #expect(structured["status"] == .string("declined_by_user"))
+    // The panel is still the operator's to answer: a refusal must not become a Cancel.
+    #expect(session.runtime.pendingJavaScriptDialog()?.dialogID == session.dialogID)
+    #expect(session.runtime.latestJavaScriptDialogRecord() == nil)
+
+    // Never leave a suspended page behind for whatever runs next.
+    _ = try session.runtime.answerJavaScriptDialog(dialogID: session.dialogID, accept: false)
   }
 
   private enum TestError: Error {

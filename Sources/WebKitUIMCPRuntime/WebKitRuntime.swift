@@ -47,6 +47,22 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case nativeGestureReceiptUnavailable
   /// A handoff was requested but no window a human could act in could be shown.
   case handoffSurfaceUnavailable
+  /// A JavaScript panel is open, so the page's script is suspended on it and nothing
+  /// else can be dispatched. Carries the kind and the pending dialog's identity; the
+  /// panel's own message is deliberately absent, because it is site-authored text and
+  /// an error string reaches a client with no provenance attached to it. The
+  /// observation carries the message, labelled.
+  case javaScriptDialogPending(kind: String, dialogID: String)
+  /// The gesture that was dispatched opened the panel itself. The gesture landed; the
+  /// page then stopped running, so nothing about the action can be verified until the
+  /// panel is answered.
+  case javaScriptDialogOpenedByAction(kind: String, dialogID: String)
+  case noPendingJavaScriptDialog
+  /// An answer named a dialog that is no longer the pending one — already answered,
+  /// timed out, or replaced. An answer is bound to one panel and fails closed.
+  case staleJavaScriptDialog
+  case javaScriptDialogValueRequired
+  case javaScriptDialogValueUnsupported
 }
 
 public enum AuthenticationUIClassification: String, Codable, Equatable, Sendable {
@@ -234,7 +250,9 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let unreadableFrameCount: Int
   /// Everything on this page was both returned and legible. Anything less has to be
   /// said out loud, or an absence gets reported as a fact.
-  public var isComplete: Bool { !isPartial && unreadableFrameCount == 0 }
+  public var isComplete: Bool {
+    !isPartial && unreadableFrameCount == 0 && pendingDialog == nil
+  }
   public let semanticTextTruncated: Bool
   public let crossOriginFramesOpaque: Bool
   /// Controls the raw DOM renders, counted independently of the semantic matcher.
@@ -261,6 +279,10 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// One control described in full, so an empty tree can be diagnosed in one look.
   public let firstControlProbe: String
   public let capturedAtMonotonicNanoseconds: UInt64
+  /// The JavaScript panel the page is suspended on, if any. While one is open the
+  /// page's script does not run, so nothing else in this observation could be read:
+  /// the dialog is the observation.
+  public let pendingDialog: WebKitPendingJavaScriptDialog?
 }
 
 public struct WebKitCapture: Sendable {
@@ -354,6 +376,56 @@ public struct WebKitFileUploadReceipt: Codable, Equatable, Sendable {
   public let selectionMode: WebKitFileUploadSelectionMode
   public let selectedByHuman: Bool
   public let localPathsExposed: Bool
+  public let monotonicNanoseconds: UInt64
+}
+
+/// Which JavaScript panel WebKit is holding open.
+///
+/// There is deliberately no `beforeUnload` case. The public macOS 27 SDK's
+/// `WKUIDelegate.h` declares no before-unload panel at all — no `BeforeUnload` symbol
+/// exists in it — so an unload prompt cannot be observed or answered from an embedder,
+/// and it is out of scope here rather than quietly mishandled.
+public enum WebKitJavaScriptDialogKind: String, Codable, Equatable, Sendable {
+  case alert
+  case confirm
+  case prompt
+}
+
+/// One JavaScript panel the page is suspended on, waiting for an answer.
+public struct WebKitPendingJavaScriptDialog: Codable, Equatable, Sendable {
+  /// Single-use identity an answer is bound to, exactly as a confirmed click is bound
+  /// to a re-resolved target.
+  public let dialogID: String
+  public let kind: WebKitJavaScriptDialogKind
+  /// Site-authored, carried with its provenance like every other page string.
+  public let message: ProvenancedText
+  /// What the site pre-filled a prompt with. Site-authored too.
+  public let defaultText: ProvenancedText?
+  public let frameOrigin: String?
+  public let frameIsMain: Bool
+  public let openedAtMonotonicNanoseconds: UInt64
+}
+
+public enum WebKitJavaScriptDialogOutcome: String, Codable, Equatable, Sendable {
+  case accepted
+  case dismissed
+  /// Nobody answered inside the window. WebKit is released so neither the page nor the
+  /// server can wedge, and the site does then read a cancel — but the outcome says
+  /// plainly that no one answered, which is the fact an unimplemented panel destroyed.
+  case unansweredTimeout = "indeterminate_unanswered_timeout"
+  /// A second panel opened while one was still unanswered. Answering it would either
+  /// overwrite the identity an approval was granted against or queue behind a panel
+  /// nobody has answered yet, so it is refused and said out loud.
+  case refusedConcurrent = "refused_second_dialog"
+}
+
+/// How one panel ended. The prompt text a caller supplied is deliberately not here:
+/// this record is exported, and a prompt carries whatever the operator typed.
+public struct WebKitJavaScriptDialogRecord: Codable, Equatable, Sendable {
+  public let dialogID: String
+  public let kind: WebKitJavaScriptDialogKind
+  public let outcome: WebKitJavaScriptDialogOutcome
+  public let valueSupplied: Bool
   public let monotonicNanoseconds: UInt64
 }
 
@@ -463,6 +535,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var completedDownloadReceipt: WebKitDownloadReceipt?
   private var activeDownload: WKDownload?
   private var downloadTimeoutTask: Task<Void, Never>?
+  /// How long one unanswered JavaScript panel is held before it resolves indeterminate.
+  /// It exists so that a panel nobody answers bounds every wait behind it instead of
+  /// suspending the page, and the server, for as long as the site likes.
+  private let javaScriptDialogAnswerTimeout: Duration
+  private var pendingJavaScriptDialogState: PendingJavaScriptDialogState?
+  private var javaScriptDialogTimeoutTask: Task<Void, Never>?
+  private var lastJavaScriptDialogRecord: WebKitJavaScriptDialogRecord?
+  private var dialogRaceToken: UInt64 = 0
+  /// Keyed rather than single, so two overlapping dispatches cannot steal each other's
+  /// continuation: a stolen one is never resumed, and a continuation nobody resumes is
+  /// an unbounded wait — the one failure this whole feature exists to avoid.
+  private var dialogRaceContinuations:
+    [UInt64: CheckedContinuation<ActionDispatchRace, any Error>] = [:]
 
   public override convenience init() {
     self.init(websiteDataStore: .default())
@@ -484,8 +569,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     managesApplicationActivationPolicy: Bool = true,
     downloadDestinationProvider: (@MainActor @Sendable (String) async -> URL?)? = nil,
     uploadSelectionProvider:
-      (@MainActor @Sendable (Bool, Bool) async -> [URL]?)? = nil
+      (@MainActor @Sendable (Bool, Bool) async -> [URL]?)? = nil,
+    javaScriptDialogAnswerTimeout: Duration = .seconds(30)
   ) {
+    self.javaScriptDialogAnswerTimeout = javaScriptDialogAnswerTimeout
     self.egressProxy = egressProxy
     self.managesApplicationActivationPolicy = managesApplicationActivationPolicy
     self.downloadDestinationProvider = downloadDestinationProvider
@@ -635,6 +722,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     try requireObservationControl()
     guard maximumElements > 0, elementOffset >= 0, maximumFieldCharacters > 0 else {
       throw WebKitRuntimeError.malformedInstrumentationResult
+    }
+    if let dialog = pendingJavaScriptDialogState?.dialog {
+      return try dialogPendingObservation(dialog)
     }
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
 
@@ -809,7 +899,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       documentElementCount: raw.documentElementCount,
       bodyTextLength: raw.bodyTextLength,
       firstControlProbe: raw.firstControlProbe,
-      capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds
+      capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+      pendingDialog: nil
     )
     rememberRecoverableURL(URL(string: raw.url) ?? webView.url)
     if controlState == .resumeRequested {
@@ -1203,31 +1294,47 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // operator approved. A fresh navigation supersedes it.
     approvedSubmissionOrigin = (webView.url ?? lastCommittedHTTPURL).flatMap(
       Self.sanitizedOrigin(for:))
-    let second: RawActionResolution
-    if dispatchMode == .nativeAppKit, operationName == "click" {
-      second = try await resolveAndPerformNativeClick(
-        criteria: criteria, physicalIdentity: target.physicalIdentity,
-        expectedCandidateCount: target.observedCandidateCount,
-        expectedBoundingBox: firstCandidate.boundingBox)
-    } else if dispatchMode == .nativeAppKit, operationName == "press_key", let value {
-      second = try await resolveAndPerformNativeKey(
-        criteria: criteria, physicalIdentity: target.physicalIdentity,
-        expectedCandidateCount: target.observedCandidateCount,
-        expectedBoundingBox: firstCandidate.boundingBox, key: value)
-    } else if dispatchMode == .nativeAppKit, operationName == "fill", let value {
-      second = try await resolveAndPerformNativeFill(
-        criteria: criteria, physicalIdentity: target.physicalIdentity,
-        expectedCandidateCount: target.observedCandidateCount,
-        expectedBoundingBox: firstCandidate.boundingBox, value: value)
-    } else {
-      second = try await resolveAndPerform(
+    let expectedBoundingBox = firstCandidate.boundingBox
+    let physicalIdentityHint = target.physicalIdentity
+    let expectedCandidateCount = target.observedCandidateCount
+    let race = try await dispatchRacingJavaScriptDialog { [self] in
+      if dispatchMode == .nativeAppKit, operationName == "click" {
+        return try await resolveAndPerformNativeClick(
+          criteria: criteria, physicalIdentity: physicalIdentityHint,
+          expectedCandidateCount: expectedCandidateCount,
+          expectedBoundingBox: expectedBoundingBox)
+      }
+      if dispatchMode == .nativeAppKit, operationName == "press_key", let value {
+        return try await resolveAndPerformNativeKey(
+          criteria: criteria, physicalIdentity: physicalIdentityHint,
+          expectedCandidateCount: expectedCandidateCount,
+          expectedBoundingBox: expectedBoundingBox, key: value)
+      }
+      if dispatchMode == .nativeAppKit, operationName == "fill", let value {
+        return try await resolveAndPerformNativeFill(
+          criteria: criteria, physicalIdentity: physicalIdentityHint,
+          expectedCandidateCount: expectedCandidateCount,
+          expectedBoundingBox: expectedBoundingBox, value: value)
+      }
+      return try await resolveAndPerform(
         criteria: criteria,
-        physicalIdentity: target.physicalIdentity,
-        expectedCandidateCount: target.observedCandidateCount,
-        expectedBoundingBox: firstCandidate.boundingBox,
+        physicalIdentity: physicalIdentityHint,
+        expectedCandidateCount: expectedCandidateCount,
+        expectedBoundingBox: expectedBoundingBox,
         operation: operationName,
         value: value
       )
+    }
+    let second: RawActionResolution
+    switch race {
+    case .resolved(let resolution):
+      second = resolution
+    case .interruptedByDialog(let dialog):
+      // The gesture landed and the page then stopped running inside a panel. Saying so
+      // is the whole point: the caller learns that its own click opened this dialog, and
+      // which one to answer, instead of waiting on a script only it can unblock.
+      throw WebKitRuntimeError.javaScriptDialogOpenedByAction(
+        kind: dialog.kind.rawValue, dialogID: dialog.dialogID)
     }
     try recordCardinality(
       second.count, target: target, eliminatedBy: second.eliminatedBy ?? [],
@@ -1341,6 +1448,289 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// Discards an armed selection that no panel consumed.
   public func disarmUploadSelection() {
     armedUploadSelection = nil
+  }
+
+  // WebKit treats a panel whose delegate method is not implemented as dismissed, so
+  // until these three existed `confirm()` returned `false` and `prompt()` returned `nil`
+  // on every page, silently: a site that guards a delete or a save behind `confirm()`
+  // always received Cancel, the action never happened, and the failure surfaced as an
+  // unverified postcondition rather than as a dialog nobody answered (measured
+  // 2026-09-09). All three are public API in `WKUIDelegate.h`.
+  //
+  // These three are the whole surface. A reader looking for a before-unload panel will
+  // not find one: the public macOS 27 SDK's `WKUIDelegate.h` declares no such method —
+  // there is no `BeforeUnload` symbol in it — so an unload prompt cannot be observed or
+  // answered from an embedder at all, and `beforeunload` is out of scope here.
+  public func webView(
+    _ webView: WKWebView,
+    runJavaScriptAlertPanelWithMessage message: String,
+    initiatedByFrame frame: WKFrameInfo
+  ) async {
+    _ = await awaitJavaScriptDialogAnswer(
+      kind: .alert, message: message, defaultText: nil, frame: frame)
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    runJavaScriptConfirmPanelWithMessage message: String,
+    initiatedByFrame frame: WKFrameInfo
+  ) async -> Bool {
+    switch await awaitJavaScriptDialogAnswer(
+      kind: .confirm, message: message, defaultText: nil, frame: frame)
+    {
+    case .accepted: true
+    case .dismissed, .unanswered: false
+    }
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    runJavaScriptTextInputPanelWithPrompt prompt: String,
+    defaultText: String?,
+    initiatedByFrame frame: WKFrameInfo
+  ) async -> String? {
+    switch await awaitJavaScriptDialogAnswer(
+      kind: .prompt, message: prompt, defaultText: defaultText, frame: frame)
+    {
+    case .accepted(let value): value
+    case .dismissed, .unanswered: nil
+    }
+  }
+
+  /// Holds one panel open until it is answered, or until the answer window closes.
+  ///
+  /// The main thread is never blocked here: only the web content process is suspended,
+  /// which is what lets the server keep serving while the operator decides. The timeout
+  /// is not an answer — it releases WebKit so nothing wedges, and files the outcome as
+  /// nobody having answered.
+  private func awaitJavaScriptDialogAnswer(
+    kind: WebKitJavaScriptDialogKind,
+    message: String,
+    defaultText: String?,
+    frame: WKFrameInfo
+  ) async -> JavaScriptDialogAnswer {
+    let dialogID = UUID().uuidString
+    guard pendingJavaScriptDialogState == nil else {
+      // Answering a second panel would either overwrite the identity an approval was
+      // granted against or queue behind a panel nobody has answered yet. Refuse it, and
+      // say which it was: the first panel stays answerable.
+      recordJavaScriptDialog(
+        dialogID: dialogID, kind: kind, outcome: .refusedConcurrent, valueSupplied: false)
+      return .dismissed
+    }
+    let frameURL = frame.request.url ?? webView.url
+    let dialog: WebKitPendingJavaScriptDialog
+    do {
+      let source = ProvenanceSource(
+        // A panel raised by a subframe is not this page speaking, and its text is what
+        // the confirmation shows an operator.
+        classification: frame.isMainFrame ? .firstPartySiteContent : .thirdPartyEmbed,
+        documentID: documentID,
+        frameID: frame.isMainFrame ? "main" : "subframe",
+        securityOrigin: Self.securityOrigin(from: frameURL))
+      dialog = WebKitPendingJavaScriptDialog(
+        dialogID: dialogID,
+        kind: kind,
+        message: try ProvenancedText(
+          text: String(message.prefix(Self.maximumJavaScriptDialogTextLength)), source: source),
+        defaultText: try defaultText.map {
+          try ProvenancedText(
+            text: String($0.prefix(Self.maximumJavaScriptDialogTextLength)), source: source)
+        },
+        frameOrigin: frameURL.flatMap(Self.sanitizedOrigin(for:)),
+        frameIsMain: frame.isMainFrame,
+        openedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    } catch {
+      // A panel that cannot even be described cannot be presented for approval, so it
+      // is released rather than held open against an operator who would never see it.
+      recordJavaScriptDialog(
+        dialogID: dialogID, kind: kind, outcome: .refusedConcurrent, valueSupplied: false)
+      return .dismissed
+    }
+    return await withCheckedContinuation { continuation in
+      pendingJavaScriptDialogState = PendingJavaScriptDialogState(
+        dialog: dialog, continuation: continuation)
+      javaScriptDialogTimeoutTask = Task { @MainActor [weak self] in
+        try? await Task.sleep(for: self?.javaScriptDialogAnswerTimeout ?? .seconds(30))
+        guard let self, let state = self.pendingJavaScriptDialogState,
+          state.dialog.dialogID == dialogID
+        else { return }
+        self.pendingJavaScriptDialogState = nil
+        self.javaScriptDialogTimeoutTask = nil
+        self.recordJavaScriptDialog(
+          dialogID: dialogID, kind: kind, outcome: .unansweredTimeout, valueSupplied: false)
+        state.continuation.resume(returning: .unanswered)
+      }
+      // If a gesture this runtime dispatched is what opened the panel, its dispatch
+      // script is suspended inside the panel and cannot return until somebody answers.
+      // Stop waiting for it now, or the caller waits for an answer only it can give.
+      // Every outstanding dispatch is suspended behind this one panel, so every one of
+      // them is released.
+      for token in dialogRaceContinuations.keys {
+        settleActionDispatchRace(token: token, .success(.interruptedByDialog(dialog)))
+      }
+    }
+  }
+
+  private static let maximumJavaScriptDialogTextLength = 2_048
+
+  /// Dispatches one gesture, and stops waiting for it if the gesture opens a panel.
+  ///
+  /// A `confirm()` inside an `onclick` handler suspends the page inside the very call
+  /// that dispatched the gesture. The dispatch task is abandoned rather than cancelled:
+  /// it does complete once the panel is answered, and its result is irrelevant by then
+  /// because the action's own verification was lost the moment the page stopped running.
+  private func dispatchRacingJavaScriptDialog(
+    _ body: @escaping @MainActor @Sendable () async throws -> RawActionResolution
+  ) async throws -> ActionDispatchRace {
+    dialogRaceToken &+= 1
+    let token = dialogRaceToken
+    Task { @MainActor [weak self] in
+      do {
+        let resolution = try await body()
+        self?.settleActionDispatchRace(token: token, .success(.resolved(resolution)))
+      } catch {
+        self?.settleActionDispatchRace(token: token, .failure(error))
+      }
+    }
+    return try await withCheckedThrowingContinuation { continuation in
+      dialogRaceContinuations[token] = continuation
+    }
+  }
+
+  /// First settlement of a given dispatch wins; the loser is dropped. An abandoned
+  /// dispatch script that finally returns long after a panel decided its race finds
+  /// nothing to resume.
+  private func settleActionDispatchRace(
+    token: UInt64,
+    _ result: Result<ActionDispatchRace, any Error>
+  ) {
+    guard let continuation = dialogRaceContinuations.removeValue(forKey: token) else { return }
+    continuation.resume(with: result)
+  }
+
+  /// The JavaScript panel this session is suspended on, if any.
+  public func pendingJavaScriptDialog() -> WebKitPendingJavaScriptDialog? {
+    pendingJavaScriptDialogState?.dialog
+  }
+
+  /// How the last panel ended. Nothing is inferred from its absence: a panel that is
+  /// still pending has no record yet.
+  public func latestJavaScriptDialogRecord() -> WebKitJavaScriptDialogRecord? {
+    lastJavaScriptDialogRecord
+  }
+
+  /// Answers the one panel this runtime is holding open.
+  ///
+  /// Nothing here is automatic. The caller names the exact dialog it was shown, and an
+  /// answer for any other one — a dialog already answered, one that timed out, one the
+  /// page replaced — fails closed rather than landing on whatever is open now. A prompt
+  /// is accepted only with an exact value, because the value is what the confirmation
+  /// showed the operator.
+  @discardableResult
+  public func answerJavaScriptDialog(
+    dialogID: String,
+    accept: Bool,
+    promptValue: ProvenancedText? = nil
+  ) throws -> WebKitJavaScriptDialogRecord {
+    try requireAgentControlIgnoringJavaScriptDialog()
+    guard let state = pendingJavaScriptDialogState else {
+      throw WebKitRuntimeError.noPendingJavaScriptDialog
+    }
+    guard state.dialog.dialogID == dialogID else {
+      throw WebKitRuntimeError.staleJavaScriptDialog
+    }
+    if promptValue != nil, state.dialog.kind != .prompt {
+      throw WebKitRuntimeError.javaScriptDialogValueUnsupported
+    }
+    if accept, state.dialog.kind == .prompt, promptValue == nil {
+      throw WebKitRuntimeError.javaScriptDialogValueRequired
+    }
+    pendingJavaScriptDialogState = nil
+    javaScriptDialogTimeoutTask?.cancel()
+    javaScriptDialogTimeoutTask = nil
+    let value = promptValue.map { $0.segments.map(\.text).joined() }
+    let record = recordJavaScriptDialog(
+      dialogID: dialogID,
+      kind: state.dialog.kind,
+      outcome: accept ? .accepted : .dismissed,
+      valueSupplied: value != nil)
+    state.continuation.resume(returning: accept ? .accepted(value) : .dismissed)
+    return record
+  }
+
+  @discardableResult
+  private func recordJavaScriptDialog(
+    dialogID: String,
+    kind: WebKitJavaScriptDialogKind,
+    outcome: WebKitJavaScriptDialogOutcome,
+    valueSupplied: Bool
+  ) -> WebKitJavaScriptDialogRecord {
+    let record = WebKitJavaScriptDialogRecord(
+      dialogID: dialogID,
+      kind: kind,
+      outcome: outcome,
+      valueSupplied: valueSupplied,
+      monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    lastJavaScriptDialogRecord = record
+    return record
+  }
+
+  /// A panel suspends the page's script, so the observation instrumentation cannot run
+  /// at all: nothing about the DOM can be read until somebody answers. Waiting on a
+  /// script only the caller can unblock would hang the call, so the observation reports
+  /// the one thing that is true — this dialog is open — and reports itself incomplete.
+  private func dialogPendingObservation(
+    _ dialog: WebKitPendingJavaScriptDialog
+  ) throws -> WebKitPageObservation {
+    let (nextGeneration, overflow) = observationGeneration.addingReportingOverflow(1)
+    guard !overflow else { throw WebKitRuntimeError.malformedInstrumentationResult }
+    observationGeneration = nextGeneration
+    let observationID = UUID().uuidString
+    let origin = Self.securityOrigin(from: webView.url)
+    let pageSource = ProvenanceSource(
+      classification: .firstPartySiteContent,
+      documentID: documentID,
+      frameID: "main",
+      securityOrigin: origin)
+    let toolSource = ProvenanceSource(
+      classification: .toolResult,
+      documentID: documentID,
+      frameID: "main",
+      securityOrigin: origin)
+    latestObservationID = observationID
+    // No element in this observation can be addressed, so none is handed out. Anything
+    // the caller held from before is superseded, which is honest: the page will have
+    // moved on by the time the panel is answered.
+    latestTargets.removeAll(keepingCapacity: true)
+    return WebKitPageObservation(
+      observationID: observationID,
+      generation: nextGeneration,
+      documentID: documentID,
+      url: try ProvenancedText(
+        text: agentSafeURLString(webView.url) ?? "about:blank", source: toolSource),
+      title: try ProvenancedText(text: webView.title ?? "", source: pageSource),
+      readyState: "javascript_dialog_pending",
+      mutationCount: 0,
+      elements: [],
+      totalElementCount: 0,
+      elementOffset: 0,
+      nextElementOffset: nil,
+      unreadableFrameCount: 0,
+      semanticTextTruncated: false,
+      crossOriginFramesOpaque: false,
+      renderedInteractiveCount: 0,
+      documentLanguage: nil,
+      ariaHiddenDropCount: 0,
+      unrenderedControlCount: 0,
+      unrenderedControlNames: [],
+      rawControlCount: 0,
+      obscuredByAncestorOpacity: false,
+      documentElementCount: 0,
+      bodyTextLength: 0,
+      firstControlProbe: "javascript_dialog_pending",
+      capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+      pendingDialog: dialog)
   }
 
   public func webView(
@@ -2802,10 +3192,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   private func requireAgentControl() throws {
+    try requireAgentControlIgnoringJavaScriptDialog()
+    try requireNoPendingJavaScriptDialog()
+  }
+
+  /// The one route that may run while a panel is open: answering it. Everything else
+  /// goes through `requireAgentControl`.
+  private func requireAgentControlIgnoringJavaScriptDialog() throws {
     guard controlState == .agentControlled || controlState == .freshlyReobserved else {
       throw WebKitRuntimeError.humanControlActive
     }
     try requireNonAuthenticationOrigin()
+  }
+
+  /// A JavaScript panel suspends the page's script, so every route into the page —
+  /// acting, scrolling, reading text, capturing — would block on instrumentation that
+  /// cannot run until somebody answers. The state that forbids acting is named rather
+  /// than waited on, exactly as human control is.
+  private func requireNoPendingJavaScriptDialog() throws {
+    if let dialog = pendingJavaScriptDialogState?.dialog {
+      throw WebKitRuntimeError.javaScriptDialogPending(
+        kind: dialog.kind.rawValue, dialogID: dialog.dialogID)
+    }
   }
 
   private func requireObservationControl() throws {
@@ -5165,14 +5573,34 @@ private struct RawCaptureDOMState: Decodable {
   let renderedInteractiveCount: Int
 }
 
-private struct RawActionResolution: Decodable {
+/// What one panel's caller asked for. `unanswered` is not a decision: it is the
+/// absence of one, and it is recorded as such.
+private enum JavaScriptDialogAnswer: Sendable {
+  case accepted(String?)
+  case dismissed
+  case unanswered
+}
+
+private struct PendingJavaScriptDialogState {
+  let dialog: WebKitPendingJavaScriptDialog
+  let continuation: CheckedContinuation<JavaScriptDialogAnswer, Never>
+}
+
+/// Which of two things happened first: the dispatch script returned, or the gesture it
+/// dispatched opened a JavaScript panel and stopped the page.
+private enum ActionDispatchRace: Sendable {
+  case resolved(RawActionResolution)
+  case interruptedByDialog(WebKitPendingJavaScriptDialog)
+}
+
+private struct RawActionResolution: Decodable, Sendable {
   let count: Int
   let candidate: RawActionCandidate?
   let eliminatedBy: [String]?
   let pinnedState: String?
 }
 
-private struct RawActionCandidate: Decodable {
+private struct RawActionCandidate: Decodable, Sendable {
   let physicalIdentity: String
   let boundingBox: ObservedBoundingBox
   let geometryStable: Bool
