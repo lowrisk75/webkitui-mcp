@@ -726,6 +726,32 @@ EOF
 
 ---
 
+## Task 2 outcome, recorded because it changes what may be claimed
+
+Committed as `e86f737`, correct, and **inert on this build**. WebKit does not call
+`webView(_:willSubmitForm:submissionHandler:)` on macOS 27.0 build 26A5419a — not for
+`submit()`, not for `requestSubmit()`, and not for a native trusted-gesture click. All 601
+`WKPreferences._features()` entries were enumerated and none enables it. This reproduces
+`docs/research/2026-08-22-will-submit-form-notebooklm.md`, which measured zero events on
+build 26A5416b three weeks earlier — evidence this plan should have read before ranking
+the task first.
+
+Consequences that Task 4 must carry into the documentation:
+
+- `SubmissionApproval` and its wiring are implemented and unit-tested, and will activate
+  if WebKit begins delivering the callback. Nothing about them is claimed to run today.
+- **Task 1's destination line is the live defence** against the published attack. The
+  `WKFormInfo` gate must never be described as a second live gate.
+- `willSubmitForm` already existed in the runtime from the first commit, as an HMAC-only
+  audit hook. Task 2 extended it rather than adding a duplicate selector.
+- The runtime test drives the delegate through subclassed WebKit stubs, because the OS
+  declares the method and never calls it. `-[WKFrameInfo dealloc]` traps on a null
+  `CFRetain` when a Swift subclass is released, so the stubs are singletons kept for the
+  life of the process. That is bounded and documented at their definition, and it is not
+  a substitute for the real path.
+
+---
+
 ## Task 3: Make dialog fatigue cost the attacker something
 
 `grep -niE 'rateLimit|cooldown|throttl'` over `Sources/WebKitUIMCPServer` returns nothing. On a product whose safety rests on a human reading a dialog, an agent — or an injected page driving one — can raise fifty confirmations in a row and train the operator to click through. OWASP files this as the clickthrough vulnerability, and it is gap 4 in the security research.
@@ -955,6 +981,10 @@ Four published claims were refuted. The comparison with Apple's server currently
 - Modify: `README.md`
 - Modify: `docs/network-boundary.md`
 - Modify: `Tests/WebKitUIMCPServerTests/CapabilityClaimsCoherenceTests.swift`
+
+Task 4 must also state that the `WKFormInfo` gate is implemented and untriggered on
+macOS 27.0 build 26A5419a. A gate described as live when it never fires is the same class
+of false claim as the two this task exists to remove.
 
 - [ ] **Step 1: Write the failing test**
 
