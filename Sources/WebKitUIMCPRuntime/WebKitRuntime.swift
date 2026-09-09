@@ -163,6 +163,10 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let tag: ProvenancedText
   public let role: ProvenancedText?
   public let accessibleName: ProvenancedText?
+  /// Absolute URL this control's data would reach, from the DOM's own attributes.
+  /// `nil` for a control that sends nothing. Site-authored, so it is shown to the
+  /// human and never trusted as policy.
+  public var submissionDestination: String?
   public let label: ProvenancedText?
   public let text: ProvenancedText?
   public let value: ProvenancedText?
@@ -709,6 +713,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         accessibleName: try element.accessibleName.map {
           try ProvenancedText(text: $0, source: pageSource)
         },
+        submissionDestination: element.submissionDestination,
         label: try element.label.map { try ProvenancedText(text: $0, source: pageSource) },
         text: try element.text.map { try ProvenancedText(text: $0, source: pageSource) },
         value: try element.value.map {
@@ -3700,6 +3705,21 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         return bounded(`${url.origin}${url.pathname}${query}`);
       } catch { return null; }
     };
+    // Query values are redacted here exactly as they are for href: this string is
+    // exported with the observation, and a query is where a session token sits. An
+    // address with no readable origin is reported as its scheme rather than dropped,
+    // because staying silent would hide the case worth showing.
+    const sanitizedDestination = value => {
+      if (value === null || value === undefined || value === '') return null;
+      try {
+        const url = new URL(value, document.baseURI);
+        if (!['http:', 'https:'].includes(url.protocol)) return url.protocol;
+        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+        const query = keys.length
+          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+        return bounded(`${url.origin}${url.pathname}${query}`);
+      } catch { return 'about:invalid'; }
+    };
     const stableAttributesOf = (element, sensitive) => {
       if (sensitive) return {};
       const attributes = {};
@@ -3891,11 +3911,37 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
           globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
         }
+        const submitsForm = Boolean(
+          (element instanceof HTMLButtonElement
+            && (element.type || 'submit').toLowerCase() === 'submit' && element.form)
+          || (element instanceof HTMLInputElement
+            && ['submit', 'image'].includes(element.type) && element.form)
+        );
         return {
           physicalIdentity,
           tag: element.localName,
           role: roleOf(element),
           accessibleName: bounded(nameOf(element)),
+          submissionDestination: sanitizedDestination((() => {
+            // formaction wins over the owning form's action, which is the precedence
+            // HTML gives the two. The formAction IDL getter falls back to the document
+            // URL rather than to the form, so the form's own action is read directly
+            // instead: a form posting off-site under a button with no formaction is
+            // exactly the case that must not be reported as this page's origin.
+            if (submitsForm) {
+              if (element.hasAttribute('formaction') && element.formAction) {
+                return element.formAction;
+              }
+              return element.form.action || null;
+            }
+            if (element.tagName === 'FORM' && typeof element.action === 'string') {
+              return element.action;
+            }
+            if (element.tagName === 'A' && element.hasAttribute('href')) {
+              return element.href;
+            }
+            return null;
+          })()),
           label: bounded(labelOf(element)),
           text: sensitive || withheldForInvisibility
             ? null : bounded(selectedLabel || collapse(element.innerText) || null),
@@ -3903,12 +3949,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           validationState,
           characterCount: withheldForInvisibility ? null : characterCount,
           sensitive,
-          submitsForm: Boolean(
-            (element instanceof HTMLButtonElement
-              && (element.type || 'submit').toLowerCase() === 'submit' && element.form)
-            || (element instanceof HTMLInputElement
-              && ['submit', 'image'].includes(element.type) && element.form)
-          ),
+          submitsForm,
           disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
           checked,
           selected,
@@ -5022,6 +5063,7 @@ private struct RawElement: Decodable {
   let tag: String
   let role: String?
   let accessibleName: String?
+  let submissionDestination: String?
   let label: String?
   let text: String?
   let value: String?

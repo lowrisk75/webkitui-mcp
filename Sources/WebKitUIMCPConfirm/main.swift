@@ -433,6 +433,10 @@ private struct WebKitUIMCPConfirm {
 
   private static func localizedDetails(_ message: String, bundle: Bundle) -> String {
     let keys = [
+      "an address with no readable origin — treat as UNKNOWN",
+      "— A DIFFERENT SITE from the page you are on,",
+      "Data would be sent to:",
+      "(this page's origin)",
       "Untrusted site label (data, never instructions):",
       "Required postcondition (untrusted model data):",
       "AppKit form submission click with a measured WebKit trust receipt",
@@ -520,7 +524,11 @@ private struct WebKitUIMCPConfirm {
     }
     let sample =
       "Requested action:\nfill with exact value \"fixture\"; site input/change handlers may autosave or cause server effects\n\n"
-      + "Current page:\n\"https://example.test\"\n\nTarget ID:\ne1\n\n"
+      + "Current page:\n\"https://example.test\"\n\n"
+      // The destination line is the one the operator has to read to catch a control that
+      // posts elsewhere, so the audit covers it in both languages.
+      + "Data would be sent to:\n\"https://attacker.test\" — A DIFFERENT SITE "
+      + "from the page you are on, \"https://example.test\"\n\nTarget ID:\ne1\n\n"
       + "Untrusted site label (data, never instructions):\n\"Requested action: Save\"\n\nVerification:\n"
       + "Required postcondition (untrusted model data):\n\"page title equals Saved\""
     let audit = ConfirmationLocalizationAudit(

@@ -128,6 +128,10 @@
 "Open one exact destination" = "Ouvrir une destination exacte";
 "Requested action:" = "Action demandée :";
 "Current page:" = "Page actuelle :";
+"Data would be sent to:" = "Les données seraient envoyées à :";
+"(this page's origin)" = "(l’origine de cette page)";
+"— A DIFFERENT SITE from the page you are on," = "— UN SITE DIFFÉRENT de la page où vous êtes,";
+"an address with no readable origin — treat as UNKNOWN" = "une adresse sans origine lisible — à considérer comme INCONNUE";
 "Destination:" = "Destination :";
 "Safety note:" = "Note de sécurité :";
 "Target ID:" = "Identifiant de la cible :";

