@@ -483,10 +483,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     )
     configuration.userContentController = contentController
     configuration.websiteDataStore = websiteDataStore
-    // The agent lands on pages nobody picked by hand. WebKit's own fraudulent-site
-    // check is the one reputation lookup that sends hashed prefixes rather than URLs,
-    // so it stays on by decision, not by default; a denylist evaluated before the
-    // confirmation is the place for anything stricter.
+    // The agent lands on pages nobody picked by hand, so WebKit's own fraudulent-site
+    // check stays on by decision rather than by inherited default.
+    //
+    // It is not free of privacy cost, and an earlier version of this comment claimed it
+    // was. Apple's Safari privacy notice names Google Safe Browsing and Apple, and
+    // Tencent for mainland China and Hong Kong regions; it says the actual website
+    // address is never shared, and that Google may log the IP address. Apple never
+    // describes the protocol as hashed or prefixed, and WebKit hands the full NSURL to a
+    // closed framework, so nothing here may assert one. It runs on main-frame and
+    // subframe navigations, per URL in a redirect chain, and never on subresources.
+    // A local denylist evaluated before the confirmation is the place for anything
+    // stricter, and it is the only option that makes no request at all.
     configuration.preferences.isFraudulentWebsiteWarningEnabled = true
 
     self.instrumentationWorld = world

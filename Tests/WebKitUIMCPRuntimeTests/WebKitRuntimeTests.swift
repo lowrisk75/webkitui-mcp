@@ -2545,9 +2545,12 @@ struct WebKitRuntimeTests {
 
   @Test("WebKit's fraudulent-site warning is on for every runtime")
   func fraudulentWebsiteWarningIsEnabled() {
-    // The agent steers the browser onto pages nobody chose by hand, so the one
-    // reputation check that costs no privacy — WebKit's own hashed Safe Browsing
-    // lookup — has to be on. It is off by default on a bare configuration.
+    // The agent steers the browser onto pages nobody chose by hand, so WebKit's own
+    // fraudulent-site check has to be on. It is already on for a bare configuration, so
+    // this pins a decision rather than fixing a defect: a future `= false` cannot pass
+    // unnoticed. See the source comment for what the check actually transmits — an
+    // earlier version of this test claimed both that the default was off and that the
+    // lookup was hashed, and neither is true.
     let runtime = WebKitRuntime()
     #expect(runtime.webView.configuration.preferences.isFraudulentWebsiteWarningEnabled)
   }
