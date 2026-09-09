@@ -23,3 +23,16 @@ known_hosts*
 .tmp-design/
 audit-output/
 *.profraw
+
+# Retained Playwright/CDP prior art, kept on disk and out of the index. It is not the
+# product: the supported surface is the Swift/WKWebView server, which deliberately
+# exposes no JavaScript or CDP tool. Tracking these files made the repository contradict
+# that claim in public, on the one point the product is sold on.
+# scripts/verify-installed-native.mjs is NOT here: it uses only Node built-ins and
+# scripts/verify-native-installed.sh runs it as part of the install gate.
+src/
+package.json
+package-lock.json
+tsconfig.json
+scripts/goat-test*.mjs
+scripts/smoke-test.mjs
