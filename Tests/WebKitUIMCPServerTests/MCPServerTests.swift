@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Testing
+import WebKitUIMCPCore
 import WebKitUIMCPRuntime
 
 @testable import WebKitUIMCPServer
@@ -2564,6 +2565,150 @@ struct MCPServerTests {
     #expect(shown.contains("attacker.example"), "the dialog never named the destination")
     #expect(shown.contains("A DIFFERENT SITE"))
     #expect(shown.contains("shop.example"), "the dialog must name the page for comparison")
+  }
+
+  @Test("A flood of confirmations is refused instead of shown")
+  func confirmationFloodIsRefused() async throws {
+    // Twenty dialogs in a minute is not a workflow; it is an attempt to make the human
+    // stop reading. The refusal names the count so the agent is told why.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      "<button>Save</button>", baseURL: URL(string: "https://example.test/start"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(
+      responses: Array(repeating: false, count: ConfirmationRatePolicy.refuseThreshold))
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+
+    var lastError: JSONValue?
+    for index in 0..<(ConfirmationRatePolicy.refuseThreshold + 1) {
+      let observed = try await toolCall(
+        server, id: Int64(1000 + index * 2), name: "browser_observe",
+        arguments: ["session_id": .string(handle.rawValue.uuidString)])
+      let observation = try object(try object(observed["result"])["structuredContent"])
+      let target = try object(try array(observation["elements"]).first)
+      let acted = try await toolCall(
+        server, id: Int64(1001 + index * 2), name: "browser_act",
+        arguments: [
+          "session_id": .string(handle.rawValue.uuidString),
+          "observation_id": .string(try string(observation["observationID"])),
+          "element_id": .string(try string(target["elementID"])),
+          "operation": .string("click"),
+          "idempotency_key": .string("flood-\(index)"),
+          "postcondition": .object([
+            "type": .string("url_equals"), "value": .string("https://example.test/done"),
+          ]),
+        ])
+      lastError = acted["error"]
+    }
+
+    let error = try object(lastError)
+    #expect(try string(error["message"]).contains("in the last minute"))
+    #expect(
+      presenter.requests.count <= ConfirmationRatePolicy.refuseThreshold,
+      "the flood was presented to the operator instead of refused")
+  }
+
+  @Test("A burst names which request it is without displacing the exact requested action")
+  func confirmationBurstIsNamedInTheDialog() async throws {
+    // The count is the one fact that makes a flood legible. It is appended, because the
+    // first thing the operator reads must remain the exact action being asked for.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let presenter = ConfirmationPresenterStub(
+      responses: Array(repeating: false, count: ConfirmationRatePolicy.burstThreshold))
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    for index in 0..<ConfirmationRatePolicy.burstThreshold {
+      _ = try await toolCall(
+        server, id: Int64(6000 + index), name: "browser_navigate",
+        arguments: [
+          "session_id": .string(handle.rawValue.uuidString),
+          "url": .string("https://example.test/burst/\(index)"),
+        ])
+    }
+    #expect(presenter.requests.count == ConfirmationRatePolicy.burstThreshold)
+    let quiet = try #require(presenter.requests.first?.message)
+    #expect(!quiet.contains("Confirmations asked for in the last minute:"))
+    let burst = try #require(presenter.requests.last?.message)
+    #expect(burst.hasPrefix("Requested action:"), "the burst line displaced the exact action")
+    let expectedTail =
+      "\n\nConfirmations asked for in the last minute:\n"
+      + "\(ConfirmationRatePolicy.burstThreshold)"
+    #expect(burst.hasSuffix(expectedTail))
+  }
+
+  @Test("A flood in one session does not starve another session's operator")
+  func confirmationRateIsScopedToItsSession() async throws {
+    // Two MCP clients hold two sessions. One of them being driven into a flood must not
+    // refuse the other's operator, whose dialog nobody has been trained to click through.
+    // Two sessions at once is what two MCP clients look like to this server.
+    let registry = try WebKitSessionRegistry(maximumSessions: 2)
+    let flooded = try registry.open()
+    let quiet = try registry.open()
+    let presenter = ConfirmationPresenterStub(
+      responses: Array(repeating: false, count: ConfirmationRatePolicy.refuseThreshold + 2))
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    for index in 0..<(ConfirmationRatePolicy.refuseThreshold + 1) {
+      _ = try await toolCall(
+        server, id: Int64(7000 + index), name: "browser_navigate",
+        arguments: [
+          "session_id": .string(flooded.rawValue.uuidString),
+          "url": .string("https://example.test/flood/\(index)"),
+        ])
+    }
+    let presentedWhileFlooding = presenter.requests.count
+    #expect(presentedWhileFlooding < ConfirmationRatePolicy.refuseThreshold + 1)
+
+    let allowed = try await toolCall(
+      server, id: 7100, name: "browser_navigate",
+      arguments: [
+        "session_id": .string(quiet.rawValue.uuidString),
+        "url": .string("https://example.test/quiet"),
+      ])
+    #expect(allowed["error"] == nil, "a fresh session inherited another session's flood")
+    #expect(presenter.requests.count == presentedWhileFlooding + 1)
+    #expect(presenter.requests.last?.message.contains("in the last minute") == false)
+  }
+
+  @Test("Closing a session drops its confirmation count")
+  func confirmationRateForgetsAClosedSession() async throws {
+    // A handle is reusable state on the server. An operator who opened a fresh session
+    // must not be refused for what the previous holder of that session did.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let presenter = ConfirmationPresenterStub(
+      responses: Array(repeating: false, count: ConfirmationRatePolicy.refuseThreshold + 2))
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    var lastError: JSONValue?
+    for index in 0..<(ConfirmationRatePolicy.refuseThreshold + 1) {
+      lastError = try await toolCall(
+        server, id: Int64(8000 + index), name: "browser_navigate",
+        arguments: [
+          "session_id": .string(handle.rawValue.uuidString),
+          "url": .string("https://example.test/before-close/\(index)"),
+        ])["error"]
+    }
+    #expect(lastError != nil, "the flood was never refused")
+    _ = try await toolCall(
+      server, id: 8100, name: "browser_session",
+      arguments: [
+        "operation": .string("close"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let reopened = try registry.open()
+    let afterClose = try await toolCall(
+      server, id: 8101, name: "browser_navigate",
+      arguments: [
+        "session_id": .string(reopened.rawValue.uuidString),
+        "url": .string("https://example.test/after-close"),
+      ])
+    #expect(
+      afterClose["error"] == nil, "a reopened session carried the closed session's count")
+    #expect(
+      presenter.requests.last?.message.contains("Confirmations asked for in the last minute:")
+        == false,
+      "a reopened session was told it was mid-burst")
   }
 
   @Test("Native approval and AppKit dispatch produce distinct trusted receipts")

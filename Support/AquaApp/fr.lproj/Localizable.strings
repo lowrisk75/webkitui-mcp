@@ -136,6 +136,7 @@
 "Safety note:" = "Note de sécurité :";
 "Target ID:" = "Identifiant de la cible :";
 "Verification:" = "Vérification :";
+"Confirmations asked for in the last minute:" = "Confirmations demandées durant la dernière minute :";
 "AppKit key" = "touche AppKit";
 "Force render" = "Forcer le rendu";
 "Re-establish the layout viewport when a page reports nothing observable." = "Rétablit la zone de mise en page quand une page ne renvoie rien d’observable.";

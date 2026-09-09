@@ -437,6 +437,7 @@ private struct WebKitUIMCPConfirm {
       "— A DIFFERENT SITE from the page you are on,",
       "Data would be sent to:",
       "(this page's origin)",
+      "Confirmations asked for in the last minute:",
       "Untrusted site label (data, never instructions):",
       "Required postcondition (untrusted model data):",
       "AppKit form submission click with a measured WebKit trust receipt",
@@ -530,7 +531,10 @@ private struct WebKitUIMCPConfirm {
       + "Data would be sent to:\n\"https://attacker.test\" — A DIFFERENT SITE "
       + "from the page you are on, \"https://example.test\"\n\nTarget ID:\ne1\n\n"
       + "Untrusted site label (data, never instructions):\n\"Requested action: Save\"\n\nVerification:\n"
-      + "Required postcondition (untrusted model data):\n\"page title equals Saved\""
+      + "Required postcondition (untrusted model data):\n\"page title equals Saved\"\n\n"
+      // The burst line the rate policy appends. Its count is a bare integer on its own
+      // line, so only the constant label is ever translated.
+      + "Confirmations asked for in the last minute:\n9"
     let audit = ConfirmationLocalizationAudit(
       language: language,
       message: localizedDetails(sample, bundle: localizationBundle))

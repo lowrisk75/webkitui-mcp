@@ -1,5 +1,6 @@
 import CryptoKit
 import Darwin
+import Dispatch
 import Foundation
 import WebKitUIMCPCore
 import WebKitUIMCPRuntime
@@ -43,6 +44,9 @@ public final class WebKitMCPServer {
   private var pendingNavigations: [String: PendingNavigation] = [:]
   private var safariCompatibilityHandoffs: Set<WebKitSessionHandle> = []
   private var goalDelegations: [WebKitSessionHandle: GoalDelegation] = [:]
+  /// One policy per session: two clients holding two sessions must not starve each
+  /// other, and the count an attacker built up dies with the session it was built in.
+  private var confirmationRates: [WebKitSessionHandle: ConfirmationRatePolicy] = [:]
   private struct CompletedDownload {
     let arguments: [String: JSONValue]
     let receipt: WebKitDownloadReceipt
@@ -308,6 +312,10 @@ public final class WebKitMCPServer {
     pendingHandoffs.removeAll(keepingCapacity: false)
     pendingNavigations.removeAll(keepingCapacity: false)
     goalDelegations.removeAll(keepingCapacity: false)
+    // `confirmationRates` is deliberately kept. The browser survives a reconnect, so the
+    // dialogs its operator has already been shown survive with it; clearing them here
+    // would make disconnect-and-reconnect a way to reset the flood counter. The 60-second
+    // window is what forgets.
     safariCompatibilityHandoffs.removeAll(keepingCapacity: false)
     // The durable broker deliberately preserves the browser across a reconnect, so
     // the session is not closed here. Ownership is released, which leaves it
@@ -1091,6 +1099,7 @@ public final class WebKitMCPServer {
       pendingNavigations = pendingNavigations.filter { $0.value.session != handle }
       await revokeGoalDelegation(for: handle)
       safariCompatibilityHandoffs.remove(handle)
+      confirmationRates.removeValue(forKey: handle)
       if !preserveBrowserOnClose {
         try registry.close(handle)
       } else {
@@ -1179,7 +1188,8 @@ public final class WebKitMCPServer {
     }
     let previousHolder = try registry.sessionOwner(for: handle)
     guard
-      await confirmationPresenter.confirm(
+      try await rateLimitedConfirmation(
+        session: handle,
         title: "Transfer WebKitUI Control",
         message:
           "Transfer browser control from \(previousHolder?.clientName ?? "another local client") "
@@ -1247,6 +1257,46 @@ public final class WebKitMCPServer {
     ])
   }
 
+  /// Presents the server's own confirmation, counting it, and refuses a flood.
+  ///
+  /// Only the dialog this server draws is governed. The MCP elicitation path is the
+  /// client's own interface, and rate-limiting it would be this server deciding how often
+  /// another product may draw its own UI. From the fifth confirmation in a minute the
+  /// dialog carries the count, which is the one fact that makes a flood legible; from the
+  /// twentieth nothing is presented at all.
+  ///
+  /// The count is appended, never prepended. This message is an ordered document whose
+  /// first line is the exact action being asked for, and the operator reading that line
+  /// first is the entire safety argument; the count reads as one more labelled section, in
+  /// the same shape as every other one, which also keeps the number out of the translated
+  /// phrase.
+  private func rateLimitedConfirmation(
+    session: WebKitSessionHandle,
+    title: String,
+    message: String,
+    approveLabel: String
+  ) async throws -> NativeConfirmationOutcome {
+    var policy = confirmationRates[session] ?? ConfirmationRatePolicy()
+    let verdict = policy.record(atMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    confirmationRates[session] = policy
+    let shown: String
+    switch verdict {
+    case .normal:
+      shown = message
+    case .burst(let count):
+      shown = message + "\n\nConfirmations asked for in the last minute:\n\(count)"
+    case .refuse(let count):
+      throw MCPServerError.invalidParams(
+        "confirmation_rate_limited: this is request \(count) in the last minute, which is a "
+          + "flood rather than a workflow, so nothing was presented to the user and nothing "
+          + "was dispatched. Wait until fewer than \(ConfirmationRatePolicy.refuseThreshold) "
+          + "confirmations have been asked for in the last 60 seconds, then retry the same "
+          + "bounded operation. Retrying immediately will be refused again.")
+    }
+    return await confirmationPresenter.confirm(
+      title: title, message: shown, approveLabel: approveLabel)
+  }
+
   /// A confirmation that never reached a person must never be reported as a refusal.
   /// Blaming the user for a broken or unverifiable helper sends every caller looking
   /// for a decision that was never offered.
@@ -1302,6 +1352,7 @@ public final class WebKitMCPServer {
       }
       observations.removeValue(forKey: handle)
       coordinators.removeValue(forKey: handle)
+      confirmationRates.removeValue(forKey: handle)
       try? registry.close(handle)
     }
     registry.releaseSessionOwnerships(owner: clientAuthorityID)
@@ -1387,7 +1438,8 @@ public final class WebKitMCPServer {
       delegation.allowedQueryKeys.isEmpty
       ? "none" : delegation.allowedQueryKeys.sorted().joined(separator: ", ")
     guard
-      await confirmationPresenter.confirm(
+      try await rateLimitedConfirmation(
+        session: handle,
         title: "Delegate Browser Goal",
         message:
           "Temporarily auto-authorize navigation only? Goal: \(jsonQuoted(goalDisplay)). "
@@ -1529,7 +1581,8 @@ public final class WebKitMCPServer {
         modern: modern)
     }
     guard
-      await confirmationPresenter.confirm(
+      try await rateLimitedConfirmation(
+        session: handle,
         title: "Continue Authentication in Safari",
         message:
           "Open \(restriction.origin) in Safari for passkey or security-key authentication?\n\n"
@@ -1648,7 +1701,8 @@ public final class WebKitMCPServer {
     )
     if !modern || approvalMode == "native" {
       let currentURL = runtime.agentSafeCurrentURL() ?? "no current page"
-      let outcome = await confirmationPresenter.confirm(
+      let outcome = try await rateLimitedConfirmation(
+        session: handle,
         title: "Approve Web Navigation",
         message: navigationConfirmationMessage(currentURL: currentURL, url: url),
         approveLabel: "Navigate")
@@ -1724,7 +1778,8 @@ public final class WebKitMCPServer {
       let origin =
         "\(binding.origin.scheme)://\(binding.origin.asciiHost):\(binding.origin.effectivePort)"
       let accepted =
-        await confirmationPresenter.confirm(
+        try await rateLimitedConfirmation(
+          session: handle,
           title: "No Saved SiliconPass Credential",
           message:
             "No credential is saved for \(origin). Continue in the visible browser to sign in manually, then add or update this credential in SiliconPass? No password will be sent through MCP.",
@@ -1885,7 +1940,8 @@ public final class WebKitMCPServer {
         )
       case .humanControlled, .humanStepCompleted:
         guard
-          await confirmationPresenter.confirm(
+          try await rateLimitedConfirmation(
+            session: handle,
             title: "Return Browser Control",
             message:
               "Return control of the visible WebKit session to the requesting agent? A fresh observation will be required.",
@@ -2346,7 +2402,8 @@ public final class WebKitMCPServer {
       dispatchMode: pending.dispatchMode
     )
     if !modern || approvalMode == "native" {
-      let outcome = await confirmationPresenter.confirm(
+      let outcome = try await rateLimitedConfirmation(
+        session: pending.session,
         title: "Approve Browser Action",
         message: confirmationMessage,
         approveLabel: "Approve Once")
@@ -2507,14 +2564,24 @@ public final class WebKitMCPServer {
       let toOrigin
     ) {
       observations.removeValue(forKey: pending.session)
-      guard
-        await confirmationPresenter.confirm(
+      // A refusal here throws, and this navigation is already in flight: the pending
+      // cross-origin hop and the issued capability have to be given up before the error
+      // leaves, or a refused flood would leave the runtime holding a redirect nobody
+      // approved.
+      let redirectOutcome: NativeConfirmationOutcome
+      do {
+        redirectOutcome = try await rateLimitedConfirmation(
+          session: pending.session,
           title: "Approve Cross-Origin Redirect",
           message:
             "Allow this exact redirect from \(fromOrigin) to \(toOrigin)? Its private path and query stay inside WebKitUI and are never exposed through MCP.",
-          approveLabel: "Continue"
-        ) == .approved
-      else {
+          approveLabel: "Continue")
+      } catch {
+        runtime.discardPendingCrossOriginNavigation()
+        await capabilityAuthority.revoke(capability)
+        throw error
+      }
+      guard redirectOutcome == .approved else {
         runtime.discardPendingCrossOriginNavigation()
         await capabilityAuthority.revoke(capability)
         return try redirectApprovalResult(
@@ -2753,7 +2820,8 @@ public final class WebKitMCPServer {
     let label = String(
       ((target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text).joined() ?? "")
         .prefix(120))
-    let uploadOutcome = await confirmationPresenter.confirm(
+    let uploadOutcome = try await rateLimitedConfirmation(
+      session: handle,
       title: "Approve Browser Upload",
       message: uploadConfirmationMessage(
         candidates: candidates,
@@ -2886,7 +2954,8 @@ public final class WebKitMCPServer {
       triggerDescription = "Freshly observed control:\n" + jsonQuoted(String(label.prefix(120)))
     }
     guard
-      await confirmationPresenter.confirm(
+      try await rateLimitedConfirmation(
+        session: handle,
         title: "Approve Browser Download",
         message:
           "Download from the current authenticated WebKit session.\n\n"
