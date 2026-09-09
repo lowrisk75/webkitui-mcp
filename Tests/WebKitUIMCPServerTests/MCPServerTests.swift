@@ -1745,6 +1745,7 @@ struct MCPServerTests {
       "observation_id": .string(observationID),
       "element_id": try firstElement["elementID"].map { .string(try string($0)) } ?? .null,
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("confirm-once"),
       "postcondition": .object([
         "type": .string("url_equals"),
@@ -1828,6 +1829,7 @@ struct MCPServerTests {
       "element_id": .string(try string(element["elementID"])),
       "operation": .string("fill"),
       "value": .string(longFormValue),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("fill-name-once"),
     ]
     var newlineArguments = arguments
@@ -1893,6 +1895,7 @@ struct MCPServerTests {
       "element_id": .string(try string(element["elementID"])),
       "operation": .string("fill"),
       "value": .string("Present but rejected"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("invalid-fill-is-not-verified"),
     ]
     let prepared = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
@@ -1930,6 +1933,7 @@ struct MCPServerTests {
       "element_id": .string(try string(element["elementID"])),
       "operation": .string("fill"),
       "value": .string(value),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("normalized-textarea-fill"),
     ]
     let prepared = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
@@ -1964,6 +1968,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(element["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("url-prefix-spa-route"),
       "postcondition": .object([
         "type": .string("url_prefix"),
@@ -2001,6 +2006,7 @@ struct MCPServerTests {
       "element_id": .string(try string(element["elementID"])),
       "operation": .string("fill"),
       "value": .string(value),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("fill-contenteditable-once"),
     ]
     let prepared = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
@@ -2039,6 +2045,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(target["elementID"])),
       "operation": .string("submit"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("submit-form-once"),
       "postcondition": .object([
         "type": .string("semantic_text_appears"), "value": .string("Submitted once"),
@@ -2087,6 +2094,7 @@ struct MCPServerTests {
         "element_id": .string(try string(try object(elements[0])["elementID"])),
         "operation": .string("fill"),
         "value": .string("secret"),
+        "approval_mode": .string("mcp"),
         "idempotency_key": .string("blocked-password"),
       ])
     #expect(try object(password["error"])["code"] == .int(-32602))
@@ -2100,6 +2108,7 @@ struct MCPServerTests {
         "observation_id": .string(observationID),
         "element_id": .string(try string(try object(elements[1])["elementID"])),
         "operation": .string("click"),
+        "approval_mode": .string("mcp"),
         "idempotency_key": .string("wrong-capability"),
         "postcondition": .object([
           "type": .string("url_equals"), "value": .string("https://example.test/done"),
@@ -2139,6 +2148,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(element["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("semantic-save-once"),
       "postcondition": .object([
         "type": .string("semantic_text_appears"),
@@ -2198,6 +2208,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(target["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("title-change-once"),
       "postcondition": .object([
         "type": .string("title_contains"), "value": .string("Saved"),
@@ -2239,6 +2250,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(target["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("route-change-once"),
       "postcondition": .object([
         "type": .string("url_changes_from"), "value": .string(initialURL),
@@ -2286,6 +2298,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(try object(target)["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("wizard-heading-once"),
       "postcondition": .object([
         "type": .string("heading_equals"), "value": .string("Select Certificates"),
@@ -2309,6 +2322,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(refreshed["observationID"])),
       "element_id": .string(try string(try object(generate)["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("wizard-generate-heading-once"),
       "postcondition": .object([
         "type": .string("heading_equals"), "value": .string("Download"),
@@ -2345,6 +2359,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(try object(target)["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("same-url-diagnostic-once"),
       "postcondition": .object([
         "type": .string("url_changes_from"), "value": .string(initialURL),
@@ -2384,6 +2399,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(target["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("check-financial-data-once"),
       "postcondition": .object([
         "type": .string("checked_equals"), "value": .string("true"),
@@ -2428,6 +2444,7 @@ struct MCPServerTests {
       "observation_id": .string(try string(observation["observationID"])),
       "element_id": .string(try string(target["elementID"])),
       "operation": .string("click"),
+      "approval_mode": .string("mcp"),
       "idempotency_key": .string("save-before-confirm-once"),
       "postcondition": .object([
         "type": .string("dialog_appears"), "value": .string("Confirm"),
@@ -2452,6 +2469,53 @@ struct MCPServerTests {
       try await runtime.webView.evaluateJavaScript(
         "document.querySelector('button').dataset.dispatchCount") as? String
     #expect(dispatchCount == "1")
+  }
+
+  @Test("A modern client that names no approval mode still gets the native dialog")
+  func modernActDefaultsToNativeConfirmation() async throws {
+    // browser_act defaulted to MCP elicitation for a modern client while
+    // browser_navigate defaulted to native, so the product's own sentence — human
+    // confirmation before every exposed click — was false for the ordinary case. It
+    // matters because elicitation carries no guarantee a human answered it: the
+    // specification only says clients SHOULD offer approval controls, the TypeScript
+    // SDK fulfils the request from a callback, and at least one shipping client
+    // auto-accepts it outright. The gate cannot live on a channel the client may fill
+    // in by itself.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <button aria-label='Create app'
+        onclick="this.dataset.state=event.isTrusted ? 'trusted' : 'rejected'">Create app</button>
+      """,
+      baseURL: URL(string: "https://example.test/apps"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try object(try array(observation["elements"]).first)
+
+    let acted = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(target["elementID"])),
+        "operation": .string("click"),
+        "idempotency_key": .string("default-mode-once"),
+        "postcondition": .object([
+          "type": .string("attribute_equals"), "attribute": .string("data-state"),
+          "value": .string("trusted"),
+        ]),
+      ])
+
+    let structured = try object(try object(acted["result"])["structuredContent"])
+    #expect(structured["confirmation_mode"] == .string("native"))
+    #expect(presenter.requests.count == 1, "the native dialog was never asked for")
   }
 
   @Test("Native approval and AppKit dispatch produce distinct trusted receipts")

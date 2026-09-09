@@ -2198,7 +2198,14 @@ public final class WebKitMCPServer {
     arguments: [String: JSONValue],
     modern: Bool
   ) async throws -> JSONValue {
-    let approvalMode = arguments["approval_mode"]?.stringValue ?? (modern ? "mcp" : "native")
+    // Native, like browser_navigate, and for the same reason. Defaulting a modern client
+    // to elicitation made the product's own sentence — human confirmation before every
+    // exposed click — false for the ordinary case: the specification only says clients
+    // SHOULD offer approval controls, the TypeScript SDK fulfils an elicitation from a
+    // callback, and at least one shipping client auto-accepts it. A gate the client can
+    // fill in by itself is not a gate. `approval_mode: "mcp"` is still available to a
+    // caller that asks for it explicitly.
+    let approvalMode = arguments["approval_mode"]?.stringValue ?? "native"
     guard ["native", "mcp"].contains(approvalMode) else {
       throw MCPServerError.invalidParams("approval_mode must be native or mcp")
     }
