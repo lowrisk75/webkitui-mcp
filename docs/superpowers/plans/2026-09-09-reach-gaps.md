@@ -245,6 +245,44 @@ governs a state a human has to be talked out of, and it carries nothing.
 
 ---
 
+## Task 8: Let an agent see the options it is allowed to choose
+
+`select_option` shipped in Task 4 and addresses an option by its exact visible label,
+deliberately, because an index is structure and this product refuses to let structure be
+identity. But the observation publishes only `selectedOption`. An agent therefore has to
+guess the available labels from surrounding page text, and a guess that misses is refused
+— correctly, and uselessly.
+
+Reported by the implementer of Task 4 against their own work.
+
+**Contract:**
+- A `<select>` in the observation carries its selectable option labels, as untrusted site
+  content like every other page string.
+- The list is bounded, and says when it was truncated. A country list is 250 entries; a
+  list of every timezone is more, and neither may spend a client's whole context.
+- A disabled option is marked, not omitted: an agent that cannot see it will keep asking
+  for it.
+- A sensitive `<select>` publishes no options, matching the rule `fill` and
+  `select_option` already apply.
+- Options are not published for a control the observation is not otherwise reporting.
+
+**Files:** `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift` (the observation source and
+`WebKitObservedElement`), `Sources/WebKitUIMCPServer/MCPServer.swift` if the payload needs
+it, both test bundles.
+
+**Tests that must exist and must have been seen to fail first:**
+- [ ] A three-option select reports all three labels, and the selected one is still
+  identifiable.
+- [ ] A list longer than the bound is truncated and says so.
+- [ ] A disabled option is present and marked disabled.
+- [ ] A sensitive select publishes no options at all.
+- [ ] An option label chosen from what the observation published is accepted by
+  `select_option` — the two halves agree.
+
+- [ ] **Commit.**
+
+---
+
 ## Not in this plan
 
 **Cross-origin iframe content — the largest gap, and it needs its own plan.** The gap matrix ranks it first: hosted payment fields, CAPTCHAs and embedded SSO widgets are counted and never read, which removes a checkout — the flagship task — from what the product can do.
