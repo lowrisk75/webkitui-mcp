@@ -216,6 +216,11 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let disabled: Bool
   public let checked: Bool?
   public let selected: Bool?
+  /// What is chosen in a `<select>`, which is the only form that control's value takes.
+  /// `nil` for a sensitive control, exactly as `text` and `value` are `nil` there: a
+  /// selected label is a value, and a sensitive control's value does not leave this
+  /// machine. The control itself is still reported, with its role and its accessible
+  /// name, so an agent can see it exists and hand it to a human.
   public let selectedOption: ProvenancedText?
   /// What a `<select>` will accept as an address. `select_option` names an option by its
   /// exact visible label and never by an index, so an observation that publishes only
@@ -4814,7 +4819,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           const editableValue = (element.textContent ?? '').replace(/\\s+$/, '');
           observableValue = editableValue.length <= maximumFieldCharacters ? editableValue : null;
         }
-        const selectedLabel = element instanceof HTMLSelectElement
+        // What is chosen in a `<select>` is that control's value, in the one form a
+        // `<select>` has one. So a sensitive select's selection is never read here, on
+        // the same rule that withholds its `value` and its `text` and that makes `fill`
+        // and `select_option` refuse it: a two-factor delivery method, a reason for
+        // closing an account and a clinic's appointment type are each a secret spelled
+        // out in a label.
+        const selectedLabel = element instanceof HTMLSelectElement && !sensitive
           ? collapse(Array.from(element.selectedOptions).map(option => option.textContent).join(' '))
           : null;
         // `select_option` addresses an option by its exact visible label, so the labels
@@ -4933,7 +4944,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
           checked,
           selected,
-          selectedOption: withheldForInvisibility ? null : bounded(selectedLabel || null),
+          // Both conditions, stated here rather than left to the definition above: this
+          // key was gated on invisibility alone, and published the chosen label of every
+          // sensitive select on every page until it was found.
+          selectedOption: sensitive || withheldForInvisibility
+            ? null : bounded(selectedLabel || null),
           // Three keys a page of buttons never pays for: absent, not empty, wherever
           // there is no list to publish.
           options,

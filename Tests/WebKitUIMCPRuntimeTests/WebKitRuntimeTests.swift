@@ -1062,6 +1062,109 @@ struct WebKitRuntimeTests {
     #expect(control.optionsTruncated == nil)
   }
 
+  @Test("A sensitive select's chosen label reaches no encoded payload")
+  func sensitiveSelectWithholdsItsSelectedLabel() async throws {
+    // A selected label is the value of a `<select>` in the one form a `<select>` has, so
+    // the rule that a sensitive control's value never leaves the machine covers it. The
+    // assertion is made against the encoded bytes rather than against one key by name:
+    // reading `selectedOption` back proves only that the field the reader thought of was
+    // fixed, and this leak was exactly a field nobody thought of.
+    let chosen = "chosen-delivery-canary-4477"
+    let alternative = "other-delivery-canary-8811"
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='delivery'>Where to send the one-time code</label>
+      <select id='delivery' name='one-time-code'>
+        <option value='mail'>\(alternative)</option>
+        <option value='sms' selected>\(chosen)</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/verify-selection"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+
+    #expect(control.sensitive)
+    #expect(control.selectedOption == nil)
+    #expect(control.text == nil)
+    #expect(control.value == nil)
+    // Absent, never empty: an empty list is a claim about the control, and on this
+    // control the claim would be false.
+    #expect(control.options == nil)
+    #expect(control.optionCount == nil)
+    #expect(control.optionsTruncated == nil)
+
+    let observationJSON = String(decoding: try JSONEncoder().encode(observation), as: UTF8.self)
+    let canonicalJSON = String(
+      decoding: try JSONEncoder().encode(try observation.canonicalState()), as: UTF8.self)
+    let recipesJSON = String(
+      decoding: try JSONEncoder().encode(observation.elements.map(\.locatorRecipe)),
+      as: UTF8.self)
+    for label in [chosen, alternative] {
+      #expect(!observationJSON.contains(label))
+      #expect(!canonicalJSON.contains(label))
+      #expect(!recipesJSON.contains(label))
+    }
+  }
+
+  @Test("A sensitive select is still reported as a control with its name and role")
+  func sensitiveSelectRemainsVisibleAsAControl() async throws {
+    // Withholding what is inside a control is not hiding the control. An agent that
+    // cannot see this element exists cannot ask a human to operate it, and the human
+    // handoff is the designed way through exactly this refusal.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='delivery'>Where to send the one-time code</label>
+      <select id='delivery' name='one-time-code'>
+        <option value='mail'>Email</option>
+        <option value='sms' selected>Text message</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/verify-presence"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+
+    #expect(control.sensitive)
+    #expect(control.role?.segments.map(\.text).joined() == "combobox")
+    #expect(
+      control.accessibleName?.segments.map(\.text).joined()
+        == "Where to send the one-time code")
+    #expect(control.visible)
+    #expect(control.actionability == .actionable)
+  }
+
+  @Test("A select that is not sensitive still publishes what is chosen in it")
+  func ordinarySelectStillPublishesItsSelection() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='country'>Country</label>
+      <select id='country'>
+        <option value='de'>Germany</option>
+        <option value='fr' selected>France</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/address"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+
+    #expect(!control.sensitive)
+    #expect(control.selectedOption?.segments.map(\.text).joined() == "France")
+    #expect(control.text?.segments.map(\.text).joined() == "France")
+    #expect(control.value?.segments.map(\.text).joined() == "France")
+    #expect(control.optionCount == 2)
+    #expect(
+      try #require(control.options).map { $0.label.segments.map(\.text).joined() }
+        == ["Germany", "France"])
+  }
+
   @Test("A Material checkbox hidden behind an aria-hidden box stays addressable")
   func materialCheckboxRemainsAddressable() async throws {
     // Play Console renders every checkbox in two halves: a real input with no size,

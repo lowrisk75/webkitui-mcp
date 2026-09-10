@@ -2400,6 +2400,56 @@ struct MCPServerTests {
     #expect(try object(submitAsClick["error"])["code"] == .int(-32602))
   }
 
+  @Test("An option_selected postcondition on a sensitive control is refused with its reason")
+  func optionSelectedPostconditionOnSensitiveControlIsRefused() async throws {
+    // The control's selected option is withheld from every observation, so this
+    // postcondition could never be read back. Left to run it would fail as an
+    // unverifiable comparison, which reads to a caller as a page that misbehaved
+    // rather than as a rule this product applied on purpose.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <label for='delivery'>Where to send the one-time code</label>
+      <select id='delivery' name='one-time-code'>
+        <option value='mail'>Email</option>
+        <option value='sms' selected>Text message</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://example.test/verify"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let server = WebKitMCPServer(registry: registry)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let delivery = try element(in: observation, named: "Where to send the one-time code")
+    // The control is published; only what is chosen in it is not.
+    #expect(delivery["selectedOption"] == nil)
+
+    let refused = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(delivery["elementID"])),
+        "operation": .string("click"),
+        "approval_mode": .string("mcp"),
+        "idempotency_key": .string("sensitive-option-postcondition"),
+        "postcondition": .object([
+          "type": .string("option_selected"), "value": .string("Email"),
+        ]),
+      ])
+    let error = try object(refused["error"])
+    #expect(error["code"] == .int(-32602))
+    let message = try string(error["message"])
+    #expect(message.contains("sensitive"))
+    // The refusal names the way through, which is the same way `fill` and
+    // `select_option` already name.
+    #expect(message.contains("handoff"))
+  }
+
   @Test("A confirmed MCP click verifies newly appearing same-page semantic text")
   func semanticPostconditionActuation() async throws {
     let registry = try WebKitSessionRegistry()

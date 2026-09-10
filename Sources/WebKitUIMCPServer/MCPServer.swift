@@ -2599,6 +2599,16 @@ public final class WebKitMCPServer {
           "operation must be click, fill, submit, select_option, hover, press_key, blur, or "
             + "commit_input")
       }
+      // A sensitive control publishes no selected option, so this postcondition has
+      // nothing to be verified against and never will have. Refused here, with the
+      // reason, rather than dispatched and left to fail as an unverifiable comparison —
+      // which reads as a page that misbehaved instead of a rule this product applied.
+      if case .optionSelected = postcondition, target.sensitive {
+        throw MCPServerError.invalidParams(
+          "option_selected cannot be verified on a sensitive control: its selected option "
+            + "is withheld from every observation, so nothing can read the result back. "
+            + "Sensitive controls require local human handoff.")
+      }
       let idempotencyKey = try requireString(
         arguments["idempotency_key"], named: "idempotency_key")
 
@@ -4702,7 +4712,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_observe",
       description:
-        "Return rendered, actionable full-page semantics with provenance, sanitized context/stable attributes, locator quality, and fresh observation-scoped element IDs. compact=true factors document provenance once, returns concise rows, and on modern MCP avoids duplicating the structured payload in content text. Hidden, zero-size, aria-hidden, inert, transparent, and sensitive field values are omitted before serialization. URL query values are redacted. A select publishes the option labels it will accept, each marked selected or disabled, in document order, bounded to 64 per control with optionsTruncated saying when the list was cut and optionCount giving the true total; a sensitive select publishes no options key at all, and neither does anything that is not a select. Restricted authentication origins require local human handoff and return no page semantics. Never reuse an element ID after another observation.",
+        "Return rendered, actionable full-page semantics with provenance, sanitized context/stable attributes, locator quality, and fresh observation-scoped element IDs. compact=true factors document provenance once, returns concise rows, and on modern MCP avoids duplicating the structured payload in content text. Hidden, zero-size, aria-hidden, inert, transparent, and sensitive field values are omitted before serialization. URL query values are redacted. A select publishes the option labels it will accept, each marked selected or disabled, in document order, bounded to 64 per control with optionsTruncated saying when the list was cut and optionCount giving the true total; a sensitive select publishes no options key, no optionCount and no selectedOption at all, because what is chosen in a select is that control's value, and neither does anything that is not a select publish options. Restricted authentication origins require local human handoff and return no page semantics. Never reuse an element ID after another observation.",
       properties: sessionSchemaProperties.merging([
         "maximum_elements": integerSchema(minimum: 1, maximum: 2_000, defaultValue: 150),
         "element_offset": integerSchema(minimum: 0, maximum: 100_000, defaultValue: 0),
