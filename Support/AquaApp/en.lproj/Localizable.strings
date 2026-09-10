@@ -139,6 +139,13 @@
 "Confirmations asked for in the last minute:" = "Confirmations asked for in the last minute:";
 "AppKit key" = "AppKit key";
 "Modifier keys held down:" = "Modifier keys held down:";
+"Option to be selected:" = "Option to be selected:";
+"Option currently selected (untrusted site text):" = "Option currently selected (untrusted site text):";
+"no option is currently selected" = "no option is currently selected";
+"untrusted JavaScript selection in a dropdown list" = "untrusted JavaScript selection in a dropdown list";
+"The selected option will be verified after dispatch." = "The selected option will be verified after dispatch.";
+"untrusted JavaScript hover — mouseover, mouseenter and mousemove" = "untrusted JavaScript hover — mouseover, mouseenter and mousemove";
+"Nothing is verified: what a hover reveals is read by the next observation." = "Nothing is verified: what a hover reveals is read by the next observation.";
 "Force render" = "Force render";
 "Re-establish the layout viewport when a page reports nothing observable." = "Re-establish the layout viewport when a page reports nothing observable.";
 "Clear browsing data" = "Clear browsing data";

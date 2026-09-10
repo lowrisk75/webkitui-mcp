@@ -1905,6 +1905,119 @@ struct MCPServerTests {
     #expect(secondStructured["new_window_suppressed"] == nil)
   }
 
+  @Test("A confirmed selection and a confirmed hover both report untrusted JavaScript dispatch")
+  func selectOptionAndHoverReportUntrustedJavaScriptDispatch() async throws {
+    // Neither has a trusted route out of WebKit: a `<select>` popup is an NSMenu with
+    // its own event loop that a posted NSEvent never reaches, and no
+    // NSEventTypeMouseMoved is forwarded to an embedder at all. So both are dispatched
+    // as JavaScript and reported as untrusted, exactly as `fill` and `blur` already are.
+    // What must never happen is either of them reporting `trusted` with no receipt.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <label for='country'>Country</label>
+      <select id='country' onchange="document.title = 'Shipping to ' + this.value">
+        <option value='Germany'>Germany</option>
+        <option value='France'>France</option>
+      </select>
+      <button id='account' onmouseover="document.body.dataset.menu = 'open'">Account</button>
+      """,
+      baseURL: URL(string: "https://example.test/checkout"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: [true, true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+
+    let selected = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "Country")),
+        "operation": .string("select_option"),
+        "value": .string("France"),
+        "idempotency_key": .string("select-country-once"),
+      ])
+    let selectionStructured = try object(try object(selected["result"])["structuredContent"])
+    #expect(selectionStructured["dispatch_mode"] == .string("javascript"))
+    #expect(selectionStructured["trusted_gesture_state"] == .string("untrusted_javascript"))
+    #expect(try object(selectionStructured["verification"])["verified"] != nil)
+
+    let reobserved = try await toolCall(
+      server, id: 3, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let fresh = try object(try object(reobserved["result"])["structuredContent"])
+    // Hover carries no postcondition of its own: what it reveals belongs to the next
+    // observation, and nothing here claims a menu appeared.
+    let hovered = try await toolCall(
+      server, id: 4, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(fresh["observationID"])),
+        "element_id": .string(try elementID(in: fresh, named: "Account")),
+        "operation": .string("hover"),
+        "idempotency_key": .string("hover-account-once"),
+      ])
+    let hoverStructured = try object(try object(hovered["result"])["structuredContent"])
+    #expect(hoverStructured["dispatch_mode"] == .string("javascript"))
+    #expect(hoverStructured["trusted_gesture_state"] == .string("untrusted_javascript"))
+    // Nothing claimed, and the next step said out loud.
+    #expect(hoverStructured["verification"] == .string("not_attempted"))
+    #expect(try string(hoverStructured["safe_next_step"]).contains("Observe again"))
+    let menu =
+      try await runtime.webView.evaluateJavaScript("document.body.dataset.menu")
+      as? String
+    #expect(menu == "open")
+    #expect(presenter.requests.count == 2, "both gestures went through the one funnel")
+  }
+
+  @Test("A selection confirmation names the option being chosen and the one already selected")
+  func selectOptionConfirmationNamesBothLabels() async throws {
+    // "Choose France" does not tell an operator whether that is a change or a no-op.
+    // The confirmation has to show the change, so it states both labels.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <label for='country'>Country</label>
+      <select id='country'>
+        <option value='de'>Germany</option>
+        <option value='fr'>France</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://example.test/checkout"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: [false])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    _ = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "Country")),
+        "operation": .string("select_option"),
+        "value": .string("France"),
+        "idempotency_key": .string("select-country-confirmation"),
+      ])
+    let shown = try #require(presenter.requests.first?.message)
+    #expect(shown.contains("Option to be selected:"))
+    #expect(shown.contains("\"France\""), "the dialog never named the option being chosen")
+    #expect(shown.contains("Option currently selected"))
+    #expect(shown.contains("\"Germany\""), "the dialog never named the current selection")
+    // The control itself, so the operator knows which dropdown is being changed.
+    #expect(shown.contains("\"Country\""))
+  }
+
   @Test("A confirmed fill verifies the same semantic target's exact value")
   func verifiedFill() async throws {
     let registry = try WebKitSessionRegistry()
@@ -4109,6 +4222,14 @@ struct MCPServerTests {
   /// heading never stands in for its file input.
   private func fileControlID(
     in observation: [String: JSONValue], labelled label: String
+  ) throws -> String {
+    try elementID(in: observation, named: label)
+  }
+
+  /// The observed element whose accessible name is exactly this. Addressing a fixture by
+  /// position breaks the moment the fixture grows a second control.
+  private func elementID(
+    in observation: [String: JSONValue], named label: String
   ) throws -> String {
     for element in try array(observation["elements"]) {
       let fields = try object(element)

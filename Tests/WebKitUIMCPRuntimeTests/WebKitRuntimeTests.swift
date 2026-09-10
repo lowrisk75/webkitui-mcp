@@ -758,6 +758,185 @@ struct WebKitRuntimeTests {
     #expect(runtime.webView.url?.absoluteString == "https://fixture.invalid/billing")
   }
 
+  @Test("Choosing an option by its label moves the selection and runs the site's own handler")
+  func selectOptionChoosesByLabelAndRaisesChange() async throws {
+    // A country dropdown could be read and never written: `fill` takes an input or a
+    // textarea and refuses a `<select>`, and the popup a real click opens is an NSMenu
+    // running its own event loop that a synthetic NSEvent never reaches. The gesture is
+    // therefore JavaScript and says so — but it must still be the gesture a real
+    // selection makes, or the site's own handler never runs.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='country'>Country</label>
+      <select id='country' onchange="document.title = 'change:' + this.value"
+        oninput="document.body.dataset.input = this.value">
+        <option value='de'>Germany</option>
+        <option value='fr'>France</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/checkout"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+    #expect(control.selectedOption?.segments.map(\.text).joined() == "Germany")
+
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: control.elementID,
+      operation: .selectOption(
+        try ProvenancedText(
+          text: "France", source: ProvenanceSource(classification: .modelGenerated))),
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    // Untrusted by necessity, and never reported otherwise.
+    #expect(!result.trustedUserGesture)
+    #expect(result.dispatchMode == .javascript)
+
+    let after = try await runtime.observe()
+    let refreshed = try #require(
+      after.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+    #expect(refreshed.selectedOption?.segments.map(\.text).joined() == "France")
+    // The site's own listeners, not just the DOM property: a selection that skips
+    // input and change looks right and does nothing.
+    #expect(after.title.segments.map(\.text).joined() == "change:fr")
+    let inputSeen =
+      try await runtime.webView.evaluateJavaScript(
+        "document.body.dataset.input") as? String
+    #expect(inputSeen == "fr")
+  }
+
+  @Test("An option label that names two options is refused before anything is dispatched")
+  func ambiguousOptionLabelIsRefusedWithItsCount() async throws {
+    // An option index is a structural fact, and this product already refuses to let
+    // structure be identity. A label that names two options is the same failure the
+    // addressing layer reports as target_not_unique: refused with the count, never
+    // guessed at.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='branch'>Branch</label>
+      <select id='branch'>
+        <option value='current'>Paris</option>
+        <option value='north'>Paris</option>
+        <option value='lyon'>Lyon</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/branches"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+
+    await #expect(throws: WebKitRuntimeError.optionLabelNotUnique(2)) {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: control.elementID,
+        operation: .selectOption(
+          try ProvenancedText(
+            text: "Paris", source: ProvenanceSource(classification: .modelGenerated))),
+        stabilityInterval: .milliseconds(1))
+    }
+    await #expect(throws: WebKitRuntimeError.optionLabelNotUnique(0)) {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: control.elementID,
+        operation: .selectOption(
+          try ProvenancedText(
+            text: "Marseille", source: ProvenanceSource(classification: .modelGenerated))),
+        stabilityInterval: .milliseconds(1))
+    }
+    // Nothing moved: the refusal happens before the gesture, not after it.
+    let selected =
+      try await runtime.webView.evaluateJavaScript(
+        "document.getElementById('branch').value") as? String
+    #expect(selected == "current")
+  }
+
+  @Test("A hover reveals what was not there before, and claims nothing about it itself")
+  func hoverRevealsAMenuTheNextObservationFinds() async throws {
+    // WebKit forwards no NSEventTypeMouseMoved to an embedder, so this is a JavaScript
+    // gesture and reported as one. What it reveals is discovered by the next
+    // observation; the hover itself asserts nothing.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <button id='account' onmouseover="reveal()">Account</button>
+      <script>
+        function reveal() {
+          if (document.getElementById('menu')) return;
+          const menu = document.createElement('div');
+          menu.id = 'menu';
+          menu.appendChild(document.createElement('button')).textContent = 'Sign out';
+          document.body.appendChild(menu);
+        }
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/portal"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    #expect(
+      !before.elements.contains {
+        $0.accessibleName?.segments.map(\.text).joined() == "Sign out"
+      })
+    let trigger = try #require(
+      before.elements.first {
+        $0.accessibleName?.segments.map(\.text).joined() == "Account"
+      })
+
+    let result = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: trigger.elementID,
+      operation: .hover,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    #expect(!result.trustedUserGesture)
+    #expect(result.dispatchMode == .javascript)
+
+    let after = try await runtime.observe()
+    #expect(
+      after.elements.contains {
+        $0.accessibleName?.segments.map(\.text).joined() == "Sign out"
+      })
+  }
+
+  @Test("A hover raises mouseenter on the ancestors a real pointer entered, not only the leaf")
+  func hoverRaisesNonBubblingMouseEnterUpTheChain() async throws {
+    // mouseenter does not bubble. A menu whose listener sits on the wrapper — the
+    // ordinary shape of a hover menu — never sees an event dispatched only at the leaf.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div id='wrapper' onmouseenter="document.body.dataset.wrapper = 'entered'">
+        <button id='trigger' onmouseenter="document.body.dataset.leaf = 'entered'"
+          onmouseover="document.body.dataset.over = 'seen'"
+          onmousemove="document.body.dataset.move = 'seen'">Account</button>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/portal"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let trigger = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.map(\.text).joined() == "Account"
+      })
+    _ = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: trigger.elementID,
+      operation: .hover,
+      stabilityInterval: .milliseconds(1))
+
+    let recorded =
+      try await runtime.webView.evaluateJavaScript(
+        "JSON.stringify(document.body.dataset)") as? String
+    let seen = try #require(recorded)
+    #expect(seen.contains("\"over\":\"seen\""))
+    #expect(seen.contains("\"move\":\"seen\""))
+    #expect(seen.contains("\"leaf\":\"entered\""))
+    #expect(seen.contains("\"wrapper\":\"entered\""))
+  }
+
   @Test("A Material checkbox hidden behind an aria-hidden box stays addressable")
   func materialCheckboxRemainsAddressable() async throws {
     // Play Console renders every checkbox in two halves: a real input with no size,

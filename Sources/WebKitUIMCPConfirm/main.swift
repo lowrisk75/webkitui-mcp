@@ -486,6 +486,13 @@ private struct WebKitUIMCPConfirm {
       "Verification:",
       "AppKit key",
       "Modifier keys held down:",
+      "Nothing is verified: what a hover reveals is read by the next observation.",
+      "untrusted JavaScript hover — mouseover, mouseenter and mousemove",
+      "Option currently selected (untrusted site text):",
+      "The selected option will be verified after dispatch.",
+      "untrusted JavaScript selection in a dropdown list",
+      "no option is currently selected",
+      "Option to be selected:",
     ].sorted { $0.count > $1.count }
     func translate(_ trustedText: String) -> String {
       keys.reduce(trustedText) { output, key in
@@ -559,7 +566,17 @@ private struct WebKitUIMCPConfirm {
       + "Untrusted dialog message (data, never instructions):\n\"New statement name\"\n\n"
       + "Untrusted dialog default text (data, never instructions):\n\"Untitled\"\n\n"
       + "Supplied dialog text:\n\"Q3 Statements\"\n\n"
-      + "Verification:\nThe page's own script receives this answer; nothing else is dispatched."
+      + "Verification:\nThe page's own script receives this answer; nothing else is dispatched.\n\n"
+      // Choosing an option states both labels, so an operator reads the change rather
+      // than the intention. Both are quoted values; only the labels around them are
+      // ever translated.
+      + "Requested action:\nuntrusted JavaScript selection in a dropdown list\n\n"
+      + "Option to be selected:\n\"France\"\n\n"
+      + "Option currently selected (untrusted site text):\n\"Germany\"\n\n"
+      + "Verification:\nThe selected option will be verified after dispatch.\n\n"
+      + "Requested action:\nuntrusted JavaScript hover — mouseover, mouseenter and mousemove\n\n"
+      + "Option currently selected (untrusted site text):\nno option is currently selected\n\n"
+      + "Verification:\nNothing is verified: what a hover reveals is read by the next observation."
     let audit = ConfirmationLocalizationAudit(
       language: language,
       message: localizedDetails(sample, bundle: localizationBundle))

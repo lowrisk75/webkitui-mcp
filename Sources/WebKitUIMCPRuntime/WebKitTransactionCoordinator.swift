@@ -187,7 +187,10 @@ public final class WebKitTransactionCoordinator {
       .javaScriptDialogValueRequired, .javaScriptDialogValueUnsupported,
       // A key that cannot be mapped, or a chord this app's own menu claims, is refused
       // while the keyboard is still idle. Nothing reached the page.
-      .keyCodeUnavailable, .keyChordReservedByApplicationMenu, .keyModifierChangesCharacter:
+      .keyCodeUnavailable, .keyChordReservedByApplicationMenu, .keyModifierChangesCharacter,
+      // An option label that names two options or none is refused while the control is
+      // still untouched, so nothing reached the page.
+      .optionLabelNotUnique:
       .notDispatched
     case .targetNotActionable, .nativeGestureReceiptUnavailable,
       .webContentProcessTerminated, .malformedInstrumentationResult, .noDocument,
@@ -200,7 +203,10 @@ public final class WebKitTransactionCoordinator {
       .unsupportedDownload, .downloadHTTPFailure, .downloadFailed,
       // The gesture landed — it is what opened the panel — and then the page stopped
       // running, so its effect is exactly as unknown as a dispatch that never verified.
-      .javaScriptDialogOpenedByAction:
+      .javaScriptDialogOpenedByAction,
+      // The selection was dispatched and the re-resolved control does not agree. The
+      // gesture landed; what it did is unknown, which is not the same as refused.
+      .selectedOptionMismatch:
       .unknown
     }
   }

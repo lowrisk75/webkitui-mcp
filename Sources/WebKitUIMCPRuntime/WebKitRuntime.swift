@@ -77,6 +77,15 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   /// alongside the character itself, so the event's characters and its modifier mask
   /// would contradict each other. Carries the chord.
   case keyModifierChangesCharacter(String)
+  /// The option label named none of the control's options, or more than one of them.
+  /// Carries how many it matched, which is the same shape `targetNotUnique` reports for
+  /// an address that settles on no single element: an option is addressed by what it
+  /// says, never by where it sits, so a tie is refused rather than broken by position.
+  case optionLabelNotUnique(Int)
+  /// The selection was dispatched and the freshly re-resolved control does not report
+  /// the requested option as selected. The gesture landed; its effect is unknown, so
+  /// this is indeterminate and never a failure to dispatch.
+  case selectedOptionMismatch
 }
 
 public enum AuthenticationUIClassification: String, Codable, Equatable, Sendable {
@@ -554,6 +563,13 @@ public enum WebKitActionOperation: Sendable {
   case pressKey(WebKitKeyPress)
   case blur
   case commitInput
+  /// Choose one of a `<select>`'s options by its exact visible label. Never by index:
+  /// an index is a structural fact, and a list that re-renders one row shorter would
+  /// silently select something else.
+  case selectOption(ProvenancedText)
+  /// Move the pointer onto a control, as far as an embedder can. See `performSource`
+  /// for what a JavaScript pointer cannot do that a real one can.
+  case hover
 }
 
 public enum WebKitActionDispatchMode: String, Codable, Equatable, Sendable {
@@ -1539,6 +1555,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     case .commitInput:
       operationName = "commit_input"
       value = nil
+    case .selectOption(let provenancedLabel):
+      // A `<select>` carrying a card type or a security question is as sensitive as a
+      // text field carrying the same thing, and the rule is already written.
+      guard !target.sensitive else { throw WebKitRuntimeError.sensitiveInputRequiresHuman }
+      operationName = "select_option"
+      value = provenancedLabel.segments.map(\.text).joined()
+    case .hover:
+      operationName = "hover"
+      value = nil
+    }
+
+    // Ambiguity is refused before the gesture, not resolved after it. The count is
+    // reported for the same reason `targetNotUnique` reports one: a client told only
+    // "no" goes looking for a second option that may not exist.
+    if operationName == "select_option", let label = value {
+      let survey = try await surveySelectedOption(
+        criteria: criteria, physicalIdentity: target.physicalIdentity,
+        expectedCandidateCount: target.observedCandidateCount, label: label,
+        alreadyDispatched: false)
+      guard survey.matchingOptionCount == 1 else {
+        throw WebKitRuntimeError.optionLabelNotUnique(survey.matchingOptionCount ?? 0)
+      }
     }
 
     armNavigationActor(.agentAction)
@@ -1642,6 +1680,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     guard candidate.actionable, candidate.dispatched else {
       throw WebKitRuntimeError.targetNotActionable
+    }
+    // Verified against a control resolved again from scratch, not against the handle
+    // held before the gesture: a framework that replaces its `<select>` on change would
+    // otherwise have its old node confirm a selection the live one never made. Exactly
+    // what `fill` does with its exact value, one layer down.
+    if operationName == "select_option", let label = value {
+      let survey = try await surveySelectedOption(
+        criteria: criteria, physicalIdentity: physicalIdentityHint,
+        expectedCandidateCount: expectedCandidateCount, label: label,
+        alreadyDispatched: true)
+      guard survey.selectedOptionMatchesRequest == true else {
+        throw WebKitRuntimeError.selectedOptionMismatch
+      }
     }
     let result = WebKitActionResult(
       elementID: elementID,
@@ -3197,6 +3248,67 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     arguments["modifiers"] = WebKitKeyModifier.displayOrder.filter(modifiers.contains)
       .map(\.rawValue)
     return try await actionScript(source: Self.performSource, arguments: arguments)
+  }
+
+  /// Resolves the control again from its own criteria and reads what its options say.
+  /// Used twice for one selection — once to refuse an ambiguous label before anything is
+  /// dispatched, once afterwards to verify what a freshly re-resolved control now
+  /// reports as selected — because both questions are about the live control rather than
+  /// about a handle that may already have been replaced.
+  ///
+  /// It runs through the dialog race like the dispatch itself: a `change` handler that
+  /// opens a panel suspends the page, and a script waiting on a suspended page never
+  /// returns.
+  private func surveySelectedOption(
+    criteria: [[String: String]],
+    physicalIdentity: String,
+    expectedCandidateCount: Int,
+    label: String,
+    alreadyDispatched: Bool
+  ) async throws -> RawActionResolution {
+    let race = try await dispatchRacingJavaScriptDialog { [self] in
+      try await actionScript(
+        source: Self.selectedOptionSurveySource,
+        arguments: [
+          "criteria": criteria,
+          "physicalIdentity": physicalIdentity,
+          "expectedCandidateCount": expectedCandidateCount,
+          "label": label,
+        ])
+    }
+    let survey: RawActionResolution
+    switch race {
+    case .resolved(let resolution):
+      survey = resolution
+    case .interruptedByDialog(let dialog):
+      // Before dispatch nothing has been sent, so this is a panel that was already in
+      // the page's way. After dispatch the gesture landed and the page then stopped
+      // running, which is the same uncertainty the dispatch path reports.
+      throw alreadyDispatched
+        ? WebKitRuntimeError.javaScriptDialogOpenedByAction(
+          kind: dialog.kind.rawValue, dialogID: dialog.dialogID)
+        : WebKitRuntimeError.javaScriptDialogPending(
+          kind: dialog.kind.rawValue, dialogID: dialog.dialogID)
+    }
+    if alreadyDispatched {
+      // A control that no longer resolves uniquely cannot confirm anything, and saying
+      // "not unique" here would claim nothing was dispatched when something was.
+      guard survey.count == 1 else { throw WebKitRuntimeError.selectedOptionMismatch }
+      return survey
+    }
+    guard survey.count == 1, let candidate = survey.candidate else {
+      if survey.count == 0 { throw WebKitRuntimeError.targetNotFound(survey.eliminatedBy ?? []) }
+      throw WebKitRuntimeError.targetNotUnique(
+        survey.count, pinned: survey.pinnedState ?? "not_requested")
+    }
+    guard survey.matchingOptionCount != nil else {
+      throw WebKitRuntimeError.operationUnsupportedForControl(
+        role: candidate.role ?? "control",
+        alternative:
+          "select_option addresses a native <select> and its <option> labels. A custom "
+          + "combobox is driven by clicking it open and pressing the arrow keys.")
+    }
+    return survey
   }
 
   private func resolveAndPerformNativeClick(
@@ -5602,8 +5714,88 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         element.dispatchEvent(new Event('change', { bubbles: true }));
         candidate.trustedUserGesture = trusted;
         candidate.dispatched = true;
+      } else if (candidate.actionable && operation === 'select_option') {
+        // By label, never by index. The label is collapsed exactly as the observation
+        // collapses the one it published, so the two cannot disagree about whitespace.
+        const wanted = collapse(value);
+        const options = Array.from(element.options ?? []);
+        const chosen = options.filter(option => collapse(option.textContent) === wanted);
+        if (chosen.length === 1) {
+          const option = chosen[0];
+          const setter =
+            Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+          if (setter) setter.call(element, option.value); else element.value = option.value;
+          // Two options may carry the same value attribute under different labels, and
+          // assigning the value would then land on the first of them. Select the option
+          // that was actually named.
+          if (element.selectedOptions[0] !== option) {
+            for (const other of options) other.selected = other === option;
+          }
+          // What a real selection raises, in the order it raises it, both bubbling. A
+          // site listens for one of these and nothing else; without them the property
+          // is right and the page has not been told.
+          element.dispatchEvent(new Event('input', { bubbles: true }));
+          element.dispatchEvent(new Event('change', { bubbles: true }));
+          // Assigning a property is not a user gesture and never claims to be one.
+          candidate.trustedUserGesture = false;
+          candidate.dispatched = true;
+        }
+      } else if (candidate.actionable && operation === 'hover') {
+        // WebKit forwards no NSEventTypeMouseMoved to an embedder, so this is the only
+        // route there is. It has a real limit: CSS `:hover` is driven by WebKit's own
+        // pointer state, which a synthesised MouseEvent does not move, so a menu that
+        // opens purely through a `:hover` rule will not open. A menu opened by a
+        // mouseover, mouseenter or mousemove listener — the ordinary shape of one that
+        // has to work on a touch screen too — will.
+        const box = surface.getBoundingClientRect();
+        const view = element.ownerDocument?.defaultView ?? window;
+        const pointer = {
+          bubbles: true, cancelable: true, composed: true, view,
+          clientX: box.left + box.width / 2, clientY: box.top + box.height / 2
+        };
+        surface.dispatchEvent(new MouseEvent('mouseover', pointer));
+        // mouseenter neither bubbles nor cancels. A real pointer entering raises it on
+        // every element it entered, outermost first, so a wrapper holding the listener —
+        // which is where a hover menu usually keeps it — never sees one dispatched at
+        // the leaf alone.
+        const entered = [];
+        for (let cursor = surface; cursor && entered.length < 32; cursor = composedParent(cursor)) {
+          entered.push(cursor);
+        }
+        for (const node of entered.reverse()) {
+          node.dispatchEvent(
+            new MouseEvent('mouseenter', { ...pointer, bubbles: false, cancelable: false }));
+        }
+        surface.dispatchEvent(new MouseEvent('mousemove', pointer));
+        candidate.trustedUserGesture = false;
+        candidate.dispatched = true;
       }
       return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
+      """
+
+  /// Reads a `<select>`'s own options: how many carry the requested label, and what it
+  /// currently reports as selected. The label is collapsed the way the observation
+  /// collapses every label it publishes, so what a caller reads and what this compares
+  /// are the same string.
+  private static let selectedOptionSurveySource =
+    actionHelpers + """
+      const element = matches.length === 1 ? matches[0] : null;
+      if (!element) return JSON.stringify({ count: matches.length, candidate: null, eliminatedBy, pinnedState });
+      const candidate = describe(element);
+      candidate.role = roleOf(element);
+      if (!(element instanceof HTMLSelectElement)) {
+        return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
+      }
+      const wanted = collapse(label);
+      const options = Array.from(element.options);
+      const selected = collapse(
+        Array.from(element.selectedOptions).map(option => option.textContent).join(' '));
+      return JSON.stringify({
+        count: matches.length, candidate, eliminatedBy, pinnedState,
+        matchingOptionCount:
+          options.filter(option => collapse(option.textContent) === wanted).length,
+        selectedOptionMatchesRequest: selected === wanted
+      });
       """
 
   private static let nativeGestureMessageHandlerName = "webkituiNativeGesture"
@@ -5931,10 +6123,18 @@ private struct RawActionResolution: Decodable, Sendable {
   let candidate: RawActionCandidate?
   let eliminatedBy: [String]?
   let pinnedState: String?
+  /// How many of a `<select>`'s options carry the requested label. `nil` everywhere the
+  /// resolved element is not a `<select>`, and from every script that is not the option
+  /// survey.
+  var matchingOptionCount: Int?
+  /// Whether the freshly re-resolved control now reports the requested label as its
+  /// selection. Only the option survey answers it.
+  var selectedOptionMatchesRequest: Bool?
 }
 
 private struct RawActionCandidate: Decodable, Sendable {
   let physicalIdentity: String
+  var role: String?
   let boundingBox: ObservedBoundingBox
   let geometryStable: Bool
   let actionable: Bool

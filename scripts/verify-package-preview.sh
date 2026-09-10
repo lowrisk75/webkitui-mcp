@@ -169,6 +169,8 @@ jq -e '
   and (.message | contains("Requested action:"))
   and (.message | contains("Verification:"))
   and (.message | contains("Modifier keys held down:"))
+  and (.message | contains("Option to be selected:"))
+  and (.message | contains("Option currently selected (untrusted site text):"))
 ' "$scratch_dir/confirmation-en.json" >/dev/null
 jq -e '
   .language == "fr"
@@ -181,6 +183,8 @@ jq -e '
   and (.message | contains("touche AppKit \"ArrowRight\""))
   and (.message | contains("remplir avec la valeur exacte"))
   and (.message | contains("\"Requested action: Save\""))
+  and (.message | contains("Option à sélectionner :"))
+  and (.message | contains("survol JavaScript non fiable"))
 ' "$scratch_dir/confirmation-fr.json" >/dev/null
 sed -n 's/^"\([^"]*\)"[[:space:]]*=.*/\1/p' \
   "$app/Contents/Resources/en.lproj/Localizable.strings" \

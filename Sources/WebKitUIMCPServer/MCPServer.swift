@@ -177,6 +177,9 @@ public final class WebKitMCPServer {
     case pressKey(WebKitKeyPress)
     case blur
     case commitInput
+    /// The exact visible label of the option to choose, already collapsed.
+    case selectOption(String)
+    case hover
 
     var name: String {
       switch self {
@@ -186,6 +189,8 @@ public final class WebKitMCPServer {
       case .pressKey: "press_key"
       case .blur: "blur"
       case .commitInput: "commit_input"
+      case .selectOption: "select_option"
+      case .hover: "hover"
       }
     }
 
@@ -195,13 +200,20 @@ public final class WebKitMCPServer {
       case .submit: .submitForm
       case .fill: .fillForm
       case .pressKey, .blur, .commitInput: .fillForm
+      // Choosing an option writes a form control's value, which is what fill_form
+      // names. A hover writes nothing and submits nothing; it is a pointer landing on
+      // an element, so it is scoped exactly as a click is.
+      case .selectOption: .fillForm
+      case .hover: .activateElement
       }
     }
 
     var inputProvenance: Set<ProvenanceClass> {
       switch self {
-      case .fill: [.modelGenerated]
-      case .click, .submit, .pressKey, .blur, .commitInput: []
+      // The option label is model-supplied text that has to match the page's own, so it
+      // carries provenance for the same reason a filled value does.
+      case .fill, .selectOption: [.modelGenerated]
+      case .click, .submit, .pressKey, .blur, .commitInput, .hover: []
       }
     }
   }
@@ -2546,9 +2558,46 @@ public final class WebKitMCPServer {
         }
         operation = operationName == "blur" ? .blur : .commitInput
         postcondition = try parseActPostcondition(arguments["postcondition"])
+      case "select_option":
+        guard !target.sensitive else {
+          throw MCPServerError.invalidParams("sensitive fields require local human handoff")
+        }
+        let tag = target.tag.segments.map(\.text).joined().lowercased()
+        guard tag == "select" else {
+          throw MCPServerError.invalidParams(
+            "select_option addresses a native select; drive a custom combobox with click "
+              + "and press_key")
+        }
+        guard arguments["postcondition"] == nil else {
+          throw MCPServerError.invalidParams(
+            "select_option uses an exact selected-option postcondition")
+        }
+        // The label is collapsed here, once, so the string the operator approves, the
+        // string matched against the page's options and the string the postcondition
+        // digests are all the same string. The observation collapses every label it
+        // publishes by the same rule.
+        let label = Self.collapsedOptionLabel(try requireString(arguments["value"], named: "value"))
+        guard !label.isEmpty, label.count <= 512 else {
+          throw MCPServerError.invalidParams(
+            "select_option value must be an option's visible label, 1 to 512 characters")
+        }
+        operation = .selectOption(label)
+        postcondition = nil
+      case "hover":
+        guard arguments["value"] == nil, arguments["key"] == nil else {
+          throw MCPServerError.invalidParams("hover accepts neither value nor key")
+        }
+        // Alone among the acting operations, hover has no postcondition of its own.
+        // What a hover reveals is revealed to the next observation, and inventing a
+        // postcondition here would be this server claiming to have seen it.
+        operation = .hover
+        postcondition =
+          arguments["postcondition"] == nil
+          ? nil : try parseActPostcondition(arguments["postcondition"])
       default:
         throw MCPServerError.invalidParams(
-          "operation must be click, fill, submit, press_key, blur, or commit_input")
+          "operation must be click, fill, submit, select_option, hover, press_key, blur, or "
+            + "commit_input")
       }
       let idempotencyKey = try requireString(
         arguments["idempotency_key"], named: "idempotency_key")
@@ -2602,6 +2651,7 @@ public final class WebKitMCPServer {
             .prefix(120)),
         submissionDestination: target.submissionDestination,
         postcondition: postcondition,
+        selectedOption: target.selectedOption?.segments.map(\.text).joined(),
         dispatchMode: dispatchMode
       )
     }
@@ -2690,6 +2740,14 @@ public final class WebKitMCPServer {
       output.unicodeScalars.append(scalar)
     }
     return output
+  }
+
+  /// An option's visible label, collapsed the way the observation collapses every label
+  /// it publishes: runs of whitespace become one space, ends trimmed. Applied once, at
+  /// the boundary, so the approved text, the matched text and the verified text are one
+  /// string rather than three that can disagree about a newline in the markup.
+  static func collapsedOptionLabel(_ value: String) -> String {
+    value.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
   }
 
   /// Field readback preserves layout whitespace, so only CRLF/CR line endings and
@@ -3000,6 +3058,7 @@ public final class WebKitMCPServer {
     label: String,
     submissionDestination: String?,
     postcondition: ActPostcondition?,
+    selectedOption: String?,
     dispatchMode: WebKitActionDispatchMode
   ) -> String {
     let action: String
@@ -3027,11 +3086,23 @@ public final class WebKitMCPServer {
       action = "explicitly blur the target"
     case .commitInput:
       action = "dispatch change and blur to commit the target input"
+    case .selectOption:
+      action = "untrusted JavaScript selection in a dropdown list"
+    case .hover:
+      action = "untrusted JavaScript hover — mouseover, mouseenter and mousemove"
     }
-    let verification =
-      postcondition.map {
-        "Required postcondition (untrusted model data):\n\(jsonQuoted($0.confirmationDescription))"
-      } ?? "Exact target value will be verified after dispatch."
+    let verification: String
+    if let postcondition {
+      verification =
+        "Required postcondition (untrusted model data):\n"
+        + jsonQuoted(postcondition.confirmationDescription)
+    } else if case .hover = operation {
+      verification = "Nothing is verified: what a hover reveals is read by the next observation."
+    } else if case .selectOption = operation {
+      verification = "The selected option will be verified after dispatch."
+    } else {
+      verification = "Exact target value will be verified after dispatch."
+    }
     // Above the site-authored label, so the operator reads what the control does before
     // reading what it calls itself.
     let destinationLine = SubmissionDestination.line(
@@ -3048,8 +3119,21 @@ public final class WebKitMCPServer {
     } else {
       heldModifiers = ""
     }
+    // "Choose France" does not say whether that is a change or a no-op. Both labels are
+    // stated, each on its own line under its own label, because a phrase carrying a
+    // value cannot itself be a translatable string.
+    let selection: String
+    if case .selectOption(let label) = operation {
+      selection =
+        "Option to be selected:\n\(jsonQuoted(label))\n\n"
+        + "Option currently selected (untrusted site text):\n"
+        + (selectedOption.map { jsonQuoted($0) } ?? "no option is currently selected") + "\n\n"
+    } else {
+      selection = ""
+    }
     return "Requested action:\n\(action)\n\n"
       + heldModifiers
+      + selection
       + "Current page:\n\(jsonQuoted(currentURL))\n\n"
       + destination
       + "Target ID:\n\(elementID)\n\n"
@@ -3561,6 +3645,48 @@ public final class WebKitMCPServer {
         expiresAt: Date().addingTimeInterval(15)
       ))
     defer { Task { await capabilityAuthority.revoke(capability) } }
+    // A hover with no postcondition cannot go through the write ledger, and this is not
+    // a shortcut around it. The ledger's whole job is proving a write landed, and it
+    // refuses a plan whose postcondition already holds at prepare time — which any
+    // postcondition a hover could invent for itself does, because a hover changes nothing
+    // about the control it lands on. What it reveals belongs to the next observation, so
+    // that is what this returns: the confirmed gesture, its honest trust state, and no
+    // claim at all. A caller that does know what should appear supplies a postcondition
+    // and the call goes through the ledger exactly like every other action.
+    if case .hover = pending.operation, pending.postcondition == nil {
+      let decision = await capabilityAuthority.evaluate(
+        CapabilityRequest(
+          action: pending.operation.capability,
+          liveOrigin: origin,
+          inputProvenance: pending.operation.inputProvenance
+        ),
+        using: capability,
+        now: Date())
+      guard decision == .allowed else {
+        throw MCPServerError.invalidParams("capability denied for this origin")
+      }
+      let action = try await runtime.perform(
+        observationID: pending.observation.observationID,
+        elementID: pending.elementID,
+        operation: .hover,
+        dispatchMode: .javascript)
+      return try toolResult(
+        structured: .object([
+          "action": try .encoded(action),
+          "confirmation_mode": .string(pending.approvalMode),
+          "dispatch_mode": .string(action.dispatchMode.rawValue),
+          "confirmation_and_dispatch_are_distinct": .bool(true),
+          // WebKit forwards no mouse-moved event to an embedder, so a hover is a
+          // JavaScript gesture and can never be anything else. It is reported as one.
+          "trusted_gesture_state": .string(
+            action.trustedUserGesture ? "trusted" : "untrusted_javascript"),
+          "verification": .string("not_attempted"),
+          "action_replayed": .bool(false),
+          "safe_next_step": .string(
+            "Observe again. A hover verifies nothing of its own: whatever it revealed is "
+              + "in the next observation, not in this result."),
+        ]), modern: modern)
+    }
     let runtimeOperation: WebKitActionOperation
     let preconditions: [ObservationPredicate]
     let postconditions: [ObservationPredicate]
@@ -3574,13 +3700,36 @@ public final class WebKitMCPServer {
       case .pressKey(let press): runtimeOperation = .pressKey(press)
       case .blur: runtimeOperation = .blur
       case .commitInput: runtimeOperation = .commitInput
-      case .fill:
+      case .fill, .selectOption, .hover:
         throw MCPServerError.invalidParams("internal operation mismatch")
       }
       preconditions = [
         .entryPresent(.init(frameID: "main", elementID: pending.elementID, field: "@tag"))
       ]
       postconditions = [postcondition.predicate(for: target)]
+    case .hover:
+      guard let postcondition = pending.postcondition else {
+        throw MCPServerError.invalidParams("internal operation mismatch")
+      }
+      runtimeOperation = .hover
+      preconditions = [
+        .entryPresent(.init(frameID: "main", elementID: pending.elementID, field: "@tag"))
+      ]
+      postconditions = [postcondition.predicate(for: target)]
+    case .selectOption(let label):
+      runtimeOperation = .selectOption(
+        try ProvenancedText(
+          text: label,
+          source: ProvenanceSource(classification: .modelGenerated)
+        ))
+      let selectedOptionKey = ObservationFieldKey(
+        frameID: "main", elementID: target.locatorRecipe.semanticIdentity,
+        field: "@selected_option")
+      preconditions = [.entryPresent(selectedOptionKey)]
+      postconditions = [
+        .entryTextDigest(
+          selectedOptionKey, ObservationPredicate.textDigest(of: label))
+      ]
     case .fill(let value):
       runtimeOperation = .fill(
         try ProvenancedText(
@@ -4371,7 +4520,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_act",
       description:
-        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, one bounded key press with optional modifiers, blur, or input commit, or answer the one JavaScript dialog a page is suspended on (dialog_accept, dialog_dismiss, dialog_accept_value). A pending dialog blocks every other operation until it is answered, and is never answered automatically. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and exact human confirmation. approval_mode=native uses server-owned confirmation and AppKit dispatch for click/submit/fill/key operations, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. UI state does not prove backend commit.",
+        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, select_option, hover, one bounded key press with optional modifiers, blur, or input commit, or answer the one JavaScript dialog a page is suspended on (dialog_accept, dialog_dismiss, dialog_accept_value). A pending dialog blocks every other operation until it is answered, and is never answered automatically. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and exact human confirmation. approval_mode=native uses server-owned confirmation and AppKit dispatch for click/submit/fill/key operations, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. select_option and hover are always JavaScript-dispatched and always report trusted_gesture_state=untrusted_javascript: a select popup is an NSMenu running its own event loop that a synthetic NSEvent never reaches, and WebKit forwards no mouse-moved event to an embedder at all. select_option names an option by its exact visible label, never an index, and a label matching no option or more than one is refused before dispatch. hover raises mouseover, mouseenter and mousemove; it cannot move WebKit\'s own pointer state, so a menu that opens purely through a CSS :hover rule will not open, and hover carries no postcondition of its own — call browser_observe to read what it revealed. UI state does not prove backend commit.",
       properties: sessionSchemaProperties.merging([
         "observation_id": .object(["type": .string("string")]),
         "element_id": .object(["type": .string("string")]),
@@ -4379,6 +4528,7 @@ public final class WebKitMCPServer {
           "type": .string("string"),
           "enum": .array([
             .string("click"), .string("fill"), .string("submit"),
+            .string("select_option"), .string("hover"),
             .string("press_key"), .string("blur"), .string("commit_input"),
             .string("dialog_accept"), .string("dialog_dismiss"),
             .string("dialog_accept_value"),
@@ -4393,7 +4543,7 @@ public final class WebKitMCPServer {
         "value": .object([
           "type": .string("string"), "maxLength": .int(4_096),
           "description": .string(
-            "Required for fill (empty string clears the control) and for dialog_accept_value (the exact string handed to the page's prompt)."
+            "Required for fill (empty string clears the control), for select_option (the exact visible label of the option to choose, never an index) and for dialog_accept_value (the exact string handed to the page\'s prompt)."
           ),
         ]),
         "key": pressKeySchema,
@@ -4460,7 +4610,9 @@ public final class WebKitMCPServer {
           .object([
             "if": .object([
               "properties": .object([
-                "operation": .object(["const": .string("fill")])
+                "operation": .object([
+                  "enum": .array([.string("fill"), .string("select_option")])
+                ])
               ]),
               "required": .array([.string("operation")]),
             ]),

@@ -139,6 +139,13 @@
 "Confirmations asked for in the last minute:" = "Confirmations demandées durant la dernière minute :";
 "AppKit key" = "touche AppKit";
 "Modifier keys held down:" = "Touches de modification maintenues :";
+"Option to be selected:" = "Option à sélectionner :";
+"Option currently selected (untrusted site text):" = "Option actuellement sélectionnée (texte non fiable du site) :";
+"no option is currently selected" = "aucune option n’est actuellement sélectionnée";
+"untrusted JavaScript selection in a dropdown list" = "sélection JavaScript non fiable dans une liste déroulante";
+"The selected option will be verified after dispatch." = "L’option sélectionnée sera vérifiée après l’envoi.";
+"untrusted JavaScript hover — mouseover, mouseenter and mousemove" = "survol JavaScript non fiable — mouseover, mouseenter et mousemove";
+"Nothing is verified: what a hover reveals is read by the next observation." = "Rien n’est vérifié : ce qu’un survol révèle se lit à la prochaine observation.";
 "Force render" = "Forcer le rendu";
 "Re-establish the layout viewport when a page reports nothing observable." = "Rétablit la zone de mise en page quand une page ne renvoie rien d’observable.";
 "Clear browsing data" = "Effacer les données de navigation";
