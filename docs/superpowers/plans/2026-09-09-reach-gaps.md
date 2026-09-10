@@ -194,6 +194,57 @@ Media capture and geolocation permission requests reach unimplemented public del
 
 ---
 
+## Task 7: Say how to get control back
+
+Reported from a real session on 2026-09-10, and the report's own diagnosis was wrong
+in a way that proves the defect. A user was sent to `idmsa.apple.com`, correctly
+received `authentication_origin_requires_human_handoff`, logged in by hand, and the
+native window said "Ready — Waiting for Agent". Every subsequent call then returned the
+bare string `humanControlActive`, forever, and the agent concluded the login was
+unrecoverable and would have to be redone.
+
+**The way back exists.** `browser_session { operation: "handoff" }` called a second time
+from `human_step_completed` reaches `requestAgentResume()` — the same operation both
+hands control over and takes it back. What does not exist is any way for a caller to
+learn that. The three token-based operations (`handoff_start`, `handoff_status`,
+`handoff_resume`) all demand a `resume_token` that this path never issues, so an agent
+reading the schema concludes, reasonably, that there is no route home.
+
+`humanControlActive` is thrown as a bare runtime enum case and never mapped to a
+structured error. Fourteen other errors in this server carry a `remediation`. This one
+governs a state a human has to be talked out of, and it carries nothing.
+
+**Contract:**
+- `humanControlActive` reaches the client as a structured error naming the current
+  control state and the exact operation that reclaims control, including the session id
+  to pass. It says whether a confirmation will be shown.
+- The message distinguishes the two states behind that one error: a human is still
+  working (`human_controlled`), versus a human has finished and the agent has simply not
+  asked for control back (`human_step_completed`). Only the second is the caller's move,
+  and the caller must be told which it is facing.
+- `browser_session operation=status` says the same thing in the same words, since that is
+  where an agent looks next. `handoff_active: false` while control is human-held is
+  itself misleading and must be reconciled or explained.
+- The tool description for `handoff` says it both hands over and reclaims. Today it reads
+  as one-way.
+- Nothing here resumes automatically. The human's completed step is still returned only
+  when the agent asks and the confirmation is accepted, exactly as now.
+
+**Files:** `Sources/WebKitUIMCPServer/MCPServer.swift`, its tool descriptions, and
+`Tests/WebKitUIMCPServerTests/MCPServerTests.swift`.
+
+**Tests that must exist and must have been seen to fail first:**
+- [ ] Acting while a human is in control returns a structured error naming
+  `operation: "handoff"` and the session id, not a bare string.
+- [ ] The error distinguishes `human_controlled` from `human_step_completed`.
+- [ ] The remediation the error names actually works: following it from
+  `human_step_completed` returns control and a fresh observation.
+- [ ] `status` and the error agree about what the caller should do.
+
+- [ ] **Commit.**
+
+---
+
 ## Not in this plan
 
 **Cross-origin iframe content — the largest gap, and it needs its own plan.** The gap matrix ranks it first: hosted payment fields, CAPTCHAs and embedded SSO widgets are counted and never read, which removes a checkout — the flagship task — from what the product can do.
