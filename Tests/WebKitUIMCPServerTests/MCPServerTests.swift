@@ -3160,6 +3160,183 @@ struct MCPServerTests {
     #expect(confirmationPresenter.requests.count == 2)
   }
 
+  /// The incident this suite exists for: a person logged in by hand, the native window
+  /// said "Ready — Waiting for Agent", and every later call came back as the bare string
+  /// `humanControlActive`. The route home existed the whole time and nothing said so.
+  @Test("A call blocked by human control names the route back, not a bare enum case")
+  func humanControlActiveNamesTheRouteBack() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Continue</button>",
+      baseURL: URL(string: "https://example.test/login"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: ConfirmationPresenterStub(responses: []))
+    let sessionID = handle.rawValue.uuidString
+    _ = try await legacyToolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff"), "session_id": .string(sessionID)])
+    #expect(runtime.interactionControlState() == .humanControlled)
+
+    let blocked = try await legacyToolCall(
+      server, id: 2, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    let result = try object(blocked["result"])
+    #expect(result["isError"] == .bool(true))
+    let structured = try object(result["structuredContent"])
+    #expect(structured["code"] == .string("human_control_active"))
+    #expect(structured["session_id"] == .string(sessionID))
+    #expect(structured["recovery_tool"] == .string("browser_session"))
+    #expect(structured["recovery_operation"] == .string("handoff"))
+    #expect(structured["recovery_session_id"] == .string(sessionID))
+    #expect(structured["recovery_confirmation_required"] == .bool(true))
+    #expect(structured["resume_token_required"] == .bool(false))
+    let text = try string(try object(try array(result["content"])[0])["text"])
+    #expect(text != "humanControlActive")
+    #expect(text.contains("operation=handoff"))
+  }
+
+  @Test("The human-control error tells a person still working apart from a finished step")
+  func humanControlActiveDistinguishesTheTwoStates() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Continue</button>",
+      baseURL: URL(string: "https://example.test/login"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: ConfirmationPresenterStub(responses: []))
+    let sessionID = handle.rawValue.uuidString
+    _ = try await legacyToolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff"), "session_id": .string(sessionID)])
+
+    let waiting = try await legacyToolCall(
+      server, id: 2, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    let waitingError = try object(try object(waiting["result"])["structuredContent"])
+    #expect(waitingError["control_state"] == .string("human_controlled"))
+    #expect(waitingError["caller_action"] == .string("wait_for_human"))
+    #expect(waitingError["wait_only"] == .bool(true))
+    #expect(waitingError["control_available"] == .bool(false))
+    #expect(waitingError["human_step_completed"] == .bool(false))
+
+    try runtime.markHumanStepCompleted()
+    let completed = try await legacyToolCall(
+      server, id: 3, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    let completedError = try object(try object(completed["result"])["structuredContent"])
+    #expect(completedError["control_state"] == .string("human_step_completed"))
+    #expect(completedError["caller_action"] == .string("request_agent_resume"))
+    #expect(completedError["wait_only"] == .bool(false))
+    #expect(completedError["control_available"] == .bool(true))
+    #expect(completedError["human_step_completed"] == .bool(true))
+    #expect(waitingError["remediation"] != completedError["remediation"])
+  }
+
+  /// An error that names a cure nobody tested is the same defect in a new coat: this
+  /// reads the operation out of the payload and calls exactly that.
+  @Test("Following the remediation from human_step_completed returns control and an observation")
+  func remediationFromHumanStepCompletedReturnsControl() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Signed in</title><button>Continue</button>",
+      baseURL: URL(string: "https://example.test/account"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let confirmationPresenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: confirmationPresenter)
+    let sessionID = handle.rawValue.uuidString
+    _ = try await legacyToolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff"), "session_id": .string(sessionID)])
+    try runtime.markHumanStepCompleted()
+
+    let blocked = try await legacyToolCall(
+      server, id: 2, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    let structured = try object(try object(blocked["result"])["structuredContent"])
+    let recoveryTool = try string(structured["recovery_tool"])
+    let recoveryOperation = try string(structured["recovery_operation"])
+    let recoverySession = try string(structured["recovery_session_id"])
+
+    let reclaimed = try await legacyToolCall(
+      server, id: 3, name: recoveryTool,
+      arguments: [
+        "operation": .string(recoveryOperation),
+        "session_id": .string(recoverySession),
+      ])
+    let reclaimedResult = try object(reclaimed["result"])
+    #expect(reclaimedResult["isError"] == nil)
+    let reclaimedStructured = try object(reclaimedResult["structuredContent"])
+    #expect(reclaimedStructured["control_state"] == .string("freshly_reobserved"))
+    #expect(reclaimedStructured["observation"] != nil)
+    // The gate is intact: control came back because a native confirmation was accepted.
+    #expect(confirmationPresenter.requests.count == 1)
+    #expect(runtime.interactionControlState() == .freshlyReobserved)
+
+    let observed = try await legacyToolCall(
+      server, id: 4, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    let observedResult = try object(observed["result"])
+    #expect(observedResult["isError"] == nil)
+    let observation = try object(observedResult["structuredContent"])
+    #expect(try string(observation["observationID"]).isEmpty == false)
+    let reclaimedObservation = try object(reclaimedStructured["observation"])
+    #expect(
+      try string(observation["observationID"])
+        != (try string(reclaimedObservation["observationID"])))
+  }
+
+  @Test("Session status and the human-control error tell the caller the same thing")
+  func statusAgreesWithTheHumanControlError() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Continue</button>",
+      baseURL: URL(string: "https://example.test/login"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: ConfirmationPresenterStub(responses: []))
+    let sessionID = handle.rawValue.uuidString
+    _ = try await legacyToolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff"), "session_id": .string(sessionID)])
+    try runtime.markHumanStepCompleted()
+
+    let blocked = try await legacyToolCall(
+      server, id: 2, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    let error = try object(try object(blocked["result"])["structuredContent"])
+
+    let status = try await legacyToolCall(
+      server, id: 3, name: "browser_session",
+      arguments: ["operation": .string("status"), "session_id": .string(sessionID)])
+    let statusContent = try object(try object(status["result"])["structuredContent"])
+    #expect(statusContent["control_state"] == error["control_state"])
+    #expect(statusContent["caller_action"] == error["caller_action"])
+    #expect(statusContent["remediation"] == error["remediation"])
+    #expect(statusContent["recovery_operation"] == error["recovery_operation"])
+    #expect(statusContent["recovery_session_id"] == error["recovery_session_id"])
+    #expect(statusContent["control_available"] == error["control_available"])
+    // handoff_active read as "there is no handoff to resume" is what sent the reported
+    // session home. It now means control is held for a person; the narrow token fact
+    // keeps its own field.
+    #expect(statusContent["human_control_active"] == .bool(true))
+    #expect(statusContent["handoff_active"] == .bool(true))
+    #expect(statusContent["handoff_resume_token_active"] == .bool(false))
+  }
+
   @Test("Human handoff keeps control until an accepted resume and returns a fresh observation")
   func humanHandoff() async throws {
     let registry = try WebKitSessionRegistry()

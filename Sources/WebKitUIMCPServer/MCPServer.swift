@@ -786,6 +786,13 @@ public final class WebKitMCPServer {
           "wait_only": .bool(true),
         ]),
         modern: modern)
+    } catch WebKitRuntimeError.humanControlActive {
+      // Reported from a real session: a person logged in by hand, the native window said
+      // it was waiting for the agent, and every later call came back as the bare string
+      // `humanControlActive`. The route home — the same `handoff` operation, called
+      // again — existed the whole time, and nothing in the payload said so, so the agent
+      // concluded the login had to be redone.
+      return try humanControlActiveError(arguments: arguments, modern: modern)
     } catch WebKitRuntimeError.javaScriptDialogPending(let kind, let dialogID) {
       return try structuredToolError(
         structured: .object([
@@ -918,6 +925,125 @@ public final class WebKitMCPServer {
       ]),
       modern: modern
     )
+  }
+
+  /// What a caller should do about the current holder of this session, written once and
+  /// returned in the same words by the error a blocked call raises and by
+  /// `operation=status`, because status is where an agent looks next.
+  ///
+  /// Two states hide behind one runtime error and they call for opposite reactions:
+  /// under `human_controlled` a person is still working and the caller must wait, while
+  /// under `human_step_completed` the person has finished and the only thing missing is
+  /// the agent's own request for control back. Only the second is the caller's move.
+  private func controlGuidance(
+    state: InteractionControlState,
+    session: WebKitSessionHandle
+  ) -> [String: JSONValue] {
+    let sessionID = session.rawValue.uuidString
+    let reclaim =
+      "Call browser_session operation=handoff with session_id \(sessionID): the operation "
+      + "that hands control to a person is the same one that takes it back. It shows one "
+      + "local confirmation and, once that is accepted, returns agent control with a fresh "
+      + "observation. Nothing resumes on its own. No resume_token is involved — "
+      + "handoff_start, handoff_status and handoff_resume are a separate token route, and "
+      + "this handoff never issued a token."
+    let message: String
+    let remediation: String
+    let callerAction: String
+    let controlAvailable: Bool
+    let humanHeld: Bool
+    let waitOnly: Bool
+    var recoveryTool: JSONValue = .string("browser_session")
+    var recoveryOperation: JSONValue = .string("handoff")
+    var confirmationRequired = true
+    switch state {
+    case .handoffRequested:
+      message =
+        "This session is being handed to a person and the window is still being presented, "
+        + "so nothing was dispatched."
+      remediation =
+        "Wait for control_state to reach human_controlled and then human_step_completed, "
+        + "which is what the person selecting Done — Return Control in the native window "
+        + "sets. Then: " + reclaim
+      callerAction = "wait_for_human"
+      controlAvailable = false
+      humanHeld = true
+      waitOnly = true
+    case .humanControlled:
+      message =
+        "A person still holds this session in the local WebKit window, so nothing was "
+        + "dispatched."
+      remediation =
+        "Wait. Poll browser_session operation=status until control_state is "
+        + "human_step_completed, which is what the person selecting Done — Return Control "
+        + "in the native window sets. Then: " + reclaim
+      callerAction = "wait_for_human"
+      controlAvailable = false
+      humanHeld = true
+      waitOnly = true
+    case .humanStepCompleted:
+      message =
+        "The person finished their step in the local WebKit window. Control is still held "
+        + "for them because the agent has not asked for it back, so nothing was dispatched."
+      remediation = reclaim
+      callerAction = "request_agent_resume"
+      controlAvailable = true
+      humanHeld = true
+      waitOnly = false
+    case .resumeRequested:
+      message =
+        "Agent resume was requested and this session has not been observed since, so "
+        + "nothing was dispatched."
+      remediation =
+        "Call browser_observe with session_id \(sessionID) to take the fresh observation "
+        + "the resume requires; acting resumes once that observation exists."
+      callerAction = "observe"
+      controlAvailable = true
+      humanHeld = false
+      waitOnly = false
+      recoveryTool = .string("browser_observe")
+      recoveryOperation = .null
+      confirmationRequired = false
+    case .agentControlled, .freshlyReobserved:
+      message = "The agent holds this session."
+      remediation = "None. Agent control is active."
+      callerAction = "none"
+      controlAvailable = true
+      humanHeld = false
+      waitOnly = false
+      recoveryTool = .null
+      recoveryOperation = .null
+      confirmationRequired = false
+    }
+    return [
+      "control_state": .string(state.rawValue),
+      "human_control_active": .bool(humanHeld),
+      "human_step_completed": .bool(state == .humanStepCompleted),
+      "control_available": .bool(controlAvailable),
+      "wait_only": .bool(waitOnly),
+      "caller_action": .string(callerAction),
+      "recovery_tool": recoveryTool,
+      "recovery_operation": recoveryOperation,
+      "recovery_session_id": .string(sessionID),
+      "recovery_confirmation_required": .bool(confirmationRequired),
+      "resume_token_required": .bool(false),
+      "message": .string(message),
+      "remediation": .string(remediation),
+    ]
+  }
+
+  private func humanControlActiveError(
+    arguments: [String: JSONValue], modern: Bool
+  ) throws -> JSONValue {
+    let handle = try sessionHandle(arguments)
+    let runtime = try registry.runtime(for: handle)
+    var structured = controlGuidance(
+      state: runtime.interactionControlState(), session: handle)
+    structured["status"] = .string("human_control_active")
+    structured["code"] = .string("human_control_active")
+    structured["session_id"] = .string(handle.rawValue.uuidString)
+    structured["dispatched"] = .bool(false)
+    return try structuredToolError(structured: .object(structured), modern: modern)
   }
 
   private func sessionTool(
@@ -1071,11 +1197,21 @@ public final class WebKitMCPServer {
       let status = try registry.status(handle)
       var statusObject = try requireObject(.encoded(status), named: "session status")
       statusObject["session_id"] = .string(handle.rawValue.uuidString)
-      statusObject["control_state"] = .string(status.controlState.rawValue)
-      statusObject["human_step_completed"] = .bool(
-        status.controlState == .humanStepCompleted)
+      // The same sentences the blocked call itself returns. An agent that reads
+      // `humanControlActive` looks here next, and what it found here used to contradict
+      // what it had just been told.
+      for (key, value) in controlGuidance(state: status.controlState, session: handle) {
+        statusObject[key] = value
+      }
       statusObject["selected_backend"] = .string(sessionBackends[handle] ?? "native_webkit")
+      // `handoff_active` meant only "an unexpired handoff_start token exists", which read
+      // as "there is no handoff to resume" while a person was holding the window — the
+      // reading that convinced a reported session it was unrecoverable. It now means what
+      // it says: control is held for a person. The narrow token fact keeps its own field.
       statusObject["handoff_active"] = .bool(
+        statusObject["human_control_active"] == .bool(true)
+          || registry.hasActiveHandoffResumeCapability(for: handle))
+      statusObject["handoff_resume_token_active"] = .bool(
         registry.hasActiveHandoffResumeCapability(for: handle))
       statusObject["handoff_owner_state"] = .string(
         try registry.handoffOwnershipState(for: handle, owner: clientAuthorityID))
@@ -4480,7 +4616,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_session",
       description:
-        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. Profile listing never exposes cookies or credentials.",
+        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
