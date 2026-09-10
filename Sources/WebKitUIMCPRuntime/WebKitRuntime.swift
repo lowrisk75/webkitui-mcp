@@ -674,6 +674,35 @@ public struct WebKitSubmissionFacts: Codable, Equatable, Sendable {
   public let fieldNames: [String]
 }
 
+/// One new window the page asked for and did not get.
+///
+/// The refusal of a second tab is the product's, and it stands: one session holds one
+/// exclusive host lease, which is what lets an approval name an unambiguous page. What
+/// changes is that the request is now said out loud. Until this existed, WebKit's own
+/// default for an unimplemented `createWebViewWith` applied — the navigation was
+/// cancelled and nil handed back — so a `target="_blank"` invoice link did nothing and
+/// reported nothing, and a click on one was indistinguishable from a click that missed.
+///
+/// Nothing here is followed. The agent reads `destination` and asks for it through
+/// `browser_navigate`, which puts it back under the ordinary exact-destination
+/// confirmation.
+public struct WebKitSuppressedNewWindowRequest: Codable, Equatable, Sendable {
+  /// Origin and path with every query value redacted, sanitised exactly as an observed
+  /// `href` is: a statement or invoice link routinely carries a session token in its
+  /// query, and this record is exported. Nil when the address is not http(s), or carries
+  /// embedded credentials, or has no readable origin.
+  public let destination: String?
+  /// WebKit's own classification of what asked: `link_activated` for `target="_blank"`,
+  /// `other` for a `window.open()` call.
+  public let navigationType: String
+  public let sourceFrameIsMain: Bool
+  public let monotonicNanoseconds: UInt64
+  // `WKWindowFeatures` is deliberately absent. Every field on it — the width, height and
+  // toolbar flags the page asked for — is site-authored data, and recording it would put
+  // unlabelled site content in an exported receipt to no benefit: the product refuses the
+  // window whatever shape the site wanted it in.
+}
+
 /// AppKit keeps titled windows on a display, which would drag the offscreen layout
 /// host back into view. Declining the constraint is what lets the window stay parked
 /// outside every screen while WebKit still lays its content out.
@@ -731,6 +760,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var pendingSubmissionDecision: SubmissionApproval.Decision?
   private var webContentTerminationEvents: [WebContentTerminationEvent] = []
   private var lastCommittedHTTPURL: URL?
+  /// The most recent new window the page asked for and was refused. Held until the
+  /// document is replaced, so an observation can say a request is still outstanding, and
+  /// cleared in `resetForNavigation()` so a later action cannot inherit an older page's
+  /// suppression.
+  private var suppressedNewWindowRequest: WebKitSuppressedNewWindowRequest?
   private var authenticationUIClassification: AuthenticationUIClassification?
   private var restrictedAuthenticationFrameOrigin: String?
   private var restrictedWebAuthnOrigin: String?
@@ -1639,6 +1673,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   public func latestSubmissionFacts() -> WebKitSubmissionFacts? { submissionFacts }
 
+  /// The new window this document asked for and did not get, if one is still outstanding.
+  public func outstandingSuppressedNewWindowRequest() -> WebKitSuppressedNewWindowRequest? {
+    suppressedNewWindowRequest
+  }
+
   /// Hosts this session's data store holds credential-bearing storage for, so a
   /// client can tell whether a profile is already signed in to an origin. Host names
   /// only: cookie names, values, paths and expiries never leave the store.
@@ -1671,6 +1710,36 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// Discards an armed selection that no panel consumed.
   public func disarmUploadSelection() {
     armedUploadSelection = nil
+  }
+
+  /// WebKit asks for a web view here for `window.open()` and for a `target="_blank"`
+  /// activation, and gets nil — exactly what it got when this method did not exist. The
+  /// refusal is the product's own and it stands: one session holds one exclusive host
+  /// lease, and a second tab would make an approval ambiguous about which page it named.
+  ///
+  /// What changed is the silence. An unimplemented `createWebViewWith` makes WebKit cancel
+  /// the navigation and report nothing at all, so an invoice or statement link on a
+  /// billing portal — overwhelmingly `target="_blank"` — did nothing, and a click on one
+  /// was indistinguishable from a click that missed (measured 2026-09-09).
+  ///
+  /// Nothing is followed from here, now or later. The destination is recorded, sanitised,
+  /// and reported; reaching it costs the caller a `browser_navigate` of its own, under the
+  /// same exact-destination confirmation as every other navigation.
+  public func webView(
+    _ webView: WKWebView,
+    createWebViewWith configuration: WKWebViewConfiguration,
+    for navigationAction: WKNavigationAction,
+    windowFeatures: WKWindowFeatures
+  ) -> WKWebView? {
+    // `windowFeatures` is read and dropped. Its every field is site-authored, and this
+    // record is exported: the shape a page wanted for a window it is not getting is not
+    // worth carrying unlabelled site content for.
+    suppressedNewWindowRequest = WebKitSuppressedNewWindowRequest(
+      destination: Self.sanitizedNewWindowDestination(navigationAction.request.url),
+      navigationType: Self.navigationTypeName(navigationAction.navigationType),
+      sourceFrameIsMain: navigationAction.sourceFrame.isMainFrame,
+      monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    return nil
   }
 
   // WebKit treats a panel whose delegate method is not implemented as dismissed, so
@@ -3484,6 +3553,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     restrictedAuthenticationFrameOrigin = nil
     restrictedWebAuthnOrigin = nil
     pendingCrossOriginNavigationRequest = nil
+    // A suppressed window belongs to the document that asked for it. Left standing, a
+    // later unrelated action would report a suppression that happened on a page nobody is
+    // looking at any more.
+    suppressedNewWindowRequest = nil
     // An approval is granted for the page the operator was shown. A fresh navigation
     // supersedes it, and a decision nothing consumed must not cancel a later navigation.
     approvedSubmissionOrigin = nil
@@ -3515,16 +3588,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       actor = .unattributed
     }
     armedNavigationActor = nil
-    let navigationType: String
-    switch action.navigationType {
-    case .linkActivated: navigationType = "link_activated"
-    case .formSubmitted: navigationType = "form_submitted"
-    case .backForward: navigationType = "back_forward"
-    case .reload: navigationType = "reload"
-    case .formResubmitted: navigationType = "form_resubmitted"
-    case .other: navigationType = "other"
-    @unknown default: navigationType = "unknown"
-    }
+    let navigationType = Self.navigationTypeName(action.navigationType)
     navigationAuditEvents.append(
       WebKitNavigationAuditEvent(
         fromOrigin: webView.url.flatMap(Self.sanitizedOrigin(for:)),
@@ -3562,6 +3626,42 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private func agentSafeURLString(_ url: URL?) -> String? {
     guard let url else { return nil }
     return Self.agentSafeURL(url)
+  }
+
+  /// WebKit's own classification of what asked for a navigation. Shared by the
+  /// main-frame navigation audit and the suppressed-new-window record so the two never
+  /// disagree about what to call a link activation.
+  private static func navigationTypeName(_ type: WKNavigationType) -> String {
+    switch type {
+    case .linkActivated: "link_activated"
+    case .formSubmitted: "form_submitted"
+    case .backForward: "back_forward"
+    case .reload: "reload"
+    case .formResubmitted: "form_resubmitted"
+    case .other: "other"
+    @unknown default: "unknown"
+    }
+  }
+
+  /// The address a refused new window was for, sanitised by the same rule the injected
+  /// observation applies to an `href`: http(s) only, no embedded credentials, origin and
+  /// path kept, the first sixteen query names kept with every value replaced, the fragment
+  /// dropped, the whole string bounded. A `target="_blank"` invoice link routinely carries
+  /// a session token in its query, and this string is exported with the action result.
+  private static func sanitizedNewWindowDestination(_ url: URL?) -> String? {
+    guard let url,
+      let origin = sanitizedOrigin(for: url),
+      (url.user(percentEncoded: false) ?? "").isEmpty,
+      (url.password(percentEncoded: false) ?? "").isEmpty
+    else { return nil }
+    let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    let names = (components?.percentEncodedQueryItems ?? []).prefix(16).map(\.name)
+    let query =
+      names.isEmpty
+      ? ""
+      : "?" + names.map { "\($0.prefix(64))=<redacted>" }.joined(separator: "&")
+    let path = url.path(percentEncoded: true)
+    return String("\(origin)\(path.isEmpty ? "/" : path)\(query)".prefix(512))
   }
 
   private static func sanitizedOrigin(for url: URL) -> String? {

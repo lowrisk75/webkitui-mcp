@@ -625,6 +625,139 @@ struct WebKitRuntimeTests {
     #expect(event.toOrigin == "https://fixture.invalid")
   }
 
+  @Test("A click on a target=_blank link is refused out loud, with its destination")
+  func blankTargetClickIsRecordedRatherThanSwallowed() async throws {
+    // WebKit's default for an unimplemented `createWebViewWith` is to cancel the
+    // navigation and hand back nil, so this click used to do nothing and say nothing:
+    // indistinguishable from a click that missed its target. The refusal stands; the
+    // silence does not.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<a href='/invoice-0421.pdf' target='_blank'>Download invoice</a>",
+      baseURL: URL(string: "https://fixture.invalid/billing"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    #expect(runtime.outstandingSuppressedNewWindowRequest() == nil)
+
+    let observation = try await runtime.observe()
+    let link = try #require(observation.elements.first)
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: link.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+
+    for _ in 0..<fixtureSettlementPolls
+    where runtime.outstandingSuppressedNewWindowRequest() == nil {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    let suppressed = try #require(runtime.outstandingSuppressedNewWindowRequest())
+    #expect(suppressed.destination == "https://fixture.invalid/invoice-0421.pdf")
+    #expect(suppressed.navigationType == "link_activated")
+    #expect(suppressed.sourceFrameIsMain)
+  }
+
+  @Test("A suppressed destination keeps its origin and path and redacts every query value")
+  func suppressedDestinationRedactsQueryValues() async throws {
+    // A statement link on a billing portal carries a session token in its query, and
+    // this record is exported. The rule is the observation's own: origin and path kept,
+    // query names kept, values replaced.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<a href='/statements/2026-09.pdf?session=s3cr3t-token&id=0421#page2' target='_blank'>"
+        + "September statement</a>",
+      baseURL: URL(string: "https://fixture.invalid/billing"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let link = try #require(observation.elements.first)
+    _ = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: link.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+
+    for _ in 0..<fixtureSettlementPolls
+    where runtime.outstandingSuppressedNewWindowRequest() == nil {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    let destination = try #require(runtime.outstandingSuppressedNewWindowRequest()?.destination)
+    #expect(
+      destination
+        == "https://fixture.invalid/statements/2026-09.pdf?session=<redacted>&id=<redacted>")
+    #expect(!destination.contains("s3cr3t-token"))
+    #expect(!destination.contains("page2"))
+  }
+
+  @Test("A suppressed new window is never followed, and never outlives its document")
+  func suppressedNewWindowIsNeverFollowed() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<a href='/invoice-0421.pdf?token=abc' target='_blank'>Download invoice</a>",
+      baseURL: URL(string: "https://fixture.invalid/billing"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let link = try #require(observation.elements.first)
+    let auditEventsBefore = runtime.navigationAuditEventCount()
+    _ = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: link.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+
+    for _ in 0..<fixtureSettlementPolls
+    where runtime.outstandingSuppressedNewWindowRequest() == nil {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    _ = try #require(runtime.outstandingSuppressedNewWindowRequest())
+    // Settle well past the point a followed navigation would have committed.
+    try await Task.sleep(for: .milliseconds(300))
+    // Nothing was followed: the page the operator approved is still the page loaded, and
+    // no main-frame navigation was ever decided. Reaching the destination costs a
+    // separate `browser_navigate`, under its own exact-destination confirmation.
+    #expect(runtime.webView.url?.absoluteString == "https://fixture.invalid/billing")
+    #expect(runtime.navigationAuditEventCount() == auditEventsBefore)
+    let after = try await runtime.observe()
+    #expect(after.url.segments.first?.text == "https://fixture.invalid/billing")
+
+    // A record nothing cleared would let a later action report a suppression that
+    // happened on a page nobody is looking at any more.
+    _ = try await runtime.loadHTML(
+      "<p>Statement archive</p>",
+      baseURL: URL(string: "https://fixture.invalid/archive"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    #expect(runtime.outstandingSuppressedNewWindowRequest() == nil)
+  }
+
+  @Test("A window.open() the page makes on its own is recorded the same way")
+  func scriptedWindowOpenIsRecorded() async throws {
+    // The second call path. A click on `target="_blank"` arrives inside a dispatched
+    // action; page script can ask at any time, with no gesture of the agent's behind it.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <p>Billing</p>
+      <script>
+        function openStatement() {
+          window.open('/report.pdf?token=s3cr3t-token', '_blank');
+        }
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/billing"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    #expect(runtime.outstandingSuppressedNewWindowRequest() == nil)
+
+    _ = try await runtime.webView.evaluateJavaScript("openStatement(); 1")
+    for _ in 0..<fixtureSettlementPolls
+    where runtime.outstandingSuppressedNewWindowRequest() == nil {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    let suppressed = try #require(runtime.outstandingSuppressedNewWindowRequest())
+    #expect(suppressed.destination == "https://fixture.invalid/report.pdf?token=<redacted>")
+    #expect(suppressed.navigationType == "other")
+    #expect(suppressed.sourceFrameIsMain)
+    #expect(runtime.webView.url?.absoluteString == "https://fixture.invalid/billing")
+  }
+
   @Test("A Material checkbox hidden behind an aria-hidden box stays addressable")
   func materialCheckboxRemainsAddressable() async throws {
     // Play Console renders every checkbox in two halves: a real input with no size,

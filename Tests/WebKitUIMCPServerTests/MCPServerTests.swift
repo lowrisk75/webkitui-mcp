@@ -1821,6 +1821,90 @@ struct MCPServerTests {
     #expect(try object(replay["error"])["code"] == .int(-32602))
   }
 
+  @Test("A click WebKit asked a new window for says so, and the next action does not inherit it")
+  func suppressedNewWindowIsReportedOnceToTheCaller() async throws {
+    // An invoice link on a billing portal is overwhelmingly `target="_blank"`. WebKit's
+    // default for an unimplemented `createWebViewWith` cancelled it silently, so this
+    // click reported nothing and could not be told from one that missed. The window is
+    // still refused — one session, one page an approval can name — but the request is
+    // now reported, with its query values redacted, and reaching it costs a separate
+    // `browser_navigate` under the ordinary exact-destination confirmation.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <a href='/invoice-0421.pdf?session=s3cr3t-token' target='_blank'>Download invoice</a>
+      <button onclick="document.title='Noted'">Mark as read</button>
+      """,
+      baseURL: URL(string: "https://example.test/billing"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let server = WebKitMCPServer(registry: registry)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    #expect(observation["suppressed_new_window"] == .null)
+    let link = try object(try array(observation["elements"]).first)
+    let linkArguments: [String: JSONValue] = [
+      "session_id": .string(handle.rawValue.uuidString),
+      "observation_id": .string(try string(observation["observationID"])),
+      "element_id": .string(try string(link["elementID"])),
+      "operation": .string("click"),
+      "approval_mode": .string("mcp"),
+      "idempotency_key": .string("suppressed-window-invoice"),
+      "postcondition": .object([
+        "type": .string("url_equals"),
+        "value": .string("https://example.test/invoice-0421.pdf"),
+      ]),
+    ]
+    let prepared = try await toolCall(
+      server, id: 2, name: "browser_act", arguments: linkArguments)
+    let completed = try await roundTripToolCall(
+      server, id: 3, name: "browser_act", arguments: linkArguments,
+      requestState: try string(try object(prepared["result"])["requestState"]),
+      action: "accept", confirm: true)
+    let structured = try object(try object(completed["result"])["structuredContent"])
+    let suppressed = try object(structured["new_window_suppressed"])
+    #expect(
+      suppressed["destination"]
+        == .string("https://example.test/invoice-0421.pdf?session=<redacted>"))
+    #expect(suppressed["navigationType"] == .string("link_activated"))
+    #expect(try string(structured["safe_next_step"]).contains("browser_navigate"))
+    // Nothing was followed: the page an approval was granted on is still the page loaded.
+    #expect(runtime.webView.url?.absoluteString == "https://example.test/billing")
+
+    let afterCall = try await toolCall(
+      server, id: 4, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let after = try object(try object(afterCall["result"])["structuredContent"])
+    #expect(try object(after["suppressed_new_window"])["destination"] != .null)
+
+    // The trap this must not fall into: a record nothing scopes to its own dispatch, so
+    // the next unrelated action reports a suppression that already happened.
+    let button = try object(try array(after["elements"]).last)
+    let buttonArguments: [String: JSONValue] = [
+      "session_id": .string(handle.rawValue.uuidString),
+      "observation_id": .string(try string(after["observationID"])),
+      "element_id": .string(try string(button["elementID"])),
+      "operation": .string("click"),
+      "approval_mode": .string("mcp"),
+      "idempotency_key": .string("suppressed-window-mark-as-read"),
+      "postcondition": .object([
+        "type": .string("title_equals"), "value": .string("Noted"),
+      ]),
+    ]
+    let secondPrepared = try await toolCall(
+      server, id: 5, name: "browser_act", arguments: buttonArguments)
+    let secondCompleted = try await roundTripToolCall(
+      server, id: 6, name: "browser_act", arguments: buttonArguments,
+      requestState: try string(try object(secondPrepared["result"])["requestState"]),
+      action: "accept", confirm: true)
+    let secondStructured = try object(
+      try object(secondCompleted["result"])["structuredContent"])
+    #expect(secondStructured["new_window_suppressed"] == nil)
+  }
+
   @Test("A confirmed fill verifies the same semantic target's exact value")
   func verifiedFill() async throws {
     let registry = try WebKitSessionRegistry()

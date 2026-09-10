@@ -606,6 +606,12 @@ public final class WebKitMCPServer {
           try runtime.latestNavigationAuditEvent()
           .map(JSONValue.encoded) ?? .null
         observed["navigation_event_count"] = .int(Int64(runtime.navigationAuditEventCount()))
+        // A new window this document asked for and did not get. Page script can ask at any
+        // time, with no action of the caller's behind it, so the standing request belongs
+        // in the observation as well as in the result of whichever action provoked one.
+        observed["suppressed_new_window"] =
+          try runtime.outstandingSuppressedNewWindowRequest()
+          .map(JSONValue.encoded) ?? .null
         // A computed property is not encoded, and this one must never be missing from
         // the payload a caller actually reads.
         observed["observation_is_partial"] = .bool(observation.isPartial)
@@ -3660,6 +3666,21 @@ public final class WebKitMCPServer {
       structured["file_upload_receipt"] = try .encoded(uploadReceipt)
       structured["file_selected"] = .bool(true)
       structured["upload_accepted_by_site"] = .string("requires_postcondition")
+    }
+    // Scoped to this dispatch by the same floor the upload receipt uses: a suppressed
+    // window stands until the document is replaced, so without the floor a later
+    // unrelated action would report a refusal that happened before it ran.
+    if let suppressed = runtime.outstandingSuppressedNewWindowRequest(),
+      suppressed.monotonicNanoseconds >= dispatchFloorNanoseconds
+    {
+      structured["new_window_suppressed"] = try .encoded(suppressed)
+      structured["safe_next_step"] = .string(
+        "The page asked for a new window and was refused: this session holds one page, so "
+          + "that an approval names an unambiguous one. Nothing was followed. Read "
+          + "new_window_suppressed.destination — its query values are redacted — and, if "
+          + "you want it, call browser_navigate for the exact address you intend, which is "
+          + "confirmed like any other navigation."
+      )
     }
     if case .urlChangesFrom(let previousURL) = pending.postcondition,
       case .indeterminate = result.verification,
