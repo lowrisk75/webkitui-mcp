@@ -283,6 +283,48 @@ it, both test bundles.
 
 ---
 
+## Task 9: A sensitive control's selected label is a value too
+
+`WebKitRuntime.swift:4936` gates the selected label on `withheldForInvisibility`, not on
+`sensitive`. So a `<select>` this product has decided is sensitive — whose `text` and
+`value` it withholds, and which `fill` and `select_option` both refuse — still publishes
+the label currently chosen in it.
+
+Found by the implementer of Task 8 in code Task 8 did not write, and out of scope for
+that task, which is why it is here. It predates all of today's work.
+
+The leak is small and real: a two-factor method selector, a reason-for-closure dropdown,
+a clinic's appointment-type list. The rule this product states is that a sensitive
+control's value does not leave the machine, and a selected label is that value in the one
+form a `<select>` has.
+
+**Contract:**
+- A sensitive `<select>` publishes no `selectedOption`, no `options` and no `optionCount`,
+  the same way it already publishes no `text` and no `value`.
+- It is still reported as an element, with its role, its accessible name and its
+  sensitivity, so an agent can see the control exists and ask a human to operate it.
+- `nil`, not empty: an empty list is a claim about the control, and the claim would be
+  false.
+- The selected-option postcondition on a sensitive control is refused rather than
+  silently unverifiable, and says why.
+- Check what else is gated on `withheldForInvisibility` where `sensitive` was meant. The
+  two conditions have been conflated once; a second site is likelier than not.
+
+**Files:** `Sources/WebKitUIMCPRuntime/WebKitRuntime.swift`, `Sources/WebKitUIMCPServer/MCPServer.swift`
+if the postcondition refusal needs it, both test bundles, and any documentation stating
+what a sensitive control withholds.
+
+**Tests that must exist and must have been seen to fail first:**
+- [ ] A sensitive select publishes no selected label, and the encoded payload does not
+  contain the fixture's chosen value anywhere.
+- [ ] The control is still present in the observation with its name and role.
+- [ ] A non-sensitive select is unaffected.
+- [ ] A selected-option postcondition on a sensitive control is refused with its reason.
+
+- [ ] **Commit.**
+
+---
+
 ## Not in this plan
 
 **Cross-origin iframe content — the largest gap, and it needs its own plan.** The gap matrix ranks it first: hosted payment fields, CAPTCHAs and embedded SSO widgets are counted and never read, which removes a checkout — the flagship task — from what the product can do.
