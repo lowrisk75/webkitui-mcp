@@ -14,7 +14,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Provenance attached to every serialized page string.
 - Observation-time privacy minimization: non-rendered controls are removed
   before bounding, sensitive/token-like fields never serialize values, and a
-  select exposes only its visible selected label.
+  sensitive select publishes neither its option labels nor how many it has.
 - Checkpoint-plus-delta observation history and Minimal Failure Set coverage metrics.
 - Optional local Ollama ranker with `think: false`, strict budgets, and deterministic fallback.
 - Transaction ledger with preconditions, exact post-conditions, idempotency keys, indeterminate outcomes, receipts, and reconciliation without replay.

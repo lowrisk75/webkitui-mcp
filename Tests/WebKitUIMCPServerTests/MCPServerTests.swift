@@ -2018,6 +2018,65 @@ struct MCPServerTests {
     #expect(shown.contains("\"Country\""))
   }
 
+  @Test("An option label read out of the observation is a label select_option accepts")
+  func publishedOptionLabelIsAcceptedBySelectOption() async throws {
+    // The two halves have to agree about whitespace. The observation collapses every
+    // label it publishes and `select_option` collapses the label it is given at the
+    // server boundary by the same rule; if either grew its own rule an agent would be
+    // copying a string out of one half that the other half then refuses. So this test
+    // never types a label — it reads one out of the payload and hands it straight back.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <label for='country'>Country</label>
+      <select id='country'>
+        <option value='de'>Germany</option>
+        <option value='fr'>France
+             (métropole)</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://example.test/checkout"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let country = try element(in: observation, named: "Country")
+    let published = try optionLabels(of: country)
+    // The markup wraps the label across a line; the published one is collapsed.
+    #expect(published == ["Germany", "France (métropole)"])
+    // Taken from the payload by position, not by matching text, so a label published
+    // in some other shape still reaches the writer and is refused there rather than
+    // being quietly skipped over here.
+    let wanted = try #require(published.last)
+
+    let selected = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(country["elementID"])),
+        "operation": .string("select_option"),
+        "value": .string(wanted),
+        "idempotency_key": .string("select-published-label-once"),
+      ])
+    let structured = try object(try object(selected["result"])["structuredContent"])
+    // Accepted, dispatched and verified against the control's own readback: the label
+    // the observation published is the label the writer takes.
+    #expect(try object(structured["verification"])["verified"] != nil)
+
+    let reobserved = try await toolCall(
+      server, id: 3, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let fresh = try object(try object(reobserved["result"])["structuredContent"])
+    let refreshed = try element(in: fresh, named: "Country")
+    #expect(try provenancedText(refreshed["selectedOption"]) == wanted)
+  }
+
   @Test("A confirmed fill verifies the same semantic target's exact value")
   func verifiedFill() async throws {
     let registry = try WebKitSessionRegistry()
@@ -4242,6 +4301,28 @@ struct MCPServerTests {
       if text == label { return try string(fields["elementID"]) }
     }
     throw TestError.wrongType
+  }
+
+  /// The whole observed element, not just its ID, for a test that reads the payload a
+  /// client reads rather than reaching past it into the runtime.
+  private func element(
+    in observation: [String: JSONValue], named label: String
+  ) throws -> [String: JSONValue] {
+    let wanted = try elementID(in: observation, named: label)
+    for element in try array(observation["elements"]) {
+      let fields = try object(element)
+      if try string(fields["elementID"]) == wanted { return fields }
+    }
+    throw TestError.wrongType
+  }
+
+  /// A provenanced string as a client reads it: the segments joined, nothing else.
+  private func provenancedText(_ value: JSONValue?) throws -> String {
+    try array(object(value)["segments"]).map { try string(object($0)["text"]) }.joined()
+  }
+
+  private func optionLabels(of element: [String: JSONValue]) throws -> [String] {
+    try array(element["options"]).map { try provenancedText(object($0)["label"]) }
   }
 
   /// Loads a page that is ready, then makes it wait on one JavaScript panel opened from

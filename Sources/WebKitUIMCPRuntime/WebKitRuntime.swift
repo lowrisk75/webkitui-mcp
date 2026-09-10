@@ -217,6 +217,23 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let checked: Bool?
   public let selected: Bool?
   public let selectedOption: ProvenancedText?
+  /// What a `<select>` will accept as an address. `select_option` names an option by its
+  /// exact visible label and never by an index, so an observation that publishes only
+  /// the selected one leaves an agent guessing the rest off the surrounding page — and a
+  /// guess that misses is refused correctly and uselessly.
+  ///
+  /// `nil`, and absent from the wire payload, for anything that is not a `<select>` whose
+  /// options are published — which is most of a page, and every byte of that absence was
+  /// measured against the one-mebibyte wire budget. `nil` rather than empty for a
+  /// sensitive select too: nothing published is not the same claim as a control with no
+  /// choices in it.
+  public let options: [ObservedOption]?
+  /// How many options the control actually has, before the bound.
+  public let optionCount: Int?
+  /// The published list is a prefix, not the whole control. Said out loud rather than
+  /// left to be inferred by comparing two numbers: an agent that reads a cut list as
+  /// complete concludes an option does not exist and gives up.
+  public let optionsTruncated: Bool?
   public let stateAttributes: [String: ProvenancedText]
   public let contextAnchors: [ObservedContextAnchor]
   public let stableAttributes: [String: ProvenancedText]
@@ -231,6 +248,22 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
 /// Why a control can or cannot be acted on, decided during observation so an agent
 /// never has to spend a failed dispatch to find out. `locatorQuality` answers whether
 /// the address is unique; it was read as whether the target can be clicked.
+/// One choice a `<select>` offers, in the order the control offers it. Site-authored,
+/// so the label carries the same provenance as every other page string.
+public struct ObservedOption: Codable, Equatable, Sendable {
+  public let label: ProvenancedText
+  public let selected: Bool
+  /// Marked, never dropped: an agent that cannot see a disabled option keeps asking for
+  /// it and keeps being refused.
+  public let disabled: Bool
+
+  public init(label: ProvenancedText, selected: Bool, disabled: Bool) {
+    self.label = label
+    self.selected = selected
+    self.disabled = disabled
+  }
+}
+
 public enum ObservedActionability: String, Codable, Equatable, Sendable {
   case actionable
   /// Laid out but collapsed to nothing. Reported because the only exit from a form can
@@ -981,6 +1014,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     )
   }
 
+  /// How many of a `<select>`'s options one observation publishes. A country list is 250
+  /// entries and a list of every timezone is more, and a payload that does not fit a
+  /// client is a payload that does not work — so the list is bounded like every other
+  /// list here, and `optionsTruncated` says when it cut one. Sized for the ordinary long
+  /// control — a month, a title, a quantity, a set of provinces — to arrive whole.
+  public static let maximumPublishedOptions = 64
+
   public func observe(
     maximumElements: Int = 200,
     elementOffset: Int = 0,
@@ -1007,6 +1047,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       "nameFilter": nameContains?.lowercased() ?? "",
       "elementOffset": elementOffset,
       "maximumFieldCharacters": maximumFieldCharacters,
+      "maximumOptions": Self.maximumPublishedOptions,
     ]
     func captureRawObservation() async throws -> RawObservation {
       guard
@@ -1106,6 +1147,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         selectedOption: try element.selectedOption.map {
           try ProvenancedText(text: $0, source: pageSource)
         },
+        options: try element.options.map { published in
+          try published.map {
+            ObservedOption(
+              label: try ProvenancedText(text: $0.label, source: pageSource),
+              selected: $0.selected,
+              disabled: $0.disabled)
+          }
+        },
+        optionCount: element.optionCount,
+        optionsTruncated: element.optionsTruncated,
         stateAttributes: try element.stateAttributes.mapValues {
           try ProvenancedText(text: $0, source: pageSource)
         },
@@ -4766,6 +4817,29 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         const selectedLabel = element instanceof HTMLSelectElement
           ? collapse(Array.from(element.selectedOptions).map(option => option.textContent).join(' '))
           : null;
+        // `select_option` addresses an option by its exact visible label, so the labels
+        // are published or the agent has to guess them from the surrounding page. Each
+        // one goes through bounded(), the same rule every other published label goes
+        // through, because the writer collapses the label it is given by that rule too:
+        // publish them collapsed any other way and the two halves disagree in silence.
+        // Nothing is published for a sensitive control, which is the rule `fill` and
+        // `select_option` already apply, nor for one whose value is withheld because
+        // nobody can see it.
+        const optionElements =
+          element instanceof HTMLSelectElement && !sensitive && !withheldForInvisibility
+            ? Array.from(element.options) : null;
+        const options = optionElements?.slice(0, maximumOptions).map(option => {
+          const group = option.parentElement;
+          return {
+            label: bounded(option.textContent) ?? '',
+            selected: Boolean(option.selected),
+            // A disabled optgroup disables every option inside it, and the IDL getter
+            // reflects only the option's own attribute. Read both, or a whole group
+            // reads as choosable and every request for one is refused.
+            disabled: Boolean(
+              option.disabled || (group instanceof HTMLOptGroupElement && group.disabled))
+          };
+        }) ?? null;
         const isEditableField = element instanceof HTMLInputElement
           || element instanceof HTMLTextAreaElement || element.isContentEditable;
         const characterCount = !sensitive && isEditableField
@@ -4860,6 +4934,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           checked,
           selected,
           selectedOption: withheldForInvisibility ? null : bounded(selectedLabel || null),
+          // Three keys a page of buttons never pays for: absent, not empty, wherever
+          // there is no list to publish.
+          options,
+          optionCount: optionElements ? optionElements.length : null,
+          optionsTruncated: options ? optionElements.length > options.length : null,
           stateAttributes: Object.fromEntries(
             Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
           contextAnchors: sensitive ? [] : contextAnchorsOf(element),
@@ -6065,6 +6144,9 @@ private struct RawElement: Decodable {
   let checked: Bool?
   let selected: Bool?
   let selectedOption: String?
+  let options: [RawOption]?
+  let optionCount: Int?
+  let optionsTruncated: Bool?
   let stateAttributes: [String: String]
   let contextAnchors: [RawContextAnchor]
   let domPath: String
@@ -6072,6 +6154,12 @@ private struct RawElement: Decodable {
   let visible: Bool
   let actionability: String
   let boundingBox: ObservedBoundingBox
+}
+
+private struct RawOption: Decodable {
+  let label: String
+  let selected: Bool
+  let disabled: Bool
 }
 
 private struct RawContextAnchor: Decodable {

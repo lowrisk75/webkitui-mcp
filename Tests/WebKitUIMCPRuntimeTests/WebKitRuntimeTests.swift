@@ -937,6 +937,131 @@ struct WebKitRuntimeTests {
     #expect(seen.contains("\"wrapper\":\"entered\""))
   }
 
+  @Test("A select publishes the labels an agent is allowed to choose, and which one holds")
+  func selectPublishesItsSelectableOptionLabels() async throws {
+    // `select_option` addresses an option by its exact visible label, so an observation
+    // that publishes only the selected one leaves the agent guessing the rest from
+    // surrounding page text. A guess that misses is refused correctly and uselessly.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='country'>Country</label>
+      <select id='country'>
+        <option value='de'>Germany</option>
+        <option value='fr' selected>France</option>
+        <option value='it'>Italy</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/checkout"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+
+    let published = try #require(control.options)
+    #expect(
+      published.map { $0.label.segments.map(\.text).joined() } == ["Germany", "France", "Italy"])
+    #expect(control.optionCount == 3)
+    #expect(control.optionsTruncated == false)
+    // The whole list is published and the selected one stays identifiable within it.
+    #expect(
+      published.filter(\.selected).map { $0.label.segments.map(\.text).joined() } == ["France"])
+    #expect(control.selectedOption?.segments.map(\.text).joined() == "France")
+    // Site-authored text, labelled as such, on the same path as every other page string.
+    #expect(
+      published.allSatisfy {
+        $0.label.segments.allSatisfy {
+          $0.sources.contains { $0.classification == .firstPartySiteContent }
+        }
+      })
+  }
+
+  @Test("A list longer than the bound is cut to it and says that it was cut")
+  func longOptionListIsTruncatedAndSaysSo() async throws {
+    // A country list is 250 entries and a timezone list is more; neither may spend a
+    // client's whole context. An agent told nothing about the cut concludes an option
+    // does not exist and gives up, so the cut is reported rather than inferred.
+    let runtime = WebKitRuntime()
+    let optionCount = WebKitRuntime.maximumPublishedOptions + 6
+    let options = (1...optionCount)
+      .map { "<option value='z\($0)'>Zone \($0)</option>" }
+      .joined()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='zone'>Time zone</label>
+      <select id='zone'>\(options)</select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/settings"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+
+    let published = try #require(control.options)
+    #expect(published.count == WebKitRuntime.maximumPublishedOptions)
+    #expect(control.optionCount == optionCount)
+    #expect(control.optionsTruncated == true)
+    #expect(published.first?.label.segments.map(\.text).joined() == "Zone 1")
+  }
+
+  @Test("A disabled option is published and marked, never quietly dropped")
+  func disabledOptionIsMarkedRatherThanOmitted() async throws {
+    // An agent that cannot see a disabled option keeps asking for it and keeps being
+    // refused. A disabled optgroup disables its children too, and the IDL `disabled`
+    // getter reflects only the option's own attribute, so the group is read as well.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='plan'>Plan</label>
+      <select id='plan'>
+        <option value='free'>Free</option>
+        <option value='pro' disabled>Pro (sold out)</option>
+        <optgroup label='Enterprise' disabled>
+          <option value='ent'>Enterprise</option>
+        </optgroup>
+      </select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/pricing"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+
+    let marked = try #require(control.options).map {
+      ($0.label.segments.map(\.text).joined(), $0.disabled)
+    }
+    #expect(marked.count == 3)
+    #expect(marked.first { $0.0 == "Free" }?.1 == false)
+    #expect(marked.first { $0.0 == "Pro (sold out)" }?.1 == true)
+    #expect(marked.first { $0.0 == "Enterprise" }?.1 == true)
+  }
+
+  @Test("A sensitive select publishes no options at all")
+  func sensitiveSelectPublishesNoOptions() async throws {
+    // The rule `fill` and `select_option` already apply: a sensitive control is not
+    // written by an agent and its contents are not read out to one either.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='delivery'>Where to send the one-time code</label>
+      <select id='delivery' name='one-time-code'>
+        <option value='sms'>Text message to 07…41</option>
+        <option value='mail'>Email to k…@example.com</option>
+      </select>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/verify"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let control = try #require(
+      observation.elements.first { $0.tag.segments.map(\.text).joined() == "select" })
+
+    #expect(control.sensitive)
+    // Absent, not empty: an empty list is a claim about the control, and this makes none.
+    #expect(control.options == nil)
+    #expect(control.optionCount == nil)
+    #expect(control.optionsTruncated == nil)
+  }
+
   @Test("A Material checkbox hidden behind an aria-hidden box stays addressable")
   func materialCheckboxRemainsAddressable() async throws {
     // Play Console renders every checkbox in two halves: a real input with no size,
