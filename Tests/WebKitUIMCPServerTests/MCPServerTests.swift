@@ -2545,6 +2545,91 @@ struct MCPServerTests {
     #expect(presenter.requests.count == 1, "the native dialog was never asked for")
   }
 
+  @Test("A key confirmation names the exact key and the modifiers held with it")
+  func keyConfirmationNamesTheKeyAndItsModifiers() async throws {
+    // A modifier changes what a keystroke means: shift plus an arrow selects rather
+    // than moves. An operator who is shown only the key is approving something else.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      "<input aria-label='Filter' value='abc'>",
+      baseURL: URL(string: "https://example.test/filter"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: [false])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try object(try array(observation["elements"]).first)
+
+    _ = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(target["elementID"])),
+        "operation": .string("press_key"),
+        "key": .string("ArrowRight"),
+        "modifiers": .array([.string("shift")]),
+        "idempotency_key": .string("modified-key-once"),
+        "postcondition": .object([
+          "type": .string("url_contains"), "value": .string("/filter"),
+        ]),
+      ])
+
+    let shown = try #require(presenter.requests.first?.message)
+    #expect(shown.contains("\"ArrowRight\""), "the dialog never named the key")
+    #expect(shown.contains("Modifier keys held down:"))
+    #expect(shown.contains("\"shift\""), "the dialog never named the modifier")
+  }
+
+  @Test("A key the server cannot map is refused without asking anyone")
+  func unmappableKeyIsRefusedWithoutAConfirmation() async throws {
+    // A key nobody can send is a client mistake, not a decision to put to a human.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      "<input aria-label='Filter' value='abc'>",
+      baseURL: URL(string: "https://example.test/filter"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let presenter = ConfirmationPresenterStub(responses: [true, true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try object(try array(observation["elements"]).first)
+    func act(id: Int64, key: String, modifiers: [JSONValue]) async throws -> [String: JSONValue] {
+      try await toolCall(
+        server, id: id, name: "browser_act",
+        arguments: [
+          "session_id": .string(handle.rawValue.uuidString),
+          "observation_id": .string(try string(observation["observationID"])),
+          "element_id": .string(try string(target["elementID"])),
+          "operation": .string("press_key"),
+          "key": .string(key),
+          "modifiers": .array(modifiers),
+          "idempotency_key": .string("unmappable-\(id)"),
+          "postcondition": .object([
+            "type": .string("url_contains"), "value": .string("/filter"),
+          ]),
+        ])
+    }
+
+    let named = try await act(id: 2, key: "F13", modifiers: [])
+    #expect(try string(try object(named["error"])["message"]).contains("press_key key must be"))
+    // Shift changes what a real keyboard produces for a character, so the character and
+    // the modifier would contradict each other in the very event being sent.
+    let shifted = try await act(id: 3, key: "a", modifiers: [.string("shift")])
+    #expect(
+      try string(try object(shifted["error"])["message"]).contains("printable character"),
+      "a contradictory chord was accepted")
+    #expect(presenter.requests.isEmpty, "an unsendable key was put to the operator")
+  }
+
   @Test("A control whose formaction leaves the page says so in the confirmation")
   func foreignSubmissionDestinationIsConfirmed() async throws {
     // The published attack: attacker-authored region, a submit control whose accessible

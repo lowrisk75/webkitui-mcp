@@ -174,7 +174,7 @@ public final class WebKitMCPServer {
     case click
     case submit
     case fill(String)
-    case pressKey(String)
+    case pressKey(WebKitKeyPress)
     case blur
     case commitInput
 
@@ -2346,6 +2346,9 @@ public final class WebKitMCPServer {
       guard let target = observation.elements.first(where: { $0.elementID == elementID }) else {
         throw MCPServerError.invalidParams("element_id is not in that observation")
       }
+      guard operationName == "press_key" || arguments["modifiers"] == nil else {
+        throw MCPServerError.invalidParams("modifiers apply to press_key only")
+      }
       let operation: ActOperation
       let postcondition: ActPostcondition?
       switch operationName {
@@ -2393,12 +2396,7 @@ public final class WebKitMCPServer {
         guard arguments["value"] == nil else {
           throw MCPServerError.invalidParams("press_key uses key, not value")
         }
-        let key = try requireString(arguments["key"], named: "key")
-        let normalized = ["enter": "Enter", "tab": "Tab", "escape": "Escape"][key.lowercased()]
-        guard let normalized else {
-          throw MCPServerError.invalidParams("press_key key must be Enter, Tab, or Escape")
-        }
-        operation = .pressKey(normalized)
+        operation = .pressKey(try parseKeyPress(arguments))
         postcondition = try parseActPostcondition(arguments["postcondition"])
       case "blur", "commit_input":
         guard arguments["value"] == nil, arguments["key"] == nil else {
@@ -2878,11 +2876,11 @@ public final class WebKitMCPServer {
         dispatchMode == .nativeAppKit
         ? "AppKit text insertion and native Tab commit with exact value \(jsonQuoted(value)); site input/change/blur handlers may autosave or cause server effects"
         : "fill with exact value \(jsonQuoted(value)); site input/change handlers may autosave or cause server effects"
-    case .pressKey(let key):
+    case .pressKey(let press):
       action =
         dispatchMode == .nativeAppKit
-        ? "AppKit key \(jsonQuoted(key)) with a measured WebKit trust receipt"
-        : "untrusted JavaScript key \(jsonQuoted(key))"
+        ? "AppKit key \(jsonQuoted(press.key)) with a measured WebKit trust receipt"
+        : "untrusted JavaScript key \(jsonQuoted(press.key))"
     case .blur:
       action = "explicitly blur the target"
     case .commitInput:
@@ -2898,7 +2896,18 @@ public final class WebKitMCPServer {
       pageURL: URL(string: currentURL),
       destination: submissionDestination)
     let destination = destinationLine.map { "\($0)\n\n" } ?? ""
+    // A modifier changes what the keystroke means — shift plus an arrow selects instead
+    // of moving, and command plus a character is a menu command on many pages — so it is
+    // stated on its own line rather than folded into the action sentence. Labelled,
+    // because the value is not a phrase anything can translate.
+    let heldModifiers: String
+    if case .pressKey(let press) = operation, let named = press.modifierDescription {
+      heldModifiers = "Modifier keys held down:\n\(jsonQuoted(named))\n\n"
+    } else {
+      heldModifiers = ""
+    }
     return "Requested action:\n\(action)\n\n"
+      + heldModifiers
       + "Current page:\n\(jsonQuoted(currentURL))\n\n"
       + destination
       + "Target ID:\n\(elementID)\n\n"
@@ -3221,6 +3230,54 @@ public final class WebKitMCPServer {
     ])
   }
 
+  /// The key and the modifiers held with it, refused here if there is no keystroke that
+  /// means them. A key nobody can send is a client mistake, not a decision to put to an
+  /// operator, so the refusal happens before the confirmation rather than after it. The
+  /// runtime asks the same question again immediately before dispatch; this is the early
+  /// half of one rule, not a second rule.
+  private func parseKeyPress(_ arguments: [String: JSONValue]) throws -> WebKitKeyPress {
+    let key = try requireString(arguments["key"], named: "key")
+    // A named key is matched case-insensitively, as `enter` always was. A single
+    // character is taken verbatim: `a` and `A` are different keys, and folding one into
+    // the other would send the one nobody asked for.
+    let resolved =
+      key.count > 1
+      ? (WebKitKeyCatalogue.keyNames.first { $0.lowercased() == key.lowercased() } ?? key)
+      : key
+    var modifiers: Set<WebKitKeyModifier> = []
+    if let supplied = arguments["modifiers"] {
+      guard case .array(let entries) = supplied else {
+        throw MCPServerError.invalidParams("modifiers must be an array of modifier names")
+      }
+      for entry in entries {
+        guard let name = entry.stringValue, let modifier = WebKitKeyModifier(rawValue: name)
+        else {
+          throw MCPServerError.invalidParams(
+            "modifiers entries must be command, control, option, or shift")
+        }
+        modifiers.insert(modifier)
+      }
+    }
+    let press = WebKitKeyPress(resolved, modifiers: modifiers)
+    do {
+      try WebKitKeyCatalogue.validate(press)
+    } catch WebKitRuntimeError.keyCodeUnavailable {
+      throw MCPServerError.invalidParams(
+        "press_key key must be a single printable character this keyboard layout can "
+          + "produce, or one of: " + WebKitKeyCatalogue.keyNames.joined(separator: ", "))
+    } catch WebKitRuntimeError.keyModifierChangesCharacter(let chord) {
+      throw MCPServerError.invalidParams(
+        "\(chord) is refused: control, option and shift each change which character a "
+          + "keyboard produces, so none of them can be held with a printable character. "
+          + "Ask for the character wanted instead.")
+    } catch WebKitRuntimeError.keyChordReservedByApplicationMenu(let chord) {
+      throw MCPServerError.invalidParams(
+        "\(chord) is a key equivalent this application's own menu claims, so it would not "
+          + "reach the page. It is refused rather than sent as something else.")
+    }
+    return press
+  }
+
   private func parseActPostcondition(_ value: JSONValue?) throws -> ActPostcondition {
     guard value != nil else {
       throw MCPServerError.invalidParams(
@@ -3372,7 +3429,7 @@ public final class WebKitMCPServer {
       }
       switch pending.operation {
       case .click, .submit: runtimeOperation = .click
-      case .pressKey(let key): runtimeOperation = .pressKey(key)
+      case .pressKey(let press): runtimeOperation = .pressKey(press)
       case .blur: runtimeOperation = .blur
       case .commitInput: runtimeOperation = .commitInput
       case .fill:
@@ -4048,6 +4105,40 @@ public final class WebKitMCPServer {
     ]),
   ])
 
+  /// Extended, not replaced: Enter, Tab and Escape still mean exactly what they meant. A
+  /// printable character cannot be enumerated, so the named keys are one branch of the
+  /// schema and a single character is the other.
+  private static let pressKeySchema: JSONValue = .object([
+    "type": .string("string"),
+    "minLength": .int(1),
+    "anyOf": .array([
+      .object(["enum": .array(WebKitKeyCatalogue.keyNames.map { JSONValue.string($0) })]),
+      .object(["maxLength": .int(1)]),
+    ]),
+    "description": .string(
+      "Required only for press_key: one of "
+        + WebKitKeyCatalogue.keyNames.joined(separator: ", ")
+        + ", or a single printable character. A character this Mac's keyboard layout cannot "
+        + "produce with one key is refused rather than approximated."
+    ),
+  ])
+
+  private static let pressKeyModifierSchema: JSONValue = .object([
+    "type": .string("array"),
+    "items": .object([
+      "type": .string("string"),
+      "enum": .array(WebKitKeyModifier.allCases.map { JSONValue.string($0.rawValue) }),
+    ]),
+    "maxItems": .int(4),
+    "uniqueItems": .bool(true),
+    "description": .string(
+      "Optional, press_key only: the modifiers held down. The confirmation names them. "
+        + "control, option and shift change which character a keyboard produces, so none of "
+        + "them can be held with a printable character, and a chord this application's own "
+        + "menu claims is refused."
+    ),
+  ])
+
   private static let toolDefinitions: [JSONValue] = [
     tool(
       name: "browser_download",
@@ -4123,7 +4214,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_act",
       description:
-        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, bounded key, blur, or input commit, or answer the one JavaScript dialog a page is suspended on (dialog_accept, dialog_dismiss, dialog_accept_value). A pending dialog blocks every other operation until it is answered, and is never answered automatically. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and exact human confirmation. approval_mode=native uses server-owned confirmation and AppKit dispatch for click/submit/fill/key operations, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. UI state does not prove backend commit.",
+        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, one bounded key press with optional modifiers, blur, or input commit, or answer the one JavaScript dialog a page is suspended on (dialog_accept, dialog_dismiss, dialog_accept_value). A pending dialog blocks every other operation until it is answered, and is never answered automatically. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and exact human confirmation. approval_mode=native uses server-owned confirmation and AppKit dispatch for click/submit/fill/key operations, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. UI state does not prove backend commit.",
       properties: sessionSchemaProperties.merging([
         "observation_id": .object(["type": .string("string")]),
         "element_id": .object(["type": .string("string")]),
@@ -4148,11 +4239,8 @@ public final class WebKitMCPServer {
             "Required for fill (empty string clears the control) and for dialog_accept_value (the exact string handed to the page's prompt)."
           ),
         ]),
-        "key": .object([
-          "type": .string("string"),
-          "enum": .array([.string("Enter"), .string("Tab"), .string("Escape")]),
-          "description": .string("Required only for press_key."),
-        ]),
+        "key": pressKeySchema,
+        "modifiers": pressKeyModifierSchema,
         "idempotency_key": .object(["type": .string("string"), "minLength": .int(1)]),
         "approval_mode": .object([
           "type": .string("string"),

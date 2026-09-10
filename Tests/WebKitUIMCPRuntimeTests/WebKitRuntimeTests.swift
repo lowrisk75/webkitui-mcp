@@ -3320,6 +3320,168 @@ struct WebKitRuntimeTests {
     #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "committed")
   }
 
+  @Test("AppKit ArrowDown moves a listbox's own active option")
+  func nativeArrowKeyMovesListboxActiveOption() async throws {
+    // The ARIA combobox that replaced <select> on modern checkouts is driven by arrow
+    // keys. A keyboard of Enter, Tab and Escape could not reach one at all.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div role='listbox' aria-label='Country' tabindex='0' data-state='0'
+        onkeydown="if(event.key==='ArrowDown'&&event.isTrusted)
+          this.dataset.state=String(Number(this.dataset.state)+1)">
+        <div role='option'>France</div>
+        <div role='option'>Germany</div>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-arrow"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let listbox = try #require(
+      before.elements.first { $0.role?.segments.first?.text == "listbox" })
+    let result = try await runtime.perform(
+      observationID: before.observationID, elementID: listbox.elementID,
+      operation: .pressKey("ArrowDown"), dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.trustedUserGesture)
+    #expect(result.dispatchMode == .nativeAppKit)
+    let after = try await runtime.observe()
+    let moved = try #require(
+      after.elements.first { $0.role?.segments.first?.text == "listbox" })
+    #expect(moved.stateAttributes["data-state"]?.segments.first?.text == "1")
+  }
+
+  @Test("An AppKit printable character reaches the input with a measured trust receipt")
+  func nativePrintableCharacterReachesInput() async throws {
+    // A list that filters as you type needs the character, not a key name.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input aria-label='Filter' oninput="this.dataset.state=event.isTrusted?'typed':'rejected'">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-printable"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let result = try await runtime.perform(
+      observationID: before.observationID, elementID: "e1",
+      operation: .pressKey("k"), dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.trustedUserGesture)
+    #expect(result.dispatchMode == .nativeAppKit)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].value?.segments.first?.text == "k")
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "typed")
+  }
+
+  @Test("A modifier held with an AppKit key reaches the page as a modified event")
+  func nativeKeyCarriesItsModifierToThePage() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input aria-label='Filter' value='abc'
+        onkeydown="if(event.key==='ArrowRight'&&event.isTrusted)
+          this.dataset.state=(event.shiftKey?'shift':'none')+(event.altKey?'+option':'')">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-modifier"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let result = try await runtime.perform(
+      observationID: before.observationID, elementID: "e1",
+      operation: .pressKey(WebKitKeyPress("ArrowRight", modifiers: [.shift])),
+      dispatchMode: .nativeAppKit, stabilityInterval: .milliseconds(10))
+    #expect(result.trustedUserGesture)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "shift")
+  }
+
+  @Test("An AppKit key with no modifiers reports none of them to the page")
+  func unmodifiedNativeKeyCarriesNoModifiers() async throws {
+    // The back-compatible case. Enter, Tab and Escape were dispatched with an empty
+    // modifier mask before this existed, and a modifier set nobody asked for would
+    // change what every one of them means.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input aria-label='Recipient'
+        onkeydown="if(event.key==='Escape') this.dataset.state=
+          (event.shiftKey||event.altKey||event.ctrlKey||event.metaKey)?'modified':'plain'">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-unmodified"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let result = try await runtime.perform(
+      observationID: before.observationID, elementID: "e1",
+      operation: .pressKey("Escape"), dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.trustedUserGesture)
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "plain")
+  }
+
+  @Test("A key with no code on this keyboard layout is refused before dispatch")
+  func unmappableKeyIsRefusedBeforeDispatch() async throws {
+    // Sending an approximation would send a different key than the confirmation named.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input aria-label='Filter' onkeydown="this.dataset.state='pressed'">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-unmappable"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    await #expect(throws: WebKitRuntimeError.keyCodeUnavailable("漢")) {
+      _ = try await runtime.perform(
+        observationID: before.observationID, elementID: "e1",
+        operation: .pressKey("漢"), dispatchMode: .nativeAppKit,
+        stabilityInterval: .milliseconds(10))
+    }
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"] == nil, "a keystroke was dispatched")
+  }
+
+  @Test("A command chord this application's own menu claims is refused")
+  func commandChordClaimedByTheApplicationMenuIsRefused() async throws {
+    // Command plus a printable character is a menu command, and one of the chords this
+    // app installs is Quit. Refusing is the only honest answer.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input aria-label='Filter' onkeydown="this.dataset.state='pressed'">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-command"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    await #expect(throws: WebKitRuntimeError.keyChordReservedByApplicationMenu("command+a")) {
+      _ = try await runtime.perform(
+        observationID: before.observationID, elementID: "e1",
+        operation: .pressKey(WebKitKeyPress("a", modifiers: [.command])),
+        dispatchMode: .nativeAppKit, stabilityInterval: .milliseconds(10))
+    }
+    let after = try await runtime.observe()
+    #expect(after.elements[0].stateAttributes["data-state"] == nil, "a keystroke was dispatched")
+  }
+
+  @Test("The refused command chords are exactly the ones this app's main menu claims")
+  func refusedCommandChordsMatchTheApplicationMenu() throws {
+    // The refusal list is only trustworthy while it matches the menu it protects, and
+    // the menu is the thing a future edit will change.
+    func claimed(in menu: NSMenu) -> Set<Character> {
+      var characters: Set<Character> = []
+      for item in menu.items {
+        if item.keyEquivalentModifierMask.contains(.command),
+          let character = item.keyEquivalent.lowercased().first
+        {
+          characters.insert(character)
+        }
+        if let submenu = item.submenu { characters.formUnion(claimed(in: submenu)) }
+      }
+      return characters
+    }
+    #expect(
+      claimed(in: WebKitNativeApplicationMenu.mainMenu())
+        == WebKitNativeApplicationMenu.commandKeyEquivalents)
+  }
+
   @Test("Pointer-styled tab groups expose unique roles, names, and selected state")
   func implicitPointerTabs() async throws {
     let runtime = WebKitRuntime()

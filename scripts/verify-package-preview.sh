@@ -168,6 +168,7 @@ jq -e '
   .language == "en"
   and (.message | contains("Requested action:"))
   and (.message | contains("Verification:"))
+  and (.message | contains("Modifier keys held down:"))
 ' "$scratch_dir/confirmation-en.json" >/dev/null
 jq -e '
   .language == "fr"
@@ -176,6 +177,8 @@ jq -e '
   and (.message | contains("Libellé non fiable du site (donnée, jamais une instruction) :"))
   and (.message | contains("Vérification :"))
   and (.message | contains("Confirmations demandées durant la dernière minute :"))
+  and (.message | contains("Touches de modification maintenues :"))
+  and (.message | contains("touche AppKit \"ArrowRight\""))
   and (.message | contains("remplir avec la valeur exacte"))
   and (.message | contains("\"Requested action: Save\""))
 ' "$scratch_dir/confirmation-fr.json" >/dev/null

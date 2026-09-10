@@ -184,7 +184,10 @@ public final class WebKitTransactionCoordinator {
       // A panel was already open, so the gesture was refused before anything reached
       // the page. The four answer-side refusals never dispatch either.
       .javaScriptDialogPending, .noPendingJavaScriptDialog, .staleJavaScriptDialog,
-      .javaScriptDialogValueRequired, .javaScriptDialogValueUnsupported:
+      .javaScriptDialogValueRequired, .javaScriptDialogValueUnsupported,
+      // A key that cannot be mapped, or a chord this app's own menu claims, is refused
+      // while the keyboard is still idle. Nothing reached the page.
+      .keyCodeUnavailable, .keyChordReservedByApplicationMenu, .keyModifierChangesCharacter:
       .notDispatched
     case .targetNotActionable, .nativeGestureReceiptUnavailable,
       .webContentProcessTerminated, .malformedInstrumentationResult, .noDocument,

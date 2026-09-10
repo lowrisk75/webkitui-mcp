@@ -1,4 +1,7 @@
 import AppKit
+// Text Input Services and UCKeyTranslate: the only route to what a key produces on the
+// layout this Mac is actually using. Nothing else here comes from Carbon.
+import Carbon
 import CryptoKit
 import Foundation
 import OSLog
@@ -63,6 +66,17 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case staleJavaScriptDialog
   case javaScriptDialogValueRequired
   case javaScriptDialogValueUnsupported
+  /// No virtual key code exists for the requested key on the keyboard layout this Mac is
+  /// using, so there is no keystroke that means what the confirmation named. Carries the
+  /// key as asked for.
+  case keyCodeUnavailable(String)
+  /// The requested chord is a key equivalent this application's own main menu claims.
+  /// Carries the chord.
+  case keyChordReservedByApplicationMenu(String)
+  /// A modifier that changes which character a real keyboard produces was asked for
+  /// alongside the character itself, so the event's characters and its modifier mask
+  /// would contradict each other. Carries the chord.
+  case keyModifierChangesCharacter(String)
 }
 
 public enum AuthenticationUIClassification: String, Codable, Equatable, Sendable {
@@ -328,10 +342,216 @@ public struct WebKitTextSnapshot: Codable, Equatable, Sendable {
   public let truncated: Bool
 }
 
+/// A modifier held down for one key press. An explicit set, not a chord string: the
+/// confirmation has to state each one, and nothing should have to parse operator text to
+/// find out what is being approved.
+public enum WebKitKeyModifier: String, Codable, CaseIterable, Equatable, Sendable {
+  case control
+  case option
+  case shift
+  case command
+
+  /// Control-Option-Shift-Command, the order macOS writes a chord in.
+  static let displayOrder: [WebKitKeyModifier] = [.control, .option, .shift, .command]
+}
+
+/// One key press: the key as the DOM names it — `Enter`, `ArrowDown`, `PageUp`, or a
+/// single printable character — plus the modifiers held with it.
+///
+/// The DOM spelling is the wire format deliberately. Trust is measured by an isolated
+/// handler in the page comparing `KeyboardEvent.key` against what was asked for, so a
+/// second spelling would be a second thing that can disagree with itself.
+public struct WebKitKeyPress: Equatable, Sendable, ExpressibleByStringLiteral {
+  public let key: String
+  public let modifiers: Set<WebKitKeyModifier>
+
+  public init(_ key: String, modifiers: Set<WebKitKeyModifier> = []) {
+    self.key = key
+    self.modifiers = modifiers
+  }
+
+  /// A bare key name stays a bare key press, so every existing `.pressKey("Enter")`
+  /// caller keeps meaning exactly what it meant.
+  public init(stringLiteral value: String) {
+    self.init(value)
+  }
+
+  /// The chord as the confirmation states it, and as a refusal names it.
+  public var chordDescription: String {
+    (WebKitKeyModifier.displayOrder.filter(modifiers.contains).map(\.rawValue) + [key])
+      .joined(separator: "+")
+  }
+
+  /// The modifiers alone, in the same order, for the labelled section of a confirmation.
+  public var modifierDescription: String? {
+    let named = WebKitKeyModifier.displayOrder.filter(modifiers.contains).map(\.rawValue)
+    return named.isEmpty ? nil : named.joined(separator: "+")
+  }
+}
+
+/// Everything that decides which keystroke a confirmed key press is, in one place, so the
+/// server refuses a key it cannot send before an operator is asked about it and the
+/// runtime refuses the same key again at the moment of dispatch.
+public enum WebKitKeyCatalogue {
+  /// One resolved keystroke: exactly what `NSEvent.keyEvent` needs, decided before the
+  /// keyboard is touched so a key that cannot be sent is refused rather than approximated.
+  struct NativeKeyEvent {
+    let keyCode: UInt16
+    let characters: String
+    let flags: NSEvent.ModifierFlags
+  }
+
+  /// The keys named by their DOM spelling, with the virtual key code AppKit reports for
+  /// each. Codes are the `kVK_*` constants from `Carbon/HIToolbox/Events.h`; the
+  /// characters are what AppKit puts in an `NSEvent`'s `characters` for that key — a
+  /// control character for the four the ASCII table covers, and otherwise the reserved
+  /// function-key unicodes from `NSEvent.h` (0xF700–0xF8FF).
+  ///
+  /// The two delete keys are crossed on purpose. The key labelled Delete on a Mac
+  /// keyboard is `kVK_Delete`, and it is the DOM's `Backspace`; the DOM's `Delete` is the
+  /// forward delete, `kVK_ForwardDelete`. Reading them the other way round would erase
+  /// the character on the wrong side of the caret.
+  static let namedKeys: [String: (characters: String, keyCode: UInt16)] = [
+    "Enter": ("\r", 0x24),  // kVK_Return
+    "Tab": ("\t", 0x30),  // kVK_Tab
+    "Escape": ("\u{1B}", 0x35),  // kVK_Escape
+    "Backspace": ("\u{8}", 0x33),  // kVK_Delete
+    "Delete": ("\u{F728}", 0x75),  // kVK_ForwardDelete, NSDeleteFunctionKey
+    "ArrowUp": ("\u{F700}", 0x7E),  // kVK_UpArrow, NSUpArrowFunctionKey
+    "ArrowDown": ("\u{F701}", 0x7D),  // kVK_DownArrow, NSDownArrowFunctionKey
+    "ArrowLeft": ("\u{F702}", 0x7B),  // kVK_LeftArrow, NSLeftArrowFunctionKey
+    "ArrowRight": ("\u{F703}", 0x7C),  // kVK_RightArrow, NSRightArrowFunctionKey
+    "Home": ("\u{F729}", 0x73),  // kVK_Home, NSHomeFunctionKey
+    "End": ("\u{F72B}", 0x77),  // kVK_End, NSEndFunctionKey
+    "PageUp": ("\u{F72C}", 0x74),  // kVK_PageUp, NSPageUpFunctionKey
+    "PageDown": ("\u{F72D}", 0x79),  // kVK_PageDown, NSPageDownFunctionKey
+  ]
+
+  /// The keys a client may name, for the schema and its refusals.
+  public static var keyNames: [String] { namedKeys.keys.sorted() }
+
+  /// Whether this key press can be sent at all, throwing the refusal that says why not.
+  /// Asked before an operator is shown anything.
+  public static func validate(_ press: WebKitKeyPress) throws {
+    _ = try event(for: press)
+  }
+
+  /// Resolves a confirmed key press into the one event that means it, or refuses.
+  static func event(for press: WebKitKeyPress) throws -> NativeKeyEvent {
+    // ⌘ first: whether the key is nameable does not matter if the chord never reaches
+    // the page. The dispatch below goes through the window rather than NSApplication, so
+    // the main menu is not offered the event — but AppKit's key-equivalent routing is not
+    // a contract this product controls, and one of the claimed chords quits the process.
+    // A keystroke whose destination cannot be stated is refused, not sent. ⌘A before
+    // retyping, the one claimed chord a caller has a real use for, is not lost by this:
+    // the native fill path already selects the field's contents before it inserts.
+    if press.modifiers.contains(.command), press.key.count == 1,
+      let character = press.key.lowercased().first,
+      WebKitNativeApplicationMenu.commandKeyEquivalents.contains(character)
+    {
+      throw WebKitRuntimeError.keyChordReservedByApplicationMenu(press.chordDescription)
+    }
+    var flags = NSEvent.ModifierFlags()
+    if press.modifiers.contains(.control) { flags.insert(.control) }
+    if press.modifiers.contains(.option) { flags.insert(.option) }
+    if press.modifiers.contains(.shift) { flags.insert(.shift) }
+    if press.modifiers.contains(.command) { flags.insert(.command) }
+
+    if let named = namedKeys[press.key] {
+      // AppKit sets the function flag for every key in the reserved unicode range, and
+      // the numeric-pad flag for the arrows as well. Enter, Tab, Escape and Backspace are
+      // in neither set, so those keep the exact mask they were dispatched with before
+      // this table existed.
+      if let scalar = named.characters.unicodeScalars.first, scalar.value >= 0xF700 {
+        flags.insert(.function)
+      }
+      if ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].contains(press.key) {
+        flags.insert(.numericPad)
+      }
+      return NativeKeyEvent(
+        keyCode: named.keyCode, characters: named.characters, flags: flags)
+    }
+
+    // A single printable character.
+    guard press.key.unicodeScalars.count == 1, let scalar = press.key.unicodeScalars.first,
+      !CharacterSet.controlCharacters.contains(scalar),
+      let character = press.key.first
+    else { throw WebKitRuntimeError.keyCodeUnavailable(press.key) }
+    guard press.modifiers.isSubset(of: [.command]) else {
+      // Control, option and shift each change which character a real keyboard produces:
+      // shift+a is A, option+a is å, control+a is U+0001. Sending the requested character
+      // with one of those flags raised would be an event no keyboard can generate, and
+      // the page would read a keystroke nobody approved. The character wanted is the one
+      // to ask for; shift is then inferred from the layout, below.
+      throw WebKitRuntimeError.keyModifierChangesCharacter(press.chordDescription)
+    }
+    guard let derived = virtualKeyCode(for: character) else {
+      throw WebKitRuntimeError.keyCodeUnavailable(press.key)
+    }
+    // `charactersIgnoringModifiers` honours shift and caps lock, so a shifted character
+    // is the same string in both fields, exactly as AppKit reports a real ⇧A.
+    if derived.shift { flags.insert(.shift) }
+    return NativeKeyEvent(keyCode: derived.keyCode, characters: press.key, flags: flags)
+  }
+
+  /// The virtual key code that produces `character` on the keyboard layout this Mac is
+  /// currently using, and whether shift is needed to reach it.
+  ///
+  /// Derived, never assumed. A hardcoded US-ANSI table would send `q` where an AZERTY
+  /// operator approved `a` — the worst failure this product has, because the confirmation
+  /// would have named the other key. The layout itself is asked what each key produces
+  /// and the answer is inverted; the lowest code wins, which keeps the main row ahead of
+  /// the keypad for the digits. A character no single key reaches — a CJK ideograph, or
+  /// anything behind a dead key or option — has no answer here, and the caller refuses.
+  private static func virtualKeyCode(for character: Character) -> (keyCode: UInt16, shift: Bool)? {
+    guard let layout = currentUnicodeKeyLayout() else { return nil }
+    let wanted = String(character)
+    return layout.withUnsafeBytes { raw -> (keyCode: UInt16, shift: Bool)? in
+      guard let base = raw.baseAddress else { return nil }
+      let keyboardLayout = base.assumingMemoryBound(to: UCKeyboardLayout.self)
+      let keyboardType = UInt32(LMGetKbdType())
+      for shifted in [false, true] {
+        // UCKeyTranslate takes the modifier byte of an old Event Manager modifier word.
+        let modifierKeyState = shifted ? UInt32(shiftKey >> 8) : UInt32(0)
+        for keyCode in UInt16(0)...127 {
+          var deadKeyState: UInt32 = 0
+          var length = 0
+          var produced = [UniChar](repeating: 0, count: 8)
+          let status = UCKeyTranslate(
+            keyboardLayout, keyCode, UInt16(kUCKeyActionDown), modifierKeyState,
+            keyboardType, OptionBits(kUCKeyTranslateNoDeadKeysBit), &deadKeyState,
+            produced.count, &length, &produced)
+          guard status == noErr, length > 0 else { continue }
+          if String(utf16CodeUnits: produced, count: length) == wanted {
+            return (keyCode, shifted)
+          }
+        }
+      }
+      return nil
+    }
+  }
+
+  private static func currentUnicodeKeyLayout() -> Data? {
+    // The layout input source is the one that answers for a keyboard; the current input
+    // source is asked as well because an input method occupies that slot and carries no
+    // layout data of its own.
+    for source in [
+      TISCopyCurrentKeyboardLayoutInputSource(), TISCopyCurrentKeyboardInputSource(),
+    ] {
+      guard let source = source?.takeRetainedValue(),
+        let property = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+      else { continue }
+      let data = Unmanaged<CFData>.fromOpaque(property).takeUnretainedValue() as Data
+      if !data.isEmpty { return data }
+    }
+    return nil
+  }
+}
+
 public enum WebKitActionOperation: Sendable {
   case click
   case fill(ProvenancedText)
-  case pressKey(String)
+  case pressKey(WebKitKeyPress)
   case blur
   case commitInput
 }
@@ -1266,6 +1486,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
     let value: String?
     let operationName: String
+    var keyPress: WebKitKeyPress?
     switch operation {
     case .click:
       operationName = "click"
@@ -1274,9 +1495,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       guard !target.sensitive else { throw WebKitRuntimeError.sensitiveInputRequiresHuman }
       operationName = "fill"
       value = provenancedValue.segments.map(\.text).joined()
-    case .pressKey(let key):
+    case .pressKey(let press):
       operationName = "press_key"
-      value = key
+      value = press.key
+      keyPress = press
     case .blur:
       operationName = "blur"
       value = nil
@@ -1304,11 +1526,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           expectedCandidateCount: expectedCandidateCount,
           expectedBoundingBox: expectedBoundingBox)
       }
-      if dispatchMode == .nativeAppKit, operationName == "press_key", let value {
+      if dispatchMode == .nativeAppKit, let keyPress {
         return try await resolveAndPerformNativeKey(
           criteria: criteria, physicalIdentity: physicalIdentityHint,
           expectedCandidateCount: expectedCandidateCount,
-          expectedBoundingBox: expectedBoundingBox, key: value)
+          expectedBoundingBox: expectedBoundingBox, press: keyPress)
       }
       if dispatchMode == .nativeAppKit, operationName == "fill", let value {
         return try await resolveAndPerformNativeFill(
@@ -1322,7 +1544,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         expectedCandidateCount: expectedCandidateCount,
         expectedBoundingBox: expectedBoundingBox,
         operation: operationName,
-        value: value
+        value: value,
+        modifiers: keyPress?.modifiers ?? []
       )
     }
     let second: RawActionResolution
@@ -2883,7 +3106,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
     operation: String,
-    value: String?
+    value: String?,
+    modifiers: Set<WebKitKeyModifier> = []
   ) async throws -> RawActionResolution {
     var arguments: [String: Any] = [
       "criteria": criteria,
@@ -2898,6 +3122,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       "operation": operation,
     ]
     if let value { arguments["value"] = value }
+    // The JavaScript route is untrusted and says so, but it must still dispatch the
+    // chord that was approved: an unmodified event where a modified one was confirmed
+    // would be a different keystroke than the operator read.
+    arguments["modifiers"] = WebKitKeyModifier.displayOrder.filter(modifiers.contains)
+      .map(\.rawValue)
     return try await actionScript(source: Self.performSource, arguments: arguments)
   }
 
@@ -2978,8 +3207,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     physicalIdentity: String,
     expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
-    key: String
+    press: WebKitKeyPress
   ) async throws -> RawActionResolution {
+    // Before the page is touched at all, and before the operator's approval turns into a
+    // keystroke: a key with no code, or a chord the app's own menu claims, is refused
+    // while the keyboard is still idle rather than approximated.
+    let event = try WebKitKeyCatalogue.event(for: press)
+    let key = press.key
     guard let window = webView.window, window.makeFirstResponder(webView) else {
       throw WebKitRuntimeError.targetNotActionable
     }
@@ -3001,7 +3235,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       ])
     guard armed.count == 1, let candidate = armed.candidate else { return armed }
     guard candidate.geometryStable, candidate.actionable else { return armed }
-    try dispatchNativeKey(key)
+    try dispatchNativeKey(event)
     let expectedReceiptEvent = key == "Tab" ? "blur" : "keydown"
     let deadline = ContinuousClock.now + .seconds(1)
     while ContinuousClock.now < deadline {
@@ -3063,7 +3297,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       {
         // Commit within the same confirmed action. A later action can address
         // a framework replacement node and leave validation state untouched.
-        try dispatchNativeKey("Tab")
+        try dispatchNativeKey(WebKitKeyCatalogue.event(for: "Tab"))
         let commitDeadline = ContinuousClock.now + .seconds(1)
         while ContinuousClock.now < commitDeadline {
           if let commitReceipt = nativeGestureReceipt(
@@ -3102,25 +3336,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
   }
 
-  private func dispatchNativeKey(_ key: String) throws {
+  private func dispatchNativeKey(_ event: WebKitKeyCatalogue.NativeKeyEvent) throws {
     guard let window = webView.window else { throw WebKitRuntimeError.targetNotActionable }
-    let mapping: (characters: String, keyCode: UInt16)
-    switch key {
-    case "Enter": mapping = ("\r", 36)
-    case "Tab": mapping = ("\t", 48)
-    case "Escape": mapping = ("\u{1B}", 53)
-    default: throw WebKitRuntimeError.targetNotActionable
-    }
     let timestamp = ProcessInfo.processInfo.systemUptime
     guard
       let down = NSEvent.keyEvent(
-        with: .keyDown, location: .zero, modifierFlags: [], timestamp: timestamp,
-        windowNumber: window.windowNumber, context: nil, characters: mapping.characters,
-        charactersIgnoringModifiers: mapping.characters, isARepeat: false, keyCode: mapping.keyCode),
+        with: .keyDown, location: .zero, modifierFlags: event.flags, timestamp: timestamp,
+        windowNumber: window.windowNumber, context: nil, characters: event.characters,
+        charactersIgnoringModifiers: event.characters, isARepeat: false,
+        keyCode: event.keyCode),
       let up = NSEvent.keyEvent(
-        with: .keyUp, location: .zero, modifierFlags: [], timestamp: timestamp + 0.001,
-        windowNumber: window.windowNumber, context: nil, characters: mapping.characters,
-        charactersIgnoringModifiers: mapping.characters, isARepeat: false, keyCode: mapping.keyCode)
+        with: .keyUp, location: .zero, modifierFlags: event.flags, timestamp: timestamp + 0.001,
+        windowNumber: window.windowNumber, context: nil, characters: event.characters,
+        charactersIgnoringModifiers: event.characters, isARepeat: false,
+        keyCode: event.keyCode)
     else { throw WebKitRuntimeError.targetNotActionable }
     window.sendEvent(down)
     window.sendEvent(up)
@@ -5221,7 +5450,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         candidate.trustedUserGesture = trusted;
         candidate.dispatched = true;
       } else if (candidate.actionable && operation === 'press_key') {
-        const options = { key: value, bubbles: true, cancelable: true };
+        const options = {
+          key: value, bubbles: true, cancelable: true,
+          ctrlKey: modifiers.includes('control'), altKey: modifiers.includes('option'),
+          shiftKey: modifiers.includes('shift'), metaKey: modifiers.includes('command')
+        };
         element.focus({ preventScroll: true });
         element.dispatchEvent(new KeyboardEvent('keydown', options));
         element.dispatchEvent(new KeyboardEvent('keyup', options));

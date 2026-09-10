@@ -485,6 +485,7 @@ private struct WebKitUIMCPConfirm {
       "Target ID:",
       "Verification:",
       "AppKit key",
+      "Modifier keys held down:",
     ].sorted { $0.count > $1.count }
     func translate(_ trustedText: String) -> String {
       keys.reduce(trustedText) { output, key in
@@ -545,6 +546,10 @@ private struct WebKitUIMCPConfirm {
       // The burst line the rate policy appends. Its count is a bare integer on its own
       // line, so only the constant label is ever translated.
       + "Confirmations asked for in the last minute:\n9\n\n"
+      // A held modifier changes what the keystroke means, so it is audited in both
+      // languages. The chord itself is quoted, like every other value.
+      + "Requested action:\nAppKit key \"ArrowRight\" with a measured WebKit trust receipt\n\n"
+      + "Modifier keys held down:\n\"shift\"\n\n"
       // The JavaScript dialog answer. The panel's own message and the value supplied to
       // a prompt are quoted, so only the labels around them are ever translated, and the
       // dialog kind is a machine token like a target ID.
