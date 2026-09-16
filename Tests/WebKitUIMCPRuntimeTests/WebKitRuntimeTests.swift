@@ -124,6 +124,17 @@ private final class StubFrameInfo: WKFrameInfo {
   override var isMainFrame: Bool { stubIsMainFrame }
 }
 
+private final class SecurityOriginCapture: NSObject, WKScriptMessageHandler {
+  private(set) var origin: WKSecurityOrigin?
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    origin = message.frameInfo.securityOrigin
+  }
+}
+
 @available(macOS 27, *)
 private final class StubFormInfo: WKFormInfo {
   private let stubSubmissionURL: URL
@@ -224,6 +235,33 @@ struct WebKitRuntimeTests {
 
     #expect(result.readiness == .ready)
     #expect(result.elapsedNanoseconds > 0)
+  }
+
+  @Test("Visible media keeps a textless document usable")
+  func textlessVisualDocumentIsUsable() async throws {
+    let runtime = WebKitRuntime()
+    let navigation = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Canvas report</title>
+      <canvas width="320" height="180" style="display:block"></canvas>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/canvas-report"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40))
+
+    #expect(navigation.readiness == .ready)
+    #expect(navigation.contentState == .usable)
+
+    let observation = try await runtime.observe()
+    #expect(observation.bodyTextLength == 0)
+    #expect(observation.renderedInteractiveCount == 0)
+    #expect(observation.renderedContentCount > 0)
+    #expect(observation.contentState == .usable)
+
+    let text = try await runtime.readText()
+    #expect(text.bodyText.isEmpty)
+    #expect(text.renderedContentCount > 0)
+    #expect(text.contentState == .usable)
   }
 
   @Test("Observation emits semantic recipes and provenance")
@@ -2146,6 +2184,7 @@ struct WebKitRuntimeTests {
       url: "https://play.google.com/console/u/0/developers/1/app-list",
       requestedURL: "https://play.google.com/console/u/0/developers/1/app-content",
       readiness: arrival.readiness,
+      contentState: arrival.contentState,
       elapsedNanoseconds: 0,
       mutationCount: 0)
     #expect(elsewhere.redirected)
@@ -2219,10 +2258,9 @@ struct WebKitRuntimeTests {
 
   @Test("A page holding an unreadable frame says so as plainly as a truncated one")
   func crossOriginFrameIsAnnouncedLoudly() async throws {
-    // Same-origin frames are readable now; cross-origin ones never will be. That is not
-    // the problem — being quiet about it is. An agent that reads a page as complete
-    // when part of it was never legible concludes things are absent that are on screen,
-    // which is exactly how a user was told a finished declaration was missing.
+    // Same-origin frames and registered HTTP(S) cross-origin frames are readable. A
+    // frame with no usable native origin cannot be registered; being quiet about that
+    // gap would let an agent conclude that absent content is absent from the page.
     let runtime = WebKitRuntime()
     _ = try await runtime.loadHTML(
       """
@@ -2244,6 +2282,801 @@ struct WebKitRuntimeTests {
     #expect(observation.crossOriginFramesOpaque)
     #expect(observation.unreadableFrameCount >= 1)
     #expect(observation.isComplete == false)
+  }
+
+  @Test("Cross-origin frames register distinct native capabilities")
+  func crossOriginFramesRegisterDistinctNativeCapabilities() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><title>Child frame</title><button>Child action</button>")
+    }
+    let childURL = URL(string: "http://127.0.0.1:\(child.port)/child")!
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><title>Parent frame</title>
+          <iframe src="\(childURL.absoluteString)"></iframe>
+          <iframe src="\(childURL.absoluteString)"></iframe>
+          """)
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    var childFrames: [WebKitFrameCapabilitySnapshot] = []
+    for _ in 0..<fixtureSettlementPolls {
+      childFrames = runtime.frameRegistrySnapshot().capabilities.filter {
+        !$0.isMainFrame && $0.origin == childOrigin
+      }
+      if childFrames.count == 2 { break }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+
+    #expect(childFrames.count == 2)
+    #expect(Set(childFrames.map(\.capabilityID)).count == 2)
+    for frame in childFrames {
+      #expect(
+        await runtime.probeFrameDocument(capabilityID: frame.capabilityID)
+          == .available(title: "Child frame"))
+    }
+    let topLevelReadResult = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('iframe').contentDocument !== null")
+    let topLevelCanReadChild = try #require(topLevelReadResult as? Bool)
+    #expect(topLevelCanReadChild == false)
+
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelectorAll('iframe').forEach(frame => frame.remove())")
+    try? await Task.sleep(for: .milliseconds(50))
+    for frame in childFrames {
+      #expect(
+        await runtime.probeFrameDocument(capabilityID: frame.capabilityID) == .unavailable)
+    }
+    let removedIDs = Set(childFrames.map(\.capabilityID))
+    #expect(
+      runtime.frameRegistrySnapshot().capabilities.contains {
+        removedIDs.contains($0.capabilityID)
+      } == false)
+  }
+
+  @Test("Frame capabilities expire on navigation and WebContent termination")
+  func frameCapabilitiesExpireAtDocumentBoundaries() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(body: "<!doctype html><title>Expiring child</title>")
+    }
+    let childURL = URL(string: "http://127.0.0.1:\(child.port)/child")!
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><iframe src=\"\(childURL.absoluteString)\"></iframe>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/first")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    var expiredCapabilityID: String?
+    for _ in 0..<fixtureSettlementPolls {
+      expiredCapabilityID =
+        runtime.frameRegistrySnapshot().capabilities.first {
+          !$0.isMainFrame && $0.origin == "http://127.0.0.1:\(child.port)"
+        }?.capabilityID
+      if expiredCapabilityID != nil { break }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    let originalCapabilityID = try #require(expiredCapabilityID)
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    #expect(await runtime.probeFrameDocument(capabilityID: originalCapabilityID) == .unavailable)
+    try runtime.requestAgentResume()
+    _ = try await runtime.observe(hydrationTimeout: .milliseconds(50))
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: originalCapabilityID)
+        == .available(title: "Expiring child"))
+
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/replacement")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(50))
+    #expect(
+      runtime.frameRegistrySnapshot().capabilities.contains {
+        $0.capabilityID == originalCapabilityID
+      } == false)
+    #expect(await runtime.probeFrameDocument(capabilityID: originalCapabilityID) == .unavailable)
+
+    runtime.webViewWebContentProcessDidTerminate(runtime.webView)
+    #expect(runtime.frameRegistrySnapshot().capabilities.isEmpty)
+  }
+
+  @Test("The native frame registry reports overflow without becoming unbounded")
+  func nativeFrameRegistryIsBounded() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(body: "<!doctype html><title>Flood child</title>")
+    }
+    let frames = (0..<40).map { index in
+      "<iframe src=\"http://127.0.0.1:\(child.port)/child?index=\(index)\"></iframe>"
+    }.joined()
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      "<!doctype html><title>Frame flood</title>\(frames)",
+      baseURL: URL(string: "http://localhost:\(child.port)/frame-flood"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    var snapshot = runtime.frameRegistrySnapshot()
+    for _ in 0..<fixtureSettlementPolls where snapshot.droppedRegistrationCount == 0 {
+      try? await Task.sleep(for: .milliseconds(20))
+      snapshot = runtime.frameRegistrySnapshot()
+    }
+    #expect(snapshot.capabilities.count <= 32)
+    #expect(snapshot.droppedRegistrationCount > 0)
+
+    let observation = try await runtime.observe(hydrationTimeout: .milliseconds(50))
+    #expect(observation.unreadableFrameCount > 0)
+    #expect(observation.crossOriginFramesOpaque)
+    #expect(!observation.isComplete)
+  }
+
+  @Test("Cross-origin controls are observable only as third-party, non-native targets")
+  func crossOriginControlsCarryThirdPartyProvenance() async throws {
+    let cardCanary = "FRAME-CARD-CANARY-4b9f5e"
+    let stateCanary = "FRAME-STATE-CANARY-6a128d"
+    let optionCanary = "FRAME-OTP-CANARY-8c7341"
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><title>Embedded checkout</title>
+          <script>
+            globalThis.__webkituiFrameCapabilityID = "page-forged-capability";
+            globalThis.frameOrigin = "https://forged.example";
+            globalThis.frameIsMain = true;
+          </script>
+          <button aria-label="Third-party action">Continue</button>
+          <input aria-label="Card number" autocomplete="cc-number"
+            value="\(cardCanary)" data-state="\(stateCanary)">
+          <select aria-label="One-time code" name="one-time-code">
+            <option selected>\(optionCanary)</option>
+          </select>
+          """)
+    }
+    let childURL = URL(string: "http://127.0.0.1:\(child.port)/checkout")!
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><title>Merchant</title>
+          <button aria-label="Merchant action">Outer</button>
+          <iframe src="\(childURL.absoluteString)"></iframe>
+          """)
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/cart")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    let observation = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let embedded = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Third-party action"
+      })
+    #expect(embedded.frameOrigin == "http://127.0.0.1:\(child.port)")
+    #expect(embedded.frameIsMain == false)
+    #expect(embedded.actionability == .crossOriginFrameNativeGeometryUnavailable)
+    #expect(embedded.frameActionModes == [.hoverJavaScript, .pressKeyNativeAppKit])
+    #expect(embedded.boundingBoxCoordinateSpace == .frameViewport)
+    let payment = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Card number"
+      })
+    let otp = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "One-time code"
+      })
+    #expect(payment.frameActionModes == [])
+    #expect(otp.frameActionModes == [])
+    await #expect(throws: WebKitRuntimeError.sensitiveInputRequiresHuman) {
+      try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: payment.elementID,
+        operation: .hover,
+        stabilityInterval: .zero)
+    }
+    let source = try #require(embedded.accessibleName?.segments.first?.sources.first)
+    #expect(source.classification == .thirdPartyEmbed)
+    #expect(source.documentID == observation.documentID)
+    #expect(source.frameID == "embedded")
+    #expect(
+      source.securityOrigin
+        == SecurityOrigin(scheme: "http", host: "127.0.0.1", port: Int(child.port)))
+    var embeddedStrings = [embedded.tag]
+    embeddedStrings.append(
+      contentsOf: [
+        embedded.role, embedded.accessibleName, embedded.label, embedded.text, embedded.value,
+        embedded.selectedOption,
+      ].compactMap { $0 })
+    embeddedStrings.append(contentsOf: embedded.stateAttributes.values)
+    embeddedStrings.append(contentsOf: embedded.contextAnchors.map(\.text))
+    embeddedStrings.append(contentsOf: embedded.stableAttributes.values)
+    embeddedStrings.append(contentsOf: (embedded.options ?? []).map(\.label))
+    #expect(
+      embeddedStrings.allSatisfy { text in
+        text.segments.allSatisfy { segment in
+          segment.sources.allSatisfy {
+            $0.classification == .thirdPartyEmbed
+              && $0.documentID == observation.documentID
+              && $0.frameID == "embedded"
+              && $0.securityOrigin == source.securityOrigin
+          }
+        }
+      })
+    #expect(observation.unreadableFrameCount == 0)
+    #expect(observation.crossOriginFramesOpaque == false)
+
+    let canonicalState = try observation.canonicalState()
+    #expect(
+      canonicalState.entries.contains {
+        $0.key.frameID == "embedded" && $0.key.elementID == embedded.elementID
+          && $0.key.field == "@accessible_name"
+      })
+    #expect(
+      !canonicalState.entries.contains {
+        $0.key.frameID == "main" && $0.key.elementID == embedded.elementID
+      })
+    let payloads = try [
+      JSONEncoder().encode(observation),
+      canonicalState.canonicalJSONData(),
+      JSONEncoder().encode(observation.elements.map(\.locatorRecipe)),
+    ]
+    let nativeCapabilityID = try #require(
+      runtime.frameRegistrySnapshot().capabilities.first {
+        !$0.isMainFrame && $0.origin == "http://127.0.0.1:\(child.port)"
+      }?.capabilityID)
+    #expect(
+      payloads.allSatisfy {
+        let encoded = String(decoding: $0, as: UTF8.self)
+        return !encoded.contains(nativeCapabilityID)
+          && !encoded.contains("page-forged-capability")
+          && !encoded.contains("https://forged.example")
+      })
+    for canary in [cardCanary, stateCanary, optionCanary] {
+      #expect(payloads.allSatisfy { !String(decoding: $0, as: UTF8.self).contains(canary) })
+    }
+
+    await #expect(
+      throws: WebKitRuntimeError.crossOriginFrameActionUnavailable(
+        "http://127.0.0.1:\(child.port)"
+      )
+    ) {
+      try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: embedded.elementID,
+        operation: .click,
+        stabilityInterval: .zero)
+    }
+  }
+
+  @Test("Cross-origin hover and select stay explicit untrusted JavaScript actions")
+  func crossOriginScriptActionsAreMeasuredAndUntrusted() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><title>Waiting</title>
+          <button aria-label="Hover target"
+            onmouseover="document.title='hovered:' + event.isTrusted">Hover</button>
+          <label for="country">Country</label>
+          <select id="country"
+            onchange="document.title='selected:' + this.value + ':' + event.isTrusted">
+            <option value="de">Germany</option>
+            <option value="fr">France</option>
+          </select>
+          """)
+    }
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><iframe src='\(childOrigin)/controls'></iframe>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    let beforeHover = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let hover = try #require(
+      beforeHover.elements.first {
+        $0.accessibleName?.segments.first?.text == "Hover target"
+      })
+    let hoverResult = try await runtime.perform(
+      observationID: beforeHover.observationID,
+      elementID: hover.elementID,
+      operation: .hover,
+      stabilityInterval: .milliseconds(1))
+    #expect(hoverResult.dispatched)
+    #expect(!hoverResult.trustedUserGesture)
+    #expect(hoverResult.dispatchMode == .javascript)
+    let frameCapabilityID = try #require(
+      runtime.frameRegistrySnapshot().capabilities.first {
+        !$0.isMainFrame && $0.origin == childOrigin
+      }?.capabilityID)
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: frameCapabilityID)
+        == .available(title: "hovered:false"))
+
+    let beforeSelect = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let select = try #require(
+      beforeSelect.elements.first {
+        $0.accessibleName?.segments.first?.text == "Country"
+      })
+    let selectResult = try await runtime.perform(
+      observationID: beforeSelect.observationID,
+      elementID: select.elementID,
+      operation: .selectOption(
+        try ProvenancedText(
+          text: "France", source: ProvenanceSource(classification: .modelGenerated))),
+      stabilityInterval: .milliseconds(1))
+    #expect(selectResult.dispatched)
+    #expect(!selectResult.trustedUserGesture)
+    #expect(selectResult.dispatchMode == .javascript)
+
+    let afterSelect = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let refreshed = try #require(
+      afterSelect.elements.first {
+        $0.accessibleName?.segments.first?.text == "Country"
+      })
+    #expect(refreshed.selectedOption?.segments.first?.text == "France")
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: frameCapabilityID)
+        == .available(title: "selected:fr:false"))
+  }
+
+  @Test("Cross-origin AppKit key and fill require a trusted exact-frame receipt")
+  func crossOriginNativeTextActionsCarryTrustedFrameReceipt() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><title>Waiting</title>
+          <input aria-label="Key target"
+            onkeydown="if(event.key==='Enter') document.title='key:' + event.isTrusted">
+          <input aria-label="Fill target"
+            oninput="document.title='fill:' + event.isTrusted">
+          """)
+    }
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><iframe src='\(childOrigin)/controls'></iframe>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+    let frameCapabilityID = try #require(
+      runtime.frameRegistrySnapshot().capabilities.first {
+        !$0.isMainFrame && $0.origin == childOrigin
+      }?.capabilityID)
+
+    let beforeKey = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let keyTarget = try #require(
+      beforeKey.elements.first {
+        $0.accessibleName?.segments.first?.text == "Key target"
+      })
+    let originalFillTarget = try #require(
+      beforeKey.elements.first {
+        $0.accessibleName?.segments.first?.text == "Fill target"
+      })
+    #expect(
+      keyTarget.locatorRecipe.semanticIdentity != originalFillTarget.locatorRecipe.semanticIdentity)
+    let keyResult = try await runtime.perform(
+      observationID: beforeKey.observationID,
+      elementID: keyTarget.elementID,
+      operation: .pressKey("Enter"),
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+    #expect(keyResult.dispatched)
+    #expect(keyResult.trustedUserGesture)
+    #expect(keyResult.dispatchMode == .nativeAppKit)
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: frameCapabilityID)
+        == .available(title: "key:true"))
+
+    let beforeFill = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let fillTarget = try #require(
+      beforeFill.elements.first {
+        $0.accessibleName?.segments.first?.text == "Fill target"
+      })
+    #expect(
+      fillTarget.locatorRecipe.semanticIdentity
+        == originalFillTarget.locatorRecipe.semanticIdentity)
+    let fillResult = try await runtime.perform(
+      observationID: beforeFill.observationID,
+      elementID: fillTarget.elementID,
+      operation: .fill(
+        try ProvenancedText(
+          text: "Kevin", source: ProvenanceSource(classification: .modelGenerated))),
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+    #expect(fillResult.dispatched)
+    #expect(fillResult.trustedUserGesture)
+    #expect(fillResult.dispatchMode == .nativeAppKit)
+
+    let afterFill = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let filled = try #require(
+      afterFill.elements.first {
+        $0.accessibleName?.segments.first?.text == "Fill target"
+      })
+    #expect(filled.value?.segments.first?.text == "Kevin")
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: frameCapabilityID)
+        == .available(title: "fill:true"))
+  }
+
+  @Test("Cross-origin native text action without a target receipt is indeterminate")
+  func crossOriginNativeTextActionRequiresReceipt() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><title>Untouched</title>
+          <input aria-label="Vanishing target"
+            onfocus="this.replaceWith(this.cloneNode(true))"
+            onkeydown="document.title='dispatched'">
+          """)
+    }
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><iframe src='\(childOrigin)/controls'></iframe>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+    let observation = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Vanishing target"
+      })
+
+    await #expect(throws: WebKitRuntimeError.nativeGestureReceiptUnavailable) {
+      try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID,
+        operation: .pressKey("Enter"),
+        dispatchMode: .nativeAppKit,
+        stabilityInterval: .milliseconds(1))
+    }
+    let frameCapabilityID = try #require(
+      runtime.frameRegistrySnapshot().capabilities.first {
+        !$0.isMainFrame && $0.origin == childOrigin
+      }?.capabilityID)
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: frameCapabilityID)
+        == .available(title: "Untouched"))
+  }
+
+  @Test("Cross-origin native pointer refuses and preserves the human handoff route")
+  func crossOriginNativePointerRefusesIntoHandoff() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><title>Untouched</title>
+          <button aria-label="Native pointer target"
+            onclick="document.title='clicked'">Continue</button>
+          """)
+    }
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><iframe src='\(childOrigin)/controls'></iframe>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+    let observation = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Native pointer target"
+      })
+    let frameCapabilityID = try #require(
+      runtime.frameRegistrySnapshot().capabilities.first {
+        !$0.isMainFrame && $0.origin == childOrigin
+      }?.capabilityID)
+
+    await #expect(
+      throws: WebKitRuntimeError.crossOriginNativeGeometryUnavailable(childOrigin)
+    ) {
+      try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID,
+        operation: .click,
+        dispatchMode: .nativeAppKit,
+        stabilityInterval: .milliseconds(1))
+    }
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: frameCapabilityID)
+        == .available(title: "Untouched"))
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    #expect(await runtime.probeFrameDocument(capabilityID: frameCapabilityID) == .unavailable)
+    try runtime.markHumanStepCompleted()
+    try runtime.requestAgentResume()
+    let resumed = try await runtime.resumeAfterHumanControl()
+    #expect(
+      resumed.elements.contains {
+        $0.accessibleName?.segments.first?.text == "Native pointer target"
+      })
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: frameCapabilityID)
+        == .available(title: "Untouched"))
+  }
+
+  @Test("A replaced cross-origin node is recovered only inside its exact frame")
+  func crossOriginReplacementUsesPrivateFrameRecipe() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><title>Replaceable child</title>
+          <button id="target" aria-label="Replaceable child action">Continue</button>
+          <script>
+            addEventListener('message', event => {
+              if (event.data !== 'replace-target') return;
+              const current = document.getElementById('target');
+              current.replaceWith(current.cloneNode(true));
+            });
+          </script>
+          """)
+    }
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><iframe src='\(childOrigin)/child'></iframe>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    let observation = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Replaceable child action"
+      })
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('iframe').contentWindow.postMessage('replace-target', '*')")
+    try await Task.sleep(for: .milliseconds(100))
+
+    let resolution = try await runtime.preflightResolution(
+      observationID: observation.observationID,
+      elementID: target.elementID)
+    #expect(resolution.finalCandidateCount == 1)
+    let before = runtime.addressingCounterSnapshot()
+    await #expect(
+      throws: WebKitRuntimeError.crossOriginFrameActionUnavailable(childOrigin)
+    ) {
+      try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID,
+        operation: .click,
+        stabilityInterval: .zero)
+    }
+    let after = runtime.addressingCounterSnapshot()
+    #expect(
+      after.nodeReplacedButSemanticLocatorRecovered
+        == before.nodeReplacedButSemanticLocatorRecovered + 1)
+  }
+
+  @Test("Navigating a child document expires its target instead of hitting by position")
+  func crossOriginChildNavigationExpiresObservedTarget() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><button aria-label='Same semantic child'>Continue</button>")
+    }
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><iframe src='\(childOrigin)/first'></iframe>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    let observation = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Same semantic child"
+      })
+    let registrationsBefore = runtime.frameRegistrySnapshot().capabilities.count
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('iframe').src = '\(childOrigin)/second'")
+    for _ in 0..<fixtureSettlementPolls {
+      if runtime.frameRegistrySnapshot().capabilities.count > registrationsBefore { break }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(runtime.frameRegistrySnapshot().capabilities.count > registrationsBefore)
+
+    await #expect(throws: WebKitRuntimeError.staleObservation) {
+      try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID,
+        operation: .click,
+        stabilityInterval: .zero)
+    }
+  }
+
+  @Test("Duplicate controls in byte-identical frames never cross-resolve")
+  func duplicateCrossOriginFramesResolveIndependently() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><button aria-label="Duplicate child action">Continue</button>
+          <script>
+            addEventListener('message', event => {
+              if (event.data === 'rename-target') {
+                document.querySelector('button').setAttribute('aria-label', 'Changed child action');
+              }
+            });
+          </script>
+          """)
+    }
+    let childURL = "http://127.0.0.1:\(child.port)/same"
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html>
+          <iframe src="\(childURL)"></iframe><iframe src="\(childURL)"></iframe>
+          """)
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    let observation = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let targets = observation.elements.filter {
+      $0.accessibleName?.segments.first?.text == "Duplicate child action"
+    }
+    #expect(targets.count == 2)
+    for target in targets {
+      let resolution = try await runtime.preflightResolution(
+        observationID: observation.observationID,
+        elementID: target.elementID)
+      #expect(resolution.finalCandidateCount == 1)
+    }
+
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelectorAll('iframe')[0].contentWindow.postMessage('rename-target', '*')")
+    try await Task.sleep(for: .milliseconds(100))
+    var counts: [Int] = []
+    for target in targets {
+      let resolution = try await runtime.preflightResolution(
+        observationID: observation.observationID,
+        elementID: target.elementID)
+      counts.append(resolution.finalCandidateCount)
+    }
+    #expect(counts.sorted() == [0, 1])
+  }
+
+  @Test("A child-origin change after observation is stale before dispatch")
+  func crossOriginChangeIsStaleBeforeDispatch() async throws {
+    let firstChild = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body:
+          "<!doctype html><title>First child</title><button aria-label='Origin-bound action'>Continue</button>"
+      )
+    }
+    let secondChild = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body:
+          "<!doctype html><title>Second child</title><button aria-label='Origin-bound action' onclick=\"document.title='DISPATCHED'\">Continue</button>"
+      )
+    }
+    let firstOrigin = "http://127.0.0.1:\(firstChild.port)"
+    let secondOrigin = "http://127.0.0.1:\(secondChild.port)"
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<!doctype html><iframe src='\(firstOrigin)/child'></iframe>")
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/parent")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    let observation = try await runtime.observe(hydrationTimeout: .milliseconds(250))
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Origin-bound action"
+      })
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('iframe').src = '\(secondOrigin)/child'")
+    var replacementCapabilityID: String?
+    for _ in 0..<fixtureSettlementPolls {
+      replacementCapabilityID =
+        runtime.frameRegistrySnapshot().capabilities.first {
+          !$0.isMainFrame && $0.origin == secondOrigin
+        }?.capabilityID
+      if replacementCapabilityID != nil { break }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    let freshCapabilityID = try #require(replacementCapabilityID)
+
+    await #expect(throws: WebKitRuntimeError.staleObservation) {
+      try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID,
+        operation: .click,
+        stabilityInterval: .zero)
+    }
+    #expect(
+      await runtime.probeFrameDocument(capabilityID: freshCapabilityID)
+        == .available(title: "Second child"))
+  }
+
+  @Test("Frame-local observations share one filter, page bound, and stable pagination")
+  func crossOriginObservationUsesGlobalBounds() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html>
+          <button aria-label="Child first">One</button>
+          <button aria-label="Child second">Two</button>
+          """)
+    }
+    let childURL = URL(string: "http://127.0.0.1:\(child.port)/controls")!
+    let parent = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <!doctype html><button aria-label="Parent only">Outer</button>
+          <iframe srcdoc="&lt;button aria-label='Same-origin once'&gt;Same&lt;/button&gt;"></iframe>
+          <iframe src="\(childURL.absoluteString)"></iframe>
+          """)
+    }
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(parent.port)/mixed")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(150))
+
+    let first = try await runtime.observe(
+      maximumElements: 2, hydrationTimeout: .milliseconds(250))
+    let second = try await runtime.observe(
+      maximumElements: 2, elementOffset: 2, hydrationTimeout: .milliseconds(250))
+    let names = (first.elements + second.elements).compactMap {
+      $0.accessibleName?.segments.first?.text
+    }
+    #expect(first.totalElementCount == 4)
+    #expect(first.nextElementOffset == 2)
+    #expect(second.nextElementOffset == nil)
+    #expect(names == ["Parent only", "Same-origin once", "Child first", "Child second"])
+    #expect(names.filter { $0 == "Same-origin once" }.count == 1)
+    let sameOrigin = try #require(
+      (first.elements + second.elements).first {
+        $0.accessibleName?.segments.first?.text == "Same-origin once"
+      })
+    #expect(sameOrigin.frameOrigin == nil)
+    #expect(sameOrigin.frameIsMain == nil)
+    #expect(sameOrigin.boundingBoxCoordinateSpace == nil)
+    #expect(
+      sameOrigin.accessibleName?.segments.first?.sources.first?.classification
+        == .firstPartySiteContent)
+
+    let filtered = try await runtime.observe(
+      roles: ["button"], nameContains: "child second",
+      hydrationTimeout: .milliseconds(250))
+    #expect(filtered.totalElementCount == 1)
+    #expect(filtered.elements.first?.accessibleName?.segments.first?.text == "Child second")
   }
 
   @Test("Open shadow DOM controls remain observable and actionable")
@@ -2571,6 +3404,93 @@ struct WebKitRuntimeTests {
       try runtime.requestAgentResume()
     }
     #expect(runtime.interactionControlState() == .humanControlled)
+    #expect(!String(describing: result).contains(secret))
+  }
+
+  @Test("A restricted authentication child frame refuses, hands off, and resumes once it is gone")
+  func restrictedAuthenticationChildFrameHandoffAndResume() async throws {
+    let secret = "child-query-state-must-never-escape"
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<title>Sign in</title><form><input autocomplete='username'>"
+          + "<input type='password'><button>Sign in</button></form>")
+    }
+    let parent = try FormFixtureServer { request in
+      request.hasPrefix("GET /home")
+        ? FormFixtureServer.response(body: "<title>Home</title><button>Continue</button>")
+        : FormFixtureServer.response(
+          body: "<title>Account</title><iframe src='http://idmsa.apple.com:\(child.port)"
+            + "/IDMSWebAuth/signin?state=\(secret)'></iframe><button>Continue</button>")
+    }
+    // The restricted host resolves to loopback through the pinned proxy: the policy path
+    // sees the real hostname while no byte leaves the machine.
+    let proxy = try PinnedSOCKSProxy { host in
+      ResolvedPublicAddress(host: host, address: "127.0.0.1")
+    }
+    let store = WKWebsiteDataStore.nonPersistent()
+    store.proxyConfigurations = [proxy.proxyConfiguration()]
+    let runtime = WebKitRuntime(websiteDataStore: store, egressProxy: proxy)
+    // apple.com is on WebKit's HSTS preload list, so the child request is upgraded to
+    // https before the navigation policy sees it. The origin recorded for the refusal is
+    // the upgraded one; the TLS handshake against the plain fixture then fails, which
+    // this test never depends on: the refusal is decided before any child byte arrives.
+    let childOrigin = "https://idmsa.apple.com:\(child.port)"
+
+    let result = try await runtime.navigate(
+      to: URL(string: "http://account.test:\(parent.port)/")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(200)
+    )
+    #expect(result.readiness == .ready)
+    #expect(result.url == "http://account.test:\(parent.port)/")
+    let status = try #require(runtime.authenticationRestrictionStatus())
+    #expect(status.origin == childOrigin)
+    #expect(status.classification == .humanHandoffRequired)
+
+    await #expect(throws: WebKitRuntimeError.authenticationOriginRequiresHuman(childOrigin)) {
+      try await runtime.observe()
+    }
+    await #expect(throws: WebKitRuntimeError.authenticationOriginRequiresHuman(childOrigin)) {
+      try await runtime.readText()
+    }
+    await #expect(throws: WebKitRuntimeError.authenticationOriginRequiresHuman(childOrigin)) {
+      try await runtime.capture()
+    }
+    await #expect(throws: WebKitRuntimeError.authenticationOriginRequiresHuman(childOrigin)) {
+      try await runtime.perform(
+        observationID: UUID().uuidString,
+        elementID: "e1",
+        operation: .click
+      )
+    }
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    #expect(runtime.interactionControlState() == .humanControlled)
+    try runtime.markHumanStepCompleted()
+    #expect(throws: WebKitRuntimeError.authenticationOriginRequiresHuman(childOrigin)) {
+      try runtime.requestAgentResume()
+    }
+    #expect(runtime.interactionControlState() == .humanStepCompleted)
+
+    // The human finishes signing in and the site leaves the sign-in document behind.
+    _ = try await runtime.webView.evaluateJavaScript("location.assign('/home'); 0")
+    let deadline = ContinuousClock.now + .seconds(10)
+    while runtime.authenticationRestrictionStatus() != nil || runtime.webView.isLoading,
+      ContinuousClock.now < deadline
+    {
+      try await Task.sleep(for: .milliseconds(50))
+    }
+    #expect(runtime.authenticationRestrictionStatus() == nil)
+
+    try runtime.requestAgentResume()
+    let observation = try await runtime.resumeAfterHumanControl()
+    #expect(runtime.interactionControlState() == .freshlyReobserved)
+    #expect(observation.title.segments.map(\.text).joined() == "Home")
+    #expect(observation.elements.allSatisfy { $0.frameIsMain != false })
+    #expect(!observation.elements.isEmpty)
+    #expect(!String(describing: observation).contains(secret))
+    #expect(!String(describing: status).contains(secret))
     #expect(!String(describing: result).contains(secret))
   }
 
@@ -4372,5 +5292,115 @@ struct WebKitRuntimeTests {
     let page = try await runtime.observe()
     #expect(page.pendingDialog == nil)
     #expect(page.title.segments.map(\.text).joined() == "Ledger")
+  }
+
+  @Test("A viewport change crosses a media-query breakpoint and expires the old address space")
+  func viewportChangeInvalidatesObservation() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      """
+      <style>
+        #narrow { display: none }
+        @media (max-width: 500px) {
+          #wide { display: none }
+          #narrow { display: block }
+        }
+      </style>
+      <button id="wide">Wide action</button>
+      <button id="narrow">Narrow action</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/responsive"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let wide = try #require(
+      before.elements.first(where: {
+        $0.accessibleName?.segments.map(\.text).joined() == "Wide action"
+      }))
+    #expect(
+      before.elements.allSatisfy {
+        $0.accessibleName?.segments.map(\.text).joined() != "Narrow action"
+      })
+
+    let changed = try await runtime.setViewport(width: 400, height: 600)
+
+    #expect(changed.previousWidth == 1280)
+    #expect(changed.previousHeight == 800)
+    #expect(changed.width == 400)
+    #expect(changed.height == 600)
+    #expect(changed.layoutChanged)
+    #expect(changed.observationInvalidated)
+    #expect(throws: WebKitRuntimeError.staleObservation) {
+      try runtime.locatorRecipe(
+        observationID: before.observationID, elementID: wide.elementID)
+    }
+    let after = try await runtime.observe()
+    #expect(
+      after.elements.contains(where: {
+        $0.accessibleName?.segments.map(\.text).joined() == "Narrow action"
+      }))
+    #expect(
+      after.elements.allSatisfy {
+        $0.accessibleName?.segments.map(\.text).joined() != "Wide action"
+      })
+  }
+
+  @Test("Reloading a page produced by a form submission is refused before replay")
+  func formSubmissionReloadIsRefused() async throws {
+    let server = try FormFixtureServer()
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/form")!,
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(20))
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('form').requestSubmit()")
+    for _ in 0..<fixtureSettlementPolls where runtime.webView.url?.path != "/submitted" {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(runtime.webView.url?.path == "/submitted")
+
+    #expect(throws: WebKitRuntimeError.formSubmissionReloadRefused) {
+      try runtime.historyDestination(for: .reload)
+    }
+  }
+
+  @Test("A geolocation request is denied and observed with its requesting origin")
+  @available(macOS 27.0, *)
+  func geolocationPermissionDenialIsObserved() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    let capture = SecurityOriginCapture()
+    let captureName = "permissionOrigin\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+    runtime.webView.configuration.userContentController.add(capture, name: captureName)
+    defer {
+      runtime.webView.configuration.userContentController.removeScriptMessageHandler(
+        forName: captureName)
+    }
+    _ = try await runtime.loadHTML(
+      "<title>Location request</title><p>Ready</p>",
+      baseURL: URL(string: "https://permissions.example/location"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40))
+    _ = try await runtime.webView.evaluateJavaScript(
+      "window.webkit.messageHandlers['\(captureName)'].postMessage('origin'); true")
+    let origin = try #require(capture.origin)
+    var decision: WKPermissionDecision?
+    #expect(
+      runtime.responds(
+        to: NSSelectorFromString(
+          "webView:requestGeolocationPermissionForOrigin:initiatedByFrame:decisionHandler:")))
+    runtime.webView(
+      runtime.webView,
+      requestGeolocationPermissionFor: origin,
+      initiatedByFrame: StubFrameInfo.mainFrame
+    ) { decision = $0 }
+
+    #expect(decision == .deny)
+    let observation = try await runtime.observe()
+    let denial = try #require(observation.permissionDenials.last)
+    #expect(denial.permission == .geolocation)
+    #expect(denial.origin == "https://permissions.example")
+    #expect(denial.frameIsMain)
+    #expect(denial.requestCount == 1)
   }
 }

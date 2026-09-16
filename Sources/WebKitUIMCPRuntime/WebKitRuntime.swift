@@ -25,6 +25,14 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   /// it, because that is what tells a client whether to re-observe or look again.
   case targetNotUnique(Int, pinned: String)
   case targetNotActionable
+  /// A native pointer operation cannot translate a frame-local rectangle into the
+  /// top-level WebKit view with public API. Nothing was dispatched.
+  case crossOriginNativeGeometryUnavailable(String)
+  /// The control is visible inside a cross-origin frame, but public WebKit exposes no
+  /// transform from that frame's viewport to top-level native pointer coordinates.
+  /// Until an exact frame-local dispatch exists, every operation refuses before
+  /// confirmation or dispatch and offers the live human handoff.
+  case crossOriginFrameActionUnavailable(String)
   case targetGeometryChanged
   /// Nothing matched the address at all. Carries the required facts whose removal would
   /// have matched, which names what changed under the observation.
@@ -86,6 +94,17 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   /// the requested option as selected. The gesture landed; its effect is unknown, so
   /// this is indeterminate and never a failure to dispatch.
   case selectedOptionMismatch
+  /// The requested history direction has no entry. WebKit's `goBack()` and
+  /// `goForward()` otherwise return nil and leave the caller unable to distinguish a
+  /// refusal from a no-op.
+  case historyEntryUnavailable(WebKitHistoryOperation)
+  /// The entry WebKit offered before confirmation changed while the operator was
+  /// reading it. History is re-read immediately before dispatch, just like an element
+  /// is re-resolved after its confirmation.
+  case historyDestinationChanged
+  /// Reloading the response to a form submission can submit the same write twice.
+  case formSubmissionReloadRefused
+  case invalidViewportSize(width: Int, height: Int)
 }
 
 public enum AuthenticationUIClassification: String, Codable, Equatable, Sendable {
@@ -133,6 +152,15 @@ public enum PageReadiness: String, Codable, Equatable, Sendable {
   case processTerminated = "process_terminated"
 }
 
+/// Whether a technically settled document exposes anything a person or an agent can
+/// use. DOM completion is deliberately separate: a blank application shell can reach
+/// `readyState=complete` and mutation quiescence while still rendering no page at all.
+public enum PageContentState: String, Codable, Equatable, Sendable {
+  case usable
+  case emptyOrUnusable = "empty_or_unusable"
+  case unknown
+}
+
 public struct WebKitNavigationResult: Codable, Equatable, Sendable {
   public let documentID: String
   public let url: String
@@ -142,8 +170,24 @@ public struct WebKitNavigationResult: Codable, Equatable, Sendable {
   public let requestedURL: String
   public var redirected: Bool { requestedURL != url }
   public let readiness: PageReadiness
+  public let contentState: PageContentState
   public let elapsedNanoseconds: UInt64
   public let mutationCount: UInt64
+}
+
+public enum WebKitHistoryOperation: String, Codable, Equatable, Sendable {
+  case back
+  case forward
+  case reload
+}
+
+public struct WebKitViewportChangeResult: Codable, Equatable, Sendable {
+  public let previousWidth: Int
+  public let previousHeight: Int
+  public let width: Int
+  public let height: Int
+  public let layoutChanged: Bool
+  public let observationInvalidated: Bool
 }
 
 public enum WebKitNavigationActor: String, Codable, Equatable, Sendable {
@@ -199,6 +243,11 @@ public struct LocatorQuality: Codable, Equatable, Sendable {
 
 public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let elementID: String
+  /// Present only for a separately evaluated embedded frame. Main-document and
+  /// same-origin descendant controls omit both fields to preserve the default wire
+  /// budget. The origin contains no path, query, fragment, or credentials.
+  public let frameOrigin: String?
+  public let frameIsMain: Bool?
   public let tag: ProvenancedText
   public let role: ProvenancedText?
   public let accessibleName: ProvenancedText?
@@ -245,6 +294,14 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let visible: Bool
   public let actionability: ObservedActionability
   public var actionable: Bool { actionability == .actionable }
+  /// Eligible frame-local dispatch modes, not a promise of success: the live target
+  /// still has to pass exact-frame, state, uniqueness, and geometry checks. `nil` on
+  /// the main page; empty for an embedded control reserved for human handling.
+  public let frameActionModes: [WebKitFrameActionMode]?
+  /// Absent for the main document and same-origin descendants, whose boxes use the
+  /// top-level viewport. A separately evaluated frame cannot be transformed through
+  /// public WebKit API, so its local coordinate space is named instead of implied.
+  public let boundingBoxCoordinateSpace: ObservedBoundingBoxCoordinateSpace?
   public let boundingBox: ObservedBoundingBox
   public let locatorRecipe: LocatorRecipe
   public let locatorQuality: LocatorQuality
@@ -271,6 +328,10 @@ public struct ObservedOption: Codable, Equatable, Sendable {
 
 public enum ObservedActionability: String, Codable, Equatable, Sendable {
   case actionable
+  /// Semantics are readable, but the bounding box is in the embedded frame's local
+  /// viewport. Public `WKFrameInfo` exposes no exact native coordinate transform.
+  case crossOriginFrameNativeGeometryUnavailable =
+    "cross_origin_frame_native_geometry_unavailable"
   /// Laid out but collapsed to nothing. Reported because the only exit from a form can
   /// be one of these, but no click can reach it.
   case noLayoutBox = "no_layout_box"
@@ -283,10 +344,39 @@ public enum ObservedActionability: String, Codable, Equatable, Sendable {
   case covered
 }
 
+public enum WebKitFrameActionMode: String, Codable, Equatable, Sendable {
+  case hoverJavaScript = "hover_javascript"
+  case selectOptionJavaScript = "select_option_javascript"
+  case pressKeyNativeAppKit = "press_key_native_appkit"
+  case fillNativeAppKit = "fill_native_appkit"
+}
+
+public enum ObservedBoundingBoxCoordinateSpace: String, Codable, Equatable, Sendable {
+  case frameViewport = "frame_viewport"
+}
+
 public enum ObservedValidationState: String, Codable, Equatable, Sendable {
   case valid
   case invalid
   case notApplicable = "not_applicable"
+}
+
+public enum WebKitDeniedPermission: String, Codable, Equatable, Sendable {
+  case geolocation
+  case camera
+  case microphone
+  case cameraAndMicrophone = "camera_and_microphone"
+  /// A future WebKit capture kind is still denied and reported rather than silently
+  /// inheriting a more permissive default.
+  case mediaCapture = "media_capture"
+}
+
+public struct WebKitPermissionDenial: Codable, Equatable, Sendable {
+  public let origin: String
+  public let permission: WebKitDeniedPermission
+  public let frameIsMain: Bool
+  public let requestCount: UInt64
+  public let lastDeniedAtMonotonicNanoseconds: UInt64
 }
 
 public struct WebKitPageObservation: Codable, Equatable, Sendable {
@@ -305,9 +395,9 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// observation as the whole page concludes things are absent that are on screen —
   /// which is how a complete declaration was reported to a user as missing.
   public var isPartial: Bool { totalElementCount > elements.count }
-  /// Frames whose content could not be read at all. Same-origin frames are walked;
-  /// a cross-origin one never can be, and staying quiet about it is how a page gets
-  /// read as complete when part of it was never legible.
+  /// Frames whose content could not be read at all. Same-origin frames are walked and
+  /// registered cross-origin frames are evaluated independently; failures and native
+  /// registry overflow stay explicit so a partial page is never reported as complete.
   public let unreadableFrameCount: Int
   /// Everything on this page was both returned and legible. Anything less has to be
   /// said out loud, or an absence gets reported as a fact.
@@ -318,6 +408,14 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let crossOriginFramesOpaque: Bool
   /// Controls the raw DOM renders, counted independently of the semantic matcher.
   public let renderedInteractiveCount: Int
+  /// Visible text counts once, plus every rendered interactive control or visual-media
+  /// element. Zero is stronger than an empty semantic tree: it means the settled page
+  /// exposes no usable rendered content at all.
+  public let renderedContentCount: Int
+  public var contentState: PageContentState {
+    if pendingDialog != nil { return .unknown }
+    return renderedContentCount == 0 ? .emptyOrUnusable : .usable
+  }
   /// Rendered controls dropped only because an ancestor is aria-hidden or inert.
   /// A page that paints its controls and marks them hidden leaves an empty tree for
   /// a reason the caller must be able to see.
@@ -344,6 +442,11 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// page's script does not run, so nothing else in this observation could be read:
   /// the dialog is the observation.
   public let pendingDialog: WebKitPendingJavaScriptDialog?
+  /// Permissions this document asked for and WebKitUI denied. Repeated identical
+  /// requests are counted so a polling page cannot grow the observation without bound.
+  public let permissionDenials: [WebKitPermissionDenial]
+  public let permissionDenialCount: UInt64
+  public let permissionDenialsTruncated: Bool
 }
 
 public struct WebKitCapture: Sendable {
@@ -387,6 +490,8 @@ public struct WebKitTextSnapshot: Codable, Equatable, Sendable {
   public let bodyText: String
   public let regions: [WebKitTextRegion]
   public let truncated: Bool
+  public let contentState: PageContentState
+  public let renderedContentCount: Int
 }
 
 /// A modifier held down for one key press. An explicit set, not a chord string: the
@@ -718,6 +823,25 @@ public struct WebContentTerminationEvent: Codable, Equatable, Sendable {
   public let monotonicNanoseconds: UInt64
 }
 
+/// A value-only view used when frame-local observations are combined. The retained
+/// `WKFrameInfo` never crosses the runtime boundary, and this metadata is not yet
+/// model-visible.
+struct WebKitFrameCapabilitySnapshot: Equatable, Sendable {
+  let capabilityID: String
+  let origin: String
+  let isMainFrame: Bool
+}
+
+struct WebKitFrameRegistrySnapshot: Equatable, Sendable {
+  let capabilities: [WebKitFrameCapabilitySnapshot]
+  let droppedRegistrationCount: UInt64
+}
+
+enum WebKitFrameDocumentProbe: Equatable, Sendable {
+  case available(title: String)
+  case unavailable
+}
+
 /// What WebKit reported it was about to submit. Values are deliberately absent: a form
 /// carries passwords, card numbers and one-time codes, and this receipt is exported.
 public struct WebKitSubmissionFacts: Codable, Equatable, Sendable {
@@ -814,6 +938,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var pendingSubmissionDecision: SubmissionApproval.Decision?
   private var webContentTerminationEvents: [WebContentTerminationEvent] = []
   private var lastCommittedHTTPURL: URL?
+  /// Navigation type is captured from WebKit's main-frame policy callback and applied
+  /// only after that navigation finishes. A failed POST must not mark the page that
+  /// remained behind as a form result.
+  private var pendingMainFrameNavigationType: WKNavigationType?
+  private var currentDocumentWasFormSubmission = false
+  private var formSubmissionHistoryItems: Set<ObjectIdentifier> = []
+  private var permissionDenials: [WebKitPermissionDenial] = []
+  private var permissionDenialCount: UInt64 = 0
+  private var permissionDenialsTruncated = false
+  private var registeredFrameCapabilities: [RegisteredFrameCapability] = []
+  /// Never serialized. Prevents a low-entropy third-party label from being recovered
+  /// by guessing the digest in a public frame recipe's semantic identity.
+  private var frameSemanticKey = SymmetricKey(size: .bits256)
+  private var droppedFrameRegistrationCount: UInt64 = 0
+  /// Advances for every document-start frame registration. A child navigation does not
+  /// replace the main document ID, so observation races need this second generation to
+  /// distinguish the frame tree they started reading from the one they would publish.
+  private var frameRegistrationGeneration: UInt64 = 0
+  private var frameObservationRaceToken: UInt64 = 0
+  private var frameObservationRaceContinuations:
+    [UInt64: CheckedContinuation<RawObservation, any Error>] = [:]
   /// The most recent new window the page asked for and was refused. Held until the
   /// document is replaced, so an observation can say a request is still outstanding, and
   /// cleared in `resetForNavigation()` so a later action cannot inherit an older page's
@@ -824,7 +969,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var restrictedWebAuthnOrigin: String?
   private var pendingCrossOriginNavigationRequest: URLRequest?
   private let egressProxy: PinnedSOCKSProxy?
-  private var armedNativeGestureTokens: Set<String> = []
+  private var armedNativeGestureTokens: [String: ArmedNativeGestureContext] = [:]
   private var nativeGestureReceipts: [String: [NativeGestureReceipt]] = [:]
   private let downloadDestinationProvider: (@MainActor @Sendable (String) async -> URL?)?
   private let uploadSelectionProvider: (@MainActor @Sendable (Bool, Bool) async -> [URL]?)?
@@ -890,6 +1035,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     let world = WKContentWorld.world(name: "WebKitUIMCP.Instrumentation")
     contentController.addUserScript(
       WKUserScript(
+        source: Self.frameRegistrationSource,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false,
+        in: world
+      )
+    )
+    contentController.addUserScript(
+      WKUserScript(
         source: Self.instrumentationSource,
         injectionTime: .atDocumentStart,
         forMainFrameOnly: false,
@@ -929,6 +1082,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       WeakScriptMessageHandler(target: self),
       contentWorld: world,
       name: Self.nativeGestureMessageHandlerName)
+    contentController.add(
+      WeakScriptMessageHandler(target: self),
+      contentWorld: world,
+      name: Self.frameRegistrationMessageHandlerName)
     webView.navigationDelegate = self
     webView.uiDelegate = self
     _ = makeBrowserWindow()
@@ -988,6 +1145,178 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     pendingCrossOriginNavigationRequest = nil
   }
 
+  public static let viewportWidthRange = 320...3_840
+  public static let viewportHeightRange = 240...2_160
+
+  /// Changes only the CSS-pixel viewport of the existing desktop WebKit document.
+  /// Device/mobile emulation is deliberately absent: the public macOS SDK exposes no
+  /// `ContentMode` API for WKWebView. Media emulation is likewise not inferred from a
+  /// size; this is a layout operation, not a claim to be another device.
+  public func setViewport(width: Int, height: Int) async throws -> WebKitViewportChangeResult {
+    try requireAgentControl()
+    guard Self.viewportWidthRange.contains(width), Self.viewportHeightRange.contains(height) else {
+      throw WebKitRuntimeError.invalidViewportSize(width: width, height: height)
+    }
+    let previousWidth = Int(webView.bounds.width.rounded())
+    let previousHeight = Int(webView.bounds.height.rounded())
+    let changed = previousWidth != width || previousHeight != height
+    if changed {
+      let window = browserWindow ?? makeBrowserWindow()
+      window.setContentSize(NSSize(width: width, height: height))
+      webView.needsLayout = true
+      webView.needsDisplay = true
+      webView.layoutSubtreeIfNeeded()
+      await awaitViewportSettled()
+      invalidateCurrentObservation()
+    }
+    return WebKitViewportChangeResult(
+      previousWidth: previousWidth,
+      previousHeight: previousHeight,
+      width: Int(webView.bounds.width.rounded()),
+      height: Int(webView.bounds.height.rounded()),
+      layoutChanged: changed,
+      observationInvalidated: changed)
+  }
+
+  /// Returns WebKit's own exact target. The URL remains process-local; callers project
+  /// it through `agentSafeURL` before it reaches a confirmation or MCP response.
+  public func historyDestination(for operation: WebKitHistoryOperation) throws -> URL {
+    try requireAgentControl()
+    let destination: URL?
+    switch operation {
+    case .back:
+      destination = webView.backForwardList.backItem?.url
+    case .forward:
+      destination = webView.backForwardList.forwardItem?.url
+    case .reload:
+      guard !reloadCouldResubmitForm else {
+        throw WebKitRuntimeError.formSubmissionReloadRefused
+      }
+      destination = webView.url ?? lastCommittedHTTPURL
+    }
+    guard let destination else {
+      throw WebKitRuntimeError.historyEntryUnavailable(operation)
+    }
+    guard
+      let scheme = destination.scheme?.lowercased(), ["http", "https"].contains(scheme),
+      destination.host != nil, destination.user == nil, destination.password == nil
+    else { throw WebKitRuntimeError.networkBoundaryDenied }
+    return destination
+  }
+
+  public func navigateHistory(
+    _ operation: WebKitHistoryOperation,
+    expectedDestination: URL,
+    timeout: Duration = .seconds(30),
+    quietWindow: Duration = .milliseconds(300)
+  ) async throws -> WebKitNavigationResult {
+    try requireAgentControl()
+    let liveDestination = try historyDestination(for: operation)
+    guard liveDestination == expectedDestination else {
+      throw WebKitRuntimeError.historyDestinationChanged
+    }
+    if egressProxy != nil, let host = liveDestination.host {
+      do {
+        try PublicNetworkAddressPolicy().validateNavigationHost(host)
+      } catch {
+        throw WebKitRuntimeError.networkBoundaryDenied
+      }
+    }
+    guard let origin = navigationOrigin(for: liveDestination) else {
+      throw WebKitRuntimeError.unsupportedURLScheme
+    }
+    topLevelOriginLock = origin
+    try validate(quietWindow: quietWindow)
+    resetForNavigation()
+    armNavigationActor(.agentNavigation)
+    let started = DispatchTime.now().uptimeNanoseconds
+    let navigation: WKNavigation?
+    let destinationItemID: ObjectIdentifier?
+    switch operation {
+    case .back:
+      guard let item = webView.backForwardList.backItem, item.url == liveDestination else {
+        throw WebKitRuntimeError.historyDestinationChanged
+      }
+      destinationItemID = ObjectIdentifier(item)
+      navigation = webView.go(to: item)
+    case .forward:
+      guard let item = webView.backForwardList.forwardItem, item.url == liveDestination else {
+        throw WebKitRuntimeError.historyDestinationChanged
+      }
+      destinationItemID = ObjectIdentifier(item)
+      navigation = webView.go(to: item)
+    case .reload:
+      // `historyDestination` checked this before confirmation and again above. Keep the
+      // explicit guard adjacent to dispatch so a future preview refactor cannot reopen
+      // form replay.
+      guard !reloadCouldResubmitForm else {
+        throw WebKitRuntimeError.formSubmissionReloadRefused
+      }
+      destinationItemID = webView.backForwardList.currentItem.map(ObjectIdentifier.init)
+      navigation = webView.reload()
+    }
+    guard navigation != nil else {
+      throw WebKitRuntimeError.historyEntryUnavailable(operation)
+    }
+    let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
+    if readiness == .deadlineReached { webView.stopLoading() }
+    guard await historyListSettled(after: operation, at: destinationItemID) else {
+      throw WebKitRuntimeError.navigationTimedOut
+    }
+    let state = try await instrumentationState(includeContentState: readiness == .ready)
+    let contentState = readiness == .ready ? state.contentState ?? .unknown : .unknown
+    await refreshAuthenticationUIClassification()
+    rememberRecoverableURL(webView.url ?? liveDestination)
+    processTerminated = false
+    let loadedURL = webView.url ?? liveDestination
+    return WebKitNavigationResult(
+      documentID: documentID,
+      url: agentSafeURLString(loadedURL) ?? "about:blank",
+      requestedURL: agentSafeURLString(liveDestination) ?? "about:blank",
+      readiness: readiness,
+      contentState: contentState,
+      elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
+      mutationCount: state.mutationCount)
+  }
+
+  private var reloadCouldResubmitForm: Bool {
+    if currentDocumentWasFormSubmission { return true }
+    switch pendingMainFrameNavigationType {
+    case .formSubmitted?, .formResubmitted?: return true
+    default: return false
+    }
+  }
+
+  /// `webView.url` can change one callback before the back/forward list moves its
+  /// cursor. Returning in that gap makes an immediate inverse operation look absent.
+  /// Bound the wait rather than sleeping a fixed duration or claiming the list is ready
+  /// from the URL alone.
+  private func historyListSettled(
+    after operation: WebKitHistoryOperation,
+    at destinationItemID: ObjectIdentifier?,
+    timeout: Duration = .seconds(1)
+  ) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+      let currentMatches =
+        destinationItemID.map {
+          webView.backForwardList.currentItem.map(ObjectIdentifier.init) == $0
+        } ?? (webView.url != nil && !webView.isLoading)
+      let inverseExists: Bool
+      switch operation {
+      case .back:
+        inverseExists = webView.backForwardList.forwardItem != nil
+      case .forward:
+        inverseExists = webView.backForwardList.backItem != nil
+      case .reload:
+        inverseExists = true
+      }
+      if currentMatches && inverseExists { return true }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    return false
+  }
+
   /// Useful for deterministic fixtures and local benchmarks. A non-nil base
   /// URL determines the page's security origin.
   public func loadHTML(
@@ -1004,7 +1333,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     webView.loadHTMLString(html, baseURL: baseURL)
     let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
     if readiness == .deadlineReached { webView.stopLoading() }
-    let state = try await instrumentationState()
+    let state = try await instrumentationState(includeContentState: readiness == .ready)
+    let contentState = readiness == .ready ? state.contentState ?? .unknown : .unknown
     await refreshAuthenticationUIClassification()
     let loadedURL = webView.url ?? baseURL
     return WebKitNavigationResult(
@@ -1014,6 +1344,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       // construction; the field exists for the request that does not.
       requestedURL: baseURL.flatMap(agentSafeURLString) ?? "about:blank",
       readiness: readiness,
+      contentState: contentState,
       elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
       mutationCount: state.mutationCount
     )
@@ -1042,22 +1373,36 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       return try dialogPendingObservation(dialog)
     }
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
+    let observedDocumentID = documentID
+    await bindFrameCapabilitiesToIsolatedWorld()
+    let observedFrameRegistrationGeneration = frameRegistrationGeneration
 
+    let (collectionLimit, collectionLimitOverflow) = elementOffset.addingReportingOverflow(
+      maximumElements)
+    guard !collectionLimitOverflow else {
+      throw WebKitRuntimeError.malformedInstrumentationResult
+    }
     let script = Self.observationSource.replacingOccurrences(
       of: "__MAXIMUM_ELEMENTS__",
-      with: String(maximumElements)
+      with: String(collectionLimit)
     )
     let arguments: [String: Any] = [
       "roleFilters": roles.map { $0.lowercased() },
       "nameFilter": nameContains?.lowercased() ?? "",
-      "elementOffset": elementOffset,
+      // Each document group is filtered before serialization but not paginated on its
+      // own. Native code applies one slice after the unique groups are combined.
+      "elementOffset": 0,
       "maximumFieldCharacters": maximumFieldCharacters,
       "maximumOptions": Self.maximumPublishedOptions,
     ]
-    func captureRawObservation() async throws -> RawObservation {
+    func captureRawObservation(in frame: WKFrameInfo? = nil) async throws -> RawObservation {
+      if let frame {
+        return try await captureFrameRawObservation(
+          script: script, arguments: arguments, frame: frame, timeout: .seconds(2))
+      }
       guard
         let json = try await webView.callAsyncJavaScript(
-          script, arguments: arguments, in: nil, contentWorld: instrumentationWorld) as? String,
+          script, arguments: arguments, in: frame, contentWorld: instrumentationWorld) as? String,
         let data = json.data(using: .utf8),
         let decoded = try? JSONDecoder().decode(RawObservation.self, from: data)
       else { throw WebKitRuntimeError.malformedInstrumentationResult }
@@ -1085,6 +1430,40 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       raw = try await captureRawObservation()
     }
 
+    var capturedGroups = [
+      CapturedObservationGroup(raw: raw, frameCapabilityID: nil, frameOrigin: nil)
+    ]
+    var walkedFrameCapabilityIDs = Set(raw.walkedFrameCapabilityIDs)
+    let registeredFrames = registeredFrameCapabilities.filter {
+      $0.documentID == documentID && !$0.isMainFrame
+    }
+    for frame in registeredFrames where !walkedFrameCapabilityIDs.contains(frame.capabilityID) {
+      do {
+        let frameRaw = try await captureRawObservation(in: frame.frameInfo)
+        guard
+          frameRaw.walkedFrameCapabilityIDs.contains(frame.capabilityID),
+          URL(string: frameRaw.url).flatMap(Self.sanitizedOrigin(for:)) == frame.origin
+        else {
+          registeredFrameCapabilities.removeAll { $0.capabilityID == frame.capabilityID }
+          continue
+        }
+        capturedGroups.append(
+          CapturedObservationGroup(
+            raw: frameRaw,
+            frameCapabilityID: frame.capabilityID,
+            frameOrigin: frame.origin))
+        walkedFrameCapabilityIDs.formUnion(frameRaw.walkedFrameCapabilityIDs)
+      } catch {
+        registeredFrameCapabilities.removeAll { $0.capabilityID == frame.capabilityID }
+      }
+    }
+
+    guard documentID == observedDocumentID else { throw WebKitRuntimeError.staleObservation }
+    guard frameRegistrationGeneration == observedFrameRegistrationGeneration else {
+      throw WebKitRuntimeError.staleObservation
+    }
+    guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
+
     let (nextGeneration, overflow) = observationGeneration.addingReportingOverflow(1)
     guard !overflow else { throw WebKitRuntimeError.malformedInstrumentationResult }
     observationGeneration = nextGeneration
@@ -1109,37 +1488,93 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       securityOrigin: origin
     )
 
-    let recipes = try raw.elements.enumerated().map { index, element in
+    let capturedElements = capturedGroups.enumerated().flatMap { groupIndex, group in
+      group.raw.elements.map { (groupIndex: groupIndex, element: $0) }
+    }
+    let selectedElements = Array(
+      capturedElements.dropFirst(elementOffset).prefix(maximumElements))
+    let candidateCountIsLowerBound =
+      elementOffset > 0 || capturedElements.count > maximumElements
+      || capturedGroups.contains { $0.raw.totalElementCount > $0.raw.elements.count }
+    // Build the complete frame-local recipe first. Its text stays native-only; the
+    // public recipe carries a keyed identity for verification across observations.
+    let resolutionRecipes = try selectedElements.enumerated().map { index, captured in
       let elementID = "e\(index + 1)"
+      let group = capturedGroups[captured.groupIndex]
       return try locatorRecipe(
-        for: element,
-        peers: raw.elements,
+        for: captured.element,
+        peers: group.raw.elements,
         elementID: elementID,
         observationID: observationID,
         generation: nextGeneration)
     }
-    let candidates = raw.elements.map(locatorCandidate)
-    let candidateCountIsLowerBound = raw.totalElementCount > raw.elements.count
-    let elements = try raw.elements.enumerated().map { index, element in
+    // Third-party text deliberately stays out of the public locator recipe because
+    // that model has no provenance-bearing strings. The keyed identity is opaque and
+    // stable only within this document and exact native frame capability.
+    let recipes = try selectedElements.enumerated().map { index, captured in
+      let group = capturedGroups[captured.groupIndex]
+      guard let frameCapabilityID = group.frameCapabilityID else {
+        return resolutionRecipes[index]
+      }
+      return try frameLocatorRecipe(
+        for: captured.element,
+        elementID: "e\(index + 1)",
+        observationID: observationID,
+        generation: nextGeneration,
+        opaqueSemanticIdentity: frameSemanticIdentity(
+          capabilityID: frameCapabilityID,
+          privateIdentity: resolutionRecipes[index].semanticIdentity))
+    }
+    let elements = try selectedElements.enumerated().map { index, captured in
       let elementID = "e\(index + 1)"
       let recipe = recipes[index]
+      let element = captured.element
+      let group = capturedGroups[captured.groupIndex]
+      let candidates = group.raw.elements.map(locatorCandidate)
       let resolution = LocatorResolver.resolve(recipe: recipe, candidates: candidates)
       let quality = locatorQuality(
         recipe: recipe,
         candidateCount: resolution.finalCandidateCount,
         candidateCountIsLowerBound: candidateCountIsLowerBound)
+      let embedded = group.frameCapabilityID != nil
+      let reportedFrameOrigin =
+        element.frameCapabilityID.flatMap { capabilityID in
+          registeredFrameCapabilities.first { $0.capabilityID == capabilityID }?.origin
+        } ?? group.frameOrigin
+      let embeddedOrigin = reportedFrameOrigin.flatMap { value in
+        URL(string: value).flatMap(Self.securityOrigin(from:))
+      }
+      let contentSource =
+        embedded
+        ? ProvenanceSource(
+          classification: .thirdPartyEmbed,
+          documentID: documentID,
+          frameID: "embedded",
+          securityOrigin: embeddedOrigin)
+        : pageSource
       return try WebKitObservedElement(
         elementID: elementID,
-        tag: ProvenancedText(text: element.tag, source: pageSource),
-        role: try element.role.map { try ProvenancedText(text: $0, source: pageSource) },
+        frameOrigin: embedded ? reportedFrameOrigin : nil,
+        frameIsMain: embedded ? false : nil,
+        tag: ProvenancedText(text: element.tag, source: contentSource),
+        role: try element.role.map { try ProvenancedText(text: $0, source: contentSource) },
         accessibleName: try element.accessibleName.map {
-          try ProvenancedText(text: $0, source: pageSource)
+          try ProvenancedText(text: $0, source: contentSource)
         },
-        submissionDestination: element.submissionDestination,
-        label: try element.label.map { try ProvenancedText(text: $0, source: pageSource) },
-        text: try element.text.map { try ProvenancedText(text: $0, source: pageSource) },
+        // A destination is currently an unprovenanced String in this public model. Do
+        // not launder one out of a third-party frame while every action is refused.
+        submissionDestination: embedded ? nil : element.submissionDestination,
+        label: try element.label.map { try ProvenancedText(text: $0, source: contentSource) },
+        text: try element.text.map { try ProvenancedText(text: $0, source: contentSource) },
         value: try element.value.map {
-          try ProvenancedText(text: $0, source: enteredDataSource)
+          // An input's value is data entered into the site. A select's observable value
+          // is different: the injected source deliberately exports the selected option's
+          // visible label, which the site authored. Calling that label user-entered data
+          // contradicts selectedOption and options, and launders hostile option text into
+          // a provenance class the page does not own.
+          let source =
+            embedded ? contentSource : (element.tag == "select" ? pageSource : enteredDataSource)
+          return try ProvenancedText(text: $0, source: source)
         },
         validationState: ObservedValidationState(rawValue: element.validationState)
           ?? .notApplicable,
@@ -1150,12 +1585,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         checked: element.checked,
         selected: element.selected,
         selectedOption: try element.selectedOption.map {
-          try ProvenancedText(text: $0, source: pageSource)
+          try ProvenancedText(text: $0, source: contentSource)
         },
         options: try element.options.map { published in
           try published.map {
             ObservedOption(
-              label: try ProvenancedText(text: $0.label, source: pageSource),
+              label: try ProvenancedText(text: $0.label, source: contentSource),
               selected: $0.selected,
               disabled: $0.disabled)
           }
@@ -1163,19 +1598,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         optionCount: element.optionCount,
         optionsTruncated: element.optionsTruncated,
         stateAttributes: try element.stateAttributes.mapValues {
-          try ProvenancedText(text: $0, source: pageSource)
+          try ProvenancedText(text: $0, source: contentSource)
         },
         contextAnchors: try element.contextAnchors.compactMap { anchor in
           guard let kind = ObservedContextAnchorKind(rawValue: anchor.kind) else { return nil }
           return ObservedContextAnchor(
             kind: kind,
-            text: try ProvenancedText(text: anchor.text, source: pageSource))
+            text: try ProvenancedText(text: anchor.text, source: contentSource))
         },
         stableAttributes: try element.stableAttributes.mapValues {
-          try ProvenancedText(text: $0, source: pageSource)
+          try ProvenancedText(text: $0, source: contentSource)
         },
         visible: element.visible,
-        actionability: ObservedActionability(rawValue: element.actionability) ?? .actionable,
+        actionability: embedded
+          ? .crossOriginFrameNativeGeometryUnavailable
+          : ObservedActionability(rawValue: element.actionability) ?? .actionable,
+        frameActionModes: embedded ? Self.frameActionModes(for: element) : nil,
+        boundingBoxCoordinateSpace: embedded ? .frameViewport : nil,
         boundingBox: element.boundingBox,
         locatorRecipe: recipe,
         locatorQuality: quality
@@ -1183,50 +1622,95 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     latestObservationID = observationID
     latestTargets = Dictionary(
-      uniqueKeysWithValues: zip(elements, raw.elements).map { element, rawElement in
-        (
+      uniqueKeysWithValues: zip(elements, selectedElements).enumerated().map {
+        index, pair in
+        let (element, captured) = pair
+        let group = capturedGroups[captured.groupIndex]
+        let resolutionRecipe = resolutionRecipes[index]
+        let resolution = LocatorResolver.resolve(
+          recipe: resolutionRecipe,
+          candidates: group.raw.elements.map(locatorCandidate))
+        return (
           element.elementID,
           ObservedTargetRecord(
             recipe: element.locatorRecipe,
-            physicalIdentity: rawElement.physicalIdentity,
-            boundingBox: rawElement.boundingBox,
-            sensitive: rawElement.sensitive,
-            disabled: rawElement.disabled,
+            resolutionRecipe: resolutionRecipe,
+            physicalIdentity: captured.element.physicalIdentity,
+            boundingBox: captured.element.boundingBox,
+            sensitive: captured.element.sensitive,
+            disabled: captured.element.disabled,
+            checked: captured.element.checked,
+            selected: captured.element.selected,
+            selectedOption: captured.element.selectedOption,
+            stateAttributes: captured.element.stateAttributes,
+            frameCapabilityID: group.frameCapabilityID,
+            frameOrigin: element.frameOrigin,
+            maximumFieldCharacters: maximumFieldCharacters,
             observedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
-            observedCandidateCount: element.locatorQuality.candidateCount
+            observedCandidateCount: resolution.finalCandidateCount
           )
         )
       }
     )
 
+    func saturatedSum(_ values: [Int]) -> Int {
+      values.reduce(0) { partial, value in
+        let (sum, overflow) = partial.addingReportingOverflow(value)
+        return overflow ? Int.max : sum
+      }
+    }
+    let totalElementCount = saturatedSum(capturedGroups.map(\.raw.totalElementCount))
+    let encounteredOpaqueFrameCount = saturatedSum(
+      capturedGroups.map(\.raw.crossOriginFrameCount))
+    let successfullyReadOpaqueFrameCount = max(0, capturedGroups.count - 1)
+    var unreadableFrameCount = max(
+      0, encounteredOpaqueFrameCount - successfullyReadOpaqueFrameCount)
+    if droppedFrameRegistrationCount > 0 { unreadableFrameCount = max(1, unreadableFrameCount) }
+    let unrenderedControlNames = Array(
+      Set(capturedGroups.flatMap(\.raw.unrenderedControlNames)).sorted().prefix(10))
+
     let observation = WebKitPageObservation(
       observationID: observationID,
       generation: nextGeneration,
       documentID: documentID,
-      url: try ProvenancedText(text: raw.url, source: toolSource),
+      // `location.href` is exact instrumentation data and may carry session/token
+      // values in its query. Preserve the live URL locally for recovery below, but put
+      // only the redacted form into the model-visible observation and every digest that
+      // derives from it.
+      url: try ProvenancedText(
+        text: URL(string: raw.url).map(Self.agentSafeURL) ?? "unavailable",
+        source: toolSource),
       title: try ProvenancedText(text: raw.title, source: pageSource),
       readyState: raw.readyState,
       mutationCount: raw.mutationCount,
       elements: elements,
-      totalElementCount: raw.totalElementCount,
+      totalElementCount: totalElementCount,
       elementOffset: elementOffset,
-      nextElementOffset: elementOffset + elements.count < raw.totalElementCount
+      nextElementOffset: elementOffset + elements.count < totalElementCount
         ? elementOffset + elements.count : nil,
-      unreadableFrameCount: raw.crossOriginFrameCount,
-      semanticTextTruncated: raw.semanticTextTruncated,
-      crossOriginFramesOpaque: raw.crossOriginFrameCount > 0,
-      renderedInteractiveCount: raw.renderedInteractiveCount,
+      unreadableFrameCount: unreadableFrameCount,
+      semanticTextTruncated: capturedGroups.contains { $0.raw.semanticTextTruncated },
+      crossOriginFramesOpaque: unreadableFrameCount > 0,
+      renderedInteractiveCount: saturatedSum(
+        capturedGroups.map(\.raw.renderedInteractiveCount)),
+      renderedContentCount: saturatedSum(capturedGroups.map(\.raw.renderedContentCount)),
       documentLanguage: raw.documentLanguage,
-      ariaHiddenDropCount: raw.ariaHiddenDropCount,
-      unrenderedControlCount: raw.unrenderedControlCount,
-      unrenderedControlNames: raw.unrenderedControlNames,
-      rawControlCount: raw.rawControlCount,
-      obscuredByAncestorOpacity: raw.obscuredByAncestorOpacity,
-      documentElementCount: raw.documentElementCount,
-      bodyTextLength: raw.bodyTextLength,
+      ariaHiddenDropCount: saturatedSum(capturedGroups.map(\.raw.ariaHiddenDropCount)),
+      unrenderedControlCount: saturatedSum(
+        capturedGroups.map(\.raw.unrenderedControlCount)),
+      unrenderedControlNames: unrenderedControlNames,
+      rawControlCount: saturatedSum(capturedGroups.map(\.raw.rawControlCount)),
+      obscuredByAncestorOpacity: capturedGroups.contains {
+        $0.raw.obscuredByAncestorOpacity
+      },
+      documentElementCount: saturatedSum(capturedGroups.map(\.raw.documentElementCount)),
+      bodyTextLength: saturatedSum(capturedGroups.map(\.raw.bodyTextLength)),
       firstControlProbe: raw.firstControlProbe,
       capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
-      pendingDialog: nil
+      pendingDialog: nil,
+      permissionDenials: permissionDenials,
+      permissionDenialCount: permissionDenialCount,
+      permissionDenialsTruncated: permissionDenialsTruncated
     )
     rememberRecoverableURL(URL(string: raw.url) ?? webView.url)
     if controlState == .resumeRequested {
@@ -1253,7 +1737,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     try requireAgentControl()
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
     guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
-    let criteria = locatorCriteria(recipe, expectedEnabled: !target.disabled)
+    try requireMainFrameActionTarget(target)
+    let criteria = locatorCriteria(
+      recipe, expectedEnabled: !target.disabled,
+      maximumFieldCharacters: target.maximumFieldCharacters)
     let resolution = try await resolveTarget(
       criteria: criteria, scrollIntoView: true)
     guard resolution.count == 1 else {
@@ -1273,6 +1760,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     guard maximumCharacters > 0 else {
       throw WebKitRuntimeError.malformedInstrumentationResult
     }
+    ensureLayoutViewport()
+    webView.layoutSubtreeIfNeeded()
     guard
       let json = try await webView.callAsyncJavaScript(
         Self.textSnapshotSource,
@@ -1351,6 +1840,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       usernameElementID != passwordElementID,
       let username = latestTargets[usernameElementID],
       let password = latestTargets[passwordElementID],
+      username.frameCapabilityID == nil,
+      password.frameCapabilityID == nil,
       !username.sensitive,
       password.sensitive,
       username.recipe.observationGeneration == password.recipe.observationGeneration,
@@ -1395,6 +1886,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       let current = latestTargets[currentPasswordElementID],
       let new = latestTargets[newPasswordElementID],
       let confirmation = latestTargets[confirmationElementID],
+      current.frameCapabilityID == nil,
+      new.frameCapabilityID == nil,
+      confirmation.frameCapabilityID == nil,
       current.sensitive, new.sensitive, confirmation.sensitive,
       current.recipe.observationGeneration == new.recipe.observationGeneration,
       new.recipe.observationGeneration == confirmation.recipe.observationGeneration,
@@ -1441,6 +1935,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       liveOrigin == binding.origin,
       let usernameTarget = latestTargets[binding.usernameTarget.elementID],
       let passwordTarget = latestTargets[binding.passwordTarget.elementID],
+      usernameTarget.frameCapabilityID == nil,
+      passwordTarget.frameCapabilityID == nil,
       usernameTarget.recipe.observationGeneration == binding.observationGeneration,
       passwordTarget.recipe.observationGeneration == binding.observationGeneration,
       usernameTarget.physicalIdentity == binding.usernameTarget.physicalElementIdentity,
@@ -1499,6 +1995,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       let current = latestTargets[binding.currentPasswordTarget.elementID],
       let new = latestTargets[binding.newPasswordTarget.elementID],
       let confirmation = latestTargets[binding.confirmationTarget.elementID],
+      current.frameCapabilityID == nil,
+      new.frameCapabilityID == nil,
+      confirmation.frameCapabilityID == nil,
       current.recipe.observationGeneration == binding.observationGeneration,
       new.recipe.observationGeneration == binding.observationGeneration,
       confirmation.recipe.observationGeneration == binding.observationGeneration,
@@ -1540,15 +2039,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   ) async throws -> LocatorResolution {
     let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
     guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    let frameContext = try frameActionContext(for: target)
     // The transaction refuses before dispatch on this count, so it has to resolve the
     // same way the dispatch does. Without the identity and the population it saw four
     // identical buttons and stopped, while the actuation path would have reached the
     // right one — the write was refused by its own preflight.
     let resolution = try await resolveTarget(
-      criteria: locatorCriteria(recipe, expectedEnabled: !target.disabled),
+      criteria: actionLocatorCriteria(for: target, publicRecipe: recipe),
       scrollIntoView: false,
       physicalIdentity: target.physicalIdentity,
-      expectedCandidateCount: target.observedCandidateCount)
+      expectedCandidateCount: target.observedCandidateCount,
+      frameContext: frameContext)
     return LocatorResolution(
       recipeElementID: elementID,
       evaluations: (0..<resolution.count).map {
@@ -1562,6 +2063,36 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     )
   }
 
+  /// Re-resolves the observed control and reads where it would send data now. This is
+  /// intentionally separate from the observation snapshot: a page can mutate a form's
+  /// action while the caller is deciding what to do, and the confirmation must describe
+  /// the live control that will be acted on rather than the destination it used to have.
+  public func liveSubmissionDestination(
+    observationID: String,
+    elementID: String
+  ) async throws -> String? {
+    try requireAgentControl()
+    guard observationID == latestObservationID else { throw WebKitRuntimeError.staleObservation }
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
+    try requireMainFrameActionTarget(target)
+
+    let resolution = try await resolveTarget(
+      criteria: locatorCriteria(
+        target.recipe, expectedEnabled: !target.disabled,
+        maximumFieldCharacters: target.maximumFieldCharacters),
+      scrollIntoView: false,
+      physicalIdentity: target.physicalIdentity,
+      expectedCandidateCount: target.observedCandidateCount)
+    try recordCardinality(
+      resolution.count, target: target, eliminatedBy: resolution.eliminatedBy ?? [],
+      pinnedState: resolution.pinnedState ?? "not_requested")
+    guard let candidate = resolution.candidate else {
+      throw WebKitRuntimeError.malformedInstrumentationResult
+    }
+    return candidate.submissionDestination
+  }
+
   public func perform(
     observationID: String,
     elementID: String,
@@ -1573,20 +2104,81 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     guard observationID == latestObservationID else { throw WebKitRuntimeError.staleObservation }
     guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
+    let frameContext = try frameActionContext(for: target)
 
-    let criteria = locatorCriteria(target.recipe, expectedEnabled: !target.disabled)
+    let criteria = actionLocatorCriteria(for: target, publicRecipe: target.recipe)
     let first = try await resolveTarget(
-      criteria: criteria, scrollIntoView: true, physicalIdentity: target.physicalIdentity,
-      expectedCandidateCount: target.observedCandidateCount)
-    try recordCardinality(
-      first.count, target: target, eliminatedBy: first.eliminatedBy ?? [],
-      pinnedState: first.pinnedState ?? "not_requested")
+      criteria: criteria, scrollIntoView: frameContext == nil,
+      physicalIdentity: target.physicalIdentity,
+      expectedCandidateCount: target.observedCandidateCount,
+      frameContext: frameContext)
+    do {
+      try recordCardinality(
+        first.count, target: target, eliminatedBy: first.eliminatedBy ?? [],
+        pinnedState: first.pinnedState ?? "not_requested")
+    } catch {
+      if frameContext != nil { invalidateCurrentObservation() }
+      throw error
+    }
     guard let firstCandidate = first.candidate else {
       if first.count == 0 {
         throw WebKitRuntimeError.targetNotFound(first.eliminatedBy ?? [])
       }
       throw WebKitRuntimeError.targetNotUnique(
         first.count, pinned: first.pinnedState ?? "not_requested")
+    }
+    if frameContext != nil {
+      let physicalIdentity: EvidenceComparison =
+        firstCandidate.physicalIdentity == target.physicalIdentity ? .same : .different
+      let geometry: EvidenceComparison =
+        Self.boxesMatch(
+          firstCandidate.boundingBox, target.boundingBox) ? .same : .different
+      let actionTime = DispatchTime.now().uptimeNanoseconds
+      let attempt: AddressingAttempt
+      do {
+        attempt = try AddressingAttempt(
+          observationID: observationID,
+          locatorRecipeID: elementID,
+          observationGeneration: target.recipe.observationGeneration,
+          actionGeneration: observationGeneration,
+          observationMonotonicNanoseconds: target.observedAtMonotonicNanoseconds,
+          actionMonotonicNanoseconds: actionTime,
+          finalCandidateCount: first.count,
+          semanticComparison: .same,
+          physicalIdentity: physicalIdentity,
+          geometryComparison: geometry)
+      } catch {
+        throw WebKitRuntimeError.staleObservation
+      }
+      addressingCounters.record(AddressingClassifier.classify(attempt))
+      guard geometry == .same else {
+        invalidateCurrentObservation()
+        throw WebKitRuntimeError.targetGeometryChanged
+      }
+      switch (operation, dispatchMode) {
+      case (.hover, .javascript):
+        guard !target.sensitive else {
+          throw WebKitRuntimeError.sensitiveInputRequiresHuman
+        }
+      case (.selectOption, .javascript):
+        guard !target.sensitive else {
+          throw WebKitRuntimeError.sensitiveInputRequiresHuman
+        }
+      case (.pressKey, .nativeAppKit):
+        guard !target.sensitive else {
+          throw WebKitRuntimeError.sensitiveInputRequiresHuman
+        }
+      case (.fill, .nativeAppKit):
+        guard !target.sensitive else {
+          throw WebKitRuntimeError.sensitiveInputRequiresHuman
+        }
+      case (.click, .nativeAppKit):
+        throw WebKitRuntimeError.crossOriginNativeGeometryUnavailable(
+          target.frameOrigin ?? "unavailable")
+      default:
+        throw WebKitRuntimeError.crossOriginFrameActionUnavailable(
+          target.frameOrigin ?? "unavailable")
+      }
     }
     try await Task.sleep(for: stabilityInterval)
 
@@ -1629,7 +2221,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       let survey = try await surveySelectedOption(
         criteria: criteria, physicalIdentity: target.physicalIdentity,
         expectedCandidateCount: target.observedCandidateCount, label: label,
-        alreadyDispatched: false)
+        alreadyDispatched: false, frameContext: frameContext)
       guard survey.matchingOptionCount == 1 else {
         throw WebKitRuntimeError.optionLabelNotUnique(survey.matchingOptionCount ?? 0)
       }
@@ -1642,8 +2234,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // actor, this is not cleared when the action returns — WebKit delivers the submission
     // hook on its own schedule, and clearing early would refuse the very submission the
     // operator approved. A fresh navigation supersedes it.
-    approvedSubmissionOrigin = (webView.url ?? lastCommittedHTTPURL).flatMap(
-      Self.sanitizedOrigin(for:))
+    approvedSubmissionOrigin =
+      frameContext?.origin
+      ?? (webView.url ?? lastCommittedHTTPURL).flatMap(Self.sanitizedOrigin(for:))
     let expectedBoundingBox = firstCandidate.boundingBox
     let physicalIdentityHint = target.physicalIdentity
     let expectedCandidateCount = target.observedCandidateCount
@@ -1658,13 +2251,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         return try await resolveAndPerformNativeKey(
           criteria: criteria, physicalIdentity: physicalIdentityHint,
           expectedCandidateCount: expectedCandidateCount,
-          expectedBoundingBox: expectedBoundingBox, press: keyPress)
+          expectedBoundingBox: expectedBoundingBox, press: keyPress,
+          frameContext: frameContext)
       }
       if dispatchMode == .nativeAppKit, operationName == "fill", let value {
         return try await resolveAndPerformNativeFill(
           criteria: criteria, physicalIdentity: physicalIdentityHint,
           expectedCandidateCount: expectedCandidateCount,
-          expectedBoundingBox: expectedBoundingBox, value: value)
+          expectedBoundingBox: expectedBoundingBox, value: value,
+          frameContext: frameContext)
       }
       return try await resolveAndPerform(
         criteria: criteria,
@@ -1673,7 +2268,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         expectedBoundingBox: expectedBoundingBox,
         operation: operationName,
         value: value,
-        modifiers: keyPress?.modifiers ?? []
+        modifiers: keyPress?.modifiers ?? [],
+        frameContext: frameContext
       )
     }
     let second: RawActionResolution
@@ -1743,9 +2339,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // what `fill` does with its exact value, one layer down.
     if operationName == "select_option", let label = value {
       let survey = try await surveySelectedOption(
-        criteria: criteria, physicalIdentity: physicalIdentityHint,
+        criteria: actionLocatorCriteria(
+          for: target, publicRecipe: target.recipe, includeObservedState: false),
+        physicalIdentity: physicalIdentityHint,
         expectedCandidateCount: expectedCandidateCount, label: label,
-        alreadyDispatched: true)
+        alreadyDispatched: true, frameContext: frameContext)
       guard survey.selectedOptionMatchesRequest == true else {
         throw WebKitRuntimeError.selectedOptionMismatch
       }
@@ -2119,6 +2717,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       semanticTextTruncated: false,
       crossOriginFramesOpaque: false,
       renderedInteractiveCount: 0,
+      renderedContentCount: 0,
       documentLanguage: nil,
       ariaHiddenDropCount: 0,
       unrenderedControlCount: 0,
@@ -2129,7 +2728,43 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       bodyTextLength: 0,
       firstControlProbe: "javascript_dialog_pending",
       capturedAtMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
-      pendingDialog: dialog)
+      pendingDialog: dialog,
+      permissionDenials: permissionDenials,
+      permissionDenialCount: permissionDenialCount,
+      permissionDenialsTruncated: permissionDenialsTruncated)
+  }
+
+  public func webView(
+    _ webView: WKWebView,
+    requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+    initiatedByFrame frame: WKFrameInfo,
+    type: WKMediaCaptureType,
+    decisionHandler: @escaping @MainActor (WKPermissionDecision) -> Void
+  ) {
+    let permission: WebKitDeniedPermission
+    switch type {
+    case .camera:
+      permission = .camera
+    case .microphone:
+      permission = .microphone
+    case .cameraAndMicrophone:
+      permission = .cameraAndMicrophone
+    @unknown default:
+      permission = .mediaCapture
+    }
+    recordPermissionDenial(permission, origin: origin, frameIsMain: frame.isMainFrame)
+    decisionHandler(.deny)
+  }
+
+  @available(macOS 27.0, *)
+  public func webView(
+    _ webView: WKWebView,
+    requestGeolocationPermissionFor origin: WKSecurityOrigin,
+    initiatedByFrame frame: WKFrameInfo,
+    decisionHandler: @escaping @MainActor (WKPermissionDecision) -> Void
+  ) {
+    recordPermissionDenial(.geolocation, origin: origin, frameIsMain: frame.isMainFrame)
+    decisionHandler(.deny)
   }
 
   public func webView(
@@ -2307,17 +2942,67 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     _ userContentController: WKUserContentController,
     didReceive message: WKScriptMessage
   ) {
+    if message.name == Self.frameRegistrationMessageHandlerName {
+      registerFrameCapability(message.frameInfo)
+      return
+    }
     guard message.name == Self.nativeGestureMessageHandlerName,
       let body = message.body as? [String: Any],
       let token = body["token"] as? String,
-      armedNativeGestureTokens.contains(token),
+      let armedContext = armedNativeGestureTokens[token],
       let physicalIdentity = body["physicalIdentity"] as? String,
       let eventType = body["eventType"] as? String,
       let trusted = body["trusted"] as? Bool
     else { return }
+    if let expectedCapabilityID = armedContext.frameCapabilityID {
+      guard
+        body["frameCapabilityID"] as? String == expectedCapabilityID,
+        !message.frameInfo.isMainFrame,
+        let expectedOrigin = armedContext.frameOrigin,
+        Self.agentSafeSecurityOrigin(message.frameInfo.securityOrigin) == expectedOrigin
+      else { return }
+    }
     nativeGestureReceipts[token, default: []].append(
       NativeGestureReceipt(
         physicalIdentity: physicalIdentity, eventType: eventType, trusted: trusted))
+  }
+
+  func frameRegistrySnapshot() -> WebKitFrameRegistrySnapshot {
+    WebKitFrameRegistrySnapshot(
+      capabilities: registeredFrameCapabilities.map {
+        WebKitFrameCapabilitySnapshot(
+          capabilityID: $0.capabilityID,
+          origin: $0.origin,
+          isMainFrame: $0.isMainFrame)
+      },
+      droppedRegistrationCount: droppedFrameRegistrationCount)
+  }
+
+  func probeFrameDocument(capabilityID: String) async -> WebKitFrameDocumentProbe {
+    guard
+      !processTerminated,
+      controlState != .handoffRequested,
+      controlState != .humanControlled,
+      controlState != .humanStepCompleted,
+      let capability = registeredFrameCapabilities.first(where: {
+        $0.capabilityID == capabilityID && $0.documentID == documentID
+      })
+    else { return .unavailable }
+    do {
+      let result = try await webView.callAsyncJavaScript(
+        "return String(document.title || '').slice(0, 256);",
+        arguments: [:],
+        in: capability.frameInfo,
+        contentWorld: instrumentationWorld)
+      guard let title = result as? String else {
+        registeredFrameCapabilities.removeAll { $0.capabilityID == capabilityID }
+        return .unavailable
+      }
+      return .available(title: title)
+    } catch {
+      registeredFrameCapabilities.removeAll { $0.capabilityID == capabilityID }
+      return .unavailable
+    }
   }
 
   public func authenticationRestrictionStatus() -> AuthenticationRestrictionStatus? {
@@ -2365,7 +3050,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       let host = url.host?.lowercased().trimmingCharacters(
         in: CharacterSet(charactersIn: ".")),
       restrictedAuthenticationHosts.contains(host)
-    else { return url.absoluteString }
+    else {
+      // The request keeps its exact query locally, but no value from that query belongs
+      // in an observation, confirmation, transaction state, or model-visible URL. Keep
+      // the names so the page remains identifiable and replace every value before the
+      // URL crosses that boundary. Fragments deliberately remain visible pending the
+      // separately recorded HashJack product decision.
+      guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+        return sanitizedOrigin(for: url) ?? "unavailable"
+      }
+      if components.percentEncodedQuery != nil {
+        let items = components.queryItems ?? []
+        components.queryItems = items.prefix(16).map {
+          URLQueryItem(name: $0.name, value: "<redacted>")
+        }
+      }
+      return components.string ?? sanitizedOrigin(for: url) ?? "unavailable"
+    }
     return sanitizedOrigin(for: url) ?? "unavailable"
   }
 
@@ -2749,11 +3450,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private func awaitViewportSettled(timeout: Duration = .milliseconds(500)) async {
     let deadline = ContinuousClock.now + timeout
     while ContinuousClock.now < deadline {
-      let expected = webView.bounds.height
-      guard expected > 0 else { return }
-      let reported =
+      let expectedWidth = webView.bounds.width
+      let expectedHeight = webView.bounds.height
+      guard expectedWidth > 0, expectedHeight > 0 else { return }
+      let reportedWidth =
+        (try? await webView.evaluateJavaScript("window.innerWidth")) as? Double
+      let reportedHeight =
         (try? await webView.evaluateJavaScript("window.innerHeight")) as? Double
-      if let reported, abs(reported - expected) < 1 { return }
+      if let reportedWidth, let reportedHeight,
+        abs(reportedWidth - expectedWidth) < 1,
+        abs(reportedHeight - expectedHeight) < 1
+      {
+        return
+      }
       webView.needsLayout = true
       webView.layoutSubtreeIfNeeded()
       try? await Task.sleep(for: .milliseconds(20))
@@ -2773,6 +3482,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     processTerminated = true
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
+    registeredFrameCapabilities.removeAll(keepingCapacity: true)
+    droppedFrameRegistrationCount = 0
   }
 
   @available(macOS 27.0, *)
@@ -2878,6 +3589,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
     }
     guard let lockedOrigin = topLevelOriginLock else {
+      prepareForAllowedMainFrameNavigation(navigationAction)
       recordNavigationAudit(navigationAction, allowed: true)
       return .allow
     }
@@ -2900,6 +3612,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       recordNavigationAudit(navigationAction, allowed: false)
       return .cancel
     }
+    prepareForAllowedMainFrameNavigation(navigationAction)
     recordNavigationAudit(navigationAction, allowed: true)
     return .allow
   }
@@ -2958,11 +3671,44 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if downloadContinuation == nil { resetForNavigation() }
   }
 
+  public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    let completedType = pendingMainFrameNavigationType
+    let currentItem = webView.backForwardList.currentItem
+    let currentItemID = currentItem.map(ObjectIdentifier.init)
+    let resultedFromForm: Bool
+    switch completedType {
+    case .formSubmitted?, .formResubmitted?:
+      resultedFromForm = true
+    case .reload?:
+      resultedFromForm = currentDocumentWasFormSubmission
+    case .backForward?:
+      resultedFromForm = currentItemID.map(formSubmissionHistoryItems.contains) ?? false
+    default:
+      resultedFromForm = false
+    }
+    currentDocumentWasFormSubmission = resultedFromForm
+    if let currentItemID {
+      if resultedFromForm {
+        formSubmissionHistoryItems.insert(currentItemID)
+      } else {
+        formSubmissionHistoryItems.remove(currentItemID)
+      }
+    }
+    let liveItems =
+      webView.backForwardList.backList + [webView.backForwardList.currentItem].compactMap { $0 }
+      + webView.backForwardList.forwardList
+    let liveItemIDs = Set(liveItems.map(ObjectIdentifier.init))
+    formSubmissionHistoryItems.formIntersection(liveItemIDs)
+    pendingMainFrameNavigationType = nil
+    rememberRecoverableURL(webView.url)
+  }
+
   public func webView(
     _ webView: WKWebView,
     didFail navigation: WKNavigation!,
     withError error: any Error
   ) {
+    pendingMainFrameNavigationType = nil
     if navigationFailure == nil && !(downloadStarted && Self.isDownloadCancellation(error)) {
       navigationFailure = Self.sanitizedNavigationFailure(error)
     }
@@ -2973,6 +3719,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     didFailProvisionalNavigation navigation: WKNavigation!,
     withError error: any Error
   ) {
+    pendingMainFrameNavigationType = nil
     if navigationFailure == nil && !(downloadStarted && Self.isDownloadCancellation(error)) {
       navigationFailure = Self.sanitizedNavigationFailure(error)
     }
@@ -3191,7 +3938,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     webView.load(request)
     let readiness = try await awaitReadiness(timeout: timeout, quietWindow: quietWindow)
     if readiness == .deadlineReached { webView.stopLoading() }
-    let state = try await instrumentationState()
+    let state = try await instrumentationState(includeContentState: readiness == .ready)
+    let contentState = readiness == .ready ? state.contentState ?? .unknown : .unknown
     await refreshAuthenticationUIClassification()
     rememberRecoverableURL(webView.url ?? request.url)
     processTerminated = false
@@ -3201,6 +3949,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       url: agentSafeURLString(loadedURL) ?? "about:blank",
       requestedURL: request.url.flatMap(agentSafeURLString) ?? "about:blank",
       readiness: readiness,
+      contentState: contentState,
       elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds - started,
       mutationCount: state.mutationCount
     )
@@ -3208,7 +3957,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private func locatorCriteria(
     _ recipe: LocatorRecipe,
-    expectedEnabled: Bool? = nil
+    expectedEnabled: Bool? = nil,
+    maximumFieldCharacters: Int = 4_096
   ) -> [[String: String]] {
     var criteria = recipe.clauses.map { clause in
       let fact: String
@@ -3245,6 +3995,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "expected": clause.expectedValue,
         "strength": clause.strength.rawValue,
         "comparison": clause.comparison.rawValue,
+        // The observation bounded these facts before constructing the recipe. Apply
+        // the same bound when resolving it again, or a long but unchanged label can
+        // never equal the address the observation handed out.
+        "maximumCharacters": String(maximumFieldCharacters),
       ]
     }
     if let expectedEnabled {
@@ -3254,16 +4008,81 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "expected": String(expectedEnabled),
         "strength": "required",
         "comparison": "exact",
+        "maximumCharacters": String(maximumFieldCharacters),
       ])
     }
     return criteria
+  }
+
+  /// Builds the live checks for an action. Main-document behaviour keeps using its
+  /// public recipe. An embedded target uses a provenance-private semantic recipe and
+  /// also binds the mutable state that was actually observed, so a changed checkbox,
+  /// option, or ARIA state cannot be mistaken for the confirmed control.
+  private func actionLocatorCriteria(
+    for target: ObservedTargetRecord,
+    publicRecipe: LocatorRecipe,
+    includeObservedState: Bool = true
+  ) -> [[String: String]] {
+    let recipe = target.frameCapabilityID == nil ? publicRecipe : target.resolutionRecipe
+    var criteria = locatorCriteria(
+      recipe,
+      expectedEnabled: !target.disabled,
+      maximumFieldCharacters: target.maximumFieldCharacters)
+    guard target.frameCapabilityID != nil, includeObservedState else { return criteria }
+
+    func appendState(_ fact: String, argument: String = "", expected: String) {
+      criteria.append([
+        "fact": fact,
+        "argument": argument,
+        "expected": expected,
+        "strength": "required",
+        "comparison": "exact",
+        "maximumCharacters": String(target.maximumFieldCharacters),
+      ])
+    }
+    if let checked = target.checked {
+      appendState("checked", expected: String(checked))
+    }
+    if let selected = target.selected {
+      appendState("selected", expected: String(selected))
+    }
+    if let selectedOption = target.selectedOption {
+      appendState("selectedOption", expected: selectedOption)
+    }
+    for (name, value) in target.stateAttributes.sorted(by: { $0.key < $1.key }) {
+      appendState("stateAttribute", argument: name, expected: value)
+    }
+    return criteria
+  }
+
+  private func frameActionContext(
+    for target: ObservedTargetRecord
+  ) throws -> FrameActionContext? {
+    guard let capabilityID = target.frameCapabilityID else { return nil }
+    guard
+      let expectedOrigin = target.frameOrigin,
+      let capability = registeredFrameCapabilities.first(where: {
+        $0.capabilityID == capabilityID && $0.documentID == documentID && !$0.isMainFrame
+      }),
+      capability.origin == expectedOrigin
+    else {
+      invalidateCurrentObservation()
+      throw WebKitRuntimeError.staleObservation
+    }
+    return FrameActionContext(
+      capabilityID: capabilityID,
+      documentID: documentID,
+      observationID: target.recipe.observationID,
+      origin: expectedOrigin,
+      frameInfo: capability.frameInfo)
   }
 
   private func resolveTarget(
     criteria: [[String: String]],
     scrollIntoView: Bool,
     physicalIdentity: String = "",
-    expectedCandidateCount: Int = 0
+    expectedCandidateCount: Int = 0,
+    frameContext: FrameActionContext? = nil
   ) async throws -> RawActionResolution {
     try await actionScript(
       source: Self.resolveSource,
@@ -3272,7 +4091,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "physicalIdentity": physicalIdentity,
         "expectedCandidateCount": expectedCandidateCount,
         "scrollIntoView": scrollIntoView,
-      ]
+      ],
+      frameContext: frameContext
     )
   }
 
@@ -3283,7 +4103,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     expectedBoundingBox: ObservedBoundingBox,
     operation: String,
     value: String?,
-    modifiers: Set<WebKitKeyModifier> = []
+    modifiers: Set<WebKitKeyModifier> = [],
+    frameContext: FrameActionContext? = nil
   ) async throws -> RawActionResolution {
     var arguments: [String: Any] = [
       "criteria": criteria,
@@ -3303,7 +4124,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // would be a different keystroke than the operator read.
     arguments["modifiers"] = WebKitKeyModifier.displayOrder.filter(modifiers.contains)
       .map(\.rawValue)
-    return try await actionScript(source: Self.performSource, arguments: arguments)
+    return try await actionScript(
+      source: Self.performSource, arguments: arguments, frameContext: frameContext)
   }
 
   /// Resolves the control again from its own criteria and reads what its options say.
@@ -3320,7 +4142,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     physicalIdentity: String,
     expectedCandidateCount: Int,
     label: String,
-    alreadyDispatched: Bool
+    alreadyDispatched: Bool,
+    frameContext: FrameActionContext? = nil
   ) async throws -> RawActionResolution {
     let race = try await dispatchRacingJavaScriptDialog { [self] in
       try await actionScript(
@@ -3330,7 +4153,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           "physicalIdentity": physicalIdentity,
           "expectedCandidateCount": expectedCandidateCount,
           "label": label,
-        ])
+        ],
+        frameContext: frameContext)
     }
     let survey: RawActionResolution
     switch race {
@@ -3374,9 +4198,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     expectedBoundingBox: ObservedBoundingBox
   ) async throws -> RawActionResolution {
     let token = UUID().uuidString
-    armedNativeGestureTokens.insert(token)
+    armedNativeGestureTokens[token] = ArmedNativeGestureContext(
+      frameCapabilityID: nil, frameOrigin: nil)
     defer {
-      armedNativeGestureTokens.remove(token)
+      armedNativeGestureTokens.removeValue(forKey: token)
       nativeGestureReceipts.removeValue(forKey: token)
     }
     let armed = try await actionScript(
@@ -3444,7 +4269,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     physicalIdentity: String,
     expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
-    press: WebKitKeyPress
+    press: WebKitKeyPress,
+    frameContext: FrameActionContext? = nil
   ) async throws -> RawActionResolution {
     // Before the page is touched at all, and before the operator's approval turns into a
     // keystroke: a key with no code, or a chord the app's own menu claims, is refused
@@ -3455,9 +4281,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       throw WebKitRuntimeError.targetNotActionable
     }
     let token = UUID().uuidString
-    armedNativeGestureTokens.insert(token)
+    armedNativeGestureTokens[token] = ArmedNativeGestureContext(
+      frameCapabilityID: frameContext?.capabilityID,
+      frameOrigin: frameContext?.origin)
     defer {
-      armedNativeGestureTokens.remove(token)
+      armedNativeGestureTokens.removeValue(forKey: token)
       nativeGestureReceipts.removeValue(forKey: token)
     }
     let armed = try await actionScript(
@@ -3469,7 +4297,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
         "expectedKey": key,
-      ])
+      ],
+      frameContext: frameContext)
     guard armed.count == 1, let candidate = armed.candidate else { return armed }
     guard candidate.geometryStable, candidate.actionable else { return armed }
     try dispatchNativeKey(event)
@@ -3480,6 +4309,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         token: token, physicalIdentity: candidate.physicalIdentity,
         eventType: expectedReceiptEvent)
       {
+        if frameContext != nil, !receipt.trusted {
+          throw WebKitRuntimeError.nativeGestureReceiptUnavailable
+        }
         return RawActionResolution(
           count: armed.count,
           candidate: RawActionCandidate(
@@ -3503,15 +4335,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     physicalIdentity: String,
     expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox,
-    value: String
+    value: String,
+    frameContext: FrameActionContext? = nil
   ) async throws -> RawActionResolution {
     guard let window = webView.window, window.makeFirstResponder(webView) else {
       throw WebKitRuntimeError.targetNotActionable
     }
     let token = UUID().uuidString
-    armedNativeGestureTokens.insert(token)
+    armedNativeGestureTokens[token] = ArmedNativeGestureContext(
+      frameCapabilityID: frameContext?.capabilityID,
+      frameOrigin: frameContext?.origin)
     defer {
-      armedNativeGestureTokens.remove(token)
+      armedNativeGestureTokens.removeValue(forKey: token)
       nativeGestureReceipts.removeValue(forKey: token)
     }
     let armed = try await actionScript(
@@ -3522,7 +4357,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "expectedCandidateCount": expectedCandidateCount,
         "expectedBox": Self.boxDictionary(expectedBoundingBox),
         "token": token,
-      ])
+      ],
+      frameContext: frameContext)
     guard armed.count == 1, let candidate = armed.candidate else { return armed }
     guard candidate.geometryStable, candidate.actionable else { return armed }
 
@@ -3541,6 +4377,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             token: token, physicalIdentity: candidate.physicalIdentity,
             eventType: "commit_keydown")
           {
+            if frameContext != nil, !(inputReceipt.trusted && commitReceipt.trusted) {
+              throw WebKitRuntimeError.nativeGestureReceiptUnavailable
+            }
             return RawActionResolution(
               count: armed.count,
               candidate: RawActionCandidate(
@@ -3594,19 +4433,56 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private func actionScript(
     source: String,
-    arguments: [String: Any]
+    arguments: [String: Any],
+    frameContext: FrameActionContext? = nil
   ) async throws -> RawActionResolution {
+    var evaluatedSource = source
+    var evaluatedArguments = arguments
+    if let frameContext {
+      evaluatedSource = Self.frameActionGuardSource + source
+      evaluatedArguments["expectedFrameCapabilityID"] = frameContext.capabilityID
+      evaluatedArguments["expectedFrameOrigin"] = frameContext.origin
+    }
+    let rawResult: Any?
+    do {
+      rawResult = try await webView.callAsyncJavaScript(
+        evaluatedSource,
+        arguments: evaluatedArguments,
+        in: frameContext?.frameInfo,
+        contentWorld: instrumentationWorld)
+    } catch {
+      if let frameContext {
+        registeredFrameCapabilities.removeAll {
+          $0.capabilityID == frameContext.capabilityID
+        }
+        invalidateCurrentObservation()
+        throw WebKitRuntimeError.staleObservation
+      }
+      throw error
+    }
     guard
-      let json = try await webView.callAsyncJavaScript(
-        source,
-        arguments: arguments,
-        in: nil,
-        contentWorld: instrumentationWorld
-      ) as? String,
+      let json = rawResult as? String,
       let data = json.data(using: .utf8),
       let result = try? JSONDecoder().decode(RawActionResolution.self, from: data)
-    else {
-      throw WebKitRuntimeError.malformedInstrumentationResult
+    else { throw WebKitRuntimeError.malformedInstrumentationResult }
+    if let frameContext {
+      guard
+        result.frameContextMatches != false,
+        documentID == frameContext.documentID,
+        latestObservationID == frameContext.observationID,
+        registeredFrameCapabilities.contains(where: {
+          $0.capabilityID == frameContext.capabilityID
+            && $0.documentID == frameContext.documentID
+            && $0.origin == frameContext.origin
+            && !$0.isMainFrame
+        })
+      else {
+        registeredFrameCapabilities.removeAll {
+          $0.capabilityID == frameContext.capabilityID
+        }
+        invalidateCurrentObservation()
+        throw WebKitRuntimeError.staleObservation
+      }
     }
     return result
   }
@@ -3655,6 +4531,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     if count == 0 { throw WebKitRuntimeError.targetNotFound(eliminatedBy) }
     throw WebKitRuntimeError.targetNotUnique(count, pinned: pinnedState)
+  }
+
+  private func requireMainFrameActionTarget(_ target: ObservedTargetRecord) throws {
+    guard target.frameCapabilityID == nil else {
+      throw WebKitRuntimeError.crossOriginFrameActionUnavailable(
+        target.frameOrigin ?? "unavailable")
+    }
   }
 
   private func requireAgentControl() throws {
@@ -3714,6 +4597,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private func resetForNavigation() {
     documentID = UUID().uuidString
+    frameSemanticKey = SymmetricKey(size: .bits256)
     observationGeneration = 0
     navigationFailure = nil
     processTerminated = false
@@ -3729,6 +4613,156 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // supersedes it, and a decision nothing consumed must not cancel a later navigation.
     approvedSubmissionOrigin = nil
     pendingSubmissionDecision = nil
+    permissionDenials.removeAll(keepingCapacity: true)
+    permissionDenialCount = 0
+    permissionDenialsTruncated = false
+    registeredFrameCapabilities.removeAll(keepingCapacity: true)
+    droppedFrameRegistrationCount = 0
+    invalidateCurrentObservation()
+  }
+
+  private func registerFrameCapability(_ frameInfo: WKFrameInfo) {
+    frameRegistrationGeneration &+= 1
+    // A document-start message from a child means the address space observed before it
+    // no longer describes the complete frame tree. There is no public stable frame ID
+    // with which to expire only one exported element set, so the observation lease is
+    // invalidated and the next observation rebuilds every bounded target honestly.
+    if !frameInfo.isMainFrame, latestObservationID != nil {
+      invalidateCurrentObservation()
+    }
+    if registeredFrameCapabilities.count == Self.maximumRegisteredFrameCapabilities {
+      registeredFrameCapabilities.removeFirst()
+      let (nextCount, overflow) = droppedFrameRegistrationCount.addingReportingOverflow(1)
+      droppedFrameRegistrationCount = overflow ? UInt64.max : nextCount
+    }
+    registeredFrameCapabilities.append(
+      RegisteredFrameCapability(
+        capabilityID: UUID().uuidString,
+        documentID: documentID,
+        frameInfo: frameInfo,
+        origin: Self.agentSafeSecurityOrigin(frameInfo.securityOrigin),
+        isMainFrame: frameInfo.isMainFrame))
+  }
+
+  private func bindFrameCapabilitiesToIsolatedWorld() async {
+    let capabilities = registeredFrameCapabilities.filter { $0.documentID == documentID }
+    for capability in capabilities {
+      do {
+        let result = try await webView.callAsyncJavaScript(
+          Self.bindFrameCapabilitySource,
+          arguments: ["capabilityID": capability.capabilityID],
+          in: capability.frameInfo,
+          contentWorld: instrumentationWorld)
+        guard result as? Bool == true else {
+          registeredFrameCapabilities.removeAll {
+            $0.capabilityID == capability.capabilityID
+          }
+          continue
+        }
+      } catch {
+        registeredFrameCapabilities.removeAll {
+          $0.capabilityID == capability.capabilityID
+        }
+      }
+    }
+  }
+
+  /// A separately evaluated process must not make the whole observation wait forever.
+  /// The JavaScript task is deliberately abandoned after the first settlement: WebKit's
+  /// async evaluation is not cancellable, but its eventual reply finds no continuation.
+  private func captureFrameRawObservation(
+    script: String,
+    arguments: [String: Any],
+    frame: WKFrameInfo,
+    timeout: Duration
+  ) async throws -> RawObservation {
+    frameObservationRaceToken &+= 1
+    let token = frameObservationRaceToken
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      do {
+        guard
+          let json = try await self.webView.callAsyncJavaScript(
+            script, arguments: arguments, in: frame,
+            contentWorld: self.instrumentationWorld) as? String,
+          let data = json.data(using: .utf8),
+          let raw = try? JSONDecoder().decode(RawObservation.self, from: data)
+        else { throw WebKitRuntimeError.malformedInstrumentationResult }
+        self.settleFrameObservation(token: token, .success(raw))
+      } catch {
+        self.settleFrameObservation(token: token, .failure(error))
+      }
+    }
+    Task { @MainActor [weak self] in
+      try? await Task.sleep(for: timeout)
+      self?.settleFrameObservation(
+        token: token, .failure(FrameObservationEvaluationError.timedOut))
+    }
+    return try await withCheckedThrowingContinuation { continuation in
+      frameObservationRaceContinuations[token] = continuation
+    }
+  }
+
+  private func settleFrameObservation(
+    token: UInt64,
+    _ result: Result<RawObservation, any Error>
+  ) {
+    guard let continuation = frameObservationRaceContinuations.removeValue(forKey: token) else {
+      return
+    }
+    continuation.resume(with: result)
+  }
+
+  private func recordPermissionDenial(
+    _ permission: WebKitDeniedPermission,
+    origin: WKSecurityOrigin,
+    frameIsMain: Bool
+  ) {
+    let requestedOrigin = Self.agentSafeSecurityOrigin(origin)
+    let now = DispatchTime.now().uptimeNanoseconds
+    let (nextTotal, totalOverflow) = permissionDenialCount.addingReportingOverflow(1)
+    permissionDenialCount = totalOverflow ? UInt64.max : nextTotal
+    if let index = permissionDenials.firstIndex(where: {
+      $0.origin == requestedOrigin && $0.permission == permission
+        && $0.frameIsMain == frameIsMain
+    }) {
+      let existing = permissionDenials.remove(at: index)
+      let (nextCount, countOverflow) = existing.requestCount.addingReportingOverflow(1)
+      permissionDenials.append(
+        WebKitPermissionDenial(
+          origin: requestedOrigin,
+          permission: permission,
+          frameIsMain: frameIsMain,
+          requestCount: countOverflow ? UInt64.max : nextCount,
+          lastDeniedAtMonotonicNanoseconds: now))
+      return
+    }
+    if permissionDenials.count == 32 {
+      permissionDenials.removeFirst()
+      permissionDenialsTruncated = true
+    }
+    permissionDenials.append(
+      WebKitPermissionDenial(
+        origin: requestedOrigin,
+        permission: permission,
+        frameIsMain: frameIsMain,
+        requestCount: 1,
+        lastDeniedAtMonotonicNanoseconds: now))
+  }
+
+  private static func agentSafeSecurityOrigin(_ origin: WKSecurityOrigin) -> String {
+    let scheme = origin.protocol.lowercased()
+    let host = origin.host.lowercased().trimmingCharacters(
+      in: CharacterSet(charactersIn: "."))
+    guard ["http", "https"].contains(scheme), !host.isEmpty else { return "unavailable" }
+    return sanitizedOrigin(
+      SecurityOrigin(
+        scheme: scheme,
+        host: host,
+        port: origin.port > 0 ? origin.port : nil))
+  }
+
+  private func invalidateCurrentObservation() {
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
   }
@@ -3768,6 +4802,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if navigationAuditEvents.count > 128 {
       navigationAuditEvents.removeFirst(navigationAuditEvents.count - 128)
     }
+  }
+
+  private func prepareForAllowedMainFrameNavigation(_ action: WKNavigationAction) {
+    guard action.targetFrame?.isMainFrame == true else { return }
+    pendingMainFrameNavigationType = action.navigationType
   }
 
   private func navigationOrigin(for url: URL) -> SecurityOrigin? {
@@ -3982,10 +5021,22 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     return processTerminated ? .processTerminated : .deadlineReached
   }
 
-  private func instrumentationState() async throws -> RawInstrumentationState {
+  private func instrumentationState(
+    includeContentState: Bool = false
+  ) async throws -> RawInstrumentationState {
+    let source: String
+    if includeContentState {
+      source = """
+        const state = globalThis.__webkituiState;
+        const content = globalThis.__webkituiPageContentProbe?.(false);
+        return JSON.stringify(state && content ? { ...state, ...content } : null);
+        """
+    } else {
+      source = "return JSON.stringify(globalThis.__webkituiState ?? null);"
+    }
     guard
       let json = try await webView.callAsyncJavaScript(
-        "return JSON.stringify(globalThis.__webkituiState ?? null);",
+        source,
         arguments: [:],
         in: nil,
         contentWorld: instrumentationWorld
@@ -4103,6 +5154,51 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     )
   }
 
+  /// Only the tag and a keyed opaque identity leave the native frame recipe. The
+  /// semantic clauses remain private so third-party text is never republished without
+  /// provenance; the opaque identity allows exact postcondition attribution.
+  private func frameLocatorRecipe(
+    for element: RawElement,
+    elementID: String,
+    observationID: String,
+    generation: UInt64,
+    opaqueSemanticIdentity: String
+  ) throws -> LocatorRecipe {
+    try LocatorRecipe(
+      elementID: elementID,
+      observationID: observationID,
+      observationGeneration: generation,
+      clauses: [
+        LocatorClause(
+          fact: .stableAttribute("tag"),
+          expectedValue: element.tag,
+          strength: .required)
+      ],
+      opaqueSemanticIdentity: opaqueSemanticIdentity)
+  }
+
+  private func frameSemanticIdentity(
+    capabilityID: String,
+    privateIdentity: String
+  ) -> String {
+    let message = Data("\(capabilityID)\u{1F}\(privateIdentity)".utf8)
+    let digest = HMAC<SHA256>.authenticationCode(for: message, using: frameSemanticKey)
+      .map { String(format: "%02x", $0) }.joined()
+    return "locator:\(digest)"
+  }
+
+  private static func frameActionModes(for element: RawElement) -> [WebKitFrameActionMode] {
+    guard !element.sensitive, !element.disabled, element.visible,
+      element.boundingBox.width > 0, element.boundingBox.height > 0
+    else { return [] }
+    var modes: [WebKitFrameActionMode] = [.hoverJavaScript, .pressKeyNativeAppKit]
+    if element.tag == "select" { modes.append(.selectOptionJavaScript) }
+    if element.tag == "input" || element.tag == "textarea" || element.role == "textbox" {
+      modes.append(.fillNativeAppKit)
+    }
+    return modes
+  }
+
   private func locatorCandidate(_ element: RawElement) -> LocatorCandidate {
     var facts: [LocatorFact: String] = [.stableAttribute("tag"): element.tag]
     if let role = element.role { facts[.role] = role }
@@ -4175,6 +5271,81 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private static let instrumentationSource = """
     (() => {
+      const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+      const composedParent = element =>
+        element?.parentElement || element?.getRootNode?.()?.host || null;
+      const pageContentProbe = (requireRenderedGeometry = true) => {
+        const roots = [document];
+        const elements = [];
+        for (let index = 0; index < roots.length; index += 1) {
+          const current = roots[index];
+          const descendants = Array.from(current.querySelectorAll('*'));
+          elements.push(...descendants);
+          for (const candidate of descendants) {
+            if (candidate.shadowRoot) roots.push(candidate.shadowRoot);
+            if (candidate.localName === 'iframe' || candidate.localName === 'frame') {
+              let inner = null;
+              try { inner = candidate.contentDocument; } catch { inner = null; }
+              if (inner) roots.push(inner);
+            }
+          }
+        }
+        const isRendered = element => {
+          if (requireRenderedGeometry) {
+            const box = element.getBoundingClientRect();
+            if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
+              return false;
+            }
+          }
+          for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+            if (cursor.hidden || cursor.inert
+                || collapse(cursor.getAttribute?.('aria-hidden')).toLowerCase() === 'true') {
+              return false;
+            }
+            const view = cursor.ownerDocument?.defaultView;
+            const style = view?.getComputedStyle(cursor);
+            if (!style || style.display === 'none' || style.visibility === 'hidden'
+                || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+              return false;
+            }
+          }
+          return true;
+        };
+        const contentSelector = [
+          'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
+          '[contenteditable="true"]', '[role="button"]', '[role="link"]', '[role="tab"]',
+          '[role="checkbox"]', '[role="radio"]', '[role="switch"]', '[role="textbox"]',
+          'img', 'picture', 'svg', 'canvas', 'video', 'audio[controls]',
+          'iframe', 'frame', 'object', 'embed'
+        ].join(',');
+        const renderedObjects = elements.filter(
+          element => element.matches(contentSelector) && isRendered(element));
+        const hasVisibleText = roots.some(root => {
+          const body = root.nodeType === Node.DOCUMENT_NODE ? root.body : root.host;
+          return Boolean(body && collapse(body.innerText));
+        });
+        const hasGeneratedContent = elements.some(element => {
+          if (!isRendered(element)) return false;
+          const view = element.ownerDocument?.defaultView;
+          return ['::before', '::after'].some(pseudo => {
+            const content = view?.getComputedStyle(element, pseudo)?.content;
+            return Boolean(content && content !== 'none' && content !== 'normal'
+              && content !== '""' && content !== "''");
+          });
+        });
+        const renderedContentCount = renderedObjects.length
+          + (hasVisibleText ? 1 : 0) + (hasGeneratedContent ? 1 : 0);
+        return {
+          contentState: renderedContentCount === 0 ? 'empty_or_unusable' : 'usable',
+          renderedContentCount
+        };
+      };
+      Object.defineProperty(globalThis, '__webkituiPageContentProbe', {
+        value: pageContentProbe,
+        configurable: false,
+        enumerable: false,
+        writable: false
+      });
       const state = {
         mutationCount: 0,
         readyState: document.readyState,
@@ -4291,6 +5462,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private static let observationSource = """
     const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
     const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+    const walkedFrameDocuments = new Set([document]);
     const deepQueryAll = (root, selector) => {
       const matches = [];
       const roots = [root];
@@ -4304,7 +5476,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           if (host.localName === 'iframe' || host.localName === 'frame') {
             let inner = null;
             try { inner = host.contentDocument; } catch { inner = null; }
-            if (inner) roots.push(inner);
+            if (inner) {
+              walkedFrameDocuments.add(inner);
+              roots.push(inner);
+            }
           }
         }
       }
@@ -4362,7 +5537,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const sensitiveIdentifierTerm = /(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time)/i;
     const sensitiveLabelTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time)(?:$|[^a-z0-9])/i;
     const sensitiveAutocomplete = new Set([
-      'current-password', 'new-password', 'one-time-code', 'webauthn'
+      'current-password', 'new-password', 'one-time-code', 'webauthn',
+      'cc-name', 'cc-given-name', 'cc-additional-name', 'cc-family-name',
+      'cc-number', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-csc', 'cc-type'
     ]);
     // A Material-style control renders in two halves: the real input, given no size
     // or clipped away, and the painted box beside it marked aria-hidden. Neither half
@@ -4475,6 +5652,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         right: box.right + offset.x, bottom: box.bottom + offset.y,
         width: box.width, height: box.height
       };
+    };
+    const frameCapabilityIDOf = element => {
+      try {
+        const value = element?.ownerDocument?.defaultView?.__webkituiFrameCapabilityID;
+        return typeof value === 'string' && value ? value : null;
+      } catch (_) {
+        return null;
+      }
     };
     const soleControl =
       'input, button, select, textarea, a[href], summary,'
@@ -4910,6 +6095,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         );
         return {
           physicalIdentity,
+          frameCapabilityID: frameCapabilityIDOf(element),
           tag: element.localName,
           role: roleOf(element),
           accessibleName: bounded(nameOf(element)),
@@ -4954,7 +6140,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           options,
           optionCount: optionElements ? optionElements.length : null,
           optionsTruncated: options ? optionElements.length > options.length : null,
-          stateAttributes: Object.fromEntries(
+          stateAttributes: sensitive ? {} : Object.fromEntries(
             Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
           contextAnchors: sensitive ? [] : contextAnchorsOf(element),
           domPath: domPathOf(element),
@@ -5028,6 +6214,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       firstControlProbe += ' | ' + reason;
     }
     const bodyTextLength = (document.body?.innerText || '').length;
+    const pageContentProbe = globalThis.__webkituiPageContentProbe?.() ?? {
+      contentState: bodyTextLength > 0 || renderedInteractiveCount > 0
+        ? 'usable' : 'empty_or_unusable',
+      renderedContentCount: (bodyTextLength > 0 ? 1 : 0) + renderedInteractiveCount
+    };
     // The entire visible text of the document is one short loading phrase. A shell that
     // has already painted a menu button still says only this, and requiring zero
     // controls handed such a page over as complete — the agent then read an empty form.
@@ -5053,10 +6244,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       title: document.title,
       readyState: document.readyState,
       mutationCount: globalThis.__webkituiState?.mutationCount ?? 0,
+      walkedFrameCapabilityIDs: Array.from(walkedFrameDocuments).map(frameDocument => {
+        try {
+          const value = frameDocument.defaultView?.__webkituiFrameCapabilityID;
+          return typeof value === 'string' && value ? value : null;
+        } catch (_) {
+          return null;
+        }
+      }).filter(Boolean),
       crossOriginFrameCount,
       totalElementCount: matchingElements.length,
       unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
       renderedInteractiveCount,
+      renderedContentCount: pageContentProbe.renderedContentCount,
       documentLanguage: bounded(
         collapse(document.documentElement.getAttribute('lang'))
           || collapse(document.body?.getAttribute('lang'))
@@ -5398,20 +6598,88 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         return `${url.origin}${url.pathname}${query}`;
       } catch { return null; }
     };
+    // Kept aligned with the observation mapper. This copy runs at confirmation time,
+    // after the target has been resolved again, so a page cannot make the operator
+    // approve the destination from an older observation by mutating `formaction`.
+    const sanitizedSubmissionDestination = value => {
+      if (value === null || value === undefined || value === '') return null;
+      try {
+        const url = new URL(value, document.baseURI);
+        if (!['http:', 'https:'].includes(url.protocol)) return url.protocol;
+        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+        const query = keys.length
+          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+        const result = `${url.origin}${url.pathname}${query}`;
+        return result.length > 4096 ? result.slice(0, 4096) : result;
+      } catch { return 'about:invalid'; }
+    };
+    const submissionDestinationOf = element => {
+      const submitsForm = Boolean(
+        (element instanceof HTMLButtonElement
+          && (element.type || 'submit').toLowerCase() === 'submit' && element.form)
+        || (element instanceof HTMLInputElement
+          && ['submit', 'image'].includes(element.type) && element.form)
+      );
+      // The formAction getter falls back to the document URL. Only use it when the
+      // control actually carries the overriding attribute; otherwise the form wins.
+      if (submitsForm) {
+        if (element.hasAttribute('formaction') && element.formAction) {
+          return sanitizedSubmissionDestination(element.formAction);
+        }
+        return sanitizedSubmissionDestination(element.form.action || null);
+      }
+      if (element.tagName === 'FORM' && typeof element.action === 'string') {
+        return sanitizedSubmissionDestination(element.action);
+      }
+      if (element.tagName === 'A' && element.hasAttribute('href')) {
+        return sanitizedSubmissionDestination(element.href);
+      }
+      return null;
+    };
+    const boundedFactValue = (value, criterion) => {
+      if (value === null || value === undefined) return null;
+      const text = String(value);
+      const maximum = Number(criterion.maximumCharacters);
+      if (!Number.isSafeInteger(maximum) || maximum <= 0 || text.length <= maximum) return text;
+      return text.slice(0, maximum);
+    };
     const factValue = (element, criterion) => {
       switch (criterion.fact) {
         case 'role': return roleOf(element);
-        case 'accessibleName': return nameOf(element);
-        case 'label': return labelOf(element);
-        case 'text': return collapse(element.innerText) || null;
+        case 'accessibleName': return boundedFactValue(nameOf(element), criterion);
+        case 'label': return boundedFactValue(labelOf(element), criterion);
+        case 'text': return boundedFactValue(collapse(element.innerText) || null, criterion);
         case 'stableAttribute':
           if (criterion.argument === 'tag') return element.localName;
-          if (criterion.argument === 'href') return sanitizedHref(element);
+          if (criterion.argument === 'href') {
+            return boundedFactValue(sanitizedHref(element), criterion);
+          }
           return collapse(element.getAttribute(criterion.argument)) || null;
-        case 'contextAnchor': return contextAnchorOf(element, criterion.argument);
+        case 'contextAnchor':
+          return boundedFactValue(contextAnchorOf(element, criterion.argument), criterion);
         case 'domPath': return domPathOf(element);
         case 'enabled': return String(
           !(element.disabled || element.getAttribute('aria-disabled') === 'true'));
+        case 'checked':
+          if ('checked' in element) return String(Boolean(element.checked));
+          if (element.hasAttribute('aria-checked')) {
+            return String(element.getAttribute('aria-checked') === 'true');
+          }
+          return null;
+        case 'selected':
+          if ('selected' in element) return String(Boolean(element.selected));
+          if (element.hasAttribute('aria-selected')) {
+            return String(element.getAttribute('aria-selected') === 'true');
+          }
+          return null;
+        case 'selectedOption':
+          if (!(element instanceof HTMLSelectElement)) return null;
+          return boundedFactValue(collapse(
+            Array.from(element.selectedOptions).map(option => option.textContent).join(' ')
+          ), criterion);
+        case 'stateAttribute':
+          if (!element.hasAttribute(criterion.argument)) return null;
+          return boundedFactValue(element.getAttribute(criterion.argument) ?? '', criterion);
         default: return null;
       }
     };
@@ -5436,7 +6704,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const reportedFactNames = {
       role: 'role', accessibleName: 'accessible_name', label: 'label',
       contextAnchor: 'context_anchor', stableAttribute: 'stable_attribute',
-      framePath: 'frame_path', text: 'value', domPath: 'dom_path', enabled: 'enabled'
+      framePath: 'frame_path', text: 'value', domPath: 'dom_path', enabled: 'enabled',
+      checked: 'checked', selected: 'selected', selectedOption: 'selected_option',
+      stateAttribute: 'state_attribute'
     };
     const reportedFactName = criterion => {
       const base = reportedFactNames[criterion.fact] || criterion.fact;
@@ -5528,6 +6798,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return {
         physicalIdentity,
+        submissionDestination: submissionDestinationOf(element),
         boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height },
         geometryStable: false,
         actionable: false,
@@ -5707,7 +6978,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       });
     }
     const bodyText = remaining > 0 ? take(document.body?.innerText || '') : '';
-    return JSON.stringify({ bodyText, regions, truncated });
+    const pageContentProbe = globalThis.__webkituiPageContentProbe?.() ?? {
+      contentState: bodyText ? 'usable' : 'empty_or_unusable',
+      renderedContentCount: bodyText ? 1 : 0
+    };
+    return JSON.stringify({
+      bodyText, regions, truncated,
+      contentState: pageContentProbe.contentState,
+      renderedContentCount: pageContentProbe.renderedContentCount
+    });
     """
 
   private static let performSource =
@@ -5892,6 +7171,36 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       });
       """
 
+  private static let maximumRegisteredFrameCapabilities = 32
+  private static let frameRegistrationMessageHandlerName = "webkituiFrameRegistration"
+  private static let frameRegistrationSource = """
+    (() => {
+      try {
+        globalThis.webkit.messageHandlers.webkituiFrameRegistration.postMessage(true);
+      } catch (_) {}
+    })();
+    """
+  private static let bindFrameCapabilitySource = """
+    globalThis.__webkituiFrameCapabilityID = capabilityID;
+    return globalThis.__webkituiFrameCapabilityID === capabilityID;
+    """
+  /// Runs in the same async-function body as the resolver. Capability and origin are
+  /// checked before any locator or dispatch code, so a navigation cannot turn a retained
+  /// `WKFrameInfo` into authority over its replacement document.
+  private static let frameActionGuardSource = """
+    const __webkituiFrameContextMatches = (() => {
+      try {
+        return globalThis.__webkituiFrameCapabilityID === expectedFrameCapabilityID
+          && String(location.origin) === expectedFrameOrigin;
+      } catch (_) { return false; }
+    })();
+    if (!__webkituiFrameContextMatches) {
+      return JSON.stringify({
+        count: 0, candidate: null, eliminatedBy: [], pinnedState: 'frame_context_changed',
+        frameContextMatches: false
+      });
+    }
+    """
   private static let nativeGestureMessageHandlerName = "webkituiNativeGesture"
 
   private static let armNativeClickSource =
@@ -5922,7 +7231,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         const physicalIdentity = candidate.physicalIdentity;
         const report = event => {
           globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
-            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted,
+            frameCapabilityID: globalThis.__webkituiFrameCapabilityID ?? null
           });
         };
         element.addEventListener('click', report, { capture: true, once: true });
@@ -5954,13 +7264,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         element.addEventListener('keydown', event => {
           if (event.key !== expectedKey) return;
           globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
-            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted,
+            frameCapabilityID: globalThis.__webkituiFrameCapabilityID ?? null
           });
         }, { capture: true, once: true });
         if (expectedKey === 'Tab') {
           element.addEventListener('blur', event => {
             globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
-              token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+              token, physicalIdentity, eventType: event.type, trusted: event.isTrusted,
+              frameCapabilityID: globalThis.__webkituiFrameCapabilityID ?? null
             });
           }, { capture: true, once: true });
         }
@@ -5999,13 +7311,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         const physicalIdentity = candidate.physicalIdentity;
         element.addEventListener('input', event => {
           globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
-            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted
+            token, physicalIdentity, eventType: event.type, trusted: event.isTrusted,
+            frameCapabilityID: globalThis.__webkituiFrameCapabilityID ?? null
           });
         }, { capture: true, once: true });
         document.addEventListener('keydown', event => {
           if (event.key !== 'Tab') return;
           globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
-            token, physicalIdentity, eventType: 'commit_keydown', trusted: event.isTrusted
+            token, physicalIdentity, eventType: 'commit_keydown', trusted: event.isTrusted,
+            frameCapabilityID: globalThis.__webkituiFrameCapabilityID ?? null
           });
         }, { capture: true, once: true });
       }
@@ -6014,6 +7328,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private static func boxDictionary(_ box: ObservedBoundingBox) -> [String: Double] {
     ["x": box.x, "y": box.y, "width": box.width, "height": box.height]
+  }
+
+  private static func boxesMatch(
+    _ lhs: ObservedBoundingBox,
+    _ rhs: ObservedBoundingBox,
+    tolerance: Double = 0.5
+  ) -> Bool {
+    abs(lhs.x - rhs.x) <= tolerance
+      && abs(lhs.y - rhs.y) <= tolerance
+      && abs(lhs.width - rhs.width) <= tolerance
+      && abs(lhs.height - rhs.height) <= tolerance
   }
 
   private static let credentialFillSource = """
@@ -6105,6 +7430,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 private struct RawInstrumentationState: Decodable {
   let mutationCount: UInt64
   let readyState: String
+  let contentState: PageContentState?
 }
 
 private struct RawCredentialFillResult: Decodable {
@@ -6116,11 +7442,13 @@ private struct RawObservation: Decodable {
   let title: String
   let readyState: String
   let mutationCount: UInt64
+  let walkedFrameCapabilityIDs: [String]
   let crossOriginFrameCount: Int
   let totalElementCount: Int
   let unfilteredCandidateCount: Int
   let transientLoading: Bool
   let renderedInteractiveCount: Int
+  let renderedContentCount: Int
   let documentLanguage: String?
   let ariaHiddenDropCount: Int
   let unrenderedControlCount: Int
@@ -6134,6 +7462,18 @@ private struct RawObservation: Decodable {
   let elements: [RawElement]
 }
 
+private enum FrameObservationEvaluationError: Error {
+  case timedOut
+}
+
+private struct CapturedObservationGroup {
+  let raw: RawObservation
+  /// Nil for the top-level collector. A non-nil value is native-only authority used by
+  /// future frame-local resolution and is never encoded in an observation.
+  let frameCapabilityID: String?
+  let frameOrigin: String?
+}
+
 private struct RawAuthenticationUIState: Decodable {
   let readyState: String
   let hasProgressIndicator: Bool
@@ -6144,6 +7484,7 @@ private struct RawAuthenticationUIState: Decodable {
 
 private struct RawElement: Decodable {
   let physicalIdentity: String
+  let frameCapabilityID: String?
   let tag: String
   let role: String?
   let accessibleName: String?
@@ -6184,14 +7525,42 @@ private struct RawContextAnchor: Decodable {
 
 private struct ObservedTargetRecord {
   let recipe: LocatorRecipe
+  /// A provenance-private address used only inside the retained native frame. The
+  /// public recipe omits third-party strings because `LocatorRecipe` cannot label them.
+  let resolutionRecipe: LocatorRecipe
   let physicalIdentity: String
   let boundingBox: ObservedBoundingBox
   let sensitive: Bool
   let disabled: Bool
+  let checked: Bool?
+  let selected: Bool?
+  let selectedOption: String?
+  let stateAttributes: [String: String]
+  let frameCapabilityID: String?
+  let frameOrigin: String?
+  /// The bound applied before the locator recipe was constructed. Live resolution must
+  /// apply the same bound or an unchanged long fact can never equal its observed value.
+  let maximumFieldCharacters: Int
   let observedAtMonotonicNanoseconds: UInt64
   /// How many candidates the address matched when it was handed out. Structure can
   /// separate identical controls only while the set it indexes is unchanged.
   let observedCandidateCount: Int
+}
+
+private struct FrameActionContext {
+  let capabilityID: String
+  let documentID: String
+  let observationID: String
+  let origin: String
+  let frameInfo: WKFrameInfo
+}
+
+private struct RegisteredFrameCapability {
+  let capabilityID: String
+  let documentID: String
+  let frameInfo: WKFrameInfo
+  let origin: String
+  let isMainFrame: Bool
 }
 
 private struct RawCaptureDOMState: Decodable {
@@ -6226,6 +7595,9 @@ private struct RawActionResolution: Decodable, Sendable {
   let candidate: RawActionCandidate?
   let eliminatedBy: [String]?
   let pinnedState: String?
+  /// Present only on the early frame guard failure. A successful guarded resolution
+  /// omits it, and main-document scripts never know the field exists.
+  var frameContextMatches: Bool? = nil
   /// How many of a `<select>`'s options carry the requested label. `nil` everywhere the
   /// resolved element is not a `<select>`, and from every script that is not the option
   /// survey.
@@ -6237,6 +7609,7 @@ private struct RawActionResolution: Decodable, Sendable {
 
 private struct RawActionCandidate: Decodable, Sendable {
   let physicalIdentity: String
+  var submissionDestination: String? = nil
   var role: String?
   let boundingBox: ObservedBoundingBox
   let geometryStable: Bool
@@ -6250,4 +7623,9 @@ private struct NativeGestureReceipt {
   let physicalIdentity: String
   let eventType: String
   let trusted: Bool
+}
+
+private struct ArmedNativeGestureContext {
+  let frameCapabilityID: String?
+  let frameOrigin: String?
 }

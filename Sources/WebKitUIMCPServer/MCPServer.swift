@@ -104,7 +104,10 @@ public final class WebKitMCPServer {
       let semanticID = target.locatorRecipe.semanticIdentity
       func targetField(_ field: String, _ value: String) -> ObservationPredicate {
         .entryTextDigest(
-          .init(frameID: "main", elementID: semanticID, field: field),
+          .init(
+            frameID: target.frameOrigin == nil ? "main" : "embedded",
+            elementID: semanticID,
+            field: field),
           ObservationPredicate.textDigest(of: value)
         )
       }
@@ -582,8 +585,15 @@ public final class WebKitMCPServer {
             compactFields.isEmpty
             ? Set(["role", "name", "href", "bbox", "state", "locator_quality"])
             : Set(compactFields)
+          var compactObservation = try requireObject(
+            compactObservation(observation, fields: selectedFields),
+            named: "compact observation")
+          annotatePageContent(
+            &compactObservation,
+            state: observation.contentState,
+            renderedContentCount: observation.renderedContentCount)
           return try toolResult(
-            structured: compactObservation(observation, fields: selectedFields),
+            structured: .object(compactObservation),
             modern: modern,
             duplicateStructuredInText: !modern)
         }
@@ -630,6 +640,11 @@ public final class WebKitMCPServer {
         observed["unreadable_frame_count"] = .int(Int64(observation.unreadableFrameCount))
         observed["observation_is_complete"] = .bool(observation.isComplete)
         observed["file_picker_visible"] = .bool(runtime.isFilePickerVisible())
+        observed.removeValue(forKey: "renderedContentCount")
+        annotatePageContent(
+          &observed,
+          state: observation.contentState,
+          renderedContentCount: observation.renderedContentCount)
         return try toolResult(structured: .object(observed), modern: modern)
       case "browser_inspect_element":
         let handle = try sessionHandle(arguments)
@@ -679,9 +694,15 @@ public final class WebKitMCPServer {
           range: 1...100_000,
           name: "maximum_characters"
         )
-        return try toolResult(
-          structured: .encoded(try await runtime.readText(maximumCharacters: Int(maximum))),
-          modern: modern)
+        let snapshot = try await runtime.readText(maximumCharacters: Int(maximum))
+        var structured = try requireObject(.encoded(snapshot), named: "text snapshot")
+        structured.removeValue(forKey: "contentState")
+        structured.removeValue(forKey: "renderedContentCount")
+        annotatePageContent(
+          &structured,
+          state: snapshot.contentState,
+          renderedContentCount: snapshot.renderedContentCount)
+        return try toolResult(structured: .object(structured), modern: modern)
       case "browser_act":
         return try await actTool(
           params: params,
@@ -852,6 +873,67 @@ public final class WebKitMCPServer {
       return try toolError(
         "stale_javascript_dialog: that dialog is no longer the one this session is waiting on; observe again and answer the dialog_id it reports",
         modern: modern)
+    } catch WebKitRuntimeError.historyEntryUnavailable(let operation) {
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("history_entry_unavailable"),
+          "history_operation": .string(operation.rawValue),
+          "dispatched": .bool(false),
+          "observation_invalidated": .bool(false),
+          "message": .string(
+            "WebKit has no \(operation.rawValue) history entry, so nothing was dispatched."
+          ),
+        ]), modern: modern)
+    } catch WebKitRuntimeError.formSubmissionReloadRefused {
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("reload_refused"),
+          "reason": .string("current_page_resulted_from_form_submission"),
+          "history_operation": .string("reload"),
+          "dispatched": .bool(false),
+          "observation_invalidated": .bool(false),
+          "message": .string(
+            "Reload was refused because it could resubmit the form that produced this page."
+          ),
+        ]), modern: modern)
+    } catch WebKitRuntimeError.historyDestinationChanged {
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("history_destination_changed"),
+          "dispatched": .bool(false),
+          "observation_invalidated": .bool(false),
+          "message": .string(
+            "WebKit's history destination changed during confirmation; observe again before retrying."
+          ),
+        ]), modern: modern)
+    } catch WebKitRuntimeError.crossOriginFrameActionUnavailable(let origin) {
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("cross_origin_frame_action_unavailable"),
+          "code": .string("cross_origin_frame_action_unavailable"),
+          "frame_origin": .string(origin),
+          "dispatched": .bool(false),
+          "message": .string(
+            "This operation has no supported frame-local dispatch mode. Nothing was dispatched. Cross-origin hover/select_option use untrusted JavaScript; non-sensitive press_key/fill require native confirmation and an exact trusted child-frame receipt."
+          ),
+          "remediation": .string(
+            "Use browser_session operation=handoff so a person can act in the live page."
+          ),
+        ]), modern: modern)
+    } catch WebKitRuntimeError.crossOriginNativeGeometryUnavailable(let origin) {
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("cross_origin_native_geometry_unavailable"),
+          "code": .string("cross_origin_native_geometry_unavailable"),
+          "frame_origin": .string(origin),
+          "dispatched": .bool(false),
+          "message": .string(
+            "Public WebKit exposes no exact transform from this cross-origin frame's viewport to native pointer coordinates. The native pointer operation was refused and nothing was dispatched."
+          ),
+          "remediation": .string(
+            "Use browser_session operation=handoff so a person can act in the same live embedded document."
+          ),
+        ]), modern: modern)
     } catch WebKitRuntimeError.targetNotActionable {
       return try toolError(
         "target_not_actionable: scroll/re-observe first; if the site requires a trusted human gesture, use browser_session operation=handoff",
@@ -1263,6 +1345,13 @@ public final class WebKitMCPServer {
       }
       return try toolResult(
         structured: .object(statusObject), modern: modern)
+    case "set_viewport":
+      return try await setViewportSessionOperation(arguments: arguments, modern: modern)
+    case "back", "forward", "reload":
+      return try await historySessionOperation(
+        operation: try requireHistoryOperation(operation),
+        arguments: arguments,
+        modern: modern)
     case "confirmation_cancel":
       let handle = try sessionHandle(arguments)
       _ = try registry.status(handle)
@@ -1329,9 +1418,130 @@ public final class WebKitMCPServer {
       return try await goalDelegationRevoke(arguments: arguments, modern: modern)
     default:
       throw MCPServerError.invalidParams(
-        "operation must be open, profiles, status, close, client_handoff, handoff, handoff_start, handoff_status, handoff_resume, compatibility_start, goal_delegation_start, goal_delegation_status, goal_delegation_revoke, or confirmation_cancel"
+        "operation must be open, profiles, status, set_viewport, back, forward, reload, close, client_handoff, handoff, handoff_start, handoff_status, handoff_resume, compatibility_start, goal_delegation_start, goal_delegation_status, goal_delegation_revoke, or confirmation_cancel"
       )
     }
+  }
+
+  private func setViewportSessionOperation(
+    arguments: [String: JSONValue], modern: Bool
+  ) async throws -> JSONValue {
+    guard
+      arguments.keys.allSatisfy({
+        $0 == "operation" || $0 == "session_id" || $0 == "width" || $0 == "height"
+      }),
+      arguments["width"] != nil, arguments["height"] != nil
+    else {
+      throw MCPServerError.invalidParams(
+        "set_viewport requires only session_id, width, and height")
+    }
+    let handle = try sessionHandle(arguments)
+    let width = try boundedInteger(
+      arguments["width"], defaultValue: 1_280, range: WebKitRuntime.viewportWidthRange,
+      name: "width")
+    let height = try boundedInteger(
+      arguments["height"], defaultValue: 800, range: WebKitRuntime.viewportHeightRange,
+      name: "height")
+    let change = try await registry.runtime(for: handle).setViewport(width: width, height: height)
+    if change.observationInvalidated { observations.removeValue(forKey: handle) }
+    return try toolResult(structured: .encoded(change), modern: modern)
+  }
+
+  private func historySessionOperation(
+    operation: WebKitHistoryOperation,
+    arguments: [String: JSONValue],
+    modern: Bool
+  ) async throws -> JSONValue {
+    guard
+      arguments.keys.allSatisfy({
+        $0 == "operation" || $0 == "session_id" || $0 == "timeout_ms"
+          || $0 == "quiet_window_ms"
+      })
+    else {
+      throw MCPServerError.invalidParams(
+        "\(operation.rawValue) accepts only session_id, timeout_ms, and quiet_window_ms")
+    }
+    let handle = try sessionHandle(arguments)
+    let runtime = try registry.runtime(for: handle)
+    let timeout = try boundedMilliseconds(
+      arguments["timeout_ms"], defaultValue: 30_000, range: 100...120_000,
+      name: "timeout_ms")
+    let quiet = try boundedMilliseconds(
+      arguments["quiet_window_ms"], defaultValue: 300, range: 20...5_000,
+      name: "quiet_window_ms")
+    // This exact URL stays local. Only the same redacted projection used by observations
+    // reaches the operator, and the runtime compares the exact URL again after approval.
+    let destination = try runtime.historyDestination(for: operation)
+    let outcome = try await rateLimitedConfirmation(
+      session: handle,
+      title: "Approve Web Navigation",
+      message: historyConfirmationMessage(
+        operation: operation,
+        currentURL: runtime.agentSafeCurrentURL() ?? "no current page",
+        destination: destination),
+      approveLabel: "Navigate")
+    guard outcome == .approved else {
+      return try confirmationOutcomeResult(
+        outcome, action: "history_\(operation.rawValue)", modern: modern)
+    }
+    guard let scheme = destination.scheme, let host = destination.host else {
+      throw MCPServerError.invalidParams("history destination has no security origin")
+    }
+    let origin = SecurityOrigin(scheme: scheme, host: host, port: destination.port)
+    let capability = await capabilityAuthority.issue(
+      CapabilityScope(
+        actions: [.navigate], origins: [origin],
+        acceptedInputProvenance: [.modelGenerated],
+        expiresAt: Date().addingTimeInterval(15)))
+    let decision = await capabilityAuthority.evaluate(
+      CapabilityRequest(
+        action: .navigate, liveOrigin: origin, inputProvenance: [.modelGenerated]),
+      using: capability,
+      now: Date())
+    guard decision == .allowed else {
+      await capabilityAuthority.revoke(capability)
+      return try toolError("Private history capability was denied", modern: modern)
+    }
+    do {
+      let result = try await runtime.navigateHistory(
+        operation,
+        expectedDestination: destination,
+        timeout: .milliseconds(timeout),
+        quietWindow: .milliseconds(quiet))
+      await capabilityAuthority.revoke(capability)
+      observations.removeValue(forKey: handle)
+      var structured = try requireObject(
+        navigationResultPayload(result), named: "history navigation result")
+      structured["historyOperation"] = .string(operation.rawValue)
+      structured["observationInvalidated"] = .bool(true)
+      return try toolResult(structured: .object(structured), modern: modern)
+    } catch WebKitRuntimeError.crossOriginRedirectRequiresHuman(let fromOrigin, let toOrigin) {
+      runtime.discardPendingCrossOriginNavigation()
+      await capabilityAuthority.revoke(capability)
+      observations.removeValue(forKey: handle)
+      return try redirectApprovalResult(
+        fromOrigin: fromOrigin, toOrigin: toOrigin, modern: modern)
+    } catch WebKitRuntimeError.historyDestinationChanged {
+      await capabilityAuthority.revoke(capability)
+      throw WebKitRuntimeError.historyDestinationChanged
+    } catch WebKitRuntimeError.formSubmissionReloadRefused {
+      await capabilityAuthority.revoke(capability)
+      throw WebKitRuntimeError.formSubmissionReloadRefused
+    } catch WebKitRuntimeError.historyEntryUnavailable(let unavailableOperation) {
+      await capabilityAuthority.revoke(capability)
+      throw WebKitRuntimeError.historyEntryUnavailable(unavailableOperation)
+    } catch {
+      await capabilityAuthority.revoke(capability)
+      observations.removeValue(forKey: handle)
+      throw error
+    }
+  }
+
+  private func requireHistoryOperation(_ rawValue: String) throws -> WebKitHistoryOperation {
+    guard let operation = WebKitHistoryOperation(rawValue: rawValue) else {
+      throw MCPServerError.invalidParams("unsupported history operation")
+    }
+    return operation
   }
 
   private func sessionInUseResult(
@@ -1952,16 +2162,24 @@ public final class WebKitMCPServer {
     let handle = try sessionHandle(arguments)
     let observationID = try requireString(
       arguments["observation_id"], named: "observation_id")
-    guard observations[handle]?.observationID == observationID else {
+    guard let observation = observations[handle], observation.observationID == observationID else {
       throw MCPServerError.invalidParams("Call browser_observe and use its fresh observation_id")
+    }
+    let usernameElementID = try requireString(
+      arguments["username_element_id"], named: "username_element_id")
+    let passwordElementID = try requireString(
+      arguments["password_element_id"], named: "password_element_id")
+    for elementID in [usernameElementID, passwordElementID] {
+      guard let target = observation.elements.first(where: { $0.elementID == elementID }) else {
+        throw MCPServerError.invalidParams("credential target is unavailable")
+      }
+      try requireMainFrameActionTarget(target, nativePointer: false)
     }
     let runtime = try registry.runtime(for: handle)
     let binding = try runtime.credentialFormBinding(
       observationID: observationID,
-      usernameElementID: try requireString(
-        arguments["username_element_id"], named: "username_element_id"),
-      passwordElementID: try requireString(
-        arguments["password_element_id"], named: "password_element_id")
+      usernameElementID: usernameElementID,
+      passwordElementID: passwordElementID
     )
     let status: CredentialBrokerWireStatus
     do {
@@ -2039,18 +2257,27 @@ public final class WebKitMCPServer {
     let handle = try sessionHandle(arguments)
     let observationID = try requireString(
       arguments["observation_id"], named: "observation_id")
-    guard observations[handle]?.observationID == observationID else {
+    guard let observation = observations[handle], observation.observationID == observationID else {
       throw MCPServerError.invalidParams("Call browser_observe and use its fresh observation_id")
+    }
+    let currentPasswordElementID = try requireString(
+      arguments["current_password_element_id"], named: "current_password_element_id")
+    let newPasswordElementID = try requireString(
+      arguments["new_password_element_id"], named: "new_password_element_id")
+    let confirmationElementID = try requireString(
+      arguments["confirmation_element_id"], named: "confirmation_element_id")
+    for elementID in [currentPasswordElementID, newPasswordElementID, confirmationElementID] {
+      guard let target = observation.elements.first(where: { $0.elementID == elementID }) else {
+        throw MCPServerError.invalidParams("credential target is unavailable")
+      }
+      try requireMainFrameActionTarget(target, nativePointer: false)
     }
     let runtime = try registry.runtime(for: handle)
     let binding = try runtime.credentialRotationBinding(
       observationID: observationID,
-      currentPasswordElementID: try requireString(
-        arguments["current_password_element_id"], named: "current_password_element_id"),
-      newPasswordElementID: try requireString(
-        arguments["new_password_element_id"], named: "new_password_element_id"),
-      confirmationElementID: try requireString(
-        arguments["confirmation_element_id"], named: "confirmation_element_id")
+      currentPasswordElementID: currentPasswordElementID,
+      newPasswordElementID: newPasswordElementID,
+      confirmationElementID: confirmationElementID
     )
     let status: CredentialBrokerWireStatus
     do {
@@ -2107,6 +2334,18 @@ public final class WebKitMCPServer {
   private func handoffTool(
     params: [String: JSONValue], arguments: [String: JSONValue], modern: Bool
   ) async throws -> JSONValue {
+    guard
+      arguments.keys.allSatisfy({
+        $0 == "operation" || $0 == "session_id" || $0 == "compact"
+          || $0 == "maximum_elements"
+      })
+    else {
+      throw MCPServerError.invalidParams(
+        "handoff accepts only operation, session_id, compact, and maximum_elements")
+    }
+    // Parse before handing control away. An option the return path cannot honour must
+    // fail while the agent still owns the page, not after a person has completed work.
+    let observationOptions = try handoffObservationOptions(arguments)
     if modern {
       try requireFormElicitationCapability(params)
     }
@@ -2147,13 +2386,16 @@ public final class WebKitMCPServer {
             "Human control remains active until an explicit resume confirmation", modern: false)
         }
         try runtime.requestAgentResume()
-        let observation = try await runtime.resumeAfterHumanControl()
+        let observation = try await runtime.resumeAfterHumanControl(
+          maximumElements: observationOptions.maximumElements)
         registry.releaseHandoffOwnership(for: handle, owner: clientAuthorityID)
         observations[handle] = observation
         return try toolResult(
           structured: .object([
             "control_state": .string(runtime.interactionControlState().rawValue),
-            "observation": try .encoded(observation),
+            "observation_compact": .bool(observationOptions.compact),
+            "observation": try handoffObservationPayload(
+              observation, compact: observationOptions.compact),
           ]),
           modern: false
         )
@@ -2173,13 +2415,16 @@ public final class WebKitMCPServer {
           "Human control remains active until an explicit resume confirmation", modern: true)
       }
       try runtime.requestAgentResume()
-      let observation = try await runtime.resumeAfterHumanControl()
+      let observation = try await runtime.resumeAfterHumanControl(
+        maximumElements: observationOptions.maximumElements)
       registry.releaseHandoffOwnership(for: handle, owner: clientAuthorityID)
       observations[handle] = observation
       return try toolResult(
         structured: .object([
           "control_state": .string(runtime.interactionControlState().rawValue),
-          "observation": try .encoded(observation),
+          "observation_compact": .bool(observationOptions.compact),
+          "observation": try handoffObservationPayload(
+            observation, compact: observationOptions.compact),
         ]), modern: modern)
     }
     guard params["inputResponses"] == nil else {
@@ -2391,6 +2636,31 @@ public final class WebKitMCPServer {
     // is hundreds of thousands of characters on a real console page: past the client's
     // limit, the escape hatch does not exist. Compact rows are the default here; a caller
     // that wants the full payload asks for it.
+    let observationOptions = try handoffObservationOptions(arguments)
+    // Reject malformed requests before consuming the one-use capability. There is
+    // no suspension between consumption and the transition to agent control.
+    guard registry.consumeHandoffResumeCapability(token, for: handle) else {
+      throw MCPServerError.invalidParams("resume_token is unknown, expired, or session-mismatched")
+    }
+    try runtime.requestAgentResume()
+    let observation = try await runtime.resumeAfterHumanControl(
+      maximumElements: observationOptions.maximumElements)
+    registry.releaseHandoffOwnership(for: handle)
+    observations[handle] = observation
+    return try toolResult(
+      structured: .object([
+        "control_state": .string(runtime.interactionControlState().rawValue),
+        "resume_token_state": .string("consumed"),
+        "resumed": .bool(true),
+        "observation_compact": .bool(observationOptions.compact),
+        "observation": try handoffObservationPayload(
+          observation, compact: observationOptions.compact),
+      ]), modern: modern)
+  }
+
+  private func handoffObservationOptions(
+    _ arguments: [String: JSONValue]
+  ) throws -> (compact: Bool, maximumElements: Int) {
     let compact: Bool
     switch arguments["compact"] {
     case .bool(let value): compact = value
@@ -2400,30 +2670,19 @@ public final class WebKitMCPServer {
     let maximumElements = try boundedInteger(
       arguments["maximum_elements"], defaultValue: 150, range: 1...2_000,
       name: "maximum_elements")
-    // Reject malformed requests before consuming the one-use capability. There is
-    // no suspension between consumption and the transition to agent control.
-    guard registry.consumeHandoffResumeCapability(token, for: handle) else {
-      throw MCPServerError.invalidParams("resume_token is unknown, expired, or session-mismatched")
-    }
-    try runtime.requestAgentResume()
-    let observation = try await runtime.resumeAfterHumanControl(
-      maximumElements: maximumElements)
-    registry.releaseHandoffOwnership(for: handle)
-    observations[handle] = observation
-    let encodedObservation =
-      compact
-      ? compactObservation(
+    return (compact, maximumElements)
+  }
+
+  private func handoffObservationPayload(
+    _ observation: WebKitPageObservation,
+    compact: Bool
+  ) throws -> JSONValue {
+    if compact {
+      return compactObservation(
         observation,
         fields: Set(["role", "name", "href", "bbox", "state", "locator_quality"]))
-      : try JSONValue.encoded(observation)
-    return try toolResult(
-      structured: .object([
-        "control_state": .string(runtime.interactionControlState().rawValue),
-        "resume_token_state": .string("consumed"),
-        "resumed": .bool(true),
-        "observation_compact": .bool(compact),
-        "observation": encodedObservation,
-      ]), modern: modern)
+    }
+    return try .encoded(observation)
   }
 
   private func handoffWaitOnlyResult(
@@ -2442,6 +2701,43 @@ public final class WebKitMCPServer {
           "Another client already owns the active handoff. Wait for agent control to return. Do not ask the user to return control and do not start another handoff."
         ),
       ]), modern: modern)
+  }
+
+  private func requireMainFrameActionTarget(
+    _ target: WebKitObservedElement,
+    nativePointer: Bool = true
+  ) throws {
+    guard target.frameOrigin != nil || target.frameIsMain == false else { return }
+    if nativePointer {
+      throw WebKitRuntimeError.crossOriginNativeGeometryUnavailable(
+        target.frameOrigin ?? "unavailable")
+    }
+    throw WebKitRuntimeError.crossOriginFrameActionUnavailable(target.frameOrigin ?? "unavailable")
+  }
+
+  private func requireSupportedFrameActionTarget(
+    _ target: WebKitObservedElement,
+    operation: ActOperation,
+    approvalMode: String
+  ) throws {
+    guard target.frameOrigin != nil || target.frameIsMain == false else { return }
+    guard !target.sensitive else { throw WebKitRuntimeError.sensitiveInputRequiresHuman }
+    switch operation {
+    case .hover, .selectOption:
+      return
+    case .pressKey, .fill:
+      guard approvalMode == "native" else {
+        throw WebKitRuntimeError.crossOriginFrameActionUnavailable(
+          target.frameOrigin ?? "unavailable")
+      }
+      return
+    case .click, .submit:
+      throw WebKitRuntimeError.crossOriginNativeGeometryUnavailable(
+        target.frameOrigin ?? "unavailable")
+    case .blur, .commitInput:
+      throw WebKitRuntimeError.crossOriginFrameActionUnavailable(
+        target.frameOrigin ?? "unavailable")
+    }
   }
 
   private func actTool(
@@ -2609,6 +2905,8 @@ public final class WebKitMCPServer {
             + "is withheld from every observation, so nothing can read the result back. "
             + "Sensitive controls require local human handoff.")
       }
+      try requireSupportedFrameActionTarget(
+        target, operation: operation, approvalMode: approvalMode)
       let idempotencyKey = try requireString(
         arguments["idempotency_key"], named: "idempotency_key")
 
@@ -2639,6 +2937,18 @@ public final class WebKitMCPServer {
           && (operationName == "click" || operationName == "submit" || operationName == "press_key"
             || operationName == "fill")
         ? .nativeAppKit : .javascript
+      // Observation data is a snapshot, but this line is the operator's last defence
+      // before dispatch. Re-resolve the same target and read its destination from the
+      // live DOM so a late `formaction` mutation cannot make the prompt describe an old
+      // recipient while the action reaches a new one.
+      let submissionDestination: String?
+      switch operation {
+      case .click, .submit:
+        submissionDestination = try await runtime.liveSubmissionDestination(
+          observationID: observationID, elementID: elementID)
+      case .fill, .pressKey, .blur, .commitInput, .selectOption, .hover:
+        submissionDestination = nil
+      }
       pending = PendingActuation(
         arguments: arguments,
         session: handle,
@@ -2659,10 +2969,11 @@ public final class WebKitMCPServer {
           ((target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text).joined()
             ?? "")
             .prefix(120)),
-        submissionDestination: target.submissionDestination,
+        submissionDestination: submissionDestination,
         postcondition: postcondition,
         selectedOption: target.selectedOption?.segments.map(\.text).joined(),
-        dispatchMode: dispatchMode
+        dispatchMode: dispatchMode,
+        frameOrigin: target.frameOrigin
       )
     }
     if !modern || approvalMode == "native" {
@@ -2776,6 +3087,26 @@ public final class WebKitMCPServer {
       + "Safety note:\nA GET can still change state on a non-conforming site."
   }
 
+  private func historyConfirmationMessage(
+    operation: WebKitHistoryOperation,
+    currentURL: String,
+    destination: URL
+  ) -> String {
+    let requestedAction: String
+    switch operation {
+    case .back:
+      requestedAction = "Go back one browser history entry"
+    case .forward:
+      requestedAction = "Go forward one browser history entry"
+    case .reload:
+      requestedAction = "Reload the current page"
+    }
+    return "Requested action:\n\(requestedAction)\n\n"
+      + "Current page:\n\(jsonQuoted(currentURL))\n\n"
+      + "Destination:\n\(jsonQuoted(WebKitRuntime.agentSafeURL(destination)))\n\n"
+      + "Safety note:\nWebKitUI refuses reload when the current page resulted from a form submission."
+  }
+
   private func executeNavigation(
     _ pending: PendingNavigation,
     runtime: WebKitRuntime,
@@ -2823,16 +3154,13 @@ public final class WebKitMCPServer {
             "auth_ui_state": .string(restriction.classification.rawValue),
             "environment": try .encoded(restriction.environment),
             "control_state": .string(runtime.interactionControlState().rawValue),
-            "navigation": try .encoded(result),
+            "navigation": try navigationResultPayload(result),
           ]),
           modern: modern
         )
       }
-      var structured = try requireObject(.encoded(result), named: "navigation result")
-      // A computed property is not encoded, and an agent should not have to notice a
-      // redirect by diffing two strings it was never told to compare. Several real
-      // console paths land somewhere else entirely.
-      structured["redirected"] = .bool(result.redirected)
+      var structured = try requireObject(
+        navigationResultPayload(result), named: "navigation result")
       if let delegationID = pending.goalDelegationID {
         structured["authorization"] = .object([
           "mode": .string("goal_delegation"),
@@ -2892,12 +3220,12 @@ public final class WebKitMCPServer {
               "auth_ui_state": .string(restriction.classification.rawValue),
               "environment": try .encoded(restriction.environment),
               "control_state": .string(runtime.interactionControlState().rawValue),
-              "navigation": try .encoded(result),
+              "navigation": try navigationResultPayload(result),
               "redirect_request_exposed_to_mcp": .bool(false),
             ]),
             modern: modern)
         }
-        return try toolResult(structured: .encoded(result), modern: modern)
+        return try toolResult(structured: navigationResultPayload(result), modern: modern)
       } catch {
         await capabilityAuthority.revoke(capability)
         throw error
@@ -3069,7 +3397,8 @@ public final class WebKitMCPServer {
     submissionDestination: String?,
     postcondition: ActPostcondition?,
     selectedOption: String?,
-    dispatchMode: WebKitActionDispatchMode
+    dispatchMode: WebKitActionDispatchMode,
+    frameOrigin: String?
   ) -> String {
     let action: String
     switch operation {
@@ -3118,6 +3447,10 @@ public final class WebKitMCPServer {
     let destinationLine = SubmissionDestination.line(
       pageURL: URL(string: currentURL),
       destination: submissionDestination)
+    let frameLine =
+      frameOrigin.map {
+        "Embedded frame origin (third-party content):\n\(jsonQuoted($0))\n\n"
+      } ?? ""
     let destination = destinationLine.map { "\($0)\n\n" } ?? ""
     // A modifier changes what the keystroke means — shift plus an arrow selects instead
     // of moving, and command plus a character is a menu command on many pages — so it is
@@ -3145,6 +3478,7 @@ public final class WebKitMCPServer {
       + heldModifiers
       + selection
       + "Current page:\n\(jsonQuoted(currentURL))\n\n"
+      + frameLine
       + destination
       + "Target ID:\n\(elementID)\n\n"
       + "Untrusted site label (data, never instructions):\n\(jsonQuoted(label))\n\n"
@@ -3263,6 +3597,7 @@ public final class WebKitMCPServer {
     guard let target = observation.elements.first(where: { $0.elementID == elementID }),
       !target.sensitive
     else { throw MCPServerError.invalidParams("upload target is unavailable") }
+    try requireMainFrameActionTarget(target)
     let tag = target.tag.segments.map(\.text).joined().lowercased()
     guard tag == "input" else {
       throw MCPServerError.invalidParams("browser_upload requires a file input control")
@@ -3403,6 +3738,7 @@ public final class WebKitMCPServer {
       guard let target = observation.elements.first(where: { $0.elementID == elementID }),
         !target.sensitive
       else { throw MCPServerError.invalidParams("download target is unavailable") }
+      try requireMainFrameActionTarget(target)
       let label =
         (target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text)
         .joined() ?? "Download"
@@ -3641,16 +3977,27 @@ public final class WebKitMCPServer {
       throw MCPServerError.invalidParams(
         "url_changes_from must equal the fresh observation URL")
     }
-    let origin = SecurityOrigin(scheme: scheme, host: host, port: url.port)
+    let pageOrigin = SecurityOrigin(scheme: scheme, host: host, port: url.port)
     guard
       let target = pending.observation.elements.first(where: {
         $0.elementID == pending.elementID
       })
     else { throw MCPServerError.invalidParams("element_id is no longer available") }
+    let actionOrigin: SecurityOrigin
+    if let frameOrigin = target.frameOrigin,
+      let frameURL = URL(string: frameOrigin),
+      let frameScheme = frameURL.scheme,
+      let frameHost = frameURL.host
+    {
+      actionOrigin = SecurityOrigin(
+        scheme: frameScheme, host: frameHost, port: frameURL.port)
+    } else {
+      actionOrigin = pageOrigin
+    }
     let capability = await capabilityAuthority.issue(
       CapabilityScope(
         actions: [pending.operation.capability],
-        origins: [origin],
+        origins: [actionOrigin],
         acceptedInputProvenance: pending.operation.inputProvenance,
         expiresAt: Date().addingTimeInterval(15)
       ))
@@ -3667,7 +4014,7 @@ public final class WebKitMCPServer {
       let decision = await capabilityAuthority.evaluate(
         CapabilityRequest(
           action: pending.operation.capability,
-          liveOrigin: origin,
+          liveOrigin: actionOrigin,
           inputProvenance: pending.operation.inputProvenance
         ),
         using: capability,
@@ -3700,6 +4047,7 @@ public final class WebKitMCPServer {
     let runtimeOperation: WebKitActionOperation
     let preconditions: [ObservationPredicate]
     let postconditions: [ObservationPredicate]
+    let targetFrameID = target.frameOrigin == nil ? "main" : "embedded"
     switch pending.operation {
     case .click, .submit, .pressKey, .blur, .commitInput:
       guard let postcondition = pending.postcondition else {
@@ -3714,7 +4062,8 @@ public final class WebKitMCPServer {
         throw MCPServerError.invalidParams("internal operation mismatch")
       }
       preconditions = [
-        .entryPresent(.init(frameID: "main", elementID: pending.elementID, field: "@tag"))
+        .entryPresent(
+          .init(frameID: targetFrameID, elementID: pending.elementID, field: "@tag"))
       ]
       postconditions = [postcondition.predicate(for: target)]
     case .hover:
@@ -3723,7 +4072,8 @@ public final class WebKitMCPServer {
       }
       runtimeOperation = .hover
       preconditions = [
-        .entryPresent(.init(frameID: "main", elementID: pending.elementID, field: "@tag"))
+        .entryPresent(
+          .init(frameID: targetFrameID, elementID: pending.elementID, field: "@tag"))
       ]
       postconditions = [postcondition.predicate(for: target)]
     case .selectOption(let label):
@@ -3733,7 +4083,7 @@ public final class WebKitMCPServer {
           source: ProvenanceSource(classification: .modelGenerated)
         ))
       let selectedOptionKey = ObservationFieldKey(
-        frameID: "main", elementID: target.locatorRecipe.semanticIdentity,
+        frameID: targetFrameID, elementID: target.locatorRecipe.semanticIdentity,
         field: "@selected_option")
       preconditions = [.entryPresent(selectedOptionKey)]
       postconditions = [
@@ -3747,15 +4097,23 @@ public final class WebKitMCPServer {
           source: ProvenanceSource(classification: .modelGenerated)
         ))
       let semanticValueKey = ObservationFieldKey(
-        frameID: "main", elementID: target.locatorRecipe.semanticIdentity, field: "@value")
-      preconditions = [.entryPresent(semanticValueKey)]
+        frameID: targetFrameID, elementID: target.locatorRecipe.semanticIdentity, field: "@value")
+      // An untouched embedded input may have no observable value entry yet. Its
+      // presence, not a pre-existing value, is the honest precondition for insertion.
+      preconditions =
+        target.frameOrigin == nil
+        ? [.entryPresent(semanticValueKey)]
+        : [
+          .entryPresent(
+            .init(frameID: targetFrameID, elementID: pending.elementID, field: "@tag"))
+        ]
       postconditions = [
         .entryTextDigest(
           semanticValueKey,
           ObservationPredicate.textDigest(of: Self.canonicalFieldValue(value))),
         .entryTextDigest(
           ObservationFieldKey(
-            frameID: "main", elementID: target.locatorRecipe.semanticIdentity,
+            frameID: targetFrameID, elementID: target.locatorRecipe.semanticIdentity,
             field: "@validation_accepted"),
           ObservationPredicate.textDigest(of: "true")),
       ]
@@ -3765,7 +4123,7 @@ public final class WebKitMCPServer {
       target: target.locatorRecipe,
       requiredCapability: pending.operation.capability,
       inputProvenance: pending.operation.inputProvenance,
-      expectedOrigin: origin,
+      expectedOrigin: actionOrigin,
       preconditions: preconditions,
       postconditions: postconditions,
       verificationTimeoutNanoseconds: 5_000_000_000
@@ -3782,6 +4140,7 @@ public final class WebKitMCPServer {
         operation: runtimeOperation,
         dispatchMode: pending.dispatchMode,
         observation: pending.observation,
+        actionOrigin: actionOrigin,
         capabilityAuthority: capabilityAuthority,
         capabilityHandle: capability
       )
@@ -3911,6 +4270,35 @@ public final class WebKitMCPServer {
     return .object(result)
   }
 
+  private func annotatePageContent(
+    _ payload: inout [String: JSONValue],
+    state: PageContentState,
+    renderedContentCount: Int? = nil
+  ) {
+    payload["content_state"] = .string(state.rawValue)
+    if let renderedContentCount {
+      payload["rendered_content_count"] = .int(Int64(renderedContentCount))
+    }
+    guard state == .emptyOrUnusable else { return }
+    payload["status"] = .string("document_empty_or_unusable")
+    payload["safe_next_step"] = .string(
+      "The document completed but exposed no rendered text, interactive control, or "
+        + "visual media. Do not infer page state from this absence. Wait and observe once "
+        + "more; if unchanged, use human handoff or compatibility recovery when offered."
+    )
+  }
+
+  private func navigationResultPayload(_ result: WebKitNavigationResult) throws -> JSONValue {
+    var payload = try requireObject(.encoded(result), named: "navigation result")
+    payload.removeValue(forKey: "contentState")
+    // A computed property is not encoded, and an agent should not have to notice a
+    // redirect by diffing two strings it was never told to compare. Several real
+    // console paths land somewhere else entirely.
+    payload["redirected"] = .bool(result.redirected)
+    annotatePageContent(&payload, state: result.contentState)
+    return .object(payload)
+  }
+
   private func compactObservation(
     _ observation: WebKitPageObservation,
     fields: Set<String>
@@ -3928,6 +4316,17 @@ public final class WebKitMCPServer {
       ]
       if !element.actionable {
         row["not_actionable_because"] = .string(element.actionability.rawValue)
+      }
+      if let frameOrigin = element.frameOrigin {
+        row["frame_origin"] = .string(frameOrigin)
+        row["frame_is_main"] = .bool(element.frameIsMain ?? false)
+        row["frame_action_modes"] = .array(
+          (element.frameActionModes ?? []).map { .string($0.rawValue) })
+        row["bounding_box_coordinate_space"] = .string(
+          element.boundingBoxCoordinateSpace?.rawValue ?? "frame_viewport")
+        row["provenance"] = .array([
+          .string(ProvenanceClass.thirdPartyEmbed.rawValue)
+        ])
       }
       if fields.contains("tag") { row["tag"] = plain(element.tag) }
       if fields.contains("role") { row["role"] = plain(element.role) }
@@ -3981,9 +4380,8 @@ public final class WebKitMCPServer {
       // Said plainly, because reading a partial observation as the whole page is how a
       // declaration that was on screen got reported to a user as missing.
       "observation_is_partial": .bool(observation.isPartial),
-      // Same-origin frames are read; a cross-origin one never can be. Said plainly,
-      // because a page read as complete when part of it was never legible is how an
-      // absence gets reported as a fact.
+      // Registered cross-origin frames are read independently; failures and frames that
+      // exceed the bounded native registry remain explicit so absence is never page truth.
       "unreadable_frame_count": .int(Int64(observation.unreadableFrameCount)),
       "observation_is_complete": .bool(observation.isComplete),
       "elementOffset": .int(Int64(observation.elementOffset)),
@@ -4013,6 +4411,19 @@ public final class WebKitMCPServer {
           ]),
         ])
       } ?? .null,
+      "permission_denials": .array(
+        observation.permissionDenials.map { denial in
+          .object([
+            "origin": .string(denial.origin),
+            "permission": .string(denial.permission.rawValue),
+            "frame_is_main": .bool(denial.frameIsMain),
+            "request_count": .int(Int64(clamping: denial.requestCount)),
+            "last_denied_at_monotonic_nanoseconds": .int(
+              Int64(clamping: denial.lastDeniedAtMonotonicNanoseconds)),
+          ])
+        }),
+      "permission_denial_count": .int(Int64(clamping: observation.permissionDenialCount)),
+      "permission_denials_truncated": .bool(observation.permissionDenialsTruncated),
       "compact": .bool(true),
     ])
   }
@@ -4024,7 +4435,7 @@ public final class WebKitMCPServer {
     func plain(_ value: ProvenancedText?) -> JSONValue {
       value.map { .string($0.segments.map(\.text).joined()) } ?? .null
     }
-    return .object([
+    var payload: [String: JSONValue] = [
       "observationID": .string(observation.observationID),
       "generation": .int(Int64(observation.generation)),
       "documentID": .string(observation.documentID),
@@ -4035,6 +4446,8 @@ public final class WebKitMCPServer {
       "accessibleName": plain(element.accessibleName),
       "label": plain(element.label),
       "sensitive": .bool(element.sensitive),
+      "actionable": .bool(element.actionable),
+      "actionability": .string(element.actionability.rawValue),
       "stableAttributes": .object(
         element.stableAttributes.mapValues { plain($0) }),
       "contextAnchors": .array(
@@ -4052,7 +4465,17 @@ public final class WebKitMCPServer {
       "arbitrarySelectorSupported": .bool(false),
       "rawHTMLSupported": .bool(false),
       "javascriptEvaluationSupported": .bool(false),
-    ])
+    ]
+    if let frameOrigin = element.frameOrigin {
+      payload["frame_origin"] = .string(frameOrigin)
+      payload["frame_is_main"] = .bool(element.frameIsMain ?? false)
+      payload["bounding_box_coordinate_space"] = .string(
+        element.boundingBoxCoordinateSpace?.rawValue ?? "frame_viewport")
+      payload["provenance"] = .array([
+        .string(ProvenanceClass.thirdPartyEmbed.rawValue)
+      ])
+    }
+    return .object(payload)
   }
 
   private func toolResult(
@@ -4530,7 +4953,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_act",
       description:
-        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, select_option, hover, one bounded key press with optional modifiers, blur, or input commit, or answer the one JavaScript dialog a page is suspended on (dialog_accept, dialog_dismiss, dialog_accept_value). A pending dialog blocks every other operation until it is answered, and is never answered automatically. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and exact human confirmation. approval_mode=native uses server-owned confirmation and AppKit dispatch for click/submit/fill/key operations, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. select_option and hover are always JavaScript-dispatched and always report trusted_gesture_state=untrusted_javascript: a select popup is an NSMenu running its own event loop that a synthetic NSEvent never reaches, and WebKit forwards no mouse-moved event to an embedder at all. select_option names an option by its exact visible label, never an index, and a label matching no option or more than one is refused before dispatch; the labels browser_observe publishes in a select\'s options are collapsed by the same rule this operation collapses the one it is given, so a label copied from an observation is a label this accepts. hover raises mouseover, mouseenter and mousemove; it cannot move WebKit\'s own pointer state, so a menu that opens purely through a CSS :hover rule will not open, and hover carries no postcondition of its own — call browser_observe to read what it revealed. UI state does not prove backend commit.",
+        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, select_option, hover, one bounded key press with optional modifiers, blur, or input commit, or answer the one JavaScript dialog a page is suspended on (dialog_accept, dialog_dismiss, dialog_accept_value). A pending dialog blocks every other operation until it is answered, and is never answered automatically. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and exact human confirmation. approval_mode=native uses server-owned confirmation and AppKit dispatch for click/submit/fill/key operations, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. In a registered cross-origin frame, hover/select_option use only untrusted frame-local JavaScript; non-sensitive press_key/fill use native confirmation and require an exact trusted receipt from that child frame. Native pointer click/submit cannot translate frame-local geometry and refuse before confirmation, directing the user to live human handoff. select_option and hover are always JavaScript-dispatched and always report trusted_gesture_state=untrusted_javascript: a select popup is an NSMenu running its own event loop that a synthetic NSEvent never reaches, and WebKit forwards no mouse-moved event to an embedder at all. select_option names an option by its exact visible label, never an index, and a label matching no option or more than one is refused before dispatch; the labels browser_observe publishes in a select\'s options are collapsed by the same rule this operation collapses the one it is given, so a label copied from an observation is a label this accepts. hover raises mouseover, mouseenter and mousemove; it cannot move WebKit\'s own pointer state, so a menu that opens purely through a CSS :hover rule will not open, and hover carries no postcondition of its own — call browser_observe to read what it revealed. UI state does not prove backend commit.",
       properties: sessionSchemaProperties.merging([
         "observation_id": .object(["type": .string("string")]),
         "element_id": .object(["type": .string("string")]),
@@ -4688,7 +5111,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_navigate",
       description:
-        "Prepare one exact open-world HTTP(S) navigation for human confirmation. Native local confirmation is the reliable default; MCP multi-round elicitation remains opt-in. Cross-origin redirects return redirect_requires_human_approval with origin-only data. Restricted authentication origins immediately require local human handoff. Then wait for document completion plus mutation quiescence, never network-idle or rAF. URL credentials, local names, and IP literals are blocked.",
+        "Prepare one exact open-world HTTP(S) navigation for human confirmation. Native local confirmation is the reliable default; MCP multi-round elicitation remains opt-in. Cross-origin redirects return redirect_requires_human_approval with origin-only data. Restricted authentication origins immediately require local human handoff. Then wait for document completion plus mutation quiescence, never network-idle or rAF. DOM readiness and contentState are separate: a settled document with no rendered text, controls, or visual media reports empty_or_unusable rather than inviting an absence claim. URL credentials, local names, and IP literals are blocked.",
       properties: sessionSchemaProperties.merging([
         "url": .object([
           "type": .string("string"), "format": .string("uri"),
@@ -4712,7 +5135,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_observe",
       description:
-        "Return rendered, actionable full-page semantics with provenance, sanitized context/stable attributes, locator quality, and fresh observation-scoped element IDs. compact=true factors document provenance once, returns concise rows, and on modern MCP avoids duplicating the structured payload in content text. Hidden, zero-size, aria-hidden, inert, transparent, and sensitive field values are omitted before serialization. URL query values are redacted. A select publishes the option labels it will accept, each marked selected or disabled, in document order, bounded to 64 per control with optionsTruncated saying when the list was cut and optionCount giving the true total; a sensitive select publishes no options key, no optionCount and no selectedOption at all, because what is chosen in a select is that control's value, and neither does anything that is not a select publish options. Restricted authentication origins require local human handoff and return no page semantics. Never reuse an element ID after another observation.",
+        "Return rendered full-page semantics with provenance, sanitized context/stable attributes, locator quality, and fresh observation-scoped element IDs. Registered cross-origin frames contribute bounded semantics with THIRD_PARTY_EMBED provenance and a sanitized frame origin; their bounding boxes are frame-viewport-local. frameActionModes (compact frame_action_modes) lists eligible frame-local modes separately from actionable=false, which means no native pointer geometry, not that every attempt is impossible. Only hover/select_option as untrusted JavaScript and non-sensitive native-confirmed press_key/fill with an exact trusted child-frame receipt can be attempted; native pointer actions refuse with a named human-handoff route. Frames that cannot be read remain explicit. compact=true factors document provenance once, returns concise rows, and on modern MCP avoids duplicating the structured payload in content text. Both shapes report content_state; empty_or_unusable includes an explicit safe next step and means absence is not page truth. Both also report camera, microphone, and geolocation requests that the native host denied, including the sanitized requesting origin; no MCP operation grants those permissions. Hidden, zero-size, aria-hidden, inert, transparent, and sensitive field values are omitted before serialization. URL query values are redacted. A select publishes the option labels it will accept, each marked selected or disabled, in document order, bounded to 64 per control with optionsTruncated saying when the list was cut and optionCount giving the true total; a sensitive select publishes no options key, no optionCount and no selectedOption at all, because what is chosen in a select is that control's value, and neither does anything that is not a select publish options. Restricted authentication origins require local human handoff and return no page semantics. Never reuse an element ID after another observation.",
       properties: sessionSchemaProperties.merging([
         "maximum_elements": integerSchema(minimum: 1, maximum: 2_000, defaultValue: 150),
         "element_offset": integerSchema(minimum: 0, maximum: 100_000, defaultValue: 0),
@@ -4755,7 +5178,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_read_text",
       description:
-        "Read bounded visible body text plus rendered log, terminal, preformatted, aria-live, and scrollable text regions. This exposes currently rendered virtualized console lines; scroll and repeat to read other rendered ranges.",
+        "Read bounded visible body text plus rendered log, terminal, preformatted, aria-live, and scrollable text regions. content_state distinguishes a genuinely empty or unusable settled document from an empty text extraction. This exposes currently rendered virtualized console lines; scroll and repeat to read other rendered ranges.",
       properties: sessionSchemaProperties.merging([
         "maximum_characters": integerSchema(
           minimum: 1, maximum: 100_000, defaultValue: 20_000)
@@ -4799,12 +5222,13 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_session",
       description:
-        "List persistent profiles, open, inspect, close, or transfer one bounded session behind the single WebKitUI MCP authority. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. Profile listing never exposes cookies or credentials.",
+        "List persistent profiles, open, inspect, resize, recover, close, or transfer one bounded session behind the single WebKitUI MCP authority. set_viewport changes only the CSS-pixel layout and invalidates a prior observation; width is 320–3840 and height is 240–2160. It does not emulate a mobile device: the public macOS SDK exposes no WKWebView ContentMode API, and set_emulated_media is deliberately unsupported. back, forward, and reload take their exact destination from WKBackForwardList, require native confirmation, and invalidate the observation; an absent entry is an explicit refusal, and reload is refused after a form submission to prevent replay. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation under the same bounds. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
           "enum": .array([
             .string("open"), .string("profiles"), .string("status"), .string("close"),
+            .string("set_viewport"), .string("back"), .string("forward"), .string("reload"),
             .string("client_handoff"),
             .string("handoff"), .string("handoff_start"), .string("handoff_status"),
             .string("handoff_resume"), .string("compatibility_start"),
@@ -4836,6 +5260,18 @@ public final class WebKitMCPServer {
             "For open only. Wait locally for the exclusive host lease for up to 60 seconds; never steals an active lease."
           ),
         ]),
+        "width": integerSchema(
+          minimum: Int64(WebKitRuntime.viewportWidthRange.lowerBound),
+          maximum: Int64(WebKitRuntime.viewportWidthRange.upperBound),
+          defaultValue: 1_280),
+        "height": integerSchema(
+          minimum: Int64(WebKitRuntime.viewportHeightRange.lowerBound),
+          maximum: Int64(WebKitRuntime.viewportHeightRange.upperBound),
+          defaultValue: 800),
+        "timeout_ms": integerSchema(
+          minimum: 100, maximum: 120_000, defaultValue: 30_000),
+        "quiet_window_ms": integerSchema(
+          minimum: 20, maximum: 5_000, defaultValue: 300),
         "resume_token": .object([
           "type": .string("string"), "minLength": .int(1), "maxLength": .int(128),
           "description": .string(
@@ -4844,7 +5280,7 @@ public final class WebKitMCPServer {
         "compact": .object([
           "type": .string("boolean"), "default": .bool(true),
           "description": .string(
-            "For handoff_resume only. Concise element rows, which is the default because the full payload does not fit a client. Pass false for every field."
+            "For handoff and handoff_resume. Concise element rows, which is the default because the full payload may not fit a client. Pass false for every field."
           ),
         ]),
         "maximum_elements": integerSchema(minimum: 1, maximum: 2_000, defaultValue: 150),

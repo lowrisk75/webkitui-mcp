@@ -17,6 +17,10 @@ public enum WebKitTransactionExecutionError: Error, Sendable {
 public final class WebKitTransactionCoordinator {
   private let runtime: WebKitRuntime
   private let ledger: TransactionalWriteLedger
+  /// The top-level document owns the observation, but a frame-local write is authorised
+  /// against the embedded security origin. Kept by idempotency key so later
+  /// reconciliation evaluates the same authority boundary without exposing it as data.
+  private var actionOrigins: [String: SecurityOrigin] = [:]
 
   /// How long a settled state is still accepted after the verification deadline. The
   /// deadline decides when to stop waiting; it must not decide whether the write
@@ -38,6 +42,7 @@ public final class WebKitTransactionCoordinator {
     operation: WebKitActionOperation,
     dispatchMode: WebKitActionDispatchMode = .javascript,
     observation: WebKitPageObservation,
+    actionOrigin: SecurityOrigin? = nil,
     capabilityAuthority: CapabilityAuthority,
     capabilityHandle: CapabilityHandle,
     verificationPollInterval: Duration = .milliseconds(20)
@@ -47,10 +52,16 @@ public final class WebKitTransactionCoordinator {
       elementID: plan.target.elementID
     )
     guard liveRecipe == plan.target else { throw WebKitRuntimeError.staleObservation }
+    let resolvedActionOrigin: SecurityOrigin
+    if let actionOrigin {
+      resolvedActionOrigin = actionOrigin
+    } else {
+      resolvedActionOrigin = try observation.canonicalState().securityOrigin
+    }
+    actionOrigins[plan.idempotencyKey] = resolvedActionOrigin
     let transactionObservation = TransactionObservation(
-      state: try observation.canonicalState(),
-      completeness: .complete
-    )
+      state: try transactionState(observation, origin: resolvedActionOrigin),
+      completeness: .complete)
     _ = try await ledger.prepare(
       plan,
       observation: transactionObservation,
@@ -130,7 +141,7 @@ public final class WebKitTransactionCoordinator {
         let verification = try await ledger.verify(
           idempotencyKey: plan.idempotencyKey,
           observation: TransactionObservation(
-            state: try latest.canonicalState(),
+            state: try transactionState(latest, origin: resolvedActionOrigin),
             completeness: .complete
           ),
           monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
@@ -181,6 +192,7 @@ public final class WebKitTransactionCoordinator {
     case .staleObservation, .unknownElement, .targetNotUnique, .targetNotFound,
       .operationUnsupportedForControl,
       .targetGeometryChanged, .sensitiveInputRequiresHuman, .handoffSurfaceUnavailable,
+      .crossOriginFrameActionUnavailable, .crossOriginNativeGeometryUnavailable,
       // A panel was already open, so the gesture was refused before anything reached
       // the page. The four answer-side refusals never dispatch either.
       .javaScriptDialogPending, .noPendingJavaScriptDialog, .staleJavaScriptDialog,
@@ -190,7 +202,11 @@ public final class WebKitTransactionCoordinator {
       .keyCodeUnavailable, .keyChordReservedByApplicationMenu, .keyModifierChangesCharacter,
       // An option label that names two options or none is refused while the control is
       // still untouched, so nothing reached the page.
-      .optionLabelNotUnique:
+      .optionLabelNotUnique,
+      // History and viewport validation happen before WebKit receives a navigation or
+      // layout change. These errors cannot make an action indeterminate.
+      .historyEntryUnavailable, .historyDestinationChanged, .formSubmissionReloadRefused,
+      .invalidViewportSize:
       .notDispatched
     case .targetNotActionable, .nativeGestureReceiptUnavailable,
       .webContentProcessTerminated, .malformedInstrumentationResult, .noDocument,
@@ -238,10 +254,15 @@ public final class WebKitTransactionCoordinator {
   ) async throws -> TransactionVerification {
     do {
       let current = try await runtime.observe(hydrationTimeout: .zero)
+      let currentState = try current.canonicalState()
+      let origin = actionOrigins[idempotencyKey] ?? currentState.securityOrigin
       return try await ledger.reconcile(
         idempotencyKey: idempotencyKey,
         observation: TransactionObservation(
-          state: try current.canonicalState(), completeness: .complete),
+          state: try transactionState(
+            current,
+            origin: origin),
+          completeness: .complete),
         monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds)
     } catch {
       return try await ledger.reconcile(
@@ -256,11 +277,30 @@ public final class WebKitTransactionCoordinator {
   /// It never dispatches or retries the action.
   public func reconcile(idempotencyKey: String) async throws -> TransactionVerification {
     let observation = try await runtime.observe(hydrationTimeout: .zero)
+    let origin: SecurityOrigin
+    if let actionOrigin = actionOrigins[idempotencyKey] {
+      origin = actionOrigin
+    } else {
+      origin = try observation.canonicalState().securityOrigin
+    }
     return try await ledger.reconcile(
       idempotencyKey: idempotencyKey,
       observation: TransactionObservation(
-        state: try observation.canonicalState(), completeness: .complete),
+        state: try transactionState(observation, origin: origin), completeness: .complete),
       monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
     )
+  }
+
+  private func transactionState(
+    _ observation: WebKitPageObservation,
+    origin: SecurityOrigin
+  ) throws -> CanonicalObservationState {
+    let state = try observation.canonicalState()
+    if state.securityOrigin == origin { return state }
+    return try CanonicalObservationState(
+      generation: state.generation,
+      documentID: state.documentID,
+      securityOrigin: origin,
+      entries: state.entries)
   }
 }

@@ -1,10 +1,87 @@
 import CryptoKit
 import Foundation
+import Network
 import Testing
+import WebKit
 import WebKitUIMCPCore
-import WebKitUIMCPRuntime
 
+@testable import WebKitUIMCPRuntime
 @testable import WebKitUIMCPServer
+
+private final class HistoryFixtureServer: @unchecked Sendable {
+  private let listener: NWListener
+  let port: UInt16
+
+  init(responseBody: String? = nil) throws {
+    listener = try NWListener(using: .tcp, on: .any)
+    let ready = DispatchSemaphore(value: 0)
+    listener.stateUpdateHandler = { state in
+      if case .ready = state { ready.signal() }
+    }
+    listener.newConnectionHandler = { connection in
+      connection.start(queue: .global())
+      connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) {
+        data, _, _, _ in
+        let request = String(decoding: data ?? Data(), as: UTF8.self)
+        let body: String
+        if let responseBody {
+          body = responseBody
+        } else if request.hasPrefix("GET /form ") {
+          body =
+            "<title>Form</title><form action='/submitted' method='post'>"
+            + "<input name='choice' value='once'><button type='submit'>Send</button></form>"
+        } else if request.hasPrefix("POST /submitted ") {
+          body = "<title>Submitted</title><p>Done</p>"
+        } else {
+          let first = request.hasPrefix("GET /first ")
+          let title = first ? "First" : "Second"
+          body = "<title>\(title)</title><button>\(title) action</button>"
+        }
+        let response =
+          "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: \(body.utf8.count)\r\n"
+          + "Connection: close\r\n\r\n\(body)"
+        connection.send(
+          content: Data(response.utf8), contentContext: .finalMessage, isComplete: true,
+          completion: .contentProcessed { _ in connection.cancel() })
+      }
+    }
+    listener.start(queue: .global())
+    guard ready.wait(timeout: .now() + 2) == .success, let assignedPort = listener.port else {
+      listener.cancel()
+      throw CocoaError(.coderReadCorrupt)
+    }
+    port = assignedPort.rawValue
+  }
+
+  deinit { listener.cancel() }
+}
+
+private enum PermissionStubLifetime {
+  nonisolated(unsafe) static var retained: [AnyObject] = []
+
+  static func keep(_ value: AnyObject) { retained.append(value) }
+}
+
+private final class PermissionStubFrameInfo: WKFrameInfo {
+  static let mainFrame: PermissionStubFrameInfo = {
+    let frame = PermissionStubFrameInfo()
+    PermissionStubLifetime.keep(frame)
+    return frame
+  }()
+
+  override var isMainFrame: Bool { true }
+}
+
+private final class PermissionSecurityOriginCapture: NSObject, WKScriptMessageHandler {
+  private(set) var origin: WKSecurityOrigin?
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    origin = message.frameInfo.securityOrigin
+  }
+}
 
 private final class TransactionLedgerFactoryProbe: @unchecked Sendable {
   private let lock = NSLock()
@@ -921,6 +998,56 @@ struct MCPServerTests {
     #expect(try object(elements[0])["locatorRecipe"] == nil)
     #expect(try object(elements[0])["locatorQuality"] != nil)
     #expect(encoded.count <= 1_048_576)
+  }
+
+  @Test("A settled document with no rendered content is explicit and actionable")
+  func readyButEmptyDocumentIsExplicit() async throws {
+    let registry = try WebKitSessionRegistry()
+    let server = WebKitMCPServer(registry: registry)
+    let opened = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("open")])
+    let sessionID = try string(
+      object(try object(opened["result"])["structuredContent"])["session_id"])
+    let runtime = try registry.runtime(
+      for: WebKitSessionHandle(rawValue: try #require(UUID(uuidString: sessionID))))
+    let navigation = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Contact Us - Fixture</title>
+      <script>
+        const transientShell = document.createElement('div');
+        document.body.append(transientShell);
+        transientShell.remove();
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/contact/solution/select"),
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+
+    #expect(navigation.readiness == .ready)
+    #expect(navigation.mutationCount > 0)
+    #expect(navigation.contentState == .emptyOrUnusable)
+
+    let observed = try await toolCall(
+      server, id: 2, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    #expect(observation["totalElementCount"] == .int(0))
+    #expect(observation["content_state"] == .string("empty_or_unusable"))
+    #expect(observation["status"] == .string("document_empty_or_unusable"))
+    #expect(try string(observation["safe_next_step"]).contains("Do not infer"))
+
+    let compact = try await toolCall(
+      server, id: 3, name: "browser_observe",
+      arguments: ["session_id": .string(sessionID), "compact": .bool(true)])
+    let compactObservation = try object(try object(compact["result"])["structuredContent"])
+    #expect(compactObservation["content_state"] == .string("empty_or_unusable"))
+    #expect(compactObservation["status"] == .string("document_empty_or_unusable"))
+
+    let read = try await toolCall(
+      server, id: 4, name: "browser_read_text",
+      arguments: ["session_id": .string(sessionID)])
+    let text = try object(try object(read["result"])["structuredContent"])
+    #expect(text["bodyText"] == .string(""))
+    #expect(text["content_state"] == .string("empty_or_unusable"))
   }
 
   @Test("Modern compact observations factor provenance and avoid duplicate JSON text")
@@ -2400,6 +2527,229 @@ struct MCPServerTests {
     #expect(try object(submitAsClick["error"])["code"] == .int(-32602))
   }
 
+  @Test(
+    "Cross-origin semantics stay labelled and native pointer actions refuse before confirmation")
+  func crossOriginActionRefusesBeforeConfirmation() async throws {
+    let child = try HistoryFixtureServer()
+    let distinctParentOrigin = try HistoryFixtureServer()
+    let registry = try WebKitSessionRegistry(runtimeFactory: { _ in
+      WebKitRuntime(websiteDataStore: .nonPersistent())
+    })
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Parent</title><iframe src='http://127.0.0.1:\(child.port)/child'></iframe>",
+      baseURL: URL(string: "http://127.0.0.1:\(distinctParentOrigin.port)/parent"),
+      timeout: .seconds(10), quietWindow: .milliseconds(150))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "compact": .bool(true),
+      ])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let embedded = try #require(
+      try array(observation["elements"]).compactMap { try? object($0) }.first {
+        $0["name"] == .string("Second action")
+      })
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    #expect(embedded["frame_origin"] == .string(childOrigin))
+    #expect(embedded["frame_is_main"] == .bool(false))
+    #expect(embedded["bounding_box_coordinate_space"] == .string("frame_viewport"))
+    #expect(
+      embedded["not_actionable_because"]
+        == .string("cross_origin_frame_native_geometry_unavailable"))
+    #expect(
+      embedded["frame_action_modes"]
+        == .array([.string("hover_javascript"), .string("press_key_native_appkit")]))
+    #expect(embedded["provenance"] == .array([.string("THIRD_PARTY_EMBED")]))
+
+    let response = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(embedded["elementID"])),
+        "operation": .string("click"),
+        "idempotency_key": .string("cross-origin-refusal"),
+        "postcondition": .object([
+          "type": .string("semantic_text_appears"),
+          "value": .string("Never dispatched"),
+        ]),
+      ])
+    func requireNamedRefusal(_ response: [String: JSONValue]) throws {
+      let result = try object(response["result"])
+      let structured = try object(result["structuredContent"])
+      #expect(result["isError"] == .bool(true))
+      #expect(structured["status"] == .string("cross_origin_native_geometry_unavailable"))
+      #expect(structured["code"] == .string("cross_origin_native_geometry_unavailable"))
+      #expect(structured["frame_origin"] == .string(childOrigin))
+      #expect(structured["dispatched"] == .bool(false))
+    }
+    try requireNamedRefusal(response)
+
+    let upload = try await toolCall(
+      server, id: 3, name: "browser_upload",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(embedded["elementID"])),
+        "idempotency_key": .string("cross-origin-upload-refusal"),
+        "postcondition": .object([
+          "type": .string("semantic_text_appears"),
+          "value": .string("Never uploaded"),
+        ]),
+      ])
+    try requireNamedRefusal(upload)
+
+    let download = try await toolCall(
+      server, id: 4, name: "browser_download",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(embedded["elementID"])),
+        "idempotency_key": .string("cross-origin-download-refusal"),
+      ])
+    try requireNamedRefusal(download)
+    #expect(presenter.requests.isEmpty)
+  }
+
+  @Test("Embedded select and hover use child-origin authority and disclose untrusted dispatch")
+  func crossOriginScriptActionsThroughMCP() async throws {
+    let child = try HistoryFixtureServer(
+      responseBody: """
+        <!doctype html><title>Child</title>
+        <label for='country'>Country</label>
+        <select id='country' onchange="document.title='selected:' + this.value">
+          <option value='de'>Germany</option><option value='fr'>France</option>
+        </select>
+        <button aria-label='Hover target'
+          onmouseover="document.title='hovered:' + event.isTrusted">Hover</button>
+        """)
+    let parent = try HistoryFixtureServer()
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    let registry = try WebKitSessionRegistry(runtimeFactory: { _ in
+      WebKitRuntime(websiteDataStore: .nonPersistent())
+    })
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Parent</title><iframe src='\(childOrigin)/controls'></iframe>",
+      baseURL: URL(string: "http://127.0.0.1:\(parent.port)/parent"),
+      timeout: .seconds(10), quietWindow: .milliseconds(150))
+    let presenter = ConfirmationPresenterStub(responses: [true, true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let sessionID = JSONValue.string(handle.rawValue.uuidString)
+
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe", arguments: ["session_id": sessionID])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let selected = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": sessionID,
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "Country")),
+        "operation": .string("select_option"),
+        "value": .string("France"),
+        "idempotency_key": .string("embedded-country-once"),
+      ])
+    let selection = try object(try object(selected["result"])["structuredContent"])
+    #expect(selection["dispatch_mode"] == .string("javascript"))
+    #expect(selection["trusted_gesture_state"] == .string("untrusted_javascript"))
+    #expect(try object(selection["verification"])["verified"] != nil)
+
+    let reobserved = try await toolCall(
+      server, id: 3, name: "browser_observe", arguments: ["session_id": sessionID])
+    let fresh = try object(try object(reobserved["result"])["structuredContent"])
+    let hovered = try await toolCall(
+      server, id: 4, name: "browser_act",
+      arguments: [
+        "session_id": sessionID,
+        "observation_id": .string(try string(fresh["observationID"])),
+        "element_id": .string(try elementID(in: fresh, named: "Hover target")),
+        "operation": .string("hover"),
+        "idempotency_key": .string("embedded-hover-once"),
+      ])
+    let hover = try object(try object(hovered["result"])["structuredContent"])
+    #expect(hover["dispatch_mode"] == .string("javascript"))
+    #expect(hover["trusted_gesture_state"] == .string("untrusted_javascript"))
+    #expect(hover["verification"] == .string("not_attempted"))
+    #expect(presenter.requests.count == 2)
+    #expect(presenter.requests.allSatisfy { $0.message.contains(childOrigin) })
+    #expect(presenter.requests.allSatisfy { $0.message.contains("untrusted JavaScript") })
+  }
+
+  @Test("Embedded native text actions are confirmed with the child origin and measured trust")
+  func crossOriginNativeTextActionsThroughMCP() async throws {
+    let child = try HistoryFixtureServer(
+      responseBody: """
+        <!doctype html><title>Child</title>
+        <input aria-label='Key target'
+          onkeydown="if(event.key==='Enter') this.dataset.state=event.isTrusted?'trusted':'false'">
+        <input aria-label='Fill target'>
+        """)
+    let parent = try HistoryFixtureServer()
+    let childOrigin = "http://127.0.0.1:\(child.port)"
+    let registry = try WebKitSessionRegistry(runtimeFactory: { _ in
+      WebKitRuntime(websiteDataStore: .nonPersistent())
+    })
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Parent</title><iframe src='\(childOrigin)/controls'></iframe>",
+      baseURL: URL(string: "http://127.0.0.1:\(parent.port)/parent"),
+      timeout: .seconds(10), quietWindow: .milliseconds(150))
+    let presenter = ConfirmationPresenterStub(responses: [true, true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let sessionID = JSONValue.string(handle.rawValue.uuidString)
+
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe", arguments: ["session_id": sessionID])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let pressed = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": sessionID,
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "Key target")),
+        "operation": .string("press_key"),
+        "key": .string("Enter"),
+        "postcondition": .object([
+          "type": .string("attribute_equals"), "attribute": .string("data-state"),
+          "value": .string("trusted"),
+        ]),
+        "idempotency_key": .string("embedded-key-once"),
+      ])
+    let key = try object(try object(pressed["result"])["structuredContent"])
+    #expect(key["dispatch_mode"] == .string("native_appkit"))
+    #expect(key["trusted_gesture_state"] == .string("trusted"))
+    #expect(try object(key["verification"])["verified"] != nil, "key: \(key)")
+
+    let reobserved = try await toolCall(
+      server, id: 3, name: "browser_observe", arguments: ["session_id": sessionID])
+    let fresh = try object(try object(reobserved["result"])["structuredContent"])
+    let filled = try await toolCall(
+      server, id: 4, name: "browser_act",
+      arguments: [
+        "session_id": sessionID,
+        "observation_id": .string(try string(fresh["observationID"])),
+        "element_id": .string(try elementID(in: fresh, named: "Fill target")),
+        "operation": .string("fill"),
+        "value": .string("Kevin"),
+        "idempotency_key": .string("embedded-fill-once"),
+      ])
+    let fill = try object(try object(filled["result"])["structuredContent"])
+    #expect(fill["dispatch_mode"] == .string("native_appkit"), "fill: \(fill)")
+    #expect(fill["trusted_gesture_state"] == .string("trusted"))
+    #expect(try object(fill["verification"])["verified"] != nil)
+    #expect(presenter.requests.count == 2)
+    #expect(presenter.requests.allSatisfy { $0.message.contains(childOrigin) })
+  }
+
   @Test("An option_selected postcondition on a sensitive control is refused with its reason")
   func optionSelectedPostconditionOnSensitiveControlIsRefused() async throws {
     // The control's selected option is withheld from every observation, so this
@@ -3732,6 +4082,46 @@ struct MCPServerTests {
       "the resume payload is \(encoded.count) characters, which the client cannot read")
   }
 
+  @Test("Blocking handoff resume applies its compact projection and element bound")
+  func blockingHandoffResumeIsBounded() async throws {
+    // The token route already applied these options. The original round-trip handoff
+    // accepted the same arguments, ignored both, and returned every field for every
+    // element — about 247k output tokens on Apple Developer's Capability Requests page.
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    let buttons = (0..<400)
+      .map { "<button aria-label='Control \($0) with a deliberately long accessible name'>" }
+      .joined()
+    _ = try await runtime.loadHTML(
+      "<title>Wide blocking handoff</title>" + buttons,
+      baseURL: URL(string: "https://example.test/blocking-handoff-bounds"),
+      timeout: .seconds(4), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: ConfirmationPresenterStub(responses: []))
+    let arguments: [String: JSONValue] = [
+      "operation": .string("handoff"),
+      "session_id": .string(handle.rawValue.uuidString),
+      "compact": .bool(true),
+      "maximum_elements": .int(80),
+    ]
+
+    let requested = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: arguments)
+    let requestState = try string(try object(requested["result"])["requestState"])
+    try runtime.markHumanStepCompleted()
+    let resumed = try await roundTripToolCall(
+      server, id: 2, name: "browser_session", arguments: arguments,
+      requestState: requestState, action: "accept", confirm: true)
+    let structured = try object(try object(resumed["result"])["structuredContent"])
+    #expect(structured["observation_compact"] == .bool(true))
+    let observation = try object(structured["observation"])
+    #expect((try array(observation["elements"])).count == 80)
+    let encoded = try JSONEncoder().encode(JSONValue.object(structured))
+    #expect(encoded.count < 100_000)
+  }
+
   @Test("A caller can still ask handoff resume for the full observation")
   func handoffResumeStillOffersTheFullObservation() async throws {
     let registry = try WebKitSessionRegistry()
@@ -4492,6 +4882,230 @@ struct MCPServerTests {
 
     // Never leave a suspended page behind for whatever runs next.
     _ = try session.runtime.answerJavaScriptDialog(dialogID: session.dialogID, accept: false)
+  }
+
+  @Test("Going back confirms WebKit's exact previous history entry and expires the observation")
+  func confirmedHistoryBackUsesWebKitDestination() async throws {
+    let fixture = try HistoryFixtureServer()
+    let registry = try WebKitSessionRegistry(runtimeFactory: { _ in
+      WebKitRuntime(websiteDataStore: .nonPersistent())
+    })
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(fixture.port)/first")!,
+      timeout: .seconds(10), quietWindow: .milliseconds(40))
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(fixture.port)/second")!,
+      timeout: .seconds(10), quietWindow: .milliseconds(40))
+    #expect(runtime.webView.backForwardList.backItem?.url.path == "/first")
+    let observation = try await runtime.observe()
+    let target = try #require(observation.elements.first)
+    let presenter = ConfirmationPresenterStub(responses: [true, true, true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("back"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let structured = try object(try object(response["result"])["structuredContent"])
+
+    #expect(structured["historyOperation"] == .string("back"))
+    #expect(structured["observationInvalidated"] == .bool(true))
+    #expect(runtime.webView.url?.path == "/first")
+    #expect(presenter.requests.count == 1)
+    if let request = presenter.requests.first {
+      #expect(request.message.contains("http://127.0.0.1:\(fixture.port)/first"))
+      #expect(!request.message.contains("/second\n\nDestination"))
+    }
+    #expect(throws: WebKitRuntimeError.staleObservation) {
+      try runtime.locatorRecipe(
+        observationID: observation.observationID, elementID: target.elementID)
+    }
+
+    let forward = try await toolCall(
+      server, id: 2, name: "browser_session",
+      arguments: [
+        "operation": .string("forward"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let forwardStructured = try object(try object(forward["result"])["structuredContent"])
+    #expect(forwardStructured["historyOperation"] == .string("forward"))
+    #expect(runtime.webView.url?.path == "/second")
+    #expect(presenter.requests.count == 2)
+    if presenter.requests.count == 2 {
+      #expect(
+        presenter.requests[1].message.contains(
+          "http://127.0.0.1:\(fixture.port)/second"))
+    }
+
+    let reload = try await toolCall(
+      server, id: 3, name: "browser_session",
+      arguments: [
+        "operation": .string("reload"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let reloadStructured = try object(try object(reload["result"])["structuredContent"])
+    #expect(reloadStructured["historyOperation"] == .string("reload"))
+    #expect(runtime.webView.url?.path == "/second")
+    #expect(presenter.requests.count == 3)
+    if presenter.requests.count == 3 {
+      #expect(
+        presenter.requests[2].message.contains(
+          "http://127.0.0.1:\(fixture.port)/second"))
+    }
+  }
+
+  @Test("The session tool changes only a bounded CSS viewport and reports invalidation")
+  func sessionViewportChangeIsBoundedAndExplicit() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Responsive</title><p>Ready</p>",
+      baseURL: URL(string: "https://fixture.invalid/responsive"),
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(registry: registry)
+
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("set_viewport"),
+        "session_id": .string(handle.rawValue.uuidString),
+        "width": .int(400),
+        "height": .int(600),
+      ])
+    let structured = try object(try object(response["result"])["structuredContent"])
+
+    #expect(structured["width"] == .int(400))
+    #expect(structured["height"] == .int(600))
+    #expect(structured["layoutChanged"] == .bool(true))
+    #expect(structured["observationInvalidated"] == .bool(true))
+
+    let invalid = try await toolCall(
+      server, id: 2, name: "browser_session",
+      arguments: [
+        "operation": .string("set_viewport"),
+        "session_id": .string(handle.rawValue.uuidString),
+        "width": .int(319),
+        "height": .int(600),
+      ])
+    #expect(try object(invalid["error"])["code"] == .int(-32602))
+  }
+
+  @Test("Back with no previous history entry is refused before confirmation")
+  func backWithoutHistoryIsRefused() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<title>Only page</title><p>One</p>",
+      baseURL: URL(string: "https://fixture.invalid/only"),
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("back"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let result = try object(response["result"])
+    let structured = try object(result["structuredContent"])
+
+    #expect(result["isError"] == .bool(true))
+    #expect(structured["status"] == .string("history_entry_unavailable"))
+    #expect(structured["history_operation"] == .string("back"))
+    #expect(structured["dispatched"] == .bool(false))
+    #expect(presenter.requests.isEmpty)
+  }
+
+  @Test("Reload after a form response is refused with a replay-specific reason")
+  func formResponseReloadIsRefusedBeforeConfirmation() async throws {
+    let fixture = try HistoryFixtureServer()
+    let registry = try WebKitSessionRegistry(runtimeFactory: { _ in
+      WebKitRuntime(websiteDataStore: .nonPersistent())
+    })
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(fixture.port)/form")!,
+      timeout: .seconds(10), quietWindow: .milliseconds(40))
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('form').requestSubmit()")
+    for _ in 0..<500 where runtime.webView.url?.path != "/submitted" {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(runtime.webView.url?.path == "/submitted")
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("reload"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let result = try object(response["result"])
+    let structured = try object(result["structuredContent"])
+
+    #expect(result["isError"] == .bool(true))
+    #expect(structured["status"] == .string("reload_refused"))
+    #expect(structured["reason"] == .string("current_page_resulted_from_form_submission"))
+    #expect(structured["dispatched"] == .bool(false))
+    #expect(presenter.requests.isEmpty)
+  }
+
+  @Test("A camera request is denied and the MCP observation records it")
+  func cameraPermissionDenialIsPublished() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    let capture = PermissionSecurityOriginCapture()
+    let captureName = "permissionOrigin\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+    runtime.webView.configuration.userContentController.add(capture, name: captureName)
+    defer {
+      runtime.webView.configuration.userContentController.removeScriptMessageHandler(
+        forName: captureName)
+    }
+    _ = try await runtime.loadHTML(
+      "<title>Camera request</title><p>Ready</p>",
+      baseURL: URL(string: "https://permissions.example/camera"),
+      timeout: .seconds(10), quietWindow: .milliseconds(40))
+    _ = try await runtime.webView.evaluateJavaScript(
+      "window.webkit.messageHandlers['\(captureName)'].postMessage('origin'); true")
+    let origin = try #require(capture.origin)
+    var decision: WKPermissionDecision?
+    #expect(
+      runtime.responds(
+        to: NSSelectorFromString(
+          "webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:")))
+    runtime.webView(
+      runtime.webView,
+      requestMediaCapturePermissionFor: origin,
+      initiatedByFrame: PermissionStubFrameInfo.mainFrame,
+      type: .camera
+    ) { decision = $0 }
+    #expect(decision == .deny)
+
+    let server = WebKitMCPServer(registry: registry)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "compact": .bool(true),
+      ])
+    let structured = try object(try object(response["result"])["structuredContent"])
+    let denials = try array(structured["permission_denials"])
+    #expect(denials.count == 1)
+    let denial = try object(denials[0])
+    #expect(denial["permission"] == .string("camera"))
+    #expect(denial["origin"] == .string("https://permissions.example"))
+    #expect(denial["frame_is_main"] == .bool(true))
+    #expect(denial["request_count"] == .int(1))
   }
 
   private enum TestError: Error {

@@ -126,6 +126,10 @@
 "URL contains" = "URL contains";
 "URL equals" = "URL equals";
 "Open one exact destination" = "Open one exact destination";
+"Go back one browser history entry" = "Go back one browser history entry";
+"Go forward one browser history entry" = "Go forward one browser history entry";
+"Reload the current page" = "Reload the current page";
+"WebKitUI refuses reload when the current page resulted from a form submission." = "WebKitUI refuses reload when the current page resulted from a form submission.";
 "Requested action:" = "Requested action:";
 "Current page:" = "Current page:";
 "Data would be sent to:" = "Data would be sent to:";

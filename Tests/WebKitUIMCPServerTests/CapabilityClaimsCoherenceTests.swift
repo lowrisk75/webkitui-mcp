@@ -95,4 +95,27 @@ struct CapabilityClaimsCoherenceTests {
       #expect(!readme.contains(claim), "README makes a refuted claim: \(claim)")
     }
   }
+
+  @Test("The README keeps the adversarial measurement and its narrow claim")
+  func adversarialMeasurementStaysDocumented() throws {
+    let readme = try Self.text("README.md")
+    #expect(
+      readme.contains("docs/research/2026-09-09-adversarial-corpus-measurement.md"),
+      "README no longer links the dated adversarial measurement")
+    #expect(
+      readme.contains("not human or model attack success"),
+      "README widened fixture truthfulness into an attack-success claim")
+  }
+
+  @Test("Permission delegates deny and expose no grant branch")
+  func permissionDelegatesFailClosed() throws {
+    let runtime = try Self.text("Sources/WebKitUIMCPRuntime/WebKitRuntime.swift")
+    #expect(
+      runtime.components(separatedBy: "decisionHandler(.deny)").count - 1 == 2,
+      "camera/media and geolocation delegates must each deny explicitly")
+    #expect(!runtime.contains("decisionHandler(.grant)"))
+    #expect(!runtime.contains("decisionHandler(.prompt)"))
+    let readme = try Self.text("README.md")
+    #expect(readme.contains("there is no MCP operation\n  that can grant one"))
+  }
 }

@@ -24,6 +24,14 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Human confirmation before every exposed click and open-world navigation.
   Navigation defaults to a server-owned native macOS dialog so a client cannot
   silently decline the round trip; MCP multi-round navigation remains opt-in.
+- `browser_session` can set a bounded 320×240–3840×2160 CSS viewport and can
+  navigate back, forward, or reload using WebKit's own history list. History
+  movement is confirmed against the destination WebKit reports; reloading a page
+  produced by a form submission is refused before confirmation to prevent replay.
+- Camera, microphone, and geolocation requests are always denied by the native
+  `WKUIDelegate`. The observation names the requesting origin and permission, with
+  repeated requests counted and distinct records bounded; there is no MCP operation
+  that can grant one.
 - The confirmation names the origin a submit control's data would reach, computed
   server-side from the freshly re-resolved element rather than from its accessible
   name, and says so explicitly when that origin differs from the page the operator is
@@ -80,13 +88,38 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Fill dispatches normal `input`/`change` events, so site handlers may autosave or cause server effects. It is destructive and human-confirmed; password controls require local human handoff.
 - `approval_mode: "native"` sends confirmed click/submit and Enter/Tab/Escape through public AppKit `NSEvent` handling on the freshly re-resolved `WKWebView` target. An isolated message handler must observe the matching DOM event with `event.isTrusted == true` before the receipt reports trust. Missing/mismatched receipts fail indeterminate; no flag is synthesized. `approval_mode: "mcp"`, blur, and commit remain JavaScript-dispatched and report untrusted. Native public-text fill reports trust only when its matching AppKit insertion receipt is observed.
 - Action results separately expose `confirmation_mode`, `dispatch_mode`, and `trusted_gesture_state`. Native confirmation alone never establishes event trust.
+- Navigation readiness and rendered-content availability are separate. A document can
+  reach `readyState=complete` and mutation quiescence while remaining blank;
+  navigation, observation, and text reads report `empty_or_unusable` in that case and
+  explicitly forbid treating the absence as page truth. A rendered textless canvas or
+  media document remains `usable`.
 - `browser_read_text` reads only currently rendered virtualized lines. Use bounded scroll plus another read for additional ranges.
 - No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim. A gate an agent can step around is not a gate: one JavaScript-evaluation call would do anything the confirmation exists to authorize one action at a time. Browserbase's MCP server also refuses JavaScript, so refusing it is not distinctive on its own; the combination surveyed for and not found elsewhere on 2026-09-09 is no JavaScript tool *and* a per-action gate *and* a real authenticated session.
+- Viewport resizing changes desktop CSS layout only. It does not emulate a mobile
+  device—the public macOS SDK exposes no `WKWebView` `ContentMode` API—and
+  `set_emulated_media` is deliberately absent because it does not help operate a
+  person's site.
+- Camera, microphone, and geolocation access cannot be granted through WebKitUI MCP.
+  Requests are denied and reported in the next observation instead of leaving a page
+  failure silent; use human control in a complete browser when the workflow requires
+  one of those permissions.
 - No multiple tabs and no new-window handling. One session holds one exclusive host lease, which is what lets an approval refer to an unambiguous page.
 - No subresource or XHR request inspection. It is possible and it is not offered. `WKWebsiteDataStore.proxyConfigurations` is public from macOS 14 and is Apple DTS's own recommendation for reading a `WKWebView`'s request contents, and a bundled `WKWebExtension` with the `webRequest` permission is public from macOS 15.4. Neither is free: the proxy route needs a trusted root certificate to see inside HTTPS, and the extension route reports no headers and cannot block. What is reported instead is narrow — the download receipt's HTTP status, and the egress proxy's accepted, blocked, pinned and timed-out connection counts. A main-frame navigation result carries no HTTP status today, and the proxy does not name the hosts it allowed or refused.
 - Native AppKit dispatch is not a distinguishing feature and is not claimed as one. `safaridriver` dispatches `NSEvent` through `[window sendEvent:]` exactly as this does, and the WebDriver specification requires every conformant driver to produce trusted events. What differs is the measurement: an action whose trusted DOM receipt is missing or mismatched fails indeterminate here, where Playwright's hit-target interceptor treats an absent event as success.
 - The `WKFormInfo` submission gate is implemented, unit-tested, and does not fire. WebKit did not call `webView(_:willSubmitForm:submissionHandler:)` on either macOS 27.0 build measured here, `26A5416b` and `26A5419a` — not for `submit()`, not for `requestSubmit()`, and not for a native trusted-gesture click. It is therefore not a second live gate and must not be read as one; it will decide if WebKit begins delivering the callback. The live defence against a submit control that posts to another site is the destination line in the confirmation.
-- Cross-origin frame contents are opaque.
+- Registered cross-origin frames expose bounded rendered semantics with
+  `THIRD_PARTY_EMBED` provenance and a sanitized origin. Their geometry is explicitly
+  frame-local; `frameActionModes` (or compact `frame_action_modes`) names eligible
+  attempts even when `actionable=false` means no native pointer geometry. A confirmed
+  `hover` or `select_option` runs only as untrusted JavaScript in the exact child
+  frame; non-sensitive `press_key` and `fill` can use AppKit only
+  when that frame returns a matching trusted DOM receipt. A native pointer click has
+  no public frame-to-window coordinate transform, refuses before confirmation with
+  `cross_origin_native_geometry_unavailable`, and points to live human handoff.
+  This is bounded control reach, not proof of hosted checkout completion. Sensitive
+  and authentication controls still require a human. Frames that cannot be
+  evaluated, and frames beyond the bounded native registry, remain explicitly
+  unreadable rather than being treated as empty page content.
 - Some identity providers require a complete browser surface and do not render
   inside an app-embedded `WKWebView`. The exact App Store Connect to Apple
   Account embedding returns `full_browser_required` with an internal
@@ -282,7 +315,9 @@ for a running conversation and are not retroactively replaced.
 2. `browser_navigate` opens a native exact-destination approval dialog by
    default. Use `approval_mode: "mcp"` only when the client reliably supports
    multi-round elicitation.
-3. `browser_observe`; use `element_scroll_into_view` or `browser_scroll`, then observe again when needed.
+3. `browser_observe`; use `element_scroll_into_view`, `browser_scroll`, or
+   `browser_session { operation: "set_viewport", ... }`, then observe again when
+   needed. `back`, `forward`, and `reload` are native-confirmed session operations.
 4. Use the fresh `observationID` and `elementID` once.
 5. For a login form, call `browser_fill_siliconpass`. If it returns
    `credential_not_found`, accept the native handoff and add or update the
@@ -359,6 +394,11 @@ Mac; route public, unauthenticated headless work to Linux. See
 - Same-Mac runtime benchmark: [`Benchmarks/README.md`](Benchmarks/README.md)
 - Public/private publication boundary: [`docs/architecture/public-private-boundary.md`](docs/architecture/public-private-boundary.md)
 - Vulnerability reporting and release invariants: [`SECURITY.md`](SECURITY.md)
+
+The [dated adversarial corpus measurement](docs/research/2026-09-09-adversarial-corpus-measurement.md)
+records 53 deterministic tests across 57 concrete fixture executions for provenance,
+dialog truth, destinations, and export leakage. It measures those product boundaries,
+not human or model attack success.
 
 The first measured local lane uses 30 runs of the same deterministic fixture at 2560×1600. It compares WKWebView with Playwright 1.61.1 driving installed Chrome 151. It does **not** yet measure full process-tree memory, visible-window behavior, authenticated task success, or Playwright's pinned Chromium binary; no broader superiority claim is made.
 

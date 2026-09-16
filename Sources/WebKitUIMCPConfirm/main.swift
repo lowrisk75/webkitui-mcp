@@ -478,6 +478,10 @@ private struct WebKitUIMCPConfirm {
       "URL contains",
       "URL equals",
       "Open one exact destination",
+      "Go back one browser history entry",
+      "Go forward one browser history entry",
+      "Reload the current page",
+      "WebKitUI refuses reload when the current page resulted from a form submission.",
       "Requested action:",
       "Current page:",
       "Destination:",
@@ -576,7 +580,11 @@ private struct WebKitUIMCPConfirm {
       + "Verification:\nThe selected option will be verified after dispatch.\n\n"
       + "Requested action:\nuntrusted JavaScript hover — mouseover, mouseenter and mousemove\n\n"
       + "Option currently selected (untrusted site text):\nno option is currently selected\n\n"
-      + "Verification:\nNothing is verified: what a hover reveals is read by the next observation."
+      + "Verification:\nNothing is verified: what a hover reveals is read by the next observation.\n\n"
+      + "Requested action:\nGo back one browser history entry\n\n"
+      + "Requested action:\nGo forward one browser history entry\n\n"
+      + "Requested action:\nReload the current page\n\n"
+      + "Safety note:\nWebKitUI refuses reload when the current page resulted from a form submission."
     let audit = ConfirmationLocalizationAudit(
       language: language,
       message: localizedDetails(sample, bundle: localizationBundle))

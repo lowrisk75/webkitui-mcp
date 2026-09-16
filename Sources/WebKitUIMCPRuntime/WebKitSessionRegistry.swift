@@ -234,6 +234,7 @@ public final class WebKitSessionRegistry {
   public let maximumSessions: Int
   private let enforceHostExclusiveSession: Bool
   private let hostControllerLockURL: URL?
+  private let runtimeFactory: (UUID?) throws -> WebKitRuntime
   private var sessions: [WebKitSessionHandle: WebKitRuntime] = [:]
   // Resume capabilities belong to the host-owned browser authority, not to a
   // transient MCP transport. Only a one-way digest is retained in memory.
@@ -250,7 +251,7 @@ public final class WebKitSessionRegistry {
   private let unownedLeaseGrace: Duration
   private var unownedLeaseYield: Task<Void, Never>?
 
-  public init(
+  public convenience init(
     maximumSessions: Int = 1,
     enforceHostExclusiveSession: Bool = false,
     hostControllerLockURL: URL? = nil,
@@ -260,11 +261,34 @@ public final class WebKitSessionRegistry {
     // wait it out or kill the broker.
     unownedLeaseGrace: Duration = .seconds(20)
   ) throws {
+    try self.init(
+      maximumSessions: maximumSessions,
+      enforceHostExclusiveSession: enforceHostExclusiveSession,
+      hostControllerLockURL: hostControllerLockURL,
+      unownedLeaseGrace: unownedLeaseGrace,
+      runtimeFactory: { profileIdentifier in
+        let dataStore =
+          profileIdentifier.map(WKWebsiteDataStore.init(forIdentifier:)) ?? .default()
+        return try WebKitRuntime(protectedWebsiteDataStore: dataStore)
+      })
+  }
+
+  /// Package-internal seam for deterministic local-network fixtures. Production callers
+  /// always use the convenience initializer above, which constructs the protected
+  /// persistent runtime.
+  init(
+    maximumSessions: Int = 1,
+    enforceHostExclusiveSession: Bool = false,
+    hostControllerLockURL: URL? = nil,
+    unownedLeaseGrace: Duration = .seconds(20),
+    runtimeFactory: @escaping (UUID?) throws -> WebKitRuntime
+  ) throws {
     guard maximumSessions > 0 else { throw WebKitSessionRegistryError.invalidMaximumSessions }
     self.maximumSessions = maximumSessions
     self.enforceHostExclusiveSession = enforceHostExclusiveSession
     self.hostControllerLockURL = hostControllerLockURL
     self.unownedLeaseGrace = unownedLeaseGrace
+    self.runtimeFactory = runtimeFactory
   }
 
   /// The browser is deliberately kept across a client reconnect, so releasing ownership
@@ -340,8 +364,7 @@ public final class WebKitSessionRegistry {
       : nil
     let handle = WebKitSessionHandle(rawValue: UUID())
     do {
-      let dataStore = profileIdentifier.map(WKWebsiteDataStore.init(forIdentifier:)) ?? .default()
-      sessions[handle] = try WebKitRuntime(protectedWebsiteDataStore: dataStore)
+      sessions[handle] = try runtimeFactory(profileIdentifier)
       hostControllerLease = lease
       // A session opened but not yet owned must not be swept by a yield armed for the
       // previous client.

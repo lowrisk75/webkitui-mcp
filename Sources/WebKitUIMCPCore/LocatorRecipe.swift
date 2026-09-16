@@ -77,12 +77,16 @@ public struct LocatorRecipe: Codable, Equatable, Sendable {
   public let observationID: String
   public let observationGeneration: UInt64
   public let clauses: [LocatorClause]
+  /// A runtime-minted, document-scoped identity for a provenance-private recipe.
+  /// It is evidence for verification, not a locator clause or an action capability.
+  public let opaqueSemanticIdentity: String?
 
   public init(
     elementID: String,
     observationID: String,
     observationGeneration: UInt64,
-    clauses: [LocatorClause]
+    clauses: [LocatorClause],
+    opaqueSemanticIdentity: String? = nil
   ) throws {
     guard !elementID.isEmpty else { throw LocatorRecipeError.emptyElementID }
     guard !observationID.isEmpty else { throw LocatorRecipeError.emptyObservationID }
@@ -105,11 +109,13 @@ public struct LocatorRecipe: Codable, Equatable, Sendable {
     self.observationID = observationID
     self.observationGeneration = observationGeneration
     self.clauses = clauses
+    self.opaqueSemanticIdentity = opaqueSemanticIdentity
   }
 
   /// Stable across observations while the required semantic identity remains
   /// unchanged. It is evidence for predicates, never an authority handle.
   public var semanticIdentity: String {
+    if let opaqueSemanticIdentity { return opaqueSemanticIdentity }
     let components = clauses.compactMap { clause -> String? in
       guard clause.strength == .required else { return nil }
       return [

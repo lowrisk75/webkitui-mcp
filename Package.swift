@@ -83,5 +83,9 @@ let package = Package(
       name: "WebKitUIMCPServerTests",
       dependencies: ["WebKitUIMCPServer"]
     ),
+    .testTarget(
+      name: "WebKitUIMCPAdversarialTests",
+      dependencies: ["WebKitUIMCPServer"]
+    ),
   ]
 )

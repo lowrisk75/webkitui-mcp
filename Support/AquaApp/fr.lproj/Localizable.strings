@@ -126,6 +126,10 @@
 "URL contains" = "l’URL contient";
 "URL equals" = "l’URL est égale à";
 "Open one exact destination" = "Ouvrir une destination exacte";
+"Go back one browser history entry" = "Reculer d’une entrée dans l’historique du navigateur";
+"Go forward one browser history entry" = "Avancer d’une entrée dans l’historique du navigateur";
+"Reload the current page" = "Recharger la page actuelle";
+"WebKitUI refuses reload when the current page resulted from a form submission." = "WebKitUI refuse le rechargement lorsque la page actuelle résulte de l’envoi d’un formulaire.";
 "Requested action:" = "Action demandée :";
 "Current page:" = "Page actuelle :";
 "Data would be sent to:" = "Les données seraient envoyées à :";

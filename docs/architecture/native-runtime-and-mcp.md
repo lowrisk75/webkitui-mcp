@@ -13,7 +13,26 @@ running synchronously on the UI actor.
 - Every observation mints a new observation ID and ephemeral `eN` symbols.
 - Page strings carry provenance at serialization time. Password values are
   omitted; other form values are `USER_ENTERED_SITE_DATA`.
-- Cross-origin frames are reported opaque rather than silently flattened.
+- Native `WKFrameInfo` registration retains a bounded set of opaque, document-scoped
+  frame capabilities. Registered cross-origin frames are evaluated in the same isolated
+  world and merged after same-origin traversal without duplication. Their strings carry
+  `THIRD_PARTY_EMBED` provenance and a sanitized origin. A separate native-only recipe
+  re-resolves a confirmed target in the exact retained frame and rechecks its capability,
+  origin, document generation, semantics, state, uniqueness, and frame-local geometry.
+  The public locator is tag-only with a keyed, document-scoped opaque semantic identity;
+  third-party semantic clauses never leave the runtime unprovenanced. Confirmed hover
+  and select-option dispatch as explicitly untrusted frame-local JavaScript. AppKit key
+  and text insertion require a matching trusted DOM receipt from the exact child frame;
+  a missing receipt is indeterminate, never silently successful. Their boxes cannot be
+  translated to top-level native coordinates, so native pointer actions refuse before
+  confirmation with `cross_origin_native_geometry_unavailable` and a live human-handoff
+  route. `frameActionModes` (compact `frame_action_modes`) lists eligible dispatch modes
+  separately from the pointer-specific `actionable=false`; sensitive and restricted
+  authentication controls remain human-only.
+  Unregistered or failed frames remain explicitly unreadable.
+- Media-capture and geolocation delegates deny every request. The current document's
+  observation reports the sanitized requesting origin, permission kind, frame class,
+  and aggregate request count; records are bounded and cleared on navigation.
 - Snapshot dimensions are pixels and include a backing scale factor. A flag
   states that GPU-composited effects may be missing.
 
@@ -86,6 +105,20 @@ the same privacy-safe holder record and a structured remediation. Optional
 steals it. A disconnected durable client releases session ownership while the
 host-owned browser remains alive.
 
+`browser_session(operation: "set_viewport")` changes the desktop WebKit layout
+viewport in bounded CSS pixels (width 320–3840, height 240–2160) and invalidates
+the current observation when the size changes. It is not device emulation: the
+public macOS SDK has no `WKWebView` `ContentMode` API, and the product deliberately
+does not expose `set_emulated_media`.
+
+`browser_session` history operations take their target from
+`WKBackForwardList`, show its sanitized destination in the native confirmation,
+and re-read the exact process-local URL before dispatch. An absent back or forward
+entry is a named refusal. Every successful back, forward, or reload invalidates the
+observation. The runtime records WebKit's main-frame navigation type only after a
+successful load and refuses reload both while a form navigation is in flight and
+after its response is current, preventing a replay prompt from being shown at all.
+
 `browser_session(operation: "client_handoff")` transfers an existing session
 to the requesting local client only after an exact native confirmation. The
 registry rechecks that the previous owner has no tool call in flight at the
@@ -95,7 +128,11 @@ remain in the same host-owned data store and never cross MCP.
 
 `browser_read_text` returns bounded body text and rendered scrollable/log-like
 regions. Virtualized lines that are not currently in the DOM require an
-explicit scroll and another read.
+explicit scroll and another read. Navigation, semantic observation, and text
+extraction also report rendered-content availability independently of DOM
+readiness. `empty_or_unusable` means the settled document exposed no rendered
+text, interactive control, or visual media; callers must not turn that absence
+into a claim about the page.
 
 `browser_fill_siliconpass` sends only a fresh origin/document/physical-field
 binding to the mutually authenticated SiliconPass broker. It never accepts a
@@ -106,10 +143,16 @@ or update the credential in SiliconPass.
 `browser_observe` filters before applying its element bound. Controls hidden by
 HTML, a zero box, CSS display/visibility/opacity, `aria-hidden`, or `inert` are
 absent. Visible fields classified by password/OTP autocomplete, sensitive
-identifier, or opaque token-like value retain only `sensitive=true`; their
+identifier, payment autocomplete token, or opaque token-like value retain only
+`sensitive=true`; their
 value is absent from the observation, canonical state, and locator recipe.
-Selects expose the selected option's visible label instead of its technical
-value.
+Ordinary selects expose the selected option's visible label instead of its technical
+value; sensitive selects expose neither that label nor their option catalogue.
+
+The same observation reports `permissionDenials` in its full form and
+`permission_denials` in its compact MCP projection. These entries are facts about
+requests the native host already denied, not capabilities: no tool can grant camera,
+microphone, or geolocation access.
 
 `browser_navigate` requires a native, server-owned human confirmation bound to
 the exact destination by default; `approval_mode: "mcp"` keeps modern

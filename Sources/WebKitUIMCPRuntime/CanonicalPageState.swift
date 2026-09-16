@@ -28,7 +28,11 @@ extension WebKitPageObservation {
     ]
 
     let semanticIdentityCounts = Dictionary(
-      grouping: elements, by: { $0.locatorRecipe.semanticIdentity }
+      grouping: elements,
+      by: {
+        CanonicalSemanticIdentity(
+          frameID: canonicalFrameID($0), identity: $0.locatorRecipe.semanticIdentity)
+      }
     ).mapValues(\.count)
 
     for element in elements {
@@ -64,11 +68,13 @@ extension WebKitPageObservation {
         let value = element.value
       {
         entries.append(.init(key: elementKey(element, "@value"), value: value))
-        if semanticIdentityCounts[element.locatorRecipe.semanticIdentity] == 1 {
+        let semanticIdentity = CanonicalSemanticIdentity(
+          frameID: canonicalFrameID(element), identity: element.locatorRecipe.semanticIdentity)
+        if semanticIdentityCounts[semanticIdentity] == 1 {
           entries.append(
             .init(
               key: ObservationFieldKey(
-                frameID: "main",
+                frameID: canonicalFrameID(element),
                 elementID: element.locatorRecipe.semanticIdentity,
                 field: "@value"
               ),
@@ -116,12 +122,15 @@ extension WebKitPageObservation {
       for (name, value) in element.stateAttributes.sorted(by: { $0.key < $1.key }) {
         entries.append(.init(key: elementKey(element, "@attribute:\(name)"), value: value))
       }
-      if semanticIdentityCounts[element.locatorRecipe.semanticIdentity] == 1 {
+      let semanticIdentity = CanonicalSemanticIdentity(
+        frameID: canonicalFrameID(element), identity: element.locatorRecipe.semanticIdentity)
+      if semanticIdentityCounts[semanticIdentity] == 1 {
         let semanticID = element.locatorRecipe.semanticIdentity
         func appendSemantic(_ field: String, _ value: ProvenancedText) {
           entries.append(
             .init(
-              key: ObservationFieldKey(frameID: "main", elementID: semanticID, field: field),
+              key: ObservationFieldKey(
+                frameID: canonicalFrameID(element), elementID: semanticID, field: field),
               value: value
             ))
         }
@@ -173,6 +182,16 @@ extension WebKitPageObservation {
     _ element: WebKitObservedElement,
     _ field: String
   ) -> ObservationFieldKey {
-    ObservationFieldKey(frameID: "main", elementID: element.elementID, field: field)
+    ObservationFieldKey(
+      frameID: canonicalFrameID(element), elementID: element.elementID, field: field)
   }
+
+  private func canonicalFrameID(_ element: WebKitObservedElement) -> String {
+    element.frameIsMain == false ? "embedded" : "main"
+  }
+}
+
+private struct CanonicalSemanticIdentity: Hashable {
+  let frameID: String
+  let identity: String
 }
