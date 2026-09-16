@@ -24,12 +24,17 @@ without telling anyone, a country dropdown cannot be set, the keyboard has three
 keys, and an invoice link opens nothing. Evidence in
 `docs/research/2026-09-09-tool-surface-gap-matrix.md`.
 
-**Not planned yet, and the largest single gap:** cross-origin iframe content is
-counted and never read, which removes every hosted payment field, CAPTCHA and
-embedded SSO widget — a checkout is the flagship task and the impossible one. It
-is not blocked; the instrumentation already runs in every frame. It needs its own
-plan because element identity, observation generations, the origin lock and
-provenance all assume one document.
+**Now underway, and the largest single gap:** Tasks 1–4 of the dedicated
+[cross-origin implementation plan](2026-09-15-cross-origin-frames.md) now retain
+bounded native frame capabilities and publish registered-frame semantics with explicit
+third-party provenance, origin, incompleteness, and frame-local geometry. Private
+post-confirmation resolution is bound to the exact retained frame capability, origin,
+document generation, semantics, state, and geometry. Confirmed frame-local hover/select
+are explicitly untrusted; native key/fill require the exact child's measured trusted
+receipt, while native pointer remains refused with human handoff. Three new loopback
+adversarial fixtures measure part of this boundary; a real restricted-authentication
+child and provider journeys remain unproved before any hosted payment, CAPTCHA, or
+embedded SSO workflow can be called supported end to end.
 
 Also deferred: main-frame HTTP status on the navigation result, the console
 journal, and the proxy's contacted-host list. The gap matrix argues the network
