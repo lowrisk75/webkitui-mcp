@@ -97,6 +97,19 @@ function connect() {
 async function tool(client, name, args) {
   const result = await client.call("tools/call", { name, arguments: args });
   assert.equal(result.resultType, "complete");
+  // A tool error is also a complete result. Returning its structuredContent let a
+  // failed open hand back no session_id to both clients, so the next check compared
+  // undefined with undefined and passed, and the real cause — another client holding
+  // the host — surfaced two lines later as a missing profile_id (2026-09-16).
+  if (result.isError) {
+    const content = result.structuredContent ?? {};
+    const holder = content.holder
+      ? ` Held by ${content.holder.client_name ?? "unknown client"} pid ${content.holder.pid}.`
+      : "";
+    throw new Error(
+      `${name} ${args.operation ?? ""} failed: ${content.code ?? "error"}: ${(content.message ?? "no message").replace(/\.$/, "")}.${holder}`,
+    );
+  }
   return result.structuredContent;
 }
 
