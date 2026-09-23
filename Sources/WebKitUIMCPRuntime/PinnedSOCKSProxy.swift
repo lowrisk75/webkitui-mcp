@@ -19,6 +19,8 @@ public final class PinnedSOCKSProxy: @unchecked Sendable {
   private let queue = DispatchQueue(label: "WebKitUIMCP.PinnedSOCKSProxy")
   private let listener: NWListener
   private let resolver: @Sendable (String) throws -> ResolvedPublicAddress
+  private let tailnetResolver: @Sendable (String) throws -> ResolvedPublicAddress
+  private let tailnetGrants: TailnetOriginGrants
   private let maximumActiveConnections: Int
   fileprivate let timeouts: PinnedSOCKSTimeouts
   private var pins: [String: String] = [:]
@@ -34,10 +36,16 @@ public final class PinnedSOCKSProxy: @unchecked Sendable {
   init(
     maximumActiveConnections: Int = 64,
     timeouts: PinnedSOCKSTimeouts = PinnedSOCKSTimeouts(),
+    tailnetGrants: TailnetOriginGrants = .shared,
+    tailnetResolver: @escaping @Sendable (String) throws -> ResolvedPublicAddress = {
+      try PublicNetworkAddressPolicy().resolveTailnet($0)
+    },
     resolver: @escaping @Sendable (String) throws -> ResolvedPublicAddress
   ) throws {
     precondition(maximumActiveConnections > 0)
     self.resolver = resolver
+    self.tailnetResolver = tailnetResolver
+    self.tailnetGrants = tailnetGrants
     self.maximumActiveConnections = maximumActiveConnections
     self.timeouts = timeouts
     let parameters = NWParameters.tcp
@@ -87,11 +95,15 @@ public final class PinnedSOCKSProxy: @unchecked Sendable {
     queue.sync { metrics }
   }
 
-  fileprivate func pinnedAddress(for host: String) throws -> String {
+  fileprivate func pinnedAddress(for host: String, port: UInt16) throws -> String {
     let normalized = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-    if let existing = pins[normalized] { return existing }
-    let resolved = try resolver(normalized)
-    pins[normalized] = resolved.address
+    // A granted tailnet origin is pinned under its own key and port: the grant opens
+    // one host on one port, and never widens what the same name means elsewhere.
+    let tailnet = tailnetGrants.isGranted(host: normalized, port: port)
+    let key = tailnet ? "tailnet:\(normalized):\(port)" : normalized
+    if let existing = pins[key] { return existing }
+    let resolved = try (tailnet ? tailnetResolver(normalized) : resolver(normalized))
+    pins[key] = resolved.address
     metrics.pinnedHosts = pins.count
     return resolved.address
   }
@@ -218,7 +230,7 @@ private final class SOCKSConnection: @unchecked Sendable {
       if PublicNetworkAddressPolicy().isPublicIPAddress(host) {
         address = host
       } else {
-        address = try proxy.pinnedAddress(for: host)
+        address = try proxy.pinnedAddress(for: host, port: port)
       }
       guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return reject(method: false) }
       let remote = NWConnection(host: NWEndpoint.Host(address), port: endpointPort, using: .tcp)

@@ -210,7 +210,8 @@ public final class WebKitTransactionCoordinator {
       .notDispatched
     case .targetNotActionable, .nativeGestureReceiptUnavailable,
       .webContentProcessTerminated, .malformedInstrumentationResult, .noDocument,
-      .navigationFailed, .navigationTimedOut, .networkBoundaryDenied,
+      .navigationFailed, .navigationTimedOut, .networkBoundaryDenied, .privateNetworkDestination,
+      .tailnetDestinationRequiresApproval,
       .unsupportedURLScheme, .crossOriginRedirectRequiresHuman,
       .invalidQuietWindow, .invalidCredentialOrigin, .invalidCredentialBinding,
       .invalidCredentialSecret, .humanControlActive, .authenticationOriginRequiresHuman,

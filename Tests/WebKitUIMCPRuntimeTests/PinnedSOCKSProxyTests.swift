@@ -141,6 +141,40 @@ struct PinnedSOCKSProxyTests {
     #expect(proxy.metricsSnapshot().blockedConnections == 1)
   }
 
+  @Test("A granted tailnet origin opens one host on one port, and nothing else")
+  func tailnetGrantIsExact() async throws {
+    let destination = try FormFixtureServer()
+    let grants = TailnetOriginGrants()
+    // The public resolver refuses, as it does for a 100.64.0.0/10 name; the tailnet
+    // resolver stands in for Tailscale by answering with the fixture's loopback.
+    let proxy = try PinnedSOCKSProxy(
+      tailnetGrants: grants,
+      tailnetResolver: { ResolvedPublicAddress(host: $0, address: "127.0.0.1") },
+      resolver: { _ in throw PublicNetworkAddressPolicyError.noPublicAddress })
+    let request: @Sendable (String, UInt16) async throws -> Data = { host, port in
+      try await Task.detached {
+        try socksRequest(proxyPort: proxy.port.rawValue, host: host, destinationPort: port)
+      }.value
+    }
+
+    #expect(try await request("ha.example.ts.net", destination.port) == Data([2]))
+    grants.grant(host: "HA.example.ts.net.", port: destination.port)
+    let allowed = try await request("ha.example.ts.net", destination.port)
+    #expect(String(decoding: allowed, as: UTF8.self).contains("200 OK"))
+    // Same name on another port, or another name: still refused.
+    #expect(try await request("ha.example.ts.net", destination.port &+ 1) == Data([2]))
+    #expect(try await request("nas.example.ts.net", destination.port) == Data([2]))
+  }
+
+  @Test("Only 100.64.0.0/10 counts as a tailnet address")
+  func tailnetRange() {
+    #expect(PublicNetworkAddressPolicy.isTailnetIPv4(0x6440_0001))  // 100.64.0.1
+    #expect(PublicNetworkAddressPolicy.isTailnetIPv4(0x647F_FFFE))  // 100.127.255.254
+    #expect(!PublicNetworkAddressPolicy.isTailnetIPv4(0x6480_0000))  // 100.128.0.0
+    #expect(!PublicNetworkAddressPolicy.isTailnetIPv4(0xC0A8_0001))  // 192.168.0.1
+    #expect(!PublicNetworkAddressPolicy.isTailnetIPv4(0x7F00_0001))  // 127.0.0.1
+  }
+
   @Test("UDP ASSOCIATE fails closed")
   func blocksUDPAssociate() async throws {
     let resolver = ResolverProbe()

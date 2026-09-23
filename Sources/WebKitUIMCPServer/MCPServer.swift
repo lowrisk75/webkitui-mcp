@@ -1286,8 +1286,18 @@ public final class WebKitMCPServer {
           reused: false
         )
       let handle = opened.handle
-      let controlAvailable = try registry.claimSessionOwnership(
+      var controlAvailable = try registry.claimSessionOwnership(
         for: handle, owner: clientAuthorityID, holder: clientHolder(policy: executionPolicy))
+      // Reusing a session another client holds returned at once, whatever wait the
+      // caller asked for (Home Assistant session, 2026-09-23). Honour the wait here too:
+      // the holder's disconnect and grace period free it without any handoff.
+      let ownershipDeadline =
+        ContinuousClock.now + .milliseconds(waitTimeoutMilliseconds)
+      while !controlAvailable, ContinuousClock.now < ownershipDeadline {
+        try await Task.sleep(for: .milliseconds(250))
+        controlAvailable = try registry.claimSessionOwnership(
+          for: handle, owner: clientAuthorityID, holder: clientHolder(policy: executionPolicy))
+      }
       sessionBackends[handle] = "native_webkit"
       coordinators[handle] = WebKitTransactionCoordinator(
         runtime: try registry.runtime(for: handle),
@@ -1388,8 +1398,22 @@ public final class WebKitMCPServer {
         registry.hasActiveHandoffResumeCapability(for: handle))
       statusObject["handoff_owner_state"] = .string(
         try registry.handoffOwnershipState(for: handle, owner: clientAuthorityID))
-      statusObject["session_owner_state"] = .string(
-        try registry.sessionOwnershipState(for: handle, owner: clientAuthorityID))
+      let sessionOwnerState = try registry.sessionOwnershipState(
+        for: handle, owner: clientAuthorityID)
+      statusObject["session_owner_state"] = .string(sessionOwnerState)
+      // The control guidance above describes agent versus human, not which client.
+      // Read beside owned_elsewhere, "control_available: true / The agent holds this
+      // session" told a second client it could act (Home Assistant session, 2026-09-23).
+      if sessionOwnerState == "owned_elsewhere" {
+        statusObject["control_available"] = .bool(false)
+        statusObject["wait_only"] = .bool(true)
+        statusObject["message"] = .string("Another client's agent holds this session.")
+        statusObject["remediation"] = .string(
+          "Do not navigate or act with this session_id. Wait for the holder to disconnect, "
+            + "or request browser_session operation=client_handoff for local human "
+            + "confirmation.")
+        statusObject["caller_action"] = .string("wait_or_client_handoff")
+      }
       statusObject["holder"] = holderValue(try registry.sessionOwner(for: handle))
       statusObject["file_upload_receipt"] =
         try registry.runtime(for: handle)
@@ -3242,6 +3266,27 @@ public final class WebKitMCPServer {
         ])
       }
       return try toolResult(structured: .object(structured), modern: modern)
+    } catch WebKitRuntimeError.tailnetDestinationRequiresApproval(let tailnetOrigin) {
+      await capabilityAuthority.revoke(capability)
+      let port = UInt16(pending.url.port ?? (scheme.lowercased() == "http" ? 80 : 443))
+      let approved =
+        try await rateLimitedConfirmation(
+          session: pending.session,
+          title: "Allow Tailscale Access",
+          message:
+            "\(tailnetOrigin) is on your private Tailscale network (100.64.0.0/10).\n\n"
+            + "Allow WebKitUI to connect to this exact origin until the app quits? Every other "
+            + "private address, and this name on any other port, stays blocked.",
+          approveLabel: "Allow This Origin"
+        ) == .approved
+      guard approved else {
+        return try toolError(
+          "tailnet_access_declined: Access to \(tailnetOrigin) on the Tailscale network was not "
+            + "allowed. Do not retry unless the user asks.",
+          modern: modern)
+      }
+      TailnetOriginGrants.shared.grant(host: host, port: port)
+      return try await executeNavigation(pending, runtime: runtime, modern: modern)
     } catch WebKitRuntimeError.crossOriginRedirectRequiresHuman(
       let fromOrigin,
       let toOrigin
@@ -4266,11 +4311,15 @@ public final class WebKitMCPServer {
     {
       structured["new_window_suppressed"] = try .encoded(suppressed)
       structured["safe_next_step"] = .string(
-        "The page asked for a new window and was refused: this session holds one page, so "
-          + "that an approval names an unambiguous one. Nothing was followed. Read "
-          + "new_window_suppressed.destination — its query values are redacted — and, if "
-          + "you want it, call browser_navigate for the exact address you intend, which is "
-          + "confirmed like any other navigation."
+        suppressed.followedInSameView
+          ? "The link asked for a new window; it was opened in this same view instead, under "
+            + "the same navigation policy as a link without a target. Observe again before "
+            + "acting."
+          : "The page asked for a new window and was refused: this session holds one page, "
+            + "so that an approval names an unambiguous one. Nothing was followed. Read "
+            + "new_window_suppressed.destination — its query values are redacted — and, if "
+            + "you want it, call browser_navigate for the exact address you intend, which is "
+            + "confirmed like any other navigation."
       )
     }
     if case .urlChangesFrom(let previousURL) = pending.postcondition,
@@ -4590,6 +4639,8 @@ public final class WebKitMCPServer {
       "The element is present but cannot receive input (covered, disabled or off screen). Observe again; for a radio or checkbox, try focusing it and pressing Space.",
     "preconditionUnsatisfied":
       "A precondition you supplied is false on the current page, so nothing was dispatched. Observe again and check each precondition against what the page now shows.",
+    "privateNetworkDestination":
+      "This address resolves only to a private network range (a Tailscale 100.64.0.0/10 address, a LAN or loopback address), and this browser never connects to one. Retrying will not change that. Use a browser outside WebKitUI for this origin.",
     "preconditionUnknown":
       "A precondition could not be evaluated on the current page, so nothing was dispatched. Observe again and use predicates on elements the observation lists.",
   ]

@@ -57,6 +57,39 @@ public struct PublicNetworkAddressPolicy: Sendable {
     throw PublicNetworkAddressPolicyError.noPublicAddress
   }
 
+  /// Resolves a name the owner granted as a tailnet origin to its Tailscale address.
+  /// Only 100.64.0.0/10 qualifies: a granted name that resolves to a LAN, loopback or
+  /// link-local address is refused exactly as before.
+  public func resolveTailnet(_ rawHost: String) throws -> ResolvedPublicAddress {
+    let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    guard !host.isEmpty else { throw PublicNetworkAddressPolicyError.invalidHost }
+    var hints = addrinfo()
+    hints.ai_family = AF_INET
+    hints.ai_socktype = SOCK_STREAM
+    var result: UnsafeMutablePointer<addrinfo>?
+    guard getaddrinfo(host, nil, &hints, &result) == 0, let first = result else {
+      throw PublicNetworkAddressPolicyError.invalidHost
+    }
+    defer { freeaddrinfo(first) }
+    var cursor: UnsafeMutablePointer<addrinfo>? = first
+    while let info = cursor?.pointee {
+      defer { cursor = info.ai_next }
+      guard let address = info.ai_addr, info.ai_family == AF_INET else { continue }
+      let value = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+        UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+      }
+      guard Self.isTailnetIPv4(value) else { continue }
+      let text = [24, 16, 8, 0].map { String((value >> UInt32($0)) & 0xFF) }
+        .joined(separator: ".")
+      return ResolvedPublicAddress(host: host, address: text)
+    }
+    throw PublicNetworkAddressPolicyError.noPublicAddress
+  }
+
+  static func isTailnetIPv4(_ value: UInt32) -> Bool {
+    value & 0xFFC0_0000 == 0x6440_0000
+  }
+
   public func isPublicIPAddress(_ text: String) -> Bool {
     var ipv4 = in_addr()
     if inet_pton(AF_INET, text, &ipv4) == 1 {

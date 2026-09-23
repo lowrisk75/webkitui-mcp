@@ -1950,7 +1950,8 @@ struct MCPServerTests {
 
   @Test("A click WebKit asked a new window for says so, and the next action does not inherit it")
   func suppressedNewWindowIsReportedOnceToTheCaller() async throws {
-    // An invoice link on a billing portal is overwhelmingly `target="_blank"`. WebKit's
+    // A page that opens its invoice with window.open() is still refused a window; a plain
+    // target=_blank link is now followed in the same view instead. WebKit's
     // default for an unimplemented `createWebViewWith` cancelled it silently, so this
     // click reported nothing and could not be told from one that missed. The window is
     // still refused — one session, one page an approval can name — but the request is
@@ -1961,7 +1962,7 @@ struct MCPServerTests {
     let runtime = try registry.runtime(for: handle)
     runtime.webView.loadHTMLString(
       """
-      <a href='/invoice-0421.pdf?session=s3cr3t-token' target='_blank'>Download invoice</a>
+      <button onclick="window.open('/invoice-0421.pdf?session=s3cr3t-token')">Download invoice</button>
       <button onclick="document.title='Noted'">Mark as read</button>
       """,
       baseURL: URL(string: "https://example.test/billing"))
@@ -1996,7 +1997,7 @@ struct MCPServerTests {
     #expect(
       suppressed["destination"]
         == .string("https://example.test/invoice-0421.pdf?session=<redacted>"))
-    #expect(suppressed["navigationType"] == .string("link_activated"))
+    #expect(suppressed["navigationType"] == .string("other"))
     #expect(try string(structured["safe_next_step"]).contains("browser_navigate"))
     // Nothing was followed: the page an approval was granted on is still the page loaded.
     #expect(runtime.webView.url?.absoluteString == "https://example.test/billing")

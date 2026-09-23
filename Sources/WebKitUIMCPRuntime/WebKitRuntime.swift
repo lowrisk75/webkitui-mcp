@@ -50,6 +50,12 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case downloadFailed(String)
   case invalidCredentialOrigin
   case invalidCredentialBinding
+  /// The destination resolves only to private, loopback, link-local or carrier-grade
+  /// NAT space (Tailscale's 100.64.0.0/10 among them), which the protected browser
+  /// never connects to.
+  case privateNetworkDestination(origin: String)
+  /// The destination is on the owner's Tailscale network and has not been granted.
+  case tailnetDestinationRequiresApproval(origin: String)
   case invalidCredentialSecret
   case humanControlActive
   case authenticationOriginRequiresHuman(String)
@@ -861,9 +867,11 @@ public struct WebKitSubmissionFacts: Codable, Equatable, Sendable {
 /// cancelled and nil handed back — so a `target="_blank"` invoice link did nothing and
 /// reported nothing, and a click on one was indistinguishable from a click that missed.
 ///
-/// Nothing here is followed. The agent reads `destination` and asks for it through
-/// `browser_navigate`, which puts it back under the ordinary exact-destination
-/// confirmation.
+/// A link the person or agent activated in the main frame is followed in the same view
+/// (`followedInSameView`), under the same navigation policy as a link without a target:
+/// the origin lock applies, and a foreign destination is refused as a cross-origin
+/// redirect. Anything else, `window.open()` from script above all, is not followed; the
+/// agent reads `destination` and asks for it through `browser_navigate`.
 public struct WebKitSuppressedNewWindowRequest: Codable, Equatable, Sendable {
   /// Origin and path with every query value redacted, sanitised exactly as an observed
   /// `href` is: a statement or invoice link routinely carries a session token in its
@@ -875,6 +883,8 @@ public struct WebKitSuppressedNewWindowRequest: Codable, Equatable, Sendable {
   public let navigationType: String
   public let sourceFrameIsMain: Bool
   public let monotonicNanoseconds: UInt64
+  /// True when the destination was loaded in this view instead of a new window.
+  public let followedInSameView: Bool
   // `WKWindowFeatures` is deliberately absent. Every field on it — the width, height and
   // toolbar flags the page asked for — is site-authored data, and recording it would put
   // unlabelled site content in an exported receipt to no benefit: the product refuses the
@@ -1149,6 +1159,25 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         try PublicNetworkAddressPolicy().validateNavigationHost(host)
       } catch {
         throw WebKitRuntimeError.networkBoundaryDenied
+      }
+      // The pinned proxy refuses a name that resolves only to private space — a
+      // Tailscale 100.64.0.0/10 address, say — and WebKit reported that as
+      // NSURLErrorDomain -1000, which read like a malformed URL and invited retries
+      // (Home Assistant over Tailscale, 2026-09-23). Resolve with the proxy's own
+      // policy first and say what it is. The proxy still decides every connection.
+      let resolution = await Task.detached {
+        Result { try PublicNetworkAddressPolicy().resolve(host) }
+      }.value
+      if case .failure(PublicNetworkAddressPolicyError.noPublicAddress) = resolution {
+        let origin = navigationOrigin(for: url).map(Self.sanitizedOrigin) ?? "unavailable"
+        let port = UInt16(url.port ?? (url.scheme?.lowercased() == "http" ? 80 : 443))
+        let tailnet = await Task.detached {
+          (try? PublicNetworkAddressPolicy().resolveTailnet(host)) != nil
+        }.value
+        guard tailnet else { throw WebKitRuntimeError.privateNetworkDestination(origin: origin) }
+        guard TailnetOriginGrants.shared.isGranted(host: host, port: port) else {
+          throw WebKitRuntimeError.tailnetDestinationRequiresApproval(origin: origin)
+        }
       }
     }
     if constrainToInitialOrigin {
@@ -2635,9 +2664,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// billing portal — overwhelmingly `target="_blank"` — did nothing, and a click on one
   /// was indistinguishable from a click that missed (measured 2026-09-09).
   ///
-  /// Nothing is followed from here, now or later. The destination is recorded, sanitised,
-  /// and reported; reaching it costs the caller a `browser_navigate` of its own, under the
-  /// same exact-destination confirmation as every other navigation.
+  /// A `target="_blank"` link activated in the main frame is followed here, in this same
+  /// view: a click on it carries exactly the authority of a click on the same link
+  /// without a target, and the load below goes through the same navigation policy, so
+  /// the origin lock and cross-origin refusal apply unchanged. There is still no second
+  /// window. A `window.open()` from script, or anything not a GET to http(s), is only
+  /// recorded; reaching it costs the caller a `browser_navigate` of its own.
   public func webView(
     _ webView: WKWebView,
     createWebViewWith configuration: WKWebViewConfiguration,
@@ -2647,11 +2679,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // `windowFeatures` is read and dropped. Its every field is site-authored, and this
     // record is exported: the shape a page wanted for a window it is not getting is not
     // worth carrying unlabelled site content for.
+    let request = navigationAction.request
+    let follow =
+      navigationAction.navigationType == .linkActivated
+      && navigationAction.sourceFrame.isMainFrame
+      && ["http", "https"].contains(request.url?.scheme?.lowercased() ?? "")
+      && (request.httpMethod ?? "GET").uppercased() == "GET"
+      && !processTerminated
     suppressedNewWindowRequest = WebKitSuppressedNewWindowRequest(
-      destination: Self.sanitizedNewWindowDestination(navigationAction.request.url),
+      destination: Self.sanitizedNewWindowDestination(request.url),
       navigationType: Self.navigationTypeName(navigationAction.navigationType),
       sourceFrameIsMain: navigationAction.sourceFrame.isMainFrame,
-      monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
+      monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+      followedInSameView: follow)
+    if follow {
+      // After this delegate call returns: WebKit is still inside the activation.
+      DispatchQueue.main.async { [weak self] in
+        guard let self, let url = request.url else { return }
+        self.webView.load(URLRequest(url: url))
+      }
+    }
     return nil
   }
 
@@ -3823,7 +3870,24 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       return .allow
     }
     guard navigationAction.targetFrame?.isMainFrame == true else {
-      return navigationAction.targetFrame == nil ? .cancel : .allow
+      guard navigationAction.targetFrame == nil else { return .allow }
+      // A new-window request, asked here before `createWebViewWith`. A link to the
+      // locked origin goes on and is followed in this view there; anything else is
+      // refused here. It used to be refused without a word, which is exactly the
+      // silent `target="_blank"` the suppression record exists to end.
+      if navigationAction.navigationType == .linkActivated,
+        let url = navigationAction.request.url,
+        navigationOrigin(for: url) == lockedOrigin
+      {
+        return .allow
+      }
+      suppressedNewWindowRequest = WebKitSuppressedNewWindowRequest(
+        destination: Self.sanitizedNewWindowDestination(navigationAction.request.url),
+        navigationType: Self.navigationTypeName(navigationAction.navigationType),
+        sourceFrameIsMain: navigationAction.sourceFrame.isMainFrame,
+        monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+        followedInSameView: false)
+      return .cancel
     }
     guard
       let targetURL = navigationAction.request.url,

@@ -361,6 +361,14 @@ presented, WebKitUI receives only
 `user_presence_unavailable`: no secret is released and no automatic retry is
 performed.
 
+The protected browser never connects to private address space. The one exception
+is a service on the owner's Tailscale network: navigating to a name that resolves
+only into `100.64.0.0/10` asks for a native **Allow Tailscale Access** confirmation
+for that exact origin and port. Once allowed, the proxy connects to that host on that
+port only, pinned against rebinding; every other private address, and the same name
+on another port, stays refused. Grants last until the app quits. Any other private
+destination returns `privateNetworkDestination` instead of an opaque WebKit error.
+
 Restricted authentication origins such as `idmsa.apple.com` return only their
 canonical origin and a local handoff requirement. Observe, text, capture,
 scroll, credential fill, and actuation remain blocked until the human leaves

@@ -663,18 +663,19 @@ struct WebKitRuntimeTests {
     #expect(event.toOrigin == "https://fixture.invalid")
   }
 
-  @Test("A click on a target=_blank link is refused out loud, with its destination")
+  @Test("A click on a target=_blank link is followed in the same view, under the same policy")
   func blankTargetClickIsRecordedRatherThanSwallowed() async throws {
     // WebKit's default for an unimplemented `createWebViewWith` is to cancel the
-    // navigation and hand back nil, so this click used to do nothing and say nothing:
-    // indistinguishable from a click that missed its target. The refusal stands; the
-    // silence does not.
+    // navigation and hand back nil, so this click used to do nothing and say nothing.
+    // It is now followed in this same view, under the same navigation policy as the same
+    // link without a target, and the navigation audit says so.
     let runtime = WebKitRuntime()
     _ = try await runtime.loadHTML(
       "<a href='/invoice-0421.pdf' target='_blank'>Download invoice</a>",
       baseURL: URL(string: "https://fixture.invalid/billing"),
       timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     #expect(runtime.outstandingSuppressedNewWindowRequest() == nil)
+    let auditBefore = runtime.navigationAuditEventCount()
 
     let observation = try await runtime.observe()
     let link = try #require(observation.elements.first)
@@ -686,13 +687,96 @@ struct WebKitRuntimeTests {
     #expect(result.dispatched)
 
     for _ in 0..<fixtureSettlementPolls
+    where runtime.navigationAuditEventCount() == auditBefore {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    let followed = try #require(runtime.latestNavigationAuditEvent())
+    #expect(followed.allowed)
+    #expect(followed.toOrigin == "https://fixture.invalid")
+  }
+
+  @Test("A target=_blank link to another origin is refused under the origin lock")
+  func blankTargetToForeignOriginIsRefusedUnderLock() async throws {
+    let foreign = try FormFixtureServer { _ in
+      FormFixtureServer.response(body: "<title>Foreign</title>")
+    }
+    let page = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<a href='http://localhost:\(foreign.port)/x' target='_blank'>Elsewhere</a>")
+    }
+    let runtime = WebKitRuntime()
+    let start = URL(string: "http://127.0.0.1:\(page.port)/start")!
+    _ = try await runtime.navigate(
+      to: start, timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40),
+      constrainToInitialOrigin: true)
+    let foreignOrigin = "http://localhost:\(foreign.port)"
+    let observation = try await runtime.observe()
+    let link = try #require(observation.elements.first)
+    _ = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: link.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    for _ in 0..<fixtureSettlementPolls
+    where runtime.outstandingSuppressedNewWindowRequest() == nil {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(runtime.webView.url == start)
+    // Refused out loud: the caller still learns where the link pointed.
+    let suppressed = try #require(runtime.outstandingSuppressedNewWindowRequest())
+    #expect(!suppressed.followedInSameView)
+    #expect(suppressed.destination == "\(foreignOrigin)/x")
+  }
+
+  @Test("A target=_blank link to the locked origin is followed in the same view")
+  func blankTargetToLockedOriginIsFollowed() async throws {
+    let page = try FormFixtureServer { request in
+      FormFixtureServer.response(
+        body: request.hasPrefix("GET /invoice")
+          ? "<title>Invoice</title>" : "<a href='/invoice' target='_blank'>Invoice</a>")
+    }
+    let runtime = WebKitRuntime()
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(page.port)/start")!,
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40),
+      constrainToInitialOrigin: true)
+    let observation = try await runtime.observe()
+    let link = try #require(observation.elements.first)
+    _ = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: link.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    for _ in 0..<fixtureSettlementPolls where runtime.webView.url?.path != "/invoice" {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(runtime.webView.url?.path == "/invoice")
+  }
+
+  @Test("A window.open from script is reported and not followed")
+  func scriptedWindowOpenIsNotFollowed() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<button onclick=\"window.open('https://fixture.invalid/popup')\">Open</button>",
+      baseURL: URL(string: "https://fixture.invalid/start"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let button = try #require(observation.elements.first)
+    _ = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: button.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(1))
+    for _ in 0..<fixtureSettlementPolls
     where runtime.outstandingSuppressedNewWindowRequest() == nil {
       try await Task.sleep(for: .milliseconds(20))
     }
     let suppressed = try #require(runtime.outstandingSuppressedNewWindowRequest())
-    #expect(suppressed.destination == "https://fixture.invalid/invoice-0421.pdf")
-    #expect(suppressed.navigationType == "link_activated")
-    #expect(suppressed.sourceFrameIsMain)
+    #expect(suppressed.navigationType == "other")
+    #expect(!suppressed.followedInSameView)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(runtime.webView.url?.path == "/start")
   }
 
   @Test("A suppressed destination keeps its origin and path and redacts every query value")
@@ -702,8 +786,8 @@ struct WebKitRuntimeTests {
     // query names kept, values replaced.
     let runtime = WebKitRuntime()
     _ = try await runtime.loadHTML(
-      "<a href='/statements/2026-09.pdf?session=s3cr3t-token&id=0421#page2' target='_blank'>"
-        + "September statement</a>",
+      "<button onclick=\"window.open('/statements/2026-09.pdf?session=s3cr3t-token&id=0421#page2')\">"
+        + "September statement</button>",
       baseURL: URL(string: "https://fixture.invalid/billing"),
       timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let observation = try await runtime.observe()
@@ -728,9 +812,11 @@ struct WebKitRuntimeTests {
 
   @Test("A suppressed new window is never followed, and never outlives its document")
   func suppressedNewWindowIsNeverFollowed() async throws {
+    // window.open() is the path that stays suppressed; a target=_blank link activation is
+    // followed in the same view instead (see the test above).
     let runtime = WebKitRuntime()
     _ = try await runtime.loadHTML(
-      "<a href='/invoice-0421.pdf?token=abc' target='_blank'>Download invoice</a>",
+      "<button onclick=\"window.open('/invoice-0421.pdf?token=abc')\">Download invoice</button>",
       baseURL: URL(string: "https://fixture.invalid/billing"),
       timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let observation = try await runtime.observe()

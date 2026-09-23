@@ -11,15 +11,32 @@ struct WebKitUIMCPRelay {
     let path = CommandLine.arguments[1]
     var descriptor: Int32?
     var responseBuffer = Data()
+    // The client's own handshake. Each connection reaches a fresh server in the app, so
+    // after the app restarts that server must hear it again: without it the client's
+    // name and version were lost ("unknown-client" as lease holder) and the protocol
+    // version was never negotiated on the new connection.
+    var handshake: Data?
     while let line = Swift.readLine() {
       let request = Data((line + "\n").utf8)
       let identifier = requestIdentifier(in: request)
+      let isHandshake = requestMethod(in: request) == "initialize"
+      if isHandshake { handshake = request }
       var dispatched = false
 
       for attempt in 0..<2 {
         if descriptor == nil {
           descriptor = try? connectWithRetry(to: path)
           responseBuffer.removeAll(keepingCapacity: true)
+          if let fresh = descriptor, let handshake, !isHandshake {
+            // Replayed silently: the client already has its answer to this request.
+            do {
+              try writeAll(handshake, to: fresh)
+              _ = try readLine(from: fresh, buffer: &responseBuffer)
+            } catch {
+              Darwin.close(fresh)
+              descriptor = nil
+            }
+          }
         }
         guard let liveDescriptor = descriptor else { break }
         do {
@@ -131,6 +148,10 @@ struct WebKitUIMCPRelay {
       buffer.append(contentsOf: chunk.prefix(count))
       guard buffer.count <= 8 * 1_024 * 1_024 else { throw RelayError.frameTooLarge }
     }
+  }
+
+  private static func requestMethod(in request: Data) -> String? {
+    (try? JSONSerialization.jsonObject(with: request) as? [String: Any])?["method"] as? String
   }
 
   private static func requestIdentifier(in request: Data) -> RequestIdentifier {

@@ -125,6 +125,10 @@ struct ActivityLogTests {
     #expect(
       WebKitMCPServer.toolErrorFields("preconditionUnsatisfied").remediation
         .contains("nothing was dispatched"))
+    #expect(
+      WebKitMCPServer.toolErrorFields(
+        #"privateNetworkDestination(origin: "https://homeassistant.example.ts.net")"#
+      ).remediation.contains("Retrying will not change that"))
     let coded = WebKitMCPServer.toolErrorFields("session_busy: Close the other session first.")
     #expect(coded.code == "session_busy")
     #expect(coded.remediation == "Close the other session first.")
