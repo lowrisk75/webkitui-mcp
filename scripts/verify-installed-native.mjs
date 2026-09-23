@@ -164,9 +164,16 @@ try {
     operation: "open",
     profile_id: "default",
   });
-  assert.equal(firstSession.session_id, secondSession.session_id);
+  // Since 0.6.15 each client drives its own session in the app, on the shared profile.
+  assert.notEqual(firstSession.session_id, secondSession.session_id);
   assert.equal(firstSession.profile_id, "default");
   assert.equal(secondSession.profile_id, "default");
+  assert.equal(firstSession.client_control_state, "owned_by_this_client");
+  assert.equal(secondSession.client_control_state, "owned_by_this_client");
+  assert.equal(firstSession.maximum_sessions, 3);
+  // Neither can act in the other's session.
+  const crossed = await tool(second, "browser_observe", { session_id: firstSession.session_id });
+  assert.equal(crossed.status, "session_in_use");
 
   // Closing the sockets leaves the browser session open, so the host lease is rewritten
   // as unowned and stays taken until it times out. Every delivery therefore ended with a
@@ -177,6 +184,10 @@ try {
     operation: "close",
     session_id: firstSession.session_id,
   });
+  await tool(second, "browser_session", {
+    operation: "close",
+    session_id: secondSession.session_id,
+  });
 
   console.log(JSON.stringify({
     status: "verified",
@@ -184,7 +195,7 @@ try {
     clients: 2,
     tools: expectedTools.length,
     profile: "default",
-    sharedSession: true,
+    separateSessions: true,
     hostReleased: true,
   }, null, 2));
 } finally {

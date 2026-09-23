@@ -4,10 +4,13 @@ set -euo pipefail
 project_root=${0:A:h:h}
 expected_version=$(plutil -extract CFBundleShortVersionString raw \
   "$project_root/Support/AquaApp/Info.plist")
-installed_app="$HOME/Applications/WebKitUI MCP.app"
-if [[ ! -d "$installed_app" ]]; then
-  installed_app="$HOME/Applications/WebkitUIMCP Aqua.app"
-fi
+# The app is installed system-wide on current Macs and per user on older ones.
+installed_app=""
+for candidate in "/Applications/WebKitUI MCP.app" "$HOME/Applications/WebKitUI MCP.app" \
+  "$HOME/Applications/WebkitUIMCP Aqua.app"; do
+  if [[ -d "$candidate" ]]; then installed_app=$candidate; break; fi
+done
+[[ -n "$installed_app" ]] || { print -u2 "WebKitUI MCP.app is not installed"; exit 1; }
 installed_app_confirm="$installed_app/Contents/MacOS/webkitui-mcp-confirm"
 installed_cli="$HOME/.local/bin/webkitui-mcp"
 installed_cli_confirm="$HOME/.local/bin/webkitui-mcp-confirm"
@@ -76,9 +79,16 @@ verify_installed_executable() {
     exit 1
   fi
 }
-for tool in webkitui-mcp webkitui-mcp-confirm webkitui-mcp-relay; do
-  verify_installed_executable "$tool" "$HOME/.local/bin/$tool"
-done
+# The standalone CLI is optional: an app-only install registers the app's relay.
+cli_installed=0
+if [[ -e "$installed_cli" ]]; then
+  cli_installed=1
+  for tool in webkitui-mcp webkitui-mcp-confirm webkitui-mcp-relay; do
+    verify_installed_executable "$tool" "$HOME/.local/bin/$tool"
+  done
+else
+  print "standalone CLI not installed in ~/.local/bin; verifying the app install only"
+fi
 for tool in webkitui-mcp-aqua-broker webkitui-mcp-confirm webkitui-mcp-relay; do
   verify_installed_executable "$tool" "$installed_app/Contents/MacOS/$tool"
 done
@@ -103,9 +113,11 @@ done
 
 test -x "$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker"
 test -x "$installed_app_confirm"
-test -x "$installed_cli"
-test -x "$installed_cli_confirm"
-test -x "$installed_relay"
+if (( cli_installed )); then
+  test -x "$installed_cli"
+  test -x "$installed_cli_confirm"
+  test -x "$installed_relay"
+fi
 test -S "$broker_socket"
 
 installed_version=$(plutil -extract CFBundleShortVersionString raw "$installed_app/Contents/Info.plist")
@@ -116,9 +128,10 @@ node scripts/verify-installed-native.mjs "$broker_socket" "$expected_version"
 shasum -a 256 \
   "$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker" \
   "$installed_app_confirm" \
-  "$installed_cli" \
-  "$installed_cli_confirm" \
-  "$installed_relay"
+  "$installed_app/Contents/MacOS/webkitui-mcp-relay"
+if (( cli_installed )); then
+  shasum -a 256 "$installed_cli" "$installed_cli_confirm" "$installed_relay"
+fi
 
 # The lease must be free when the verifier leaves. It used to stay taken until it timed
 # out, so every delivery handed the next client a locked host — including the client
