@@ -4,7 +4,7 @@ import tempfile
 
 base = Path(__file__).resolve().parent
 script = (base / 'verify-native-installed.sh').read_text()
-function = script[script.index('verify_installed_executable() {'):script.index('\nfor tool in webkitui-mcp webkitui-mcp-confirm webkitui-mcp-relay; do')]
+function = script[script.index('verify_installed_executable() {'):script.index('\n# The standalone CLI is optional')]
 manifest = script[script.index('(\n  manifest_scratch='):script.index('\ntest -x "$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker"')]
 
 def run(program, args):
@@ -49,7 +49,8 @@ plutil() { shasum -a 256 "$installed_app/Contents/Resources/SOURCE-MANIFEST.sha2
     result=run(prelude+manifest,[root,app]); assert result.returncode!=0 and 'source manifest differs' in result.stderr,result
     pre= (base/'verify-pre-notarization.sh').read_text()
     branch=pre[pre.index('  if wait "$probe_pid"'):pre.index('\nfi\n\nprintf', pre.index('  if wait "$probe_pid"'))]
-    result=run('scratch_dir=$1\nprintf "synthetic crash detail\\n" > "$scratch_dir/confirmation-probe.err"\n(exit 64) &\nprobe_pid=$!\n'+branch,[work])
+    # The branch now sits inside the probe's own `if`; give it that frame and its inputs.
+    result=run('scratch_dir=$1\nprintf "synthetic crash detail\\n" > "$scratch_dir/confirmation-probe.err"\n(exit 64) &\nprobe_pid=$!\nprobe_started=$(perl -MTime::HiRes=time -e "print time")\nprobe_presented=0\nif true; then\n'+branch+'\nfi\n',[work])
     assert result.returncode==1 and 'exited with 64' in result.stderr and 'synthetic crash detail' in result.stderr,result
 print('PASS: 3 signed-byte variants accepted; 3 stale embedded executables rejected; current manifest accepted; stale manifest rejected; crash status and stderr retained. No native helper or UI launched.')
 
