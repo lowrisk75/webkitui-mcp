@@ -150,8 +150,21 @@ PROBE
 "$helper" --protocol-version 1 --request-stdin < "$confirmation_probe" \
   >/dev/null 2>"$scratch_dir/confirmation-probe.err" &
 probe_pid=$!
-sleep 3
+probe_started=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+# Up to three seconds: a panel still up has presented. One a person answered —
+# Navigate (0) or Cancel (2) — has presented too: nothing can be clicked before it is
+# drawn, and the keyboard is disarmed for its first second. Only an exit too fast for
+# a person, or any other status, means the helper died before drawing. A person
+# approving the probe used to fail the whole signed build.
+probe_presented=0
+probe_ticks=0
+while [ "$probe_ticks" -lt 30 ]; do
+  if ! kill -0 "$probe_pid" 2>/dev/null; then break; fi
+  sleep 0.1
+  probe_ticks=$((probe_ticks + 1))
+done
 if kill -0 "$probe_pid" 2>/dev/null; then
+  probe_presented=1
   kill "$probe_pid" 2>/dev/null || true
   wait "$probe_pid" 2>/dev/null || true
 else
@@ -160,8 +173,17 @@ else
   else
     probe_status=$?
   fi
+  probe_elapsed=$(perl -MTime::HiRes=time -e "printf '%.3f', time - $probe_started")
+  if { [ "$probe_status" -eq 0 ] || [ "$probe_status" -eq 2 ]; } \
+    && perl -e "exit(!($probe_elapsed >= 0.5))"; then
+    probe_presented=1
+    printf '%s\n' \
+      "confirmation probe was answered by a person after ${probe_elapsed}s; it presented."
+  fi
+fi
+if [ "$probe_presented" -ne 1 ]; then
   printf '%s\n' \
-    "confirmation helper exited with $probe_status instead of presenting a prompt:" >&2
+    "confirmation helper exited with ${probe_status:-?} instead of presenting a prompt:" >&2
   cat "$scratch_dir/confirmation-probe.err" >&2
   exit 1
 fi
