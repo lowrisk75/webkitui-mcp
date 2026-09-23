@@ -6260,6 +6260,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
         ? 'actionable' : 'covered';
     };
+    // An element keeps its own box when an ancestor's overflow clips it away, so the
+    // geometry checks above still say it is laid out. A person sees nothing of it. The
+    // element stays in the tree (its actionability already says a click cannot reach
+    // it); this is what turns its visible flag off.
+    const clippedByAncestor = surface => {
+      let box = surface.getBoundingClientRect();
+      for (let cursor = composedParent(surface); cursor; cursor = composedParent(cursor)) {
+        if (cursor.nodeType !== 1 || cursor.localName === 'html') break;
+        const style = getComputedStyle(cursor);
+        const clipsX = style.overflowX !== 'visible';
+        const clipsY = style.overflowY !== 'visible';
+        if (!clipsX && !clipsY) continue;
+        const clip = cursor.getBoundingClientRect();
+        const left = clipsX ? Math.max(box.left, clip.left) : box.left;
+        const right = clipsX ? Math.min(box.right, clip.right) : box.right;
+        const top = clipsY ? Math.max(box.top, clip.top) : box.top;
+        const bottom = clipsY ? Math.min(box.bottom, clip.bottom) : box.bottom;
+        if (right - left <= 0 || bottom - top <= 0) return true;
+        box = { left, right, top, bottom };
+      }
+      return false;
+    };
     const classTokens = element => collapse(element?.getAttribute?.('class'));
     const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
     const hasSelectedToken = element =>
@@ -6719,7 +6741,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           contextAnchors: sensitive ? [] : contextAnchorsOf(element),
           domPath: domPathOf(element),
           stableAttributes: stableAttributesOf(element, sensitive),
-          visible: actionability !== 'no_layout_box' && actionability !== 'not_visible',
+          visible: actionability !== 'no_layout_box' && actionability !== 'not_visible'
+            && !clippedByAncestor(surface),
           actionability,
           boundingBox: {
             x: reportedBox.x, y: reportedBox.y,

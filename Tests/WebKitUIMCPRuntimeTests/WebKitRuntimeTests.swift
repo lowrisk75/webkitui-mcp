@@ -1546,6 +1546,14 @@ struct WebKitRuntimeTests {
     // Clipped away by an ancestor: it keeps its own box, so hit testing is what catches
     // it, and the reason is that the point does not reach it.
     #expect(actionability("Clipped") == .covered)
+    // And it is not visible: a textual postcondition can still match its name, which is
+    // why the observation says a person sees nothing of it.
+    #expect(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Clipped" }?
+        .visible == false)
+    #expect(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Under" }?
+        .visible == true)
     // No box of its own: reported, because the only exit from a form can be one of
     // these, and never claimed to be clickable.
     #expect(actionability("Sizeless") == .noLayoutBox)
@@ -1554,6 +1562,58 @@ struct WebKitRuntimeTests {
         .visible == false)
     // Deliberately hidden stays out of the tree entirely.
     #expect(actionability("Gone") == nil)
+  }
+
+  @Test("Text clipped away by an ancestor is reported, and reported as not visible")
+  func ancestorClippingTurnsVisibleOff() async throws {
+    // Volvo, 21 September: a click's textual postcondition was verified while the
+    // person saw a blank panel. isRendered checks the element's own box and its
+    // ancestors' display, visibility and hidden state, never whether an ancestor's
+    // overflow clips the box away. The element still belongs in the tree, and its
+    // text can still be matched; visible is where the honest answer lives.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <title>Clipping</title>
+      <div style="width:200px;height:0;overflow:hidden">
+        <h2 style="margin:0">Eclair Application Client Details</h2>
+        <a href="/details" aria-label="Details">Details</a>
+      </div>
+      <div style="width:200px;height:40px;overflow:hidden">
+        <h2 style="margin:0;height:20px">Shown heading</h2>
+        <h2 style="margin:0;height:20px">Half shown</h2>
+      </div>
+      <div style="width:200px;height:40px;overflow:visible">
+        <a href="/spills" style="display:block;margin-top:60px">Spills out</a>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/clipping"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let observation = try await runtime.observe()
+    func element(_ name: String) -> WebKitObservedElement? {
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == name
+          || $0.text?.segments.first?.text == name
+      }
+    }
+    // The clipped heading's own text is not published; the element is, so the agent
+    // knows a heading is there and that nobody sees it.
+    let clippedHeading = try #require(
+      observation.elements.first { $0.role?.segments.first?.text == "heading" })
+    #expect(clippedHeading.visible == false)
+    #expect(clippedHeading.text == nil)
+    let clippedLink = try #require(element("Details"))
+    #expect(clippedLink.visible == false)
+    #expect(clippedLink.actionability == .covered)
+    #expect(element("Shown heading")?.visible == true)
+    #expect(element("Half shown")?.visible == true)
+    // overflow: visible clips nothing, wherever the box lands.
+    #expect(element("Spills out")?.visible == true)
+    #expect(element("Spills out")?.actionability == .actionable)
   }
 
   @Test("The only exit from a collapsed row is exposed, named, and honest about itself")
