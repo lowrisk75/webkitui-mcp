@@ -280,7 +280,7 @@ scripts/package-preview.sh dist
 scripts/verify-package-preview.sh dist
 ```
 
-Unzip `WebKitUI-MCP-0.6.13-preview.zip`, move `WebKitUI MCP.app` to the
+Unzip `WebKitUI-MCP-0.6.14-preview.zip`, move `WebKitUI MCP.app` to the
 Applications folder, and open it. In the status window:
 
 1. Enable **Launch at Login**. macOS may require approval in System Settings.
@@ -419,7 +419,7 @@ The first measured local lane uses 30 runs of the same deterministic fixture at 
 
 ## Licensing
 
-WebKitUI MCP 0.6.13 Developer Preview is available under the
+WebKitUI MCP 0.6.14 Developer Preview is available under the
 [Business Source License 1.1](LICENSE). The source is readable, auditable and
 modifiable; production use is granted for personal noncommercial, qualifying
 noncommercial organization and evaluation use, and commercial production use
