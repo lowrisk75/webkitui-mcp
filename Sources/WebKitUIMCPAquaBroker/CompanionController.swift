@@ -59,6 +59,7 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
   private let window: NSWindow
   private let localizationBundle: Bundle
   private let licenseValue = NSTextField(wrappingLabelWithString: "")
+  private let sessionsValue = NSTextField(wrappingLabelWithString: "")
   private let serviceValue = NSTextField(wrappingLabelWithString: "")
   private let launchAtLoginValue = NSTextField(wrappingLabelWithString: "")
   private let socketValue = NSTextField(wrappingLabelWithString: "")
@@ -194,8 +195,12 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
     let socket = statusRow(
       label: text("Relay socket"), value: socketValue, identifier: "webkitui.status.socket",
       monospaced: true)
+    let sessions = statusRow(
+      label: text("Sessions"), value: sessionsValue, identifier: "webkitui.status.sessions")
+    sessionsValue.maximumNumberOfLines = 4
     let authorityCard = card(
-      title: text("Browser authority"), views: [service, launchAtLogin, license, socket])
+      title: text("Browser authority"),
+      views: [service, launchAtLogin, license, sessions, socket])
 
     goalValue.font = .systemFont(ofSize: 15, weight: .semibold)
     goalValue.textColor = .labelColor
@@ -575,6 +580,7 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
     socketValue.toolTip = socketPath
     socketValue.setAccessibilityValue(socketPath)
     refreshLaunchAtLoginStatus()
+    refreshSessions()
     refreshGoalDelegation()
     setStatusValue(licenseValue, text("Checking…"))
     let manager = WebKitUILicenseManager(
@@ -601,11 +607,32 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
     }
   }
 
+  private func refreshSessions() {
+    let summaries = maintenance?.sessionSummaries() ?? []
+    guard !summaries.isEmpty else {
+      setStatusValue(sessionsValue, text("No session open"))
+      return
+    }
+    let lines = summaries.map { summary in
+      [
+        summary.agentName,
+        summary.origin ?? text("No page"),
+        summary.personHasControl ? text("Person in control") : text("Agent in control"),
+      ].joined(separator: " · ")
+    }
+    setStatusValue(sessionsValue, lines.joined(separator: "\n"))
+  }
+
   private func refreshGoalDelegation() {
     Task { @MainActor [weak self] in
       guard let self else { return }
-      if let snapshot = await goalDelegationMonitor.snapshot() {
-        goalValue.stringValue = snapshot.goalDisplay
+      let snapshots = await goalDelegationMonitor.snapshots()
+      if let snapshot = snapshots.first {
+        goalValue.stringValue =
+          snapshots.count > 1
+          ? snapshot.goalDisplay + " · "
+            + String(format: text("%ld more active"), snapshots.count - 1)
+          : snapshot.goalDisplay
         let remaining = String(
           format: text("%ld navigations remaining"), snapshot.remainingNavigations)
         let expiry = RelativeDateTimeFormatter().localizedString(

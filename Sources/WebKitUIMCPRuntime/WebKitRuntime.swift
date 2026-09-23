@@ -944,6 +944,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// Real pop-ups, only while a person holds the window.
   let humanPopups = HumanPopupWindows()
   private var humanControlActivationObserver: (any NSObjectProtocol)?
+  private var tailnetGrantsObserver: (any NSObjectProtocol)?
+  private var installedTailnetRules: WKContentRuleList?
   /// The SiliconPass client behind the human control bar's fill button. Set by the
   /// production registry; nil hides the button, so no test or bare runtime shows it.
   public var humanCredentialFiller: (any CredentialBrokerFilling)?
@@ -1057,7 +1059,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       store.isPersistent
       ? (store.identifier?.uuidString ?? "default")
       : "ephemeral-\(ObjectIdentifier(store).hashValue)"
-    if let live = egressProxies[key]?.proxy { return live }
+    if let live = egressProxies[key]?.proxy {
+      // A second wrapper for the same named store must carry the setting too: were it
+      // kept per wrapper, a session on it would reach the network without the proxy.
+      store.proxyConfigurations = [live.proxyConfiguration()]
+      return live
+    }
     let proxy = try PinnedSOCKSProxy()
     store.proxyConfigurations = [proxy.proxyConfiguration()]
     egressProxies[key] = WeakEgressProxy(proxy: proxy)
@@ -1138,15 +1145,65 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     webView.uiDelegate = self
     _ = makeBrowserWindow()
     keepPageVisibleWhileParked()
+    tailnetGrantsObserver = NotificationCenter.default.addObserver(
+      forName: .webKitUITailnetGrantsChanged, object: nil, queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated {
+        guard let self else { return }
+        Task { @MainActor in await self.refreshTailnetRules() }
+      }
+    }
+    if TailnetOriginGrants.shared.grantCount > 0 {
+      Task { @MainActor [weak self] in await self?.refreshTailnetRules() }
+    }
     // Park now rather than on the first observation: a page loaded or navigated
     // before anything observed it ran with its window ordered out, hidden.
     ensureLayoutViewport()
+  }
+
+  /// Installs the content rule that keeps granted tailnet origins reachable only from
+  /// their own top-level page. Awaited by the server after a grant, before navigating.
+  public func refreshTailnetRules() async {
+    await installTailnetRules(for: TailnetOriginGrants.shared.origins())
+  }
+
+  func installTailnetRules(for origins: [(host: String, port: UInt16)]) async {
+    let controller = webView.configuration.userContentController
+    guard let json = TailnetOriginGrants.contentRuleJSON(for: origins) else {
+      if let installed = installedTailnetRules { controller.remove(installed) }
+      installedTailnetRules = nil
+      return
+    }
+    guard
+      let list = try? await WKContentRuleListStore.default().compileContentRuleList(
+        forIdentifier: "webkitui-tailnet-origins", encodedContentRuleList: json)
+    else { return }
+    if let installed = installedTailnetRules { controller.remove(installed) }
+    controller.add(list)
+    installedTailnetRules = list
+  }
+
+  /// getaddrinfo blocks its thread with no timeout of its own. Run on a dispatch queue,
+  /// not the cooperative pool, and give up after three seconds: an unanswered
+  /// precheck is skipped, and the pinned proxy still decides the connection.
+  private static func resolveOffPool(
+    _ host: String, tailnet: Bool = false
+  ) async -> Result<ResolvedPublicAddress, any Error>? {
+    let box = ResolutionBox()
+    DispatchQueue.global(qos: .userInitiated).async {
+      let policy = PublicNetworkAddressPolicy()
+      box.finish(Result { try tailnet ? policy.resolveTailnet(host) : policy.resolve(host) })
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { box.finish(nil) }
+    return await box.value()
   }
 
   /// An ordered-in window is retained by AppKit's window list, and it holds the web
   /// view: without this a closed session kept its view, its web process and its
   /// website data store alive for the life of the broker.
   isolated deinit {
+    tailnetGrantsObserver.map(NotificationCenter.default.removeObserver)
+    humanControlActivationObserver.map(NotificationCenter.default.removeObserver)
     humanPopups.closeAll()
     browserWindow?.orderOut(nil)
     browserWindow?.contentView = nil
@@ -1196,15 +1253,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       // NSURLErrorDomain -1000, which read like a malformed URL and invited retries
       // (Home Assistant over Tailscale, 2026-09-23). Resolve with the proxy's own
       // policy first and say what it is. The proxy still decides every connection.
-      let resolution = await Task.detached {
-        Result { try PublicNetworkAddressPolicy().resolve(host) }
-      }.value
+      let resolution = await Self.resolveOffPool(host)
       if case .failure(PublicNetworkAddressPolicyError.noPublicAddress) = resolution {
         let origin = navigationOrigin(for: url).map(Self.sanitizedOrigin) ?? "unavailable"
-        let port = UInt16(url.port ?? (url.scheme?.lowercased() == "http" ? 80 : 443))
-        let tailnet = await Task.detached {
-          (try? PublicNetworkAddressPolicy().resolveTailnet(host)) != nil
-        }.value
+        guard
+          let port = UInt16(exactly: url.port ?? (url.scheme?.lowercased() == "http" ? 80 : 443))
+        else { throw WebKitRuntimeError.networkBoundaryDenied }
+        let tailnet: Bool
+        if case .success = await Self.resolveOffPool(host, tailnet: true) {
+          tailnet = true
+        } else {
+          tailnet = false
+        }
         guard tailnet else { throw WebKitRuntimeError.privateNetworkDestination(origin: origin) }
         guard TailnetOriginGrants.shared.isGranted(host: host, port: port) else {
           throw WebKitRuntimeError.tailnetDestinationRequiresApproval(origin: origin)
@@ -1907,8 +1967,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     for (const element of document.querySelectorAll(
         '[aria-busy="true"], [role="progressbar"], body *')) {
       if (count >= 8) break;
-      const busy = element.getAttribute('aria-busy') === 'true'
-        || element.getAttribute('role') === 'progressbar';
+      // A determinate progress bar is a meter (quota, upload), not a loading region; a
+      // large container left aria-busy is not a placeholder either. Only an
+      // indeterminate bar or a small busy element counts.
+      const busy = (element.getAttribute('role') === 'progressbar'
+          && !element.hasAttribute('aria-valuenow'))
+        || (element.getAttribute('aria-busy') === 'true'
+          && (element.textContent || '').length <= 48);
       // textContent first: it costs nothing, and innerText lays the element out.
       const raw = busy || element.childElementCount > 2 ? '' : (element.textContent || '');
       const text = raw.length === 0 || raw.length > 48
@@ -2098,23 +2163,58 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       ("username", try username.asciiString(maximumBytes: 320)),
       ("password", try password.asciiString(maximumBytes: 1_024)),
     ]
-    for (field, value) in values {
-      guard
-        let json = try? await webView.callAsyncJavaScript(
-          Self.humanCredentialFocusSource,
-          arguments: ["token": pending.token, "field": field],
-          in: pending.frameInfo, contentWorld: instrumentationWorld) as? String,
-        let data = json.data(using: .utf8),
-        let focus = try? JSONDecoder().decode(RawHumanCredentialFocus.self, from: data)
-      else { throw WebKitRuntimeError.invalidCredentialBinding }
-      if focus.skip { continue }
-      guard focus.focused, window.makeFirstResponder(webView) else {
-        throw WebKitRuntimeError.invalidCredentialBinding
+    // The value is typed through AppKit into whatever holds focus when it lands. A
+    // fence in every frame of the document cancels any input that does not target the
+    // bound fields while the fill runs, so a page that moves focus between the check
+    // and the keystrokes gets nothing — the password cannot land in its field.
+    let frames = humanFillFenceFrames()
+    await setHumanFillFence(frames: frames, token: pending.token, active: true)
+    do {
+      for (field, value) in values {
+        guard controlState == .humanControlled, binding.documentID == documentID else {
+          throw WebKitRuntimeError.invalidCredentialBinding
+        }
+        guard
+          let json = try? await webView.callAsyncJavaScript(
+            Self.humanCredentialFocusSource,
+            arguments: ["token": pending.token, "field": field],
+            in: pending.frameInfo, contentWorld: instrumentationWorld) as? String,
+          let data = json.data(using: .utf8),
+          let focus = try? JSONDecoder().decode(RawHumanCredentialFocus.self, from: data)
+        else { throw WebKitRuntimeError.invalidCredentialBinding }
+        if focus.skip { continue }
+        guard focus.focused, window.makeFirstResponder(webView) else {
+          throw WebKitRuntimeError.invalidCredentialBinding
+        }
+        webView.insertText(value)
+        let landed =
+          (try? await webView.callAsyncJavaScript(
+            Self.humanCredentialLandedSource,
+            arguments: ["token": pending.token, "field": field, "length": value.count],
+            in: pending.frameInfo, contentWorld: instrumentationWorld) as? Bool) ?? false
+        guard landed else { throw WebKitRuntimeError.invalidCredentialBinding }
       }
-      webView.selectAll(nil)
-      webView.insertText(value)
+    } catch {
+      await setHumanFillFence(frames: frames, token: pending.token, active: false)
+      throw error
     }
+    await setHumanFillFence(frames: frames, token: pending.token, active: false)
     return CredentialSinkReceipt(status: .filled)
+  }
+
+  private func humanFillFenceFrames() -> [WKFrameInfo?] {
+    [nil]
+      + registeredFrameCapabilities
+      .filter { $0.documentID == documentID && !$0.isMainFrame }
+      .map { Optional($0.frameInfo) }
+  }
+
+  private func setHumanFillFence(frames: [WKFrameInfo?], token: String, active: Bool) async {
+    for frame in frames {
+      _ = try? await webView.callAsyncJavaScript(
+        Self.humanFillFenceSource, arguments: ["token": token, "active": active],
+        in: frame, contentWorld: instrumentationWorld)
+    }
   }
 
   @objc private func fillWithSiliconPass() {
@@ -2170,7 +2270,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           "SiliconPass fill was cancelled.", fallback: "SiliconPass fill was cancelled."),
         .secondaryLabelColor
       )
-    case .changed, .stale, .failed:
+    case .stale:
+      return (
+        localizedHandoff(
+          "The sign-in form changed before SiliconPass could fill it. Try again.",
+          fallback: "The sign-in form changed before SiliconPass could fill it. Try again."),
+        .systemOrange
+      )
+    case .changed, .failed:
       return (
         localizedHandoff(
           "SiliconPass is unavailable. Open and unlock SiliconPass, then try again.",
@@ -3278,6 +3385,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     _ userContentController: WKUserContentController,
     didReceive message: WKScriptMessage
   ) {
+    // A pop-up is built from this configuration and shares its user content controller,
+    // so its frames report here too. They are not this page's frames: registering them
+    // put sign-in pop-up origins in this page's registry and let them displace its own.
+    guard message.webView === webView else { return }
     if message.name == Self.frameRegistrationMessageHandlerName {
       registerFrameCapability(message.frameInfo)
       return
@@ -3377,6 +3488,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     )
   }
 
+  /// The current page's origin only, for status displays that must not show paths.
+  public func agentSafeCurrentOrigin() -> String? {
+    (webView.url ?? lastCommittedHTTPURL).flatMap { navigationOrigin(for: $0) }
+      .map(Self.sanitizedOrigin)
+  }
+
   public func agentSafeCurrentURL() -> String? {
     agentSafeURLString(webView.url ?? lastCommittedHTTPURL)
   }
@@ -3459,8 +3576,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   public func requestAgentResume() throws {
-    // Pop-ups are the person's; none outlives their turn.
-    defer { if controlState == .resumeRequested { humanPopups.closeAll() } }
+    // Pop-ups are the person's; none outlives their turn, nor does the observer that
+    // lowers their window once they bring the app forward.
+    defer {
+      if controlState == .resumeRequested {
+        humanPopups.closeAll()
+        humanControlActivationObserver.map(NotificationCenter.default.removeObserver)
+        humanControlActivationObserver = nil
+      }
+    }
     guard controlState == .humanControlled || controlState == .humanStepCompleted else {
       throw WebKitRuntimeError.invalidControlTransition
     }
@@ -3556,7 +3680,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     let baseTitle = Self.localizedHandoff(
       "WebkitUIMCP — Human control", fallback: "WebkitUIMCP — Human control")
-    window.title = humanControlRequester.map { "\(baseTitle) — \($0)" } ?? baseTitle
+    // The agent's own name for itself: quoted and labelled, so a client calling itself
+    // "SiliconPass — enter your password" cannot pass that off as the window's purpose.
+    window.title =
+      humanControlRequester.map { "\(baseTitle) — agent “\($0)” (self-reported)" } ?? baseTitle
     window.ignoresMouseEvents = false
     window.collectionBehavior.remove(.stationary)
     window.collectionBehavior.remove(.ignoresCycle)
@@ -4758,10 +4885,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
     // The arming script selected the old contents, but a rich-text editor restores
     // its own caret on the task after focus: Reddit's composer kept its draft and
-    // the new text was appended to it (2026-09-23). Select All is WebKit's own
-    // editing command, scoped to the focused editable and issued in the same turn as
-    // the insertion, so it is what the insertion replaces.
-    webView.selectAll(nil)
+    // the new text was appended to it (2026-09-23). Select again now, after that
+    // restore, and only if focus is still on the armed element: Select All would
+    // take a whole document editor, or another field the page moved focus to.
+    let reselected =
+      (try? await webView.callAsyncJavaScript(
+        Self.reselectFillTargetSource,
+        arguments: ["physicalIdentity": candidate.physicalIdentity],
+        in: frameContext?.frameInfo,
+        contentWorld: instrumentationWorld) as? Bool) ?? false
+    guard reselected else { throw WebKitRuntimeError.targetNotActionable }
     webView.insertText(value)
     let deadline = ContinuousClock.now + .seconds(1)
     while ContinuousClock.now < deadline {
@@ -5949,8 +6082,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return true;
     };
-    const sensitiveIdentifierTerm = /(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time)/i;
-    const sensitiveLabelTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time)(?:$|[^a-z0-9])/i;
+    const sensitiveIdentifierTerm = /(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_]?key|recovery[-_]?code|backup[-_]?code|private[-_]?key|seed[-_]?phrase)/i;
+    const sensitiveLabelTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_ ]?key|recovery[-_ ]?codes?|backup[-_ ]?codes?|private[-_ ]?key|seed[-_ ]?phrase)(?:$|[^a-z0-9])/i;
     const sensitiveAutocomplete = new Set([
       'current-password', 'new-password', 'one-time-code', 'webauthn',
       'cc-name', 'cc-given-name', 'cc-additional-name', 'cc-family-name',
@@ -6192,10 +6325,33 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return borrowedLabel(element);
     };
+    // innerText stops at a shadow host, so a custom element whose label is rendered in
+    // its own shadow root (Reddit's chat requests) observed with no name at all. Its
+    // shadow text, without style or script, stands in. Kept identical in the observation
+    // and the action helpers: the name recorded is the name re-resolved.
+    const shadowTextOf = (element, depth = 0) => {
+      const root = element.shadowRoot;
+      if (!root || depth > 2) return '';
+      const parts = [];
+      const walk = node => {
+        if (parts.join(' ').length > 200) return;
+        if (node.nodeType === Node.TEXT_NODE) { parts.push(node.data); return; }
+        if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
+          return;
+        }
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          if (['style', 'script', 'template'].includes(node.localName)) return;
+          if (node.shadowRoot) { parts.push(shadowTextOf(node, depth + 1)); return; }
+        }
+        node.childNodes.forEach(walk);
+      };
+      walk(root);
+      return collapse(parts.join(' ')).slice(0, 200);
+    };
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
       || collapse(element.getAttribute('placeholder'))
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
-      || collapse(element.innerText) || null;
+      || collapse(element.innerText) || shadowTextOf(element) || null;
     const directLabelledText = element => {
       const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
       if (!labelledBy) return null;
@@ -6774,10 +6930,33 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (isPointerControl(element)) return 'button';
       return null;
     };
+    // innerText stops at a shadow host, so a custom element whose label is rendered in
+    // its own shadow root (Reddit's chat requests) observed with no name at all. Its
+    // shadow text, without style or script, stands in. Kept identical in the observation
+    // and the action helpers: the name recorded is the name re-resolved.
+    const shadowTextOf = (element, depth = 0) => {
+      const root = element.shadowRoot;
+      if (!root || depth > 2) return '';
+      const parts = [];
+      const walk = node => {
+        if (parts.join(' ').length > 200) return;
+        if (node.nodeType === Node.TEXT_NODE) { parts.push(node.data); return; }
+        if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
+          return;
+        }
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          if (['style', 'script', 'template'].includes(node.localName)) return;
+          if (node.shadowRoot) { parts.push(shadowTextOf(node, depth + 1)); return; }
+        }
+        node.childNodes.forEach(walk);
+      };
+      walk(root);
+      return collapse(parts.join(' ')).slice(0, 200);
+    };
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
       || collapse(element.getAttribute('placeholder'))
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
-      || collapse(element.innerText) || null;
+      || collapse(element.innerText) || shadowTextOf(element) || null;
     let obscuredByAncestorOpacity = false;
     const isRendered = element => {
       const box = element.getBoundingClientRect();
@@ -6795,6 +6974,22 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // hides it. The two rules differed and a Material tab whose previous sibling is an
     // aria-hidden paginator was observed as unique, then refused as targetNotFound on
     // every retry with no mutation (Play Console, 2026-09-23).
+    // The observation's safeContextValue, less the bounding the comparison applies
+    // itself: a sensitive or opaque label is skipped the same way on both sides, or the
+    // observation records the next label while the action re-derives this one.
+    const anchorSensitiveTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_ ]?key|recovery[-_ ]?codes?|backup[-_ ]?codes?|private[-_ ]?key|seed[-_ ]?phrase)(?:$|[^a-z0-9])/i;
+    const anchorLooksOpaque = value => {
+      const text = String(value ?? '');
+      if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(text)) return true;
+      if (text.length < 32 || /\\s/.test(text)
+          || !/^[A-Za-z0-9._~+/=-]+$/.test(text)) return false;
+      return new Set(text).size >= 12;
+    };
+    const anchorSafeText = value => {
+      const text = collapse(value);
+      if (!text || anchorLooksOpaque(text) || anchorSensitiveTerm.test(text)) return null;
+      return text;
+    };
     const isAnchorRendered = element => {
       const box = element.getBoundingClientRect();
       if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
@@ -6993,9 +7188,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         if (candidate === element || candidate.contains(element) || !isAnchorRendered(candidate)) {
           continue;
         }
-        const text = collapse(
+        const text = anchorSafeText(
           candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
-        if (text && text !== collapse(nameOf(element))) return text;
+        if (text && text !== anchorSafeText(nameOf(element))) return text;
       }
       return null;
     };
@@ -7418,7 +7613,48 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         clientHeight: element.clientHeight
       });
     }
-    const bodyText = remaining > 0 ? take(document.body?.innerText || '') : '';
+    // WebKit's innerText stops at a shadow host: a chat panel built from web components
+    // (Reddit's) read as absent (2026-09-23). When the page has open shadow roots, read
+    // the flat tree instead — into shadow roots, through slots, skipping what is not
+    // rendered, breaking lines at blocks. Pages without shadow roots keep innerText.
+    // Closed shadow roots stay unreadable by design.
+    const hasOpenShadowRoot = Array.from(document.querySelectorAll('*'))
+      .some(element => element.shadowRoot);
+    const flatText = root => {
+      const parts = [];
+      const walk = node => {
+        if (node.nodeType === Node.TEXT_NODE) {
+          parts.push(node.data.replace(/\\s+/g, ' '));
+          return;
+        }
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const tag = node.localName;
+          if (['script', 'style', 'template', 'noscript', 'head'].includes(tag)) return;
+          if (tag === 'br') { parts.push('\\n'); return; }
+          const style = getComputedStyle(node);
+          if (style.display === 'none' || style.visibility === 'hidden'
+              || style.visibility === 'collapse') return;
+          const block = !style.display.startsWith('inline') && style.display !== 'contents';
+          if (block) parts.push('\\n');
+          if (node.shadowRoot) {
+            walk(node.shadowRoot);
+          } else if (tag === 'slot') {
+            const assigned = node.assignedNodes({ flatten: true });
+            (assigned.length ? assigned : Array.from(node.childNodes)).forEach(walk);
+          } else {
+            node.childNodes.forEach(walk);
+          }
+          if (block) parts.push('\\n');
+          return;
+        }
+        if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) node.childNodes.forEach(walk);
+      };
+      walk(root);
+      return parts.join('').split('\\n').map(line => line.trim()).filter(Boolean).join('\\n');
+    };
+    const bodySource = hasOpenShadowRoot && document.body
+      ? flatText(document.body) : (document.body?.innerText || '');
+    const bodyText = remaining > 0 ? take(bodySource) : '';
     const pageContentProbe = globalThis.__webkituiPageContentProbe?.() ?? {
       contentState: bodyText ? 'usable' : 'empty_or_unusable',
       renderedContentCount: bodyText ? 1 : 0
@@ -7750,7 +7986,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           selection.addRange(range);
         }
         const physicalIdentity = candidate.physicalIdentity;
-        element.addEventListener('input', event => {
+        // WebKit fires input on the editing host, so a block inside a document editor
+        // is heard at that host; anywhere else the element is its own host.
+        let inputTarget = element;
+        while (inputTarget.isContentEditable && inputTarget.parentElement?.isContentEditable) {
+          inputTarget = inputTarget.parentElement;
+        }
+        inputTarget.addEventListener('input', event => {
           globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
             token, physicalIdentity, eventType: event.type, trusted: event.isTrusted,
             frameCapabilityID: globalThis.__webkituiFrameCapabilityID ?? null
@@ -7782,9 +8024,36 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       && abs(lhs.height - rhs.height) <= tolerance
   }
 
-  /// Finds the one visible password field in this frame and the username field
-  /// before it, and keeps both in the isolated world under a per-request token. It
-  /// returns only whether a form was found and whether this frame has focus.
+  /// Re-selects the armed fill target's own contents, provided focus is still inside
+  /// it. Never the document: a descendant of a large editor selects only itself.
+  private static let reselectFillTargetSource = """
+    const element = globalThis.__webkituiState?.nodesByID?.get(physicalIdentity)?.deref();
+    if (!element || !element.isConnected) return false;
+    let active = document.activeElement;
+    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    // A block inside a document editor cannot hold focus itself; the editing host
+    // does. That host counts as here, and only the block's own contents get selected.
+    const focusedHere = active === element
+      || (element.isContentEditable && active
+        && (element.contains(active) || (active.isContentEditable && active.contains(element))));
+    if (!focusedHere) return false;
+    if (typeof element.select === 'function') { element.select(); return true; }
+    if (element.isContentEditable) {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      const selection = getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    }
+    return false;
+    """
+
+  /// Finds the one visible password field in this frame and, only on a clear signal,
+  /// the account field for it: autocomplete username or email, an email input, or a
+  /// user/email/login name or id, in the same form or the password's own container.
+  /// A text box elsewhere on the page — site search, say — is never taken for it; with
+  /// no clear account field the password is filled alone.
   private static let humanCredentialLocateSource = """
     const usable = (element, allowReadOnly) => {
       if (!(element instanceof HTMLInputElement) || !element.isConnected || element.disabled) {
@@ -7796,40 +8065,88 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       return box.width > 0 && box.height > 0 && style.visibility !== 'hidden'
         && style.display !== 'none' && Number(style.opacity) !== 0;
     };
+    const accountField = element => {
+      const autocomplete = (element.getAttribute('autocomplete') || '').toLowerCase();
+      const type = (element.getAttribute('type') || '').toLowerCase();
+      const identity = `${element.getAttribute('name') || ''} ${element.id || ''}`;
+      return autocomplete.split(/\\s+/).some(token => token === 'username' || token === 'email')
+        || type === 'email'
+        || /user|e-?mail|login|account|identifier/i.test(identity);
+    };
     const passwords = Array.from(document.querySelectorAll('input[type=password]'))
       .filter(element => usable(element, false));
     if (passwords.length !== 1) {
       return JSON.stringify({ found: false, focused: document.hasFocus() });
     }
     const password = passwords[0];
-    const scope = password.form || document;
-    const inputs = Array.from(scope.querySelectorAll('input'));
-    const username = inputs.slice(0, inputs.indexOf(password)).reverse().find(element =>
-      usable(element, true)
-      && (['text', 'email', 'tel', ''].includes((element.getAttribute('type') || '').toLowerCase())
-        || element.autocomplete === 'username'));
-    if (!username) return JSON.stringify({ found: false, focused: document.hasFocus() });
+    let scope = password.form;
+    if (!scope) {
+      scope = password.parentElement;
+      for (let depth = 0; depth < 4 && scope; depth += 1) {
+        if (Array.from(scope.querySelectorAll('input'))
+            .some(element => element !== password && accountField(element))) break;
+        scope = scope.parentElement;
+      }
+    }
+    const inputs = scope ? Array.from(scope.querySelectorAll('input')) : [];
+    const username = inputs.slice(0, Math.max(0, inputs.indexOf(password))).reverse()
+      .find(element => usable(element, true) && element.type !== 'password'
+        && accountField(element)) || null;
     globalThis.__webkituiHumanCredential = { token, username, password };
     return JSON.stringify({ found: true, focused: document.hasFocus() });
     """
 
-  /// Focuses one bound field for a native insertion. A read-only username, as on a
-  /// two-step sign-in that already shows the account, is skipped rather than typed.
+  /// Focuses and selects one bound field for a native insertion. A missing or read-only
+  /// account field is skipped; a password field that stopped being one is refused.
   private static let humanCredentialFocusSource = """
     const state = globalThis.__webkituiHumanCredential;
     if (!state || state.token !== token) return JSON.stringify({ focused: false, skip: false });
     const element = field === 'username' ? state.username : state.password;
+    if (field === 'username' && (!element || element.readOnly)) {
+      return JSON.stringify({ focused: false, skip: true });
+    }
     if (!(element instanceof HTMLInputElement) || !element.isConnected || element.disabled) {
       return JSON.stringify({ focused: false, skip: false });
-    }
-    if (field === 'username' && element.readOnly) {
-      return JSON.stringify({ focused: false, skip: true });
     }
     if (field === 'password' && element.type !== 'password') {
       return JSON.stringify({ focused: false, skip: false });
     }
     element.focus({ preventScroll: false });
+    element.select();
     return JSON.stringify({ focused: document.activeElement === element, skip: false });
+    """
+
+  /// Whether the typed value landed in the bound field, by length only: the value
+  /// itself is not handed back to the page's frame a second time.
+  private static let humanCredentialLandedSource = """
+    const state = globalThis.__webkituiHumanCredential;
+    if (!state || state.token !== token) return false;
+    const element = field === 'username' ? state.username : state.password;
+    return Boolean(element && element.isConnected && element.value.length === length
+      && (field !== 'password' || element.type === 'password'));
+    """
+
+  /// Cancels, in this frame, any input that does not target the bound fields while a
+  /// person's SiliconPass fill runs. Frames holding no bound field refuse all input.
+  private static let humanFillFenceSource = """
+    globalThis.__webkituiFillFence?.remove?.();
+    globalThis.__webkituiFillFence = null;
+    if (!active) return true;
+    const state = globalThis.__webkituiHumanCredential;
+    const bound = state && state.token === token
+      ? [state.username, state.password].filter(Boolean) : [];
+    const fence = event => {
+      const path = event.composedPath();
+      if (!bound.some(element => path.includes(element))) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    };
+    document.addEventListener('beforeinput', fence, true);
+    globalThis.__webkituiFillFence = {
+      remove: () => document.removeEventListener('beforeinput', fence, true)
+    };
+    return true;
     """
 
   private static let credentialFillSource = """
@@ -8133,4 +8450,35 @@ private struct NativeGestureReceipt {
 private struct ArmedNativeGestureContext {
   let frameCapabilityID: String?
   let frameOrigin: String?
+}
+
+/// Delivers the first of a resolution or its timeout, once.
+private final class ResolutionBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var done = false
+  private var result: Result<ResolvedPublicAddress, any Error>?
+  private var waiter: CheckedContinuation<Result<ResolvedPublicAddress, any Error>?, Never>?
+
+  func finish(_ value: Result<ResolvedPublicAddress, any Error>?) {
+    let resume: CheckedContinuation<Result<ResolvedPublicAddress, any Error>?, Never>? =
+      lock.withLock {
+        guard !done else { return nil }
+        done = true
+        result = value
+        defer { waiter = nil }
+        return waiter
+      }
+    resume?.resume(returning: value)
+  }
+
+  func value() async -> Result<ResolvedPublicAddress, any Error>? {
+    await withCheckedContinuation { continuation in
+      let ready: (Bool, Result<ResolvedPublicAddress, any Error>?) = lock.withLock {
+        if done { return (true, result) }
+        waiter = continuation
+        return (false, nil)
+      }
+      if ready.0 { continuation.resume(returning: ready.1) }
+    }
+  }
 }

@@ -190,3 +190,12 @@
 "SiliconPass fill was cancelled." = "SiliconPass fill was cancelled.";
 "SiliconPass is unavailable. Open and unlock SiliconPass, then try again." = "SiliconPass is unavailable. Open and unlock SiliconPass, then try again.";
 "No sign-in form with a password field is visible." = "No sign-in form with a password field is visible.";
+
+/* Status window: sessions */
+"Sessions" = "Sessions";
+"No session open" = "No session open";
+"No page" = "No page";
+"Person in control" = "Person in control";
+"Agent in control" = "Agent in control";
+"%ld more active" = "%ld more active";
+"The sign-in form changed before SiliconPass could fill it. Try again." = "The sign-in form changed before SiliconPass could fill it. Try again.";

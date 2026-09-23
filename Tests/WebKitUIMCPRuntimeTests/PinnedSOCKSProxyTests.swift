@@ -166,6 +166,43 @@ struct PinnedSOCKSProxyTests {
     #expect(try await request("nas.example.ts.net", destination.port) == Data([2]))
   }
 
+  @Test("A granted tailnet origin answers its own pages, never another site's")
+  @MainActor
+  func tailnetOriginIsReachableOnlyFromItself() async throws {
+    // Stand-in for the tailnet service, and a foreign page that would reach into it.
+    let service = try FormFixtureServer { request in
+      FormFixtureServer.response(
+        body: request.hasPrefix("GET /data")
+          ? "secret-state"
+          : "<script>fetch('/data').then(r => r.text())"
+            + ".then(t => document.title = 'reached:' + t, () => document.title = 'blocked')"
+            + "</script>")
+    }
+    let foreign = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: "<script>fetch('http://127.0.0.1:\(service.port)/data', {mode: 'no-cors'})"
+          + ".then(() => document.title = 'reached', () => document.title = 'blocked')"
+          + "</script>")
+    }
+    let runtime = WebKitRuntime()
+    await runtime.installTailnetRules(for: [(host: "127.0.0.1", port: service.port)])
+    func title(after url: String) async throws -> String? {
+      _ = try await runtime.navigate(
+        to: URL(string: url)!, timeout: .seconds(15), quietWindow: .milliseconds(40))
+      for _ in 0..<100 {
+        if let title = try await runtime.webView.evaluateJavaScript("document.title") as? String,
+          !title.isEmpty
+        {
+          return title
+        }
+        try await Task.sleep(for: .milliseconds(20))
+      }
+      return nil
+    }
+    #expect(try await title(after: "http://localhost:\(foreign.port)/") == "blocked")
+    #expect(try await title(after: "http://127.0.0.1:\(service.port)/") == "reached:secret-state")
+  }
+
   @Test("Only 100.64.0.0/10 counts as a tailnet address")
   func tailnetRange() {
     #expect(PublicNetworkAddressPolicy.isTailnetIPv4(0x6440_0001))  // 100.64.0.1

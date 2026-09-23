@@ -38,7 +38,11 @@ struct WebKitUIMCPRelay {
             }
           }
         }
-        guard let liveDescriptor = descriptor else { break }
+        guard let liveDescriptor = descriptor else {
+          // A failed replay leaves the second attempt to reconnect, as a failed write does.
+          if attempt == 0 { continue }
+          break
+        }
         do {
           try writeAll(request, to: liveDescriptor)
           dispatched = true

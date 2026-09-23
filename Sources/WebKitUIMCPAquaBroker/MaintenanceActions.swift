@@ -11,5 +11,14 @@ struct WebKitUIMaintenanceActions {
   /// Reports what actually happened. The previous signature could not say that it had
   /// done nothing, which is exactly what it did whenever another process held the lease.
   /// Asynchronous because eviction waits out a grace period the main thread must not.
+  /// One line per open session, for the Status window. Origins only, never paths.
+  let sessionSummaries: () -> [WebKitUISessionSummary]
   let releaseHostLease: (@escaping @MainActor @Sendable (HostLeaseEviction.Outcome) -> Void) -> Void
+}
+
+/// What the Status window may say about a session: who drives it and where, never what.
+struct WebKitUISessionSummary: Equatable {
+  let agentName: String
+  let origin: String?
+  let personHasControl: Bool
 }

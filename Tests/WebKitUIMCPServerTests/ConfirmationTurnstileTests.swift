@@ -68,4 +68,31 @@ struct ConfirmationTurnstileTests {
     #expect(results.1 == .cancelled)
     #expect(ConfirmationTurnstile.shared.queuedCount == 0)
   }
+
+  @Test("A confirmation that waits past its limit times out without ever being shown")
+  func queuedConfirmationTimesOut() async throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("webkitui-turnstile-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let slow = directory.appendingPathComponent("slow")
+    try Data("#!/bin/sh\n/bin/cat >/dev/null\n/bin/sleep 1\n".utf8).write(to: slow)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: slow.path)
+    let shown = directory.appendingPathComponent("shown")
+    let marker = directory.appendingPathComponent("marker")
+    try Data("#!/bin/sh\n/bin/cat >/dev/null\ntouch '\(shown.path)'\n".utf8).write(to: marker)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: marker.path)
+    let holder = NativeBrowserConfirmationPresenter(
+      helperURL: slow, helperVerification: { _ in true }, runningHelperVerification: { _ in true })
+    let late = NativeBrowserConfirmationPresenter(
+      helperURL: marker, helperVerification: { _ in true },
+      runningHelperVerification: { _ in true }, turnWaitLimit: .milliseconds(200))
+    async let held = holder.confirm(title: "A", message: "A", approveLabel: "Go")
+    try await Task.sleep(for: .milliseconds(100))
+    let waited = await late.confirm(title: "B", message: "B", approveLabel: "Go")
+    #expect(waited == .timedOut)
+    #expect(await held == .approved)
+    #expect(!FileManager.default.fileExists(atPath: shown.path))
+    #expect(ConfirmationTurnstile.shared.queuedCount == 0)
+  }
 }

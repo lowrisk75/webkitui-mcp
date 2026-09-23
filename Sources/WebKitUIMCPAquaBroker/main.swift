@@ -168,6 +168,20 @@ struct WebKitUIMCPAquaBroker {
           else { return }
           Task { @MainActor in await runtime.clearBrowsingData() }
         },
+        sessionSummaries: { [weak registry] in
+          guard let registry else { return [] }
+          return registry.openSessionHandles().compactMap { handle in
+            guard let runtime = try? registry.runtime(for: handle) else { return nil }
+            let owner = (try? registry.sessionOwner(for: handle)) ?? nil
+            let state = runtime.interactionControlState()
+            return WebKitUISessionSummary(
+              agentName: owner.map { WebKitMCPServer.displayClientName($0.clientName) }
+                ?? "—",
+              origin: runtime.agentSafeCurrentOrigin(),
+              personHasControl: state == .humanControlled || state == .humanStepCompleted
+                || state == .handoffRequested)
+          }
+        },
         releaseHostLease: { [weak registry] report in
           // Sessions this host owns first, so a lease held by the host itself goes away.
           if let registry {

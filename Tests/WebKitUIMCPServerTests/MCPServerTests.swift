@@ -1989,6 +1989,22 @@ struct MCPServerTests {
     #expect(try object(replay["error"])["code"] == .int(-32602))
   }
 
+  @Test("A navigation to a port above 65535 is refused, not a crash")
+  func outOfRangePortIsRefused() async throws {
+    let registry = try WebKitSessionRegistry()
+    let server = WebKitMCPServer(registry: registry, presentHumanWindows: false)
+    let opened = try await toolCall(
+      server, id: 1, name: "browser_session", arguments: ["operation": .string("open")])
+    let session = try object(try object(opened["result"])["structuredContent"])["session_id"]
+    let navigated = try await toolCall(
+      server, id: 2, name: "browser_navigate",
+      arguments: [
+        "session_id": try #require(session),
+        "url": .string("https://ha.example.ts.net:70000/"),
+      ])
+    #expect(try object(navigated["error"])["code"] == .int(-32602))
+  }
+
   @Test("A handle whose session is gone gets session_expired, not an internal error")
   func vanishedSessionIsTyped() async throws {
     let registry = try WebKitSessionRegistry()

@@ -4697,6 +4697,55 @@ struct WebKitRuntimeTests {
     }
   }
 
+  @Test("The SiliconPass fill never takes a site search box for the account field")
+  func humanFillSkipsUnrelatedTextField() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <header><input id="search" type="text" placeholder="Search"></header>
+      <main><div><input id="pw" type="password"></div></main>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/signin"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    let binding = try await runtime.humanCredentialFormBinding()
+    _ = try await HumanFillFake().fillForHuman(binding: binding, runtime: runtime)
+    let state =
+      try await runtime.webView.evaluateJavaScript(
+        "document.getElementById('search').value + '|' + document.getElementById('pw').value.length"
+      ) as? String
+    #expect(state == "|12")
+  }
+
+  @Test("The SiliconPass fill refuses to type where the page moves focus")
+  func humanFillFenceBlocksStolenFocus() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <form><input id="user" type="email" autocomplete="username">
+      <input id="pw" type="password"></form>
+      <input id="decoy" type="text">
+      <script>
+        // After the focus check has answered: only the fence stands in the way.
+        document.getElementById('pw').addEventListener('focus', () =>
+          setTimeout(() => document.getElementById('decoy').focus(), 0));
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/signin"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    let binding = try await runtime.humanCredentialFormBinding()
+    // Whether the timer beats the keystrokes varies; either the password lands in its
+    // own field, or the fence refuses it and the fill fails. Never in the decoy.
+    _ = try? await HumanFillFake().fillForHuman(binding: binding, runtime: runtime)
+    let decoy =
+      try await runtime.webView.evaluateJavaScript(
+        "document.getElementById('decoy').value") as? String
+    #expect(decoy == "")
+  }
+
   @Test("AppKit fill persists in an Apple-style searchable App ID selector")
   func nativeCustomSelectorFillActuation() async throws {
     let runtime = WebKitRuntime()

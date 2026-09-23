@@ -1094,6 +1094,7 @@ public final class WebKitMCPServer {
         || runtime.interactionControlState() == .freshlyReobserved
     {
       try runtime.requestHumanHandoff()
+      runtime.humanControlRequester = Self.displayClientName(clientName)
       try runtime.beginHumanControl(presentWindow: presentHumanWindows)
     }
     return try structuredToolError(
@@ -1319,10 +1320,6 @@ public final class WebKitMCPServer {
         try await Task.sleep(for: .milliseconds(250))
         controlAvailable = try registry.claimSessionOwnership(
           for: handle, owner: clientAuthorityID, holder: clientHolder(policy: executionPolicy))
-      }
-      if controlAvailable {
-        try registry.runtime(for: handle).humanControlRequester =
-          Self.displayClientName(clientName)
       }
       sessionBackends[handle] = "native_webkit"
       coordinators[handle] = WebKitTransactionCoordinator(
@@ -1833,7 +1830,7 @@ public final class WebKitMCPServer {
       title: title, message: shown, approveLabel: approveLabel)
   }
 
-  nonisolated static func displayClientName(_ raw: String) -> String {
+  public nonisolated static func displayClientName(_ raw: String) -> String {
     let cleaned = raw.unicodeScalars
       .filter {
         !CharacterSet.controlCharacters.contains($0) && !CharacterSet.newlines.contains($0)
@@ -2341,6 +2338,7 @@ public final class WebKitMCPServer {
         ) == .approved
       if accepted {
         try runtime.requestHumanHandoff()
+        runtime.humanControlRequester = Self.displayClientName(clientName)
         try runtime.beginHumanControl(presentWindow: presentHumanWindows)
       }
       return try toolResult(
@@ -2456,6 +2454,10 @@ public final class WebKitMCPServer {
       throw MCPServerError.invalidParams(
         "url must be absolute HTTP(S) without embedded credentials")
     }
+    // URL parses any integer port; one above 65535 would trap where it becomes UInt16.
+    if let port = url.port, UInt16(exactly: port) == nil || port == 0 {
+      throw MCPServerError.invalidParams("url port must be between 1 and 65535")
+    }
     let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
     var ipv4Address = in_addr()
     let isIPv4Literal = inet_aton(host, &ipv4Address) != 0
@@ -2503,6 +2505,7 @@ public final class WebKitMCPServer {
       switch runtime.interactionControlState() {
       case .agentControlled, .freshlyReobserved:
         try runtime.requestHumanHandoff()
+        runtime.humanControlRequester = Self.displayClientName(clientName)
         try runtime.beginHumanControl(presentWindow: presentHumanWindows)
         return try toolResult(
           structured: .object([
@@ -2575,6 +2578,7 @@ public final class WebKitMCPServer {
     case .agentControlled, .freshlyReobserved:
       try runtime.requestHumanHandoff()
       do {
+        runtime.humanControlRequester = Self.displayClientName(clientName)
         try runtime.beginHumanControl(presentWindow: presentHumanWindows)
       } catch WebKitRuntimeError.handoffSurfaceUnavailable {
         // Symmetric to a confirmation that was never presented: never delegate a step
@@ -2652,6 +2656,7 @@ public final class WebKitMCPServer {
     case .agentControlled, .freshlyReobserved:
       try runtime.requestHumanHandoff()
       do {
+        runtime.humanControlRequester = Self.displayClientName(clientName)
         try runtime.beginHumanControl(presentWindow: presentHumanWindows)
       } catch WebKitRuntimeError.handoffSurfaceUnavailable {
         // Symmetric to a confirmation that was never presented: never delegate a step
@@ -3288,6 +3293,7 @@ public final class WebKitMCPServer {
           || runtime.interactionControlState() == .freshlyReobserved
         {
           try runtime.requestHumanHandoff()
+          runtime.humanControlRequester = Self.displayClientName(clientName)
           try runtime.beginHumanControl(presentWindow: presentHumanWindows)
         }
         return try toolResult(
@@ -3314,15 +3320,19 @@ public final class WebKitMCPServer {
       return try toolResult(structured: .object(structured), modern: modern)
     } catch WebKitRuntimeError.tailnetDestinationRequiresApproval(let tailnetOrigin) {
       await capabilityAuthority.revoke(capability)
-      let port = UInt16(pending.url.port ?? (scheme.lowercased() == "http" ? 80 : 443))
+      guard
+        let port = UInt16(exactly: pending.url.port ?? (scheme.lowercased() == "http" ? 80 : 443))
+      else { throw MCPServerError.invalidParams("url port must be between 1 and 65535") }
       let approved =
         try await rateLimitedConfirmation(
           session: pending.session,
           title: "Allow Tailscale Access",
           message:
             "\(tailnetOrigin) is on your private Tailscale network (100.64.0.0/10).\n\n"
-            + "Allow WebKitUI to connect to this exact origin until the app quits? Every other "
-            + "private address, and this name on any other port, stays blocked.",
+            + "Allow WebKitUI to connect to this exact origin until the app quits? It applies "
+            + "to every agent using WebKitUI, but only from that origin's own pages: other "
+            + "sites cannot reach it. Every other private address, and this name on any "
+            + "other port, stays blocked.",
           approveLabel: "Allow This Origin"
         ) == .approved
       guard approved else {
@@ -3332,6 +3342,10 @@ public final class WebKitMCPServer {
           modern: modern)
       }
       TailnetOriginGrants.shared.grant(host: host, port: port)
+      // Every open session carries the rule before anything can use the grant.
+      for handle in registry.openSessionHandles() {
+        await (try? registry.runtime(for: handle))?.refreshTailnetRules()
+      }
       return try await executeNavigation(pending, runtime: runtime, modern: modern)
     } catch WebKitRuntimeError.crossOriginRedirectRequiresHuman(
       let fromOrigin,
@@ -3375,6 +3389,7 @@ public final class WebKitMCPServer {
             || runtime.interactionControlState() == .freshlyReobserved
           {
             try runtime.requestHumanHandoff()
+            runtime.humanControlRequester = Self.displayClientName(clientName)
             try runtime.beginHumanControl(presentWindow: presentHumanWindows)
           }
           return try toolResult(

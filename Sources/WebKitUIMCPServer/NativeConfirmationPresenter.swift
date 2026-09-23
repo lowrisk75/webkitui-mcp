@@ -67,6 +67,7 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   private var activeProcess: Process?
   private var cancellationRequested = false
   private var waitingForTurn = false
+  private let turnWaitLimit: Duration
 
   var state: NativeConfirmationState {
     activeProcess == nil && !waitingForTurn ? .idle : .pending
@@ -76,8 +77,10 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     helperURL: URL? = nil,
     helperVerification: ((URL) -> Bool)? = nil,
     runningHelperVerification: ((pid_t) -> Bool)? = nil,
-    timeout: Duration = .seconds(60)
+    timeout: Duration = .seconds(60),
+    turnWaitLimit: Duration = .seconds(90)
   ) {
+    self.turnWaitLimit = turnWaitLimit
     self.helperURL = helperURL ?? Self.defaultHelperURL()
     self.helperVerification = helperVerification ?? Self.verifyPackagedHelper
     self.runningHelperVerification = runningHelperVerification
@@ -94,8 +97,12 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     // against the panel's own timeout, and a cancel asked for while waiting holds.
     waitingForTurn = true
     cancellationRequested = false
-    await ConfirmationTurnstile.shared.acquire()
+    // Bounded: a client waiting behind others is frozen on its relay, and past this its
+    // own call has usually given up. Showing the panel then would let a person approve
+    // a request nobody is waiting for any more.
+    let acquired = await ConfirmationTurnstile.shared.acquire(timeout: turnWaitLimit)
     waitingForTurn = false
+    guard acquired else { return .timedOut }
     defer { ConfirmationTurnstile.shared.release() }
     if cancellationRequested {
       cancellationRequested = false
@@ -348,16 +355,26 @@ final class ConfirmationTurnstile {
   static let shared = ConfirmationTurnstile()
 
   private var busy = false
-  private var waiters: [CheckedContinuation<Void, Never>] = []
+  private var waiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
 
   var queuedCount: Int { waiters.count }
 
-  func acquire() async {
+  /// True once it is this caller's turn; false if the wait ran past `timeout`, in which
+  /// case the caller holds nothing and must not release.
+  func acquire(timeout: Duration) async -> Bool {
     guard busy else {
       busy = true
-      return
+      return true
     }
-    await withCheckedContinuation { waiters.append($0) }
+    let id = UUID()
+    Task { @MainActor [weak self] in
+      try? await Task.sleep(for: timeout)
+      guard let self, let index = self.waiters.firstIndex(where: { $0.id == id }) else {
+        return
+      }
+      self.waiters.remove(at: index).continuation.resume(returning: false)
+    }
+    return await withCheckedContinuation { waiters.append((id, $0)) }
   }
 
   func release() {
@@ -365,6 +382,6 @@ final class ConfirmationTurnstile {
       busy = false
       return
     }
-    waiters.removeFirst().resume()
+    waiters.removeFirst().continuation.resume(returning: true)
   }
 }

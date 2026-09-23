@@ -190,3 +190,12 @@
 "SiliconPass fill was cancelled." = "Remplissage SiliconPass annulé.";
 "SiliconPass is unavailable. Open and unlock SiliconPass, then try again." = "SiliconPass est indisponible. Ouvrez et déverrouillez SiliconPass, puis réessayez.";
 "No sign-in form with a password field is visible." = "Aucun formulaire de connexion avec un champ mot de passe n’est visible.";
+
+/* Status window: sessions */
+"Sessions" = "Sessions";
+"No session open" = "Aucune session ouverte";
+"No page" = "Aucune page";
+"Person in control" = "Contrôle humain";
+"Agent in control" = "Contrôle agent";
+"%ld more active" = "%ld autre(s) active(s)";
+"The sign-in form changed before SiliconPass could fill it. Try again." = "Le formulaire a changé avant que SiliconPass ne le remplisse. Réessayez.";
