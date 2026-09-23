@@ -927,6 +927,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var browserWindow: NSWindow?
   private weak var humanControlInstruction: NSTextField?
   private weak var humanControlCompletionButton: NSButton?
+  private weak var humanCredentialButton: NSButton?
+  /// The SiliconPass client behind the human control bar's fill button. Set by the
+  /// production registry; nil hides the button, so no test or bare runtime shows it.
+  public var humanCredentialFiller: (any CredentialBrokerFilling)?
+  /// The one form the person asked to fill, in the frame that holds it. Cleared
+  /// when the fill completes, fails, or control changes hands.
+  private var pendingHumanCredentialFill:
+    (binding: CredentialSinkFormBinding, frameInfo: WKFrameInfo?, token: String)?
   private var topLevelOriginLock: SecurityOrigin?
   private let formAuditKey = SymmetricKey(size: .bits256)
   private var formSubmissionEvents: [FormSubmissionAuditEvent] = []
@@ -1901,6 +1909,173 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         physicalElementIdentity: password.physicalIdentity
       )
     )
+  }
+
+  /// Binds the sign-in form a person is looking at, for a fill they asked for from
+  /// the human control bar. Unlike `credentialFormBinding`, this needs no agent
+  /// observation: it runs only while a person holds the window, and it may bind a
+  /// restricted authentication frame such as idmsa.apple.com, because the values go
+  /// from SiliconPass into that frame and never to the agent.
+  public func humanCredentialFormBinding() async throws -> CredentialSinkFormBinding {
+    pendingHumanCredentialFill = nil
+    guard controlState == .humanControlled, !processTerminated else {
+      throw WebKitRuntimeError.invalidCredentialBinding
+    }
+    let token = UUID().uuidString
+    var frames: [(WKFrameInfo?, String)] = [(nil, "main")]
+    for capability in registeredFrameCapabilities
+    where capability.documentID == documentID && !capability.isMainFrame {
+      frames.append((capability.frameInfo, capability.capabilityID))
+    }
+    var found: [(frameInfo: WKFrameInfo?, focused: Bool)] = []
+    for (frameInfo, _) in frames {
+      guard
+        let json = try? await webView.callAsyncJavaScript(
+          Self.humanCredentialLocateSource, arguments: ["token": token],
+          in: frameInfo, contentWorld: instrumentationWorld) as? String,
+        let data = json.data(using: .utf8),
+        let result = try? JSONDecoder().decode(RawHumanCredentialLocation.self, from: data),
+        result.found
+      else { continue }
+      found.append((frameInfo, result.focused))
+    }
+    // The frame the person is typing in wins; otherwise the form must be unique.
+    let focused = found.filter(\.focused)
+    guard let chosen = focused.count == 1 ? focused.first : (found.count == 1 ? found.first : nil)
+    else { throw WebKitRuntimeError.invalidCredentialBinding }
+    // A child frame is bound to its own origin: idmsa.apple.com, not the page
+    // that embeds it. SiliconPass matches the saved sign-in by that exact host.
+    let securityOrigin = chosen.frameInfo?.securityOrigin
+    let origin: CredentialSinkOrigin
+    if let securityOrigin {
+      guard securityOrigin.protocol == "https" else {
+        throw WebKitRuntimeError.invalidCredentialOrigin
+      }
+      origin = try CredentialSinkOrigin(
+        scheme: securityOrigin.protocol, asciiHost: securityOrigin.host,
+        effectivePort: securityOrigin.port == 0 ? 443 : securityOrigin.port)
+    } else {
+      guard let url = webView.url, url.scheme == "https" else {
+        throw WebKitRuntimeError.invalidCredentialOrigin
+      }
+      origin = try CredentialSinkOrigin(url: url)
+    }
+    let binding = CredentialSinkFormBinding(
+      origin: origin,
+      documentID: documentID,
+      observationID: "human-\(token)",
+      observationGeneration: frameRegistrationGeneration,
+      usernameTarget: CredentialSinkElementBinding(
+        elementID: "human-username", physicalElementIdentity: "human-username-\(token)"),
+      passwordTarget: CredentialSinkElementBinding(
+        elementID: "human-password", physicalElementIdentity: "human-password-\(token)"))
+    pendingHumanCredentialFill = (binding, chosen.frameInfo, token)
+    return binding
+  }
+
+  /// Private sink for a fill the person asked for. It types into the two fields
+  /// through AppKit, as a person or Safari's AutoFill would, so the page sees real
+  /// input events and enables its sign-in button. It never submits the form.
+  public func performHumanCredentialFill(
+    binding: CredentialSinkFormBinding,
+    username: CredentialSecretBuffer,
+    password: CredentialSecretBuffer
+  ) async throws -> CredentialSinkReceipt {
+    defer {
+      username.wipe()
+      password.wipe()
+      pendingHumanCredentialFill = nil
+    }
+    guard controlState == .humanControlled, !processTerminated,
+      let pending = pendingHumanCredentialFill,
+      pending.binding == binding,
+      binding.documentID == documentID,
+      let window = webView.window
+    else { throw WebKitRuntimeError.invalidCredentialBinding }
+    let values = [
+      ("username", try username.asciiString(maximumBytes: 320)),
+      ("password", try password.asciiString(maximumBytes: 1_024)),
+    ]
+    for (field, value) in values {
+      guard
+        let json = try? await webView.callAsyncJavaScript(
+          Self.humanCredentialFocusSource,
+          arguments: ["token": pending.token, "field": field],
+          in: pending.frameInfo, contentWorld: instrumentationWorld) as? String,
+        let data = json.data(using: .utf8),
+        let focus = try? JSONDecoder().decode(RawHumanCredentialFocus.self, from: data)
+      else { throw WebKitRuntimeError.invalidCredentialBinding }
+      if focus.skip { continue }
+      guard focus.focused, window.makeFirstResponder(webView) else {
+        throw WebKitRuntimeError.invalidCredentialBinding
+      }
+      webView.selectAll(nil)
+      webView.insertText(value)
+    }
+    return CredentialSinkReceipt(status: .filled)
+  }
+
+  @objc private func fillWithSiliconPass() {
+    guard let filler = humanCredentialFiller else { return }
+    humanCredentialButton?.isEnabled = false
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer { self.humanCredentialButton?.isEnabled = true }
+      let message: String
+      let color: NSColor
+      do {
+        let binding = try await self.humanCredentialFormBinding()
+        let status = try await filler.fillForHuman(binding: binding, runtime: self).status
+        (message, color) = Self.humanCredentialStatusText(status)
+      } catch WebKitRuntimeError.invalidCredentialBinding {
+        message = Self.localizedHandoff(
+          "No sign-in form with a password field is visible.",
+          fallback: "No sign-in form with a password field is visible.")
+        color = .systemOrange
+      } catch {
+        (message, color) = Self.humanCredentialStatusText(.failed)
+      }
+      self.pendingHumanCredentialFill = nil
+      self.humanControlInstruction?.stringValue = message
+      self.humanControlInstruction?.textColor = color
+      if let instruction = self.humanControlInstruction {
+        NSAccessibility.post(element: instruction, notification: .valueChanged)
+      }
+    }
+  }
+
+  private static func humanCredentialStatusText(
+    _ status: CredentialBrokerWireStatus
+  ) -> (String, NSColor) {
+    switch status {
+    case .filled:
+      return (
+        localizedHandoff(
+          "Filled by SiliconPass. Check the fields, then sign in.",
+          fallback: "Filled by SiliconPass. Check the fields, then sign in."),
+        .systemGreen
+      )
+    case .credentialNotFound:
+      return (
+        localizedHandoff(
+          "SiliconPass has no saved sign-in for this site.",
+          fallback: "SiliconPass has no saved sign-in for this site."),
+        .systemOrange
+      )
+    case .cancelled, .denied, .userPresenceUnavailable:
+      return (
+        localizedHandoff(
+          "SiliconPass fill was cancelled.", fallback: "SiliconPass fill was cancelled."),
+        .secondaryLabelColor
+      )
+    case .changed, .stale, .failed:
+      return (
+        localizedHandoff(
+          "SiliconPass is unavailable. Open and unlock SiliconPass, then try again.",
+          fallback: "SiliconPass is unavailable. Open and unlock SiliconPass, then try again."),
+        .systemRed
+      )
+    }
   }
 
   /// Captures exactly three password fields for an assisted rotation. This is
@@ -3361,7 +3536,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "Marks the private step complete so the requesting agent can resume this session.",
         fallback:
           "Marks the private step complete so the requesting agent can resume this session."))
-    let controls = NSStackView(views: [instruction, done])
+    var controlViews: [NSView] = [instruction]
+    if humanCredentialFiller != nil {
+      let fill = NSButton(
+        title: Self.localizedHandoff(
+          "Fill with SiliconPass", fallback: "Fill with SiliconPass"),
+        target: self,
+        action: #selector(fillWithSiliconPass))
+      fill.bezelStyle = .rounded
+      fill.image = NSImage(systemSymbolName: "key.fill", accessibilityDescription: nil)
+      fill.imagePosition = .imageLeading
+      fill.setAccessibilityIdentifier("webkitui.handoff.siliconpass")
+      fill.setAccessibilityHelp(
+        Self.localizedHandoff(
+          "Asks SiliconPass to fill the visible sign-in form. The agent never sees the values, and nothing is submitted.",
+          fallback:
+            "Asks SiliconPass to fill the visible sign-in form. The agent never sees the values, and nothing is submitted."
+        ))
+      humanCredentialButton = fill
+      controlViews.append(fill)
+    }
+    controlViews.append(done)
+    let controls = NSStackView(views: controlViews)
     controls.orientation = .horizontal
     controls.alignment = .centerY
     controls.distribution = .fill
@@ -7408,6 +7604,56 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       && abs(lhs.height - rhs.height) <= tolerance
   }
 
+  /// Finds the one visible password field in this frame and the username field
+  /// before it, and keeps both in the isolated world under a per-request token. It
+  /// returns only whether a form was found and whether this frame has focus.
+  private static let humanCredentialLocateSource = """
+    const usable = (element, allowReadOnly) => {
+      if (!(element instanceof HTMLInputElement) || !element.isConnected || element.disabled) {
+        return false;
+      }
+      if (!allowReadOnly && element.readOnly) return false;
+      const box = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return box.width > 0 && box.height > 0 && style.visibility !== 'hidden'
+        && style.display !== 'none' && Number(style.opacity) !== 0;
+    };
+    const passwords = Array.from(document.querySelectorAll('input[type=password]'))
+      .filter(element => usable(element, false));
+    if (passwords.length !== 1) {
+      return JSON.stringify({ found: false, focused: document.hasFocus() });
+    }
+    const password = passwords[0];
+    const scope = password.form || document;
+    const inputs = Array.from(scope.querySelectorAll('input'));
+    const username = inputs.slice(0, inputs.indexOf(password)).reverse().find(element =>
+      usable(element, true)
+      && (['text', 'email', 'tel', ''].includes((element.getAttribute('type') || '').toLowerCase())
+        || element.autocomplete === 'username'));
+    if (!username) return JSON.stringify({ found: false, focused: document.hasFocus() });
+    globalThis.__webkituiHumanCredential = { token, username, password };
+    return JSON.stringify({ found: true, focused: document.hasFocus() });
+    """
+
+  /// Focuses one bound field for a native insertion. A read-only username, as on a
+  /// two-step sign-in that already shows the account, is skipped rather than typed.
+  private static let humanCredentialFocusSource = """
+    const state = globalThis.__webkituiHumanCredential;
+    if (!state || state.token !== token) return JSON.stringify({ focused: false, skip: false });
+    const element = field === 'username' ? state.username : state.password;
+    if (!(element instanceof HTMLInputElement) || !element.isConnected || element.disabled) {
+      return JSON.stringify({ focused: false, skip: false });
+    }
+    if (field === 'username' && element.readOnly) {
+      return JSON.stringify({ focused: false, skip: true });
+    }
+    if (field === 'password' && element.type !== 'password') {
+      return JSON.stringify({ focused: false, skip: false });
+    }
+    element.focus({ preventScroll: false });
+    return JSON.stringify({ focused: document.activeElement === element, skip: false });
+    """
+
   private static let credentialFillSource = """
     const nodeFor = identity => {
       for (const element of document.querySelectorAll('input')) {
@@ -7612,6 +7858,16 @@ private struct ObservedTargetRecord {
   /// How many candidates the address matched when it was handed out. Structure can
   /// separate identical controls only while the set it indexes is unchanged.
   let observedCandidateCount: Int
+}
+
+private struct RawHumanCredentialLocation: Decodable {
+  let found: Bool
+  let focused: Bool
+}
+
+private struct RawHumanCredentialFocus: Decodable {
+  let focused: Bool
+  let skip: Bool
 }
 
 private struct FrameActionContext {

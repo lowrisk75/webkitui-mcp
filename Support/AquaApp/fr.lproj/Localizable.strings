@@ -181,3 +181,12 @@
 "Supplied dialog text:" = "Texte fourni à la boîte de dialogue :";
 "The page's own script receives this answer; nothing else is dispatched." = "Le script de la page reçoit cette réponse ; rien d’autre n’est envoyé.";
 "an origin with no readable form" = "une origine sans forme lisible";
+
+/* Human control bar: SiliconPass fill */
+"Fill with SiliconPass" = "Remplir avec SiliconPass";
+"Asks SiliconPass to fill the visible sign-in form. The agent never sees the values, and nothing is submitted." = "Demande à SiliconPass de remplir le formulaire de connexion visible. L’agent ne voit jamais les valeurs et rien n’est envoyé.";
+"Filled by SiliconPass. Check the fields, then sign in." = "Rempli par SiliconPass. Vérifiez les champs, puis connectez-vous.";
+"SiliconPass has no saved sign-in for this site." = "SiliconPass n’a pas d’identifiant enregistré pour ce site.";
+"SiliconPass fill was cancelled." = "Remplissage SiliconPass annulé.";
+"SiliconPass is unavailable. Open and unlock SiliconPass, then try again." = "SiliconPass est indisponible. Ouvrez et déverrouillez SiliconPass, puis réessayez.";
+"No sign-in form with a password field is visible." = "Aucun formulaire de connexion avec un champ mot de passe n’est visible.";

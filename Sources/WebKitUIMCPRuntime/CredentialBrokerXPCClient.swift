@@ -35,9 +35,25 @@ public protocol CredentialBrokerFilling: Sendable {
     binding: CredentialSinkRotationBinding,
     runtime: WebKitRuntime
   ) async throws -> CredentialBrokerWireReceipt
+
+  /// A fill the person asked for from the human control bar. Same broker round trip
+  /// and binding format; the values land through the human sink.
+  func fillForHuman(
+    binding: CredentialSinkFormBinding,
+    runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt
 }
 
 extension CredentialBrokerFilling {
+  public func fillForHuman(
+    binding: CredentialSinkFormBinding,
+    runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt {
+    _ = binding
+    _ = runtime
+    throw CredentialBrokerClientError.unavailable
+  }
+
   public func rotatePassword(
     binding: CredentialSinkRotationBinding,
     runtime: WebKitRuntime
@@ -143,17 +159,23 @@ private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCPro
   private let runtime: WebKitRuntime
   private let expectedBinding: CredentialSinkFormBinding?
   private let expectedRotationBinding: CredentialSinkRotationBinding?
+  private let humanRequested: Bool
 
-  init(runtime: WebKitRuntime, expectedBinding: CredentialSinkFormBinding) {
+  init(
+    runtime: WebKitRuntime, expectedBinding: CredentialSinkFormBinding,
+    humanRequested: Bool = false
+  ) {
     self.runtime = runtime
     self.expectedBinding = expectedBinding
     expectedRotationBinding = nil
+    self.humanRequested = humanRequested
   }
 
   init(runtime: WebKitRuntime, expectedRotationBinding: CredentialSinkRotationBinding) {
     self.runtime = runtime
     expectedBinding = nil
     self.expectedRotationBinding = expectedRotationBinding
+    humanRequested = false
   }
 
   func fillSyntheticCredential(
@@ -162,7 +184,7 @@ private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCPro
     password: Data,
     withReply reply: @escaping @Sendable (String?) -> Void
   ) {
-    Task { @MainActor [runtime, expectedBinding] in
+    Task { @MainActor [runtime, expectedBinding, humanRequested] in
       do {
         let binding = try JSONDecoder().decode(CredentialSinkFormBinding.self, from: bindingData)
         guard let expectedBinding, binding == expectedBinding else {
@@ -177,11 +199,16 @@ private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCPro
         }
         let usernameBuffer = CredentialSecretBuffer(copying: usernameCopy)
         let passwordBuffer = CredentialSecretBuffer(copying: passwordCopy)
-        _ = try await runtime.performCredentialFill(
-          binding: binding,
-          username: usernameBuffer,
-          password: passwordBuffer
-        )
+        if humanRequested {
+          _ = try await runtime.performHumanCredentialFill(
+            binding: binding, username: usernameBuffer, password: passwordBuffer)
+        } else {
+          _ = try await runtime.performCredentialFill(
+            binding: binding,
+            username: usernameBuffer,
+            password: passwordBuffer
+          )
+        }
         reply(nil)
       } catch {
         reply("stale")
@@ -276,11 +303,27 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     binding: CredentialSinkFormBinding,
     runtime: WebKitRuntime
   ) async throws -> CredentialBrokerWireReceipt {
+    try await fill(binding: binding, runtime: runtime, humanRequested: false)
+  }
+
+  public func fillForHuman(
+    binding: CredentialSinkFormBinding,
+    runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt {
+    try await fill(binding: binding, runtime: runtime, humanRequested: true)
+  }
+
+  private func fill(
+    binding: CredentialSinkFormBinding,
+    runtime: WebKitRuntime,
+    humanRequested: Bool
+  ) async throws -> CredentialBrokerWireReceipt {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let bindingData = try encoder.encode(binding)
 
-    let sinkExport = CredentialSinkExport(runtime: runtime, expectedBinding: binding)
+    let sinkExport = CredentialSinkExport(
+      runtime: runtime, expectedBinding: binding, humanRequested: humanRequested)
     let sinkDelegate = CredentialSinkListenerDelegate(
       exportedObject: sinkExport,
       secretProviderRequirement: peerRequirements.secretProvider

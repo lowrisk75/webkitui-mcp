@@ -4508,6 +4508,61 @@ struct WebKitRuntimeTests {
     #expect(checked == true)
   }
 
+  @Test("The human control bar's SiliconPass fill types into a framed sign-in form")
+  func humanSiliconPassFillTypesIntoFramedForm() async throws {
+    let runtime = WebKitRuntime()
+    // Like App Store Connect: the sign-in form lives in a child frame. Each field
+    // records whether its input events were trusted, as a real page would see them.
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Sign in</h1>
+      <iframe id="auth" width="600" height="400" srcdoc="
+        <form><input id='user' type='email' autocomplete='username'>
+        <input id='pw' type='password' autocomplete='current-password'></form>
+        <script>
+          for (const field of document.querySelectorAll('input')) {
+            field.addEventListener('input', event => {
+              field.dataset.trusted = String(event.isTrusted);
+            });
+          }
+        </script>"></iframe>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/login"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    try await Task.sleep(for: .milliseconds(200))
+
+    // Only a person holding the window may ask for it.
+    await #expect(throws: WebKitRuntimeError.invalidCredentialBinding) {
+      _ = try await runtime.humanCredentialFormBinding()
+    }
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    let binding = try await runtime.humanCredentialFormBinding()
+    #expect(binding.origin.asciiHost == "fixture.invalid")
+    let receipt = try await HumanFillFake().fillForHuman(binding: binding, runtime: runtime)
+    #expect(receipt.status == .filled)
+
+    let state =
+      try await runtime.webView.evaluateJavaScript(
+        """
+        (() => {
+          const doc = document.getElementById('auth').contentDocument;
+          const user = doc.getElementById('user');
+          const pw = doc.getElementById('pw');
+          return [user.value, String(pw.value.length), user.dataset.trusted, pw.dataset.trusted]
+            .join('|');
+        })()
+        """) as? String
+    #expect(state == "person@example.com|12|true|true")
+    // The binding is spent: replaying it fills nothing.
+    await #expect(throws: WebKitRuntimeError.invalidCredentialBinding) {
+      _ = try await runtime.performHumanCredentialFill(
+        binding: binding,
+        username: CredentialSecretBuffer(copying: Data("x@example.com".utf8)),
+        password: CredentialSecretBuffer(copying: Data("x".utf8)))
+    }
+  }
+
   @Test("AppKit fill persists in an Apple-style searchable App ID selector")
   func nativeCustomSelectorFillActuation() async throws {
     let runtime = WebKitRuntime()
@@ -5550,5 +5605,24 @@ struct WebKitRuntimeTests {
     #expect(denial.origin == "https://permissions.example")
     #expect(denial.frameIsMain)
     #expect(denial.requestCount == 1)
+  }
+}
+
+@MainActor
+private struct HumanFillFake: CredentialBrokerFilling {
+  func fill(
+    binding: CredentialSinkFormBinding, runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt {
+    CredentialBrokerWireReceipt(status: .failed)
+  }
+
+  func fillForHuman(
+    binding: CredentialSinkFormBinding, runtime: WebKitRuntime
+  ) async throws -> CredentialBrokerWireReceipt {
+    _ = try await runtime.performHumanCredentialFill(
+      binding: binding,
+      username: CredentialSecretBuffer(copying: Data("person@example.com".utf8)),
+      password: CredentialSecretBuffer(copying: Data("s3cret-value".utf8)))
+    return CredentialBrokerWireReceipt(status: .filled)
   }
 }

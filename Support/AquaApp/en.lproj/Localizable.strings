@@ -181,3 +181,12 @@
 "Supplied dialog text:" = "Supplied dialog text:";
 "The page's own script receives this answer; nothing else is dispatched." = "The page's own script receives this answer; nothing else is dispatched.";
 "an origin with no readable form" = "an origin with no readable form";
+
+/* Human control bar: SiliconPass fill */
+"Fill with SiliconPass" = "Fill with SiliconPass";
+"Asks SiliconPass to fill the visible sign-in form. The agent never sees the values, and nothing is submitted." = "Asks SiliconPass to fill the visible sign-in form. The agent never sees the values, and nothing is submitted.";
+"Filled by SiliconPass. Check the fields, then sign in." = "Filled by SiliconPass. Check the fields, then sign in.";
+"SiliconPass has no saved sign-in for this site." = "SiliconPass has no saved sign-in for this site.";
+"SiliconPass fill was cancelled." = "SiliconPass fill was cancelled.";
+"SiliconPass is unavailable. Open and unlock SiliconPass, then try again." = "SiliconPass is unavailable. Open and unlock SiliconPass, then try again.";
+"No sign-in form with a password field is visible." = "No sign-in form with a password field is visible.";

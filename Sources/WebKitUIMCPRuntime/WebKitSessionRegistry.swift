@@ -269,7 +269,9 @@ public final class WebKitSessionRegistry {
       runtimeFactory: { profileIdentifier in
         let dataStore =
           profileIdentifier.map(WKWebsiteDataStore.init(forIdentifier:)) ?? .default()
-        return try WebKitRuntime(protectedWebsiteDataStore: dataStore)
+        let runtime = try WebKitRuntime(protectedWebsiteDataStore: dataStore)
+        runtime.humanCredentialFiller = SyntheticCredentialBrokerXPCClient()
+        return runtime
       })
   }
 

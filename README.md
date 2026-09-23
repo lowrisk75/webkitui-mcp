@@ -343,6 +343,14 @@ The stable diagnostic allowlist and forbidden support data are documented in
 The manual signed-update, rollback, support and incident rules are documented
 in [`docs/release-maintenance-policy.md`](docs/release-maintenance-policy.md).
 
+While a person holds the human control window, its bar offers **Fill with
+SiliconPass** when the SiliconPass broker is installed. The person asks, not the
+agent: WebKitUI binds the one visible password form in the frame being used,
+including a restricted sign-in frame such as `idmsa.apple.com`, and SiliconPass
+matches the saved sign-in by that frame's exact host. The values are typed into the
+two fields through AppKit, so the page sees real input events; nothing is
+submitted and nothing reaches MCP, logs or the agent.
+
 SiliconPass credential release is deliberately stronger than ordinary browser
 confirmation. After the exact native fill summary is approved, macOS evaluates
 `deviceOwnerAuthentication` uses zero Touch ID reuse and delegates the

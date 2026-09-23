@@ -60,11 +60,29 @@ Non reproduit :
   reproduire avec des shadow roots.
 - Capture 2880×2000 tronquée : limite du transport du client, pas du serveur.
 
+## Remplissage SiliconPass depuis la fenêtre humaine
+
+Demande de Kevin après la connexion Apple rendue en handoff : SiliconPass ne pouvait
+pas la remplir, l'outil agent refusant les origines restreintes et les cadres enfants.
+
+- Bouton « Remplir avec SiliconPass » dans la barre de contrôle humain, affiché
+  seulement si le client broker est configuré (registre de production).
+- Liaison sans observation agent, uniquement en `humanControlled` : l'unique champ
+  mot de passe visible du cadre qui a le focus et le champ identifiant qui le précède.
+  Origine = celle du cadre (ex. `https://idmsa.apple.com`). Format de liaison
+  inchangé : aucun changement côté SiliconPass, qui fait correspondre par hôte exact
+  et propose l'ajout si rien n'est enregistré.
+- Saisie par `selectAll` + `insertText` AppKit : événements `input` de confiance,
+  pour que le bouton de connexion du site s'active. Aucune soumission.
+- Liaison à usage unique, effacée après remplissage, échec ou refus.
+- Test : cadre srcdoc, refus sous contrôle agent, valeurs saisies, `isTrusted=true`,
+  rejeu refusé. Validation physique avec le vrai coffre : à faire.
+
 ## Validation
 
 - `swift-format lint --strict` et `git diff --check` : rc=0.
 - État final, debug et release : 5 résumés Swift Testing chacun,
-  135 + 190 + 18 + 90 + 56 = 489, plus 13 XCTest, 0 échec. Exclusion :
+  135 + 191 + 18 + 90 + 56 = 490, plus 13 XCTest, 0 échec. Exclusion :
   `hostExclusiveSession` (broker installé actif). Formatage des tests appliqué
   ensuite (espaces seulement), build des tests rc=0.
 - Un passage release antérieur a perdu le résumé du bundle serveur (82 tests sans
