@@ -938,6 +938,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private weak var humanControlInstruction: NSTextField?
   private weak var humanControlCompletionButton: NSButton?
   private weak var humanCredentialButton: NSButton?
+  private var humanControlActivationObserver: (any NSObjectProtocol)?
   /// The SiliconPass client behind the human control bar's fill button. Set by the
   /// production registry; nil hides the button, so no test or bare runtime shows it.
   public var humanCredentialFiller: (any CredentialBrokerFilling)?
@@ -3483,7 +3484,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // The window is parked outside every display so pages lay out without being
     // shown. Handing control to a human must undo that, or the user is asked to act
     // in a window that is nowhere on screen.
-    window.level = .normal
+    // Since macOS 14 an app cannot take the foreground from the one the person is
+    // using, so activation alone left this window behind the agent's terminal and the
+    // person did not know a sign-in was waiting (FPS/TSP session, 2026-09-23). Float it
+    // above other apps and bounce the Dock icon; the first time the person brings the
+    // app forward it drops back to an ordinary window.
+    window.level = .floating
     window.collectionBehavior.remove(.transient)
     window.setFrame(
       NSRect(origin: .zero, size: window.frame.size), display: false)
@@ -3492,6 +3498,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     window.orderFrontRegardless()
     if managesApplicationActivationPolicy {
       application.activate(ignoringOtherApps: true)
+    }
+    application.requestUserAttention(.informationalRequest)
+    humanControlActivationObserver.map(NotificationCenter.default.removeObserver)
+    humanControlActivationObserver = NotificationCenter.default.addObserver(
+      forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+    ) { [weak self, weak window] _ in
+      MainActor.assumeIsolated {
+        guard let self else { return }
+        if let window, window.level == .floating { window.level = .normal }
+        self.humanControlActivationObserver.map(NotificationCenter.default.removeObserver)
+        self.humanControlActivationObserver = nil
+      }
     }
     window.makeFirstResponder(webView)
     window.displayIfNeeded()
@@ -6291,17 +6309,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           || sensitiveLabelTerm.test(labelMetadata)
           || (!(element instanceof HTMLSelectElement) && looksOpaque(rawValue)
             && !publicReverseDNSIdentifier);
-        const editable = !element.disabled && !element.readOnly;
+        // A disabled or read-only field shows its value to anyone looking at the page, so
+        // it is reported like any other: an account page whose address fields were all
+        // disabled read as empty, and the agent had to take a screenshot to learn a
+        // postal address (FPS/TSP, 2026-09-23). Sensitivity and visibility still decide.
         let observableValue = null;
-        if (!sensitive && editable && element instanceof HTMLSelectElement) {
+        if (!sensitive && element instanceof HTMLSelectElement) {
           observableValue = collapse(
             Array.from(element.selectedOptions).map(option => option.textContent).join(' ')) || null;
-        } else if (!sensitive && editable && element instanceof HTMLTextAreaElement) {
+        } else if (!sensitive && element instanceof HTMLTextAreaElement) {
           observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
-        } else if (!sensitive && editable && element instanceof HTMLInputElement
+        } else if (!sensitive && element instanceof HTMLInputElement
                    && ['text', 'search', 'email', 'tel', 'url', 'number'].includes(element.type)) {
           observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
-        } else if (!sensitive && editable && element.isContentEditable) {
+        } else if (!sensitive && element.isContentEditable) {
           // WebKit's own editing leaves a trailing newline in a contenteditable's text.
           // Reported verbatim it makes every exact-text postcondition fail on a write
           // that landed perfectly.

@@ -754,6 +754,26 @@ struct WebKitRuntimeTests {
     #expect(runtime.webView.url?.path == "/invoice")
   }
 
+  @Test("A visible disabled field reports its value; a sensitive or hidden one does not")
+  func disabledFieldValuesAreObserved() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label>Adresse <input disabled value="12 rue des Lilas"></label>
+      <label>Ville <input readonly value="Lyon"></label>
+      <label>Mot de passe <input type="password" disabled value="hunter22"></label>
+      <label style="display:none">Masqué <input disabled value="secret-hidden"></label>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/mes-informations"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let values = observation.elements.compactMap { $0.value?.segments.map(\.text).joined() }
+    #expect(values.contains("12 rue des Lilas"))
+    #expect(values.contains("Lyon"))
+    #expect(!values.contains("hunter22"))
+    #expect(!values.contains("secret-hidden"))
+  }
+
   @Test("A window.open from script is reported and not followed")
   func scriptedWindowOpenIsNotFollowed() async throws {
     let runtime = WebKitRuntime()

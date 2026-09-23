@@ -1948,6 +1948,20 @@ struct MCPServerTests {
     #expect(try object(replay["error"])["code"] == .int(-32602))
   }
 
+  @Test("A handle whose session is gone gets session_expired, not an internal error")
+  func vanishedSessionIsTyped() async throws {
+    let registry = try WebKitSessionRegistry()
+    let server = WebKitMCPServer(registry: registry)
+    for (index, name) in ["browser_observe", "browser_read_text"].enumerated() {
+      let response = try await toolCall(
+        server, id: Int64(index + 1), name: name,
+        arguments: ["session_id": .string(UUID().uuidString)])
+      let result = try object(response["result"])
+      #expect(result["isError"] == .bool(true))
+      #expect(try object(result["structuredContent"])["code"] == .string("session_expired"))
+    }
+  }
+
   @Test("A click WebKit asked a new window for says so, and the next action does not inherit it")
   func suppressedNewWindowIsReportedOnceToTheCaller() async throws {
     // A page that opens its invoice with window.open() is still refused a window; a plain

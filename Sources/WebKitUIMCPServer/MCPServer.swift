@@ -459,7 +459,19 @@ public final class WebKitMCPServer {
     registry.beginClientCall(owner: clientAuthorityID)
     defer { registry.endClientCall(owner: clientAuthorityID) }
     do {
-      let result = try await performToolCall(params: params, modern: modern)
+      let result: JSONValue
+      do {
+        result = try await performToolCall(params: params, modern: modern)
+      } catch WebKitSessionRegistryError.unknownSession {
+        // A handle that outlived its session used to surface as a bare JSON-RPC
+        // "Internal error" (FPS/TSP session, 2026-09-23), which reads as a server fault
+        // and says nothing about what to do next.
+        result = try toolError(
+          "session_expired: This session no longer exists: it was closed, released after "
+            + "its owner disconnected, or the WebKitUI app restarted. Open a new one with "
+            + "browser_session operation=open; earlier observation IDs are void.",
+          modern: modern)
+      }
       let failed = result.objectValue?["isError"] == .bool(true)
       let structured = result.objectValue?["structuredContent"]?.objectValue ?? [:]
       await activityLog?.record(
@@ -2764,8 +2776,12 @@ public final class WebKitMCPServer {
     case nil: compact = true
     default: throw MCPServerError.invalidParams("compact must be a boolean")
     }
+    // The resume observation is a reorientation, not a full read: 150 rows with boxes
+    // and locator quality came to 57,477 characters and overflowed the client's output
+    // limit (FPS/TSP session, 2026-09-23). A caller that wants more asks for it, or
+    // calls browser_observe.
     let maximumElements = try boundedInteger(
-      arguments["maximum_elements"], defaultValue: 150, range: 1...2_000,
+      arguments["maximum_elements"], defaultValue: compact ? 40 : 150, range: 1...2_000,
       name: "maximum_elements")
     return (compact, maximumElements)
   }
@@ -2775,9 +2791,7 @@ public final class WebKitMCPServer {
     compact: Bool
   ) throws -> JSONValue {
     if compact {
-      return compactObservation(
-        observation,
-        fields: Set(["role", "name", "href", "bbox", "state", "locator_quality"]))
+      return compactObservation(observation, fields: Set(["role", "name", "href", "state"]))
     }
     return try .encoded(observation)
   }
@@ -5434,10 +5448,15 @@ public final class WebKitMCPServer {
         "compact": .object([
           "type": .string("boolean"), "default": .bool(true),
           "description": .string(
-            "For handoff and handoff_resume. Concise element rows, which is the default because the full payload may not fit a client. Pass false for every field."
+            "For handoff and handoff_resume. Concise element rows (role, name, href, state; no boxes or locator quality), which is the default because the full payload may not fit a client. Pass false for every field."
           ),
         ]),
-        "maximum_elements": integerSchema(minimum: 1, maximum: 2_000, defaultValue: 150),
+        "maximum_elements": .object([
+          "type": .string("integer"), "minimum": .int(1), "maximum": .int(2_000),
+          "description": .string(
+            "For handoff and handoff_resume: rows in the returned observation. Default 40 when compact, 150 otherwise. Call browser_observe for the rest."
+          ),
+        ]),
         "goal_display": .object([
           "type": .string("string"), "minLength": .int(1), "maxLength": .int(200),
           "description": .string(
