@@ -66,8 +66,11 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   private let timeout: Duration
   private var activeProcess: Process?
   private var cancellationRequested = false
+  private var waitingForTurn = false
 
-  var state: NativeConfirmationState { activeProcess == nil ? .idle : .pending }
+  var state: NativeConfirmationState {
+    activeProcess == nil && !waitingForTurn ? .idle : .pending
+  }
 
   init(
     helperURL: URL? = nil,
@@ -84,7 +87,20 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   func confirm(title: String, message: String, approveLabel: String) async
     -> NativeConfirmationOutcome
   {
-    guard activeProcess == nil else { return .failed }
+    guard activeProcess == nil, !waitingForTurn else { return .failed }
+    // One panel on screen at a time for the whole app: with several agents, two
+    // confirmations asked for together used to open two panels on top of each other,
+    // and the person could approve the one they had not read. The wait does not count
+    // against the panel's own timeout, and a cancel asked for while waiting holds.
+    waitingForTurn = true
+    cancellationRequested = false
+    await ConfirmationTurnstile.shared.acquire()
+    waitingForTurn = false
+    defer { ConfirmationTurnstile.shared.release() }
+    if cancellationRequested {
+      cancellationRequested = false
+      return .cancelled
+    }
     let payload: Data
     do {
       payload = try JSONEncoder().encode(
@@ -148,7 +164,7 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   }
 
   func cancel() {
-    cancellationRequested = activeProcess != nil
+    cancellationRequested = activeProcess != nil || waitingForTurn
     activeProcess?.terminate()
   }
 
@@ -323,4 +339,32 @@ private struct NativeConfirmationRequest: Encodable {
   let title: String
   let message: String
   let approveLabel: String
+}
+
+/// First come, first shown: the single native confirmation slot of the app, shared by
+/// every client's server in the process.
+@MainActor
+final class ConfirmationTurnstile {
+  static let shared = ConfirmationTurnstile()
+
+  private var busy = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  var queuedCount: Int { waiters.count }
+
+  func acquire() async {
+    guard busy else {
+      busy = true
+      return
+    }
+    await withCheckedContinuation { waiters.append($0) }
+  }
+
+  func release() {
+    guard !waiters.isEmpty else {
+      busy = false
+      return
+    }
+    waiters.removeFirst().resume()
+  }
 }

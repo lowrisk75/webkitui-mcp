@@ -62,3 +62,22 @@ Script autonome, deux profils `WKWebsiteDataStore(forIdentifier:)` :
 - Magasins nommés à valider sur macOS 27 (seule l'énumération plante) : spike d'abord,
   repli « default seul, 1 session » en cas d'échec.
 - Une popup ne devient jamais active toute seule.
+
+## File unique des confirmations (fait)
+
+`ConfirmationTurnstile` : un seul panneau natif à la fois pour toute l'app, premier
+arrivé premier servi. L'attente ne compte pas dans le délai du panneau ; une
+annulation pendant l'attente rend `cancelled` sans rien afficher ; `state` vaut
+`pending_native_confirmation` pendant l'attente. Test : deux présentateurs, journal
+`start,end,start,end` (sans le tourniquet : `start,start,end,end`).
+
+## Bug système observé : Screen Time à la destruction d'un WKWebView
+
+Un passage debug en parallèle a planté (SIGABRT) :
+`-[WKWebView dealloc]` → `_uninstallScreenTimeWebpageController` →
+`-[STScreenTimeConfigurationObserver dealloc]` → `removeObserver:forKeyPath:` lève
+`NSInternalInconsistencyException` (observateur déjà retiré). Bug macOS 27
+(ScreenTime/WebKit), intermittent sous charge. Le broker détruit un WKWebView à chaque
+fermeture de session : risque réel mais rare. `showsSystemScreenTimeBlockingView=false`
+n'a pas pu être relié au contrôleur (sonde KVC nulle dans les deux cas) : non appliqué
+faute de preuve. À surveiller ; à signaler à Apple (Feedback) avec cette pile.

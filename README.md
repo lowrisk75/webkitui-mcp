@@ -46,14 +46,17 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Local human handoff: `handoff_start` immediately returns an opaque session-bound resume token while the actual WebKit session becomes a visible window. `handoff_status` is non-blocking; `handoff_resume` consumes the token only after local confirmation and returns a fresh observation. The agent remains locked out throughout human control.
 - The packaged handoff app installs a native Edit menu, so standard first-responder
   shortcuts such as Command-X/C/V/A work inside WebKit form controls.
-- MCP sessions use a per-session loopback SOCKS5 boundary with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
-- The production CLI enforces one browser controller across all local/remote MCP processes for the macOS account; the lease is released on close or process death.
+- MCP sessions use a loopback SOCKS5 boundary, one per profile and shared by its sessions, with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
+- One process at a time controls the browser for the macOS account: the host lease belongs to that process and is released with its last session or on process death. The production CLI holds one session.
 - Private remote clients can use the app-owned broker plus a forced-command SSH relay; WebKit and authenticated profile data remain on the logged-in Mac.
-- Multiple relay clients may use the same long-lived broker concurrently, but
-  only one client owns the single browser surface at a time. Other clients get
-  `session_in_use` with `wait_only=true`; they cannot observe, navigate, act,
-  invalidate addresses, or request duplicate user control. Ownership transfers
-  after the controlling client disconnects.
+- Multiple relay clients may use the same long-lived broker concurrently, each
+  in its own session and window, up to three, on the shared default profile. A
+  session belongs to one client: another client gets `session_in_use` with
+  `wait_only=true` and cannot observe, navigate, act, invalidate addresses, or
+  request duplicate user control in it. Ownership transfers after the owning
+  client disconnects, or through a human-confirmed `client_handoff`. Native
+  confirmations are shown one at a time across the app, and each names the
+  requesting agent as a quoted, self-reported name.
 - The app broker owns one live browser across MCP client reconnects. Every
   reconnect invalidates observations, pending approvals, capabilities, and
   transaction coordinators before returning the preserved session handle.
