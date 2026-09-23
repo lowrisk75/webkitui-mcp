@@ -172,8 +172,10 @@ try {
   assert.equal(secondSession.client_control_state, "owned_by_this_client");
   assert.equal(firstSession.maximum_sessions, 3);
   // Neither can act in the other's session.
-  const crossed = await tool(second, "browser_observe", { session_id: firstSession.session_id });
-  assert.equal(crossed.status, "session_in_use");
+  await assert.rejects(
+    tool(second, "browser_observe", { session_id: firstSession.session_id }),
+    /session_in_use/,
+  );
 
   // Closing the sockets leaves the browser session open, so the host lease is rewritten
   // as unowned and stays taken until it times out. Every delivery therefore ended with a
