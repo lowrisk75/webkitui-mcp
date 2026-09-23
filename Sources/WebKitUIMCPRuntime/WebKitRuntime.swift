@@ -941,6 +941,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private weak var humanControlInstruction: NSTextField?
   private weak var humanControlCompletionButton: NSButton?
   private weak var humanCredentialButton: NSButton?
+  /// Real pop-ups, only while a person holds the window.
+  let humanPopups = HumanPopupWindows()
   private var humanControlActivationObserver: (any NSObjectProtocol)?
   /// The SiliconPass client behind the human control bar's fill button. Set by the
   /// production registry; nil hides the button, so no test or bare runtime shows it.
@@ -1145,6 +1147,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// view: without this a closed session kept its view, its web process and its
   /// website data store alive for the life of the broker.
   isolated deinit {
+    humanPopups.closeAll()
     browserWindow?.orderOut(nil)
     browserWindow?.contentView = nil
     browserWindow?.close()
@@ -2749,6 +2752,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // `windowFeatures` is read and dropped. Its every field is site-authored, and this
     // record is exported: the shape a page wanted for a window it is not getting is not
     // worth carrying unlabelled site content for.
+    // A person holding the window gets the pop-up it asked for: a sign-in with Google
+    // or Apple reports back through window.opener and cannot finish in place.
+    if controlState == .humanControlled,
+      let popup = humanPopups.open(
+        configuration: configuration, windowFeatures: windowFeatures, above: webView.window)
+    {
+      return popup
+    }
     let request = navigationAction.request
     let follow =
       navigationAction.navigationType == .linkActivated
@@ -3448,6 +3459,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   public func requestAgentResume() throws {
+    // Pop-ups are the person's; none outlives their turn.
+    defer { if controlState == .resumeRequested { humanPopups.closeAll() } }
     guard controlState == .humanControlled || controlState == .humanStepCompleted else {
       throw WebKitRuntimeError.invalidControlTransition
     }

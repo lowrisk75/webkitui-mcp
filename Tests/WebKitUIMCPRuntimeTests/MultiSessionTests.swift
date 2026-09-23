@@ -71,4 +71,36 @@ struct MultiSessionTests {
     registry.releaseSessionOwnerships(owner: bob)
     #expect(try registry.openOrReuse().handle == second.handle)
   }
+
+  @Test("A person holding the window gets real pop-ups, closed when the agent resumes")
+  func humanPopupsAreRealAndBounded() async throws {
+    let runtime = WebKitRuntime()
+    // Tests have no user gesture to open a window with; the preference stands in.
+    runtime.webView.configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+    _ = try await runtime.loadHTML(
+      "<p>Sign in</p>", baseURL: URL(string: "https://fixture.invalid/login"),
+      timeout: .seconds(15), quietWindow: .milliseconds(40))
+
+    // Under agent control the window is refused, as before.
+    _ = try await runtime.webView.evaluateJavaScript("window.open('about:blank'); 1")
+    #expect(runtime.humanPopups.openCount == 0)
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    _ = try await runtime.webView.evaluateJavaScript(
+      "globalThis.popup = window.open('about:blank', 'signin'); 1")
+    #expect(runtime.humanPopups.openCount == 1)
+    let linked =
+      try await runtime.webView.evaluateJavaScript(
+        "globalThis.popup !== null && globalThis.popup.opener === window") as? Bool
+    #expect(linked == true)
+    for index in 0..<6 {
+      _ = try await runtime.webView.evaluateJavaScript("window.open('about:blank', 'w\(index)'); 1")
+    }
+    #expect(runtime.humanPopups.openCount == HumanPopupWindows.maximumWindows)
+
+    try runtime.markHumanStepCompleted()
+    try runtime.requestAgentResume()
+    #expect(runtime.humanPopups.openCount == 0)
+  }
 }

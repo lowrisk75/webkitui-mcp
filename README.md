@@ -57,6 +57,10 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   client disconnects, or through a human-confirmed `client_handoff`. Native
   confirmations are shown one at a time across the app, and each names the
   requesting agent as a quoted, self-reported name.
+- While a person holds the human control window, a pop-up the page opens (a sign-in
+  with Google or Apple, say) is a real window sharing the page's profile, protected
+  proxy and `window.opener`, at most four; all close when the agent resumes. Under
+  agent control new windows stay refused and reported.
 - The app broker owns one live browser across MCP client reconnects. Every
   reconnect invalidates observations, pending approvals, capabilities, and
   transaction coordinators before returning the preserved session handle.

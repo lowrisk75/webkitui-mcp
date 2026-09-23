@@ -38,9 +38,13 @@ Date : 2026-09-23. Cartographie en lecture seule, puis étape 0 implémentée.
    borné ; la fenêtre de contrôle humain porte le nom de l'agent ; « Forcer le
    rendu » agit sur toutes les sessions. Restent : file globale des confirmations,
    liste des sessions dans la fenêtre compagnon.
-3. Vraies fenêtres popup dans une session (OAuth, `window.opener`) : max 4, liées à un
-   geste ou une approbation, chaque approbation nomme (session, window_id, origine),
-   `switch_window` invalide les observations.
+3. **Fait pour l'humain (3a)** : sous contrôle humain, un popup devient une vraie
+   fenêtre construite depuis la configuration de WebKit (même profil, même proxy,
+   `window.opener` et `postMessage` fonctionnels) ; au plus 4 ; alertes et
+   confirmations JavaScript répondues par la personne ; toutes fermées quand l'agent
+   reprend et à la destruction du runtime. Sous contrôle agent, rien ne change.
+   **Reste (3b)** : popups pilotables par l'agent — chaque approbation nomme
+   (session, window_id, origine), `switch_window` invalide les observations.
 
 ## Spike magasins nommés (2026-09-23, macOS 27)
 
