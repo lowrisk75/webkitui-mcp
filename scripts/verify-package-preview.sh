@@ -203,7 +203,7 @@ perl -0777 -ne 'while (/text\(\s*((?:"(?:[^"\\]|\\.)*"\s*\+\s*)*"(?:[^"\\]|\\.)*
   "$workspace_dir/Sources/WebKitUIMCPAquaBroker/CompanionController.swift" \
   "$workspace_dir/Sources/WebKitUIMCPAquaBroker/ActivityLogWindowController.swift" \
   | LC_ALL=C sort -u > "$scratch_dir/companion-localization-keys"
-comm -23 "$scratch_dir/companion-localization-keys" "$scratch_dir/en-localization-keys" \
+LC_ALL=C comm -23 "$scratch_dir/companion-localization-keys" "$scratch_dir/en-localization-keys" \
   > "$scratch_dir/missing-localization-keys"
 if [ -s "$scratch_dir/missing-localization-keys" ]; then
   printf '%s\n' "missing companion localization keys:" >&2
