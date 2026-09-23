@@ -945,6 +945,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// The SiliconPass client behind the human control bar's fill button. Set by the
   /// production registry; nil hides the button, so no test or bare runtime shows it.
   public var humanCredentialFiller: (any CredentialBrokerFilling)?
+  /// The agent that owns this session, as it named itself, shown in the human control
+  /// window's title so a person with several windows open knows whose step it is.
+  public var humanControlRequester: String?
   /// The one form the person asked to fill, in the frame that holds it. Cleared
   /// when the fill completes, fails, or control changes hands.
   private var pendingHumanCredentialFill:
@@ -991,6 +994,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var restrictedWebAuthnOrigin: String?
   private var pendingCrossOriginNavigationRequest: URLRequest?
   private let egressProxy: PinnedSOCKSProxy?
+  /// Identity only, for tests that two sessions on one store share one proxy.
+  var egressProxyIdentity: ObjectIdentifier? { egressProxy.map(ObjectIdentifier.init) }
   private var armedNativeGestureTokens: [String: ArmedNativeGestureContext] = [:]
   private var nativeGestureReceipts: [String: [NativeGestureReceipt]] = [:]
   private let downloadDestinationProvider: (@MainActor @Sendable (String) async -> URL?)?
@@ -1033,9 +1038,28 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   public convenience init(protectedWebsiteDataStore: WKWebsiteDataStore) throws {
-    let proxy = try PinnedSOCKSProxy()
-    protectedWebsiteDataStore.proxyConfigurations = [proxy.proxyConfiguration()]
+    let proxy = try Self.sharedEgressProxy(for: protectedWebsiteDataStore)
     self.init(websiteDataStore: protectedWebsiteDataStore, egressProxy: proxy)
+  }
+
+  /// The proxy is configured on the data store, not the view, so two sessions on one
+  /// profile must share it: a second runtime used to install its own, and closing it
+  /// left the first session's store pointing at a proxy that no longer listened. Each
+  /// runtime holds the shared proxy strongly; the cache only finds a live one.
+  private static var egressProxies: [String: WeakEgressProxy] = [:]
+
+  private static func sharedEgressProxy(
+    for store: WKWebsiteDataStore
+  ) throws -> PinnedSOCKSProxy {
+    let key =
+      store.isPersistent
+      ? (store.identifier?.uuidString ?? "default")
+      : "ephemeral-\(ObjectIdentifier(store).hashValue)"
+    if let live = egressProxies[key]?.proxy { return live }
+    let proxy = try PinnedSOCKSProxy()
+    store.proxyConfigurations = [proxy.proxyConfiguration()]
+    egressProxies[key] = WeakEgressProxy(proxy: proxy)
+    return proxy
   }
 
   init(
@@ -3517,8 +3541,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if webView.url == nil, lastCommittedHTTPURL == nil, !webView.isLoading {
       webView.loadHTMLString(Self.emptyHandoffDocument, baseURL: nil)
     }
-    window.title = Self.localizedHandoff(
+    let baseTitle = Self.localizedHandoff(
       "WebkitUIMCP — Human control", fallback: "WebkitUIMCP — Human control")
+    window.title = humanControlRequester.map { "\(baseTitle) — \($0)" } ?? baseTitle
     window.ignoresMouseEvents = false
     window.collectionBehavior.remove(.stationary)
     window.collectionBehavior.remove(.ignoresCycle)
@@ -7998,6 +8023,10 @@ private struct ObservedTargetRecord {
   /// How many candidates the address matched when it was handed out. Structure can
   /// separate identical controls only while the set it indexes is unchanged.
   let observedCandidateCount: Int
+}
+
+private struct WeakEgressProxy {
+  weak var proxy: PinnedSOCKSProxy?
 }
 
 private struct RawHumanCredentialLocation: Decodable {

@@ -170,3 +170,26 @@ struct ActivityLogTests {
     )
   }
 }
+
+@Suite("Goal delegation monitor")
+struct GoalDelegationMonitorTests {
+  @Test("Two sessions' delegations are kept apart, and stop ends them all")
+  func delegationsAreKeyed() async {
+    let monitor = GoalDelegationMonitor()
+    let far = Date().addingTimeInterval(600)
+    await monitor.publish(
+      GoalDelegationSnapshot(
+        identifier: "a", goalDisplay: "A", origin: "https://a.example", expiresAt: far,
+        remainingNavigations: 3))
+    await monitor.publish(
+      GoalDelegationSnapshot(
+        identifier: "b", goalDisplay: "B", origin: "https://b.example", expiresAt: far,
+        remainingNavigations: 3))
+    #expect(await monitor.snapshots().count == 2)
+    await monitor.clear(identifier: "a")
+    #expect(await monitor.snapshots().map(\.identifier) == ["b"])
+    #expect(await monitor.requestImmediateRevocation())
+    #expect(await monitor.isRevoked("b"))
+    #expect(await monitor.snapshots().isEmpty)
+  }
+}

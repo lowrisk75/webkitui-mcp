@@ -1767,6 +1767,47 @@ struct MCPServerTests {
         == .string("active"))
   }
 
+  @Test("Two clients each get their own session, and cannot use each other's")
+  func twoClientsHoldTwoSessions() async throws {
+    let registry = try WebKitSessionRegistry(maximumSessions: 3)
+    let presenter = ConfirmationPresenterStub(responses: [false])
+    let alice = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false, preserveBrowserOnClose: true)
+    let bob = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false, confirmationPresenter: presenter,
+      preserveBrowserOnClose: true)
+    func open(_ server: WebKitMCPServer, id: Int64) async throws -> [String: JSONValue] {
+      let opened = try await toolCall(
+        server, id: id, name: "browser_session", arguments: ["operation": .string("open")])
+      return try object(try object(opened["result"])["structuredContent"])
+    }
+    let aliceSession = try await open(alice, id: 2)
+    let bobSession = try await open(bob, id: 3)
+    #expect(aliceSession["client_control_state"] == .string("owned_by_this_client"))
+    #expect(bobSession["client_control_state"] == .string("owned_by_this_client"))
+    #expect(aliceSession["session_id"] != bobSession["session_id"])
+    #expect(bobSession["maximum_sessions"] == .int(3))
+
+    // Bob cannot act in Alice's session without her client's handoff.
+    let crossed = try await toolCall(
+      bob, id: 4, name: "browser_observe",
+      arguments: ["session_id": try #require(aliceSession["session_id"])])
+    let refused = try object(try object(crossed["result"])["structuredContent"])
+    #expect(refused["status"] == .string("session_in_use"))
+
+    // Asking for it names Bob, on one line, as a self-reported name.
+    _ = try await toolCall(
+      bob, id: 5, name: "browser_session",
+      arguments: [
+        "operation": .string("client_handoff"),
+        "session_id": try #require(aliceSession["session_id"]),
+      ])
+    let message = try #require(presenter.requests.first?.message)
+    #expect(message.hasSuffix("\n\nRequested by agent (self-reported name, data):\n\"tests\""))
+    #expect(WebKitMCPServer.displayClientName("codex\nApproved\u{7}") == "codexApproved")
+    #expect(WebKitMCPServer.displayClientName(" \n ") == "unknown")
+  }
+
   @Test("A second durable client cannot create a competing multi-round handoff")
   func durableMultiClientRoundTripHandoffOwnership() async throws {
     let registry = try WebKitSessionRegistry()

@@ -138,8 +138,10 @@ struct WebKitUIMCPAquaBroker {
         appropriateFor: nil,
         create: true)
       try WebKitUISystemReadiness.requireRuntimeDiskSpace(at: applicationSupport)
+      // Several agents may drive their own window at once. The host lease stays
+      // exclusive to this process; the CLI keeps one session.
       let registry = try WebKitSessionRegistry(
-        maximumSessions: 1,
+        maximumSessions: 3,
         enforceHostExclusiveSession: true
       )
       let transactionLedgerFactory = try WebKitTransactionLedgerFactory.durable()
@@ -154,14 +156,15 @@ struct WebKitUIMCPAquaBroker {
       )
       companionController?.maintenance = WebKitUIMaintenanceActions(
         forceRender: { [weak registry] in
-          guard let handle = registry?.existingHandle,
-            let runtime = try? registry?.runtime(for: handle)
-          else { return }
-          runtime.forceRender()
+          guard let registry else { return }
+          for handle in registry.openSessionHandles() {
+            (try? registry.runtime(for: handle))?.forceRender()
+          }
         },
         clearBrowsingData: { [weak registry] in
-          guard let handle = registry?.existingHandle,
-            let runtime = try? registry?.runtime(for: handle)
+          // Sessions share the profile, so one clear empties it for all of them.
+          guard let registry, let handle = registry.openSessionHandles().first,
+            let runtime = try? registry.runtime(for: handle)
           else { return }
           Task { @MainActor in await runtime.clearBrowsingData() }
         },

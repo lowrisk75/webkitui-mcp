@@ -24,16 +24,36 @@ Date : 2026-09-23. Cartographie en lecture seule, puis étape 0 implémentée.
    cross-origin). Sous verrou, un `_blank` étranger est refusé et signalé
    (`followedInSameView=false`, destination) au lieu d'être annulé en silence.
    `window.open()` par script reste refusé et signalé.
-1. Registre : bail au niveau processus + N sessions (N=1 en production). Proxy par
-   magasin (magasin nommé par session ou proxy partagé à compteur de références).
-   `GoalDelegationMonitor` par session.
-2. Broker seulement : `maximumSessions: 3`, profil nommé isolé par client par défaut
-   (opt-in `shared_profile` avec confirmation native), en-tête client/session dans
-   chaque confirmation, file globale des confirmations, un seul handoff visible
-   (`handoff_busy`), fenêtre compagnon par session. La CLI reste à 1.
+1. **Fait** : bail d'hôte au niveau du processus (une 2e session le réutilise, un
+   autre processus reste refusé, le bail part avec la dernière session) ; proxy
+   partagé par magasin (cache faible, chaque runtime le tient) ; `openOrReuse` rend
+   d'abord une session libre du même profil, puis en ouvre une nouvelle s'il reste de
+   la place, sinon une session possédée ailleurs ; `GoalDelegationMonitor` indexé par
+   délégation, le bouton stop les révoque toutes, une reconnexion n'efface que les
+   siennes.
+2. **Fait (broker)** : `maximumSessions: 3` ; CLI à 1. Décision : profil `default`
+   partagé (toutes les connexions de l'utilisateur y sont et tous les agents agissent
+   pour lui) ; profils isolés possibles plus tard, en option. Chaque confirmation
+   native commence par « Requested by agent (self-reported name) », nom nettoyé et
+   borné ; la fenêtre de contrôle humain porte le nom de l'agent ; « Forcer le
+   rendu » agit sur toutes les sessions. Restent : file globale des confirmations,
+   liste des sessions dans la fenêtre compagnon.
 3. Vraies fenêtres popup dans une session (OAuth, `window.opener`) : max 4, liées à un
    geste ou une approbation, chaque approbation nomme (session, window_id, origine),
    `switch_window` invalide les observations.
+
+## Spike magasins nommés (2026-09-23, macOS 27)
+
+Script autonome, deux profils `WKWebsiteDataStore(forIdentifier:)` :
+
+- cookie + `localStorage` écrits dans A relus par un autre processus : OK ;
+- B ne voit rien de A : OK ;
+- `remove(forIdentifier:)` efface, mais **plante (SIGSEGV dans
+  `RunLoop::dispatch`)** si aucun WKWebView n'a encore été créé dans le processus.
+  Après initialisation de WebKit : OK. Toujours supprimer depuis un processus où
+  WebKit tourne déjà (le broker), jamais depuis un outil en ligne de commande nu.
+- L'énumération `fetchAllDataStoreIdentifiers` reste à éviter : l'app tient sa propre
+  liste d'identifiants.
 
 ## Décisions par défaut
 

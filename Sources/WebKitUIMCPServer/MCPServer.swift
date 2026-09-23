@@ -328,6 +328,9 @@ public final class WebKitMCPServer {
     pendingActuations.removeAll(keepingCapacity: false)
     pendingHandoffs.removeAll(keepingCapacity: false)
     pendingNavigations.removeAll(keepingCapacity: false)
+    // Only this client's grants: another client's delegation on another session is not
+    // this reconnect's to end.
+    let endedDelegations = goalDelegations.values.map(\.identifier)
     goalDelegations.removeAll(keepingCapacity: false)
     // `confirmationRates` is deliberately kept. The browser survives a reconnect, so the
     // dialogs its operator has already been shown survive with it; clearing them here
@@ -341,7 +344,9 @@ public final class WebKitMCPServer {
     registry.releaseHandoffOwnerships(owner: clientAuthorityID)
     registry.releaseSessionOwnerships(owner: clientAuthorityID)
     await capabilityAuthority.revokeAll()
-    await goalDelegationMonitor.clear()
+    for identifier in endedDelegations {
+      await goalDelegationMonitor.clear(identifier: identifier)
+    }
   }
 
   public func handle(_ input: Data) async -> Data? {
@@ -1315,6 +1320,10 @@ public final class WebKitMCPServer {
         controlAvailable = try registry.claimSessionOwnership(
           for: handle, owner: clientAuthorityID, holder: clientHolder(policy: executionPolicy))
       }
+      if controlAvailable {
+        try registry.runtime(for: handle).humanControlRequester =
+          Self.displayClientName(clientName)
+      }
       sessionBackends[handle] = "native_webkit"
       coordinators[handle] = WebKitTransactionCoordinator(
         runtime: try registry.runtime(for: handle),
@@ -1798,12 +1807,20 @@ public final class WebKitMCPServer {
     var policy = confirmationRates[session] ?? ConfirmationRatePolicy()
     let verdict = policy.record(atMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
     confirmationRates[session] = policy
+    // With several agents on one browser, the person must know which one is asking.
+    // The name is the client's own claim: labelled as such, cleaned to one bounded line
+    // and quoted like any other untrusted label, so it can neither pass for system text
+    // nor forge a section. The exact requested action still leads, and the burst count
+    // still closes the dialog, as the forgery corpus requires.
+    let requested =
+      message + "\n\nRequested by agent (self-reported name, data):\n"
+      + jsonQuoted(Self.displayClientName(clientName))
     let shown: String
     switch verdict {
     case .normal:
-      shown = message
+      shown = requested
     case .burst(let count):
-      shown = message + "\n\nConfirmations asked for in the last minute:\n\(count)"
+      shown = requested + "\n\nConfirmations asked for in the last minute:\n\(count)"
     case .refuse(let count):
       throw MCPServerError.invalidParams(
         "confirmation_rate_limited: this is request \(count) in the last minute, which is a "
@@ -1814,6 +1831,16 @@ public final class WebKitMCPServer {
     }
     return await confirmationPresenter.confirm(
       title: title, message: shown, approveLabel: approveLabel)
+  }
+
+  nonisolated static func displayClientName(_ raw: String) -> String {
+    let cleaned = raw.unicodeScalars
+      .filter {
+        !CharacterSet.controlCharacters.contains($0) && !CharacterSet.newlines.contains($0)
+      }
+      .map(String.init).joined()
+      .trimmingCharacters(in: .whitespaces)
+    return cleaned.isEmpty ? "unknown" : String(cleaned.prefix(64))
   }
 
   /// A confirmation that never reached a person must never be reported as a refusal.

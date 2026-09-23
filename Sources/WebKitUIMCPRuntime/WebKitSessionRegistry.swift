@@ -358,11 +358,16 @@ public final class WebKitSessionRegistry {
     guard sessions.count < maximumSessions else {
       throw WebKitSessionRegistryError.capacityReached
     }
+    // The lease belongs to this process, not to one session: a second session opened
+    // here reuses it instead of contending with its own lock and reading
+    // hostControllerBusy. Another process is still refused by the flock.
     let lease =
       try enforceHostExclusiveSession
-      ? HostControllerLease(
-        lockFileURL: hostControllerLockURL,
-        holder: holder ?? WebKitControllerHolder(clientName: ProcessInfo.processInfo.processName))
+      ? (hostControllerLease
+        ?? HostControllerLease(
+          lockFileURL: hostControllerLockURL,
+          holder: holder
+            ?? WebKitControllerHolder(clientName: ProcessInfo.processInfo.processName)))
       : nil
     let handle = WebKitSessionHandle(rawValue: UUID())
     do {
@@ -398,17 +403,29 @@ public final class WebKitSessionRegistry {
   /// Reuses the host-owned browser when a durable broker reconnects. The
   /// session handle remains process-private and no observation or action
   /// authority is carried by this operation.
+  /// The session a reconnecting client should be handed back, if any: one on the
+  /// same profile that nobody owns first, and only when no new session fits, one that
+  /// another client owns (whose caller then waits or asks for a handoff).
+  private func reusableHandle(profileIdentifier: UUID?) throws -> WebKitSessionHandle? {
+    var ownedElsewhere: WebKitSessionHandle?
+    for handle in sessions.keys.sorted(by: { $0.rawValue.uuidString < $1.rawValue.uuidString }) {
+      let identifier = try runtime(for: handle).webView.configuration.websiteDataStore
+        .identifier
+      guard identifier == profileIdentifier else { continue }
+      if sessionOwners[handle] == nil { return handle }
+      ownedElsewhere = ownedElsewhere ?? handle
+    }
+    if sessions.count < maximumSessions { return nil }
+    if let ownedElsewhere { return ownedElsewhere }
+    throw WebKitSessionRegistryError.capacityReached
+  }
+
   public func openOrReuse(
     profileIdentifier: UUID? = nil,
     holder: WebKitControllerHolder? = nil
   ) throws -> (handle: WebKitSessionHandle, reused: Bool) {
-    if let existingHandle {
-      let currentIdentifier = try runtime(for: existingHandle).webView.configuration
-        .websiteDataStore.identifier
-      guard currentIdentifier == profileIdentifier else {
-        throw WebKitSessionRegistryError.capacityReached
-      }
-      return (existingHandle, true)
+    if let reusable = try reusableHandle(profileIdentifier: profileIdentifier) {
+      return (reusable, true)
     }
     return (try open(profileIdentifier: profileIdentifier, holder: holder), false)
   }
@@ -418,13 +435,8 @@ public final class WebKitSessionRegistry {
     holder: WebKitControllerHolder? = nil,
     waitTimeoutMilliseconds: Int
   ) async throws -> (handle: WebKitSessionHandle, reused: Bool) {
-    if let existingHandle {
-      let currentIdentifier = try runtime(for: existingHandle).webView.configuration
-        .websiteDataStore.identifier
-      guard currentIdentifier == profileIdentifier else {
-        throw WebKitSessionRegistryError.capacityReached
-      }
-      return (existingHandle, true)
+    if let reusable = try reusableHandle(profileIdentifier: profileIdentifier) {
+      return (reusable, true)
     }
     return (
       try await open(
