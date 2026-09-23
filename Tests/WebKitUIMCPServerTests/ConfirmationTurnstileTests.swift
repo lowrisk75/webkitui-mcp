@@ -95,4 +95,19 @@ struct ConfirmationTurnstileTests {
     #expect(!FileManager.default.fileExists(atPath: shown.path))
     #expect(ConfirmationTurnstile.shared.queuedCount == 0)
   }
+
+  @Test("A panel the helper reports hidden is a distinct outcome, reported at once")
+  func hiddenPanelIsReported() async throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("webkitui-hidden-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let helper = directory.appendingPathComponent("hidden")
+    try Data("#!/bin/sh\n/bin/cat >/dev/null\nexit 4\n".utf8).write(to: helper)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+    let presenter = NativeBrowserConfirmationPresenter(
+      helperURL: helper, helperVerification: { _ in true }, runningHelperVerification: { _ in true }
+    )
+    #expect(await presenter.confirm(title: "A", message: "A", approveLabel: "Go") == .hidden)
+  }
 }

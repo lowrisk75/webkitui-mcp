@@ -134,7 +134,10 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     panel.maxSize = NSSize(width: 820, height: 680)
     // A nonactivating panel can receive keyboard input while the caller remains
     // the active application. It does not need a separate foreground/Dock app.
-    panel.level = .modalPanel
+    // Above the Dock, the menu bar and other apps' floating panels: a security prompt
+    // under an overlay was presented, took keyboard focus, and was never seen; every
+    // request then timed out after a minute (Éclair session, 2026-09-23).
+    panel.level = .popUpMenu
     panel.becomesKeyOnlyIfNeeded = false
     panel.hidesOnDeactivate = false
     // canJoinAllSpaces and moveToActiveSpace are mutually exclusive; AppKit throws on
@@ -280,11 +283,22 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
         presentationCompleted = true
         beginKeyboardArmingWhenFocused()
       }
+      // A panel that never becomes visible — covered, or on a Space the person is not
+      // looking at — must say so at once rather than hold the caller for a minute.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [self] in
+        guard !panel.occlusionState.contains(.visible) else { return }
+        panelWasHidden = true
+        keyboardDiagnostic("hidden")
+        NSApplication.shared.stop(nil)
+      }
     }
     NSApplication.shared.run()
     panel.orderOut(nil)
     return approved
   }
+
+  /// True when the panel stayed hidden and the helper gave up without a decision.
+  private(set) var panelWasHidden = false
 
   func windowDidBecomeKey(_ notification: Notification) {
     beginKeyboardArmingWhenFocused()
@@ -444,6 +458,7 @@ private struct WebKitUIMCPConfirm {
       approveLabel: text(request.approveLabel),
       policy: ConfirmationKeyboardPolicy.stored())
     let approved = controller.run()
+    if controller.panelWasHidden { Foundation.exit(4) }
     Foundation.exit(approved ? EXIT_SUCCESS : 2)
   }
 

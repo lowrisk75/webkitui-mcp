@@ -41,6 +41,8 @@ enum NativeConfirmationOutcome: String, Equatable, Sendable {
   case timedOut = "timed_out"
   case cancelled
   case failed
+  /// The panel was shown but never visible (covered, or on another Space).
+  case hidden
 }
 
 enum NativeConfirmationState: String, Equatable, Sendable {
@@ -158,6 +160,7 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     if process.terminationStatus == EXIT_SUCCESS { return .approved }
     if process.terminationStatus == 2 { return .declined }
     if process.terminationStatus == 3 { return .cancelled }
+    if process.terminationStatus == 4 { return .hidden }
     return .failed
   }
 

@@ -1858,19 +1858,44 @@ public final class WebKitMCPServer {
           "confirmation_presented": .bool(true),
           "remediation": .string("Ask for a different action, or none."),
         ]), modern: modern)
-    case .timedOut, .cancelled, .failed:
+    case .timedOut, .cancelled, .failed, .hidden:
+      // Three different situations used to share one message that blamed the helper's
+      // signature, which sent a caller checking a signature that was fine while the
+      // real cause was a panel nobody could see (Éclair session, 2026-09-23).
+      let message: String
+      let remediation: String
+      let presented: Bool
+      switch outcome {
+      case .hidden:
+        message =
+          "The confirmation panel opened but stayed hidden — covered by another window "
+          + "or on another Space — so no decision was taken."
+        remediation =
+          "Ask the user to close full-screen overlays or switch to the Space with "
+          + "the WebKitUI MCP panel, then retry. Nothing was dispatched."
+        presented = true
+      case .timedOut:
+        message = "The confirmation was not answered in time, so no decision was taken."
+        remediation =
+          "Ask the user whether they saw the WebKitUI MCP panel; retry once they "
+          + "are at the Mac. Nothing was dispatched."
+        presented = true
+      default:
+        message = "The confirmation helper did not present a prompt, so no decision was taken."
+        remediation =
+          "Verify the packaged confirmation helper beside the running executable: "
+          + "it must be present, executable, and signed by the same team as the server. "
+          + "Nothing was dispatched."
+        presented = false
+      }
       return try structuredToolError(
         structured: .object([
           "status": .string("confirmation_unavailable"),
           "code": .string("confirmation_unavailable"),
-          "message": .string(
-            "The confirmation helper did not present a prompt, so no decision was taken."),
-          "confirmation_presented": .bool(false),
+          "message": .string(message),
+          "confirmation_presented": .bool(presented),
           "confirmation_outcome": .string(outcome.rawValue),
-          "remediation": .string(
-            "Verify the packaged confirmation helper beside the running executable: it must "
-              + "be present, executable, and signed by the same team as the server. Nothing "
-              + "was dispatched."),
+          "remediation": .string(remediation),
         ]), modern: modern)
     }
   }
@@ -5202,7 +5227,7 @@ public final class WebKitMCPServer {
           "enum": .array([.string("native"), .string("mcp")]),
           "default": .string("mcp"),
           "description": .string(
-            "native separates exact local confirmation from measured AppKit dispatch; mcp uses multi-round elicitation and JavaScript dispatch."
+            "native separates exact local confirmation from measured AppKit dispatch; mcp uses multi-round elicitation and JavaScript dispatch, which needs MCP 2026-07-28 — a client on an earlier protocol always gets the native confirmation."
           ),
         ]),
         "postcondition": WebKitMCPServer.actPostconditionSchema,
@@ -5339,7 +5364,7 @@ public final class WebKitMCPServer {
           "enum": .array([.string("native"), .string("mcp")]),
           "default": .string("native"),
           "description": .string(
-            "native shows a local exact-destination confirmation and is the reliable default; mcp uses a multi-round client elicitation."
+            "native shows a local exact-destination confirmation and is the reliable default; mcp uses a multi-round client elicitation, which needs MCP 2026-07-28; a client on an earlier protocol always gets the native confirmation, whichever mode it asks for."
           ),
         ]),
       ]) { _, new in new },
