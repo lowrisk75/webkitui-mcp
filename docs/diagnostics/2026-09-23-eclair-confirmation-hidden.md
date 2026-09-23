@@ -40,3 +40,10 @@ Après `handoff_resume`, trois confirmations (navigate, deux clics) ont expiré 
 
 - Reproduire en vrai : handoff → « Terminé » → handoff_resume → navigate.
 - Relancer les sessions Claude/Codex dont le relais date d'avant 0.6.12.
+
+## Repro réelle (2026-09-23, 0.6.21 installée)
+
+Session Home Assistant en `human_step_completed` → `handoff` (reprise) → panneau
+présenté et accepté, observation fraîche → `browser_navigate` → panneau présenté et
+accepté, document prêt en ~2 s. Aucun `hidden` ni `timed_out`. Reste : relancer les
+sessions Claude/Codex antérieures à 0.6.12.
