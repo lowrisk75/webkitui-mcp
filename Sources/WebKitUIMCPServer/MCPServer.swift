@@ -783,6 +783,11 @@ public final class WebKitMCPServer {
           &structured,
           state: snapshot.contentState,
           renderedContentCount: snapshot.renderedContentCount)
+        if snapshot.loadingIndicatorVisible == true {
+          structured["safe_next_step"] = .string(
+            "Part of this page still shows a loading placeholder. Read again before "
+              + "concluding that something is absent.")
+        }
         return try toolResult(structured: .object(structured), modern: modern)
       case "browser_act":
         return try await actTool(

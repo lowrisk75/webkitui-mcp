@@ -498,6 +498,9 @@ public struct WebKitTextSnapshot: Codable, Equatable, Sendable {
   public let truncated: Bool
   public let contentState: PageContentState
   public let renderedContentCount: Int
+  /// True when part of the page still shows a loading placeholder after the bounded
+  /// wait: the text is real but incomplete, and reading again later may add to it.
+  public var loadingIndicatorVisible: Bool?
 }
 
 /// A modifier held down for one key press. An explicit set, not a chord string: the
@@ -1833,6 +1836,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     ensureLayoutViewport()
     webView.layoutSubtreeIfNeeded()
+    // A page whose shell is ready can still be filling one region: the TSP deposit
+    // history read "Chargement en cours" and no rows on the first call, as usable and
+    // ready (2026-09-23). Wait a bounded moment for visible loading placeholders to
+    // clear, and say so if they have not.
+    let loadingDeadline = ContinuousClock.now + .seconds(3)
+    var loading = await visibleLoadingPlaceholderCount() > 0
+    while loading, ContinuousClock.now < loadingDeadline {
+      try await Task.sleep(for: .milliseconds(150))
+      loading = await visibleLoadingPlaceholderCount() > 0
+    }
     guard
       let json = try await webView.callAsyncJavaScript(
         Self.textSnapshotSource,
@@ -1841,10 +1854,42 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         contentWorld: instrumentationWorld
       ) as? String,
       let data = json.data(using: .utf8),
-      let snapshot = try? JSONDecoder().decode(WebKitTextSnapshot.self, from: data)
+      var snapshot = try? JSONDecoder().decode(WebKitTextSnapshot.self, from: data)
     else { throw WebKitRuntimeError.malformedInstrumentationResult }
+    snapshot.loadingIndicatorVisible = loading
     return snapshot
   }
+
+  /// Visible elements that are nothing but a loading placeholder: `aria-busy`, a
+  /// progress bar, or a small element whose whole text is a loading phrase.
+  private func visibleLoadingPlaceholderCount() async -> Int {
+    (try? await webView.callAsyncJavaScript(
+      Self.loadingPlaceholderSource, arguments: [:], in: nil,
+      contentWorld: instrumentationWorld) as? Int) ?? 0
+  }
+
+  private static let loadingPlaceholderSource = """
+    const phrase = /^(loading|chargement)( en cours)?\\s*(\\.{1,3}|…)?$/i;
+    const visible = element => {
+      const box = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return box.width > 0 && box.height > 0 && style.visibility !== 'hidden'
+        && style.display !== 'none' && Number(style.opacity) !== 0;
+    };
+    let count = 0;
+    for (const element of document.querySelectorAll(
+        '[aria-busy="true"], [role="progressbar"], body *')) {
+      if (count >= 8) break;
+      const busy = element.getAttribute('aria-busy') === 'true'
+        || element.getAttribute('role') === 'progressbar';
+      // textContent first: it costs nothing, and innerText lays the element out.
+      const raw = busy || element.childElementCount > 2 ? '' : (element.textContent || '');
+      const text = raw.length === 0 || raw.length > 48
+        ? '' : String(element.innerText || '').replace(/\\s+/g, ' ').trim();
+      if ((busy || phrase.test(text)) && visible(element)) count += 1;
+    }
+    return count;
+    """
 
   public func capture() async throws -> WebKitCapture {
     try requireAgentControl()
@@ -5127,6 +5172,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   private func navigationOrigin(for url: URL) -> SecurityOrigin? {
+    // A blob: URL carries the origin that created it — blob:https://site/<uuid> belongs
+    // to https://site, as HTML defines it. Read as origin-less, a portal's own
+    // generated PDF was refused as networkBoundaryDenied (FPS/TSP, 2026-09-21).
+    if url.scheme?.lowercased() == "blob" {
+      let inner = String(url.absoluteString.dropFirst("blob:".count))
+      guard let creator = URL(string: inner), creator.scheme?.lowercased() != "blob" else {
+        return nil
+      }
+      return navigationOrigin(for: creator)
+    }
     guard
       let scheme = url.scheme?.lowercased(),
       ["http", "https"].contains(scheme),

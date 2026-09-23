@@ -13,5 +13,12 @@ Date : 2026-09-23. Source : `Documents/Emilie/FPS-TSP/WebKitUI-feedback-2026-09-
 Hors WebKitUI : les refus « auto mode classifier » viennent de Claude Code avant tout
 appel au serveur ; aucune confirmation native n'a été montrée.
 
-Non traité : téléchargement `blob:` même origine (1.5), contenu chargé après
-`ready` (1.6).
+## Suite
+
+| Constat | Cause | Correction | Preuve |
+| --- | --- | --- | --- |
+| `browser_download` → `networkBoundaryDenied` sur un document `blob:` du portail | `navigationOrigin(for:)` ne connaissait que http(s) : un `blob:` était sans origine, donc « autre origine » | Un `blob:` prend l'origine de son créateur (règle HTML) ; un `blob:` imbriqué reste sans origine | Test : PDF généré par la page en `blob:` téléchargé, octets et empreinte vérifiés ; sans la correction, exactement `networkBoundaryDenied` |
+| Premier `read_text` : « Chargement en cours », 0 ligne, `usable`/`ready` | Le signal de chargement ne regardait que la page entière, pas une zone | `read_text` attend jusqu'à 3 s qu'aucun élément visible ne soit un simple indicateur de chargement (`aria-busy`, `progressbar`, texte « Chargement en cours »/« Loading… ») ; sinon `loadingIndicatorVisible=true` et une consigne de relecture | Test : lignes du tableau lues au premier appel ; indicateur permanent signalé |
+
+Non traité : les fichiers de l'historique affichés comme simple texte de cellule, sans
+lien, restent inaccessibles tant que le site ne les expose pas.

@@ -774,6 +774,34 @@ struct WebKitRuntimeTests {
     #expect(!values.contains("secret-hidden"))
   }
 
+  @Test("read_text waits for a loading region, and says so when it never clears")
+  func readTextWaitsForLoadingRegion() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <nav><a href="/requetes">Mes requêtes</a> <a href="/depots">Historique</a></nav>
+      <div id="table">Chargement en cours</div>
+      <div id="stuck"></div>
+      <script>
+        setTimeout(() => {
+          document.getElementById('table').innerHTML =
+            '<table><tr><td>2026-09-12-FormulaireRequete.pdf</td></tr></table>';
+        }, 800);
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/historique-depots"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let first = try await runtime.readText()
+    #expect(first.bodyText.contains("FormulaireRequete.pdf"))
+    #expect(first.loadingIndicatorVisible == false)
+
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.getElementById('stuck').setAttribute('aria-busy', 'true');"
+        + "document.getElementById('stuck').textContent = 'Loading…'")
+    let stuck = try await runtime.readText()
+    #expect(stuck.loadingIndicatorVisible == true)
+  }
+
   @Test("A window.open from script is reported and not followed")
   func scriptedWindowOpenIsNotFollowed() async throws {
     let runtime = WebKitRuntime()
@@ -4861,6 +4889,46 @@ struct WebKitRuntimeTests {
     #expect(
       try String(
         contentsOf: directory.appendingPathComponent(receipt.filename), encoding: .utf8) == profile)
+  }
+
+  @Test("A document the page generated as a same-origin blob downloads")
+  func sameOriginBlobDownload() async throws {
+    // Like the TSP portal: the page builds the PDF in script and links to a blob: URL.
+    let body = "%PDF-1.4 fixture"
+    let server = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <a id="doc" download="avis.pdf">Download</a>
+          <script>
+            const blob = new Blob(["\(body)"], { type: "application/pdf" });
+            document.getElementById('doc').href = URL.createObjectURL(blob);
+          </script>
+          """)
+    }
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("webkitui-blob-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { directory.appendingPathComponent($0) })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/")!,
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let link = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Download" })
+    let receipt = try await runtime.download(
+      observationID: observation.observationID,
+      elementID: link.elementID,
+      timeout: fixtureNavigationTimeout)
+    #expect(receipt.byteCount == UInt64(body.utf8.count))
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: body))
+    #expect(
+      try String(contentsOf: directory.appendingPathComponent(receipt.filename), encoding: .utf8)
+        == body)
   }
 
   @Test("A same-origin URL fallback preserves cookies and verifies a profile UUID")
