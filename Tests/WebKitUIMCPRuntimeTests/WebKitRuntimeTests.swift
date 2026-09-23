@@ -1587,6 +1587,13 @@ struct WebKitRuntimeTests {
       <div style="width:200px;height:40px;overflow:visible">
         <a href="/spills" style="display:block;margin-top:60px">Spills out</a>
       </div>
+      <div style="width:200px;height:0;overflow:hidden">
+        <a href="/menu" style="position:fixed;top:300px;left:20px">Portal menu</a>
+        <a href="/pop" style="position:absolute;top:340px;left:20px">Escaping popover</a>
+      </div>
+      <div style="position:relative;width:200px;height:0;overflow:hidden">
+        <a href="/held" style="position:absolute;top:0;left:0">Held popover</a>
+      </div>
       """,
       baseURL: URL(string: "https://fixture.invalid/clipping"),
       timeout: fixtureNavigationTimeout,
@@ -1614,6 +1621,11 @@ struct WebKitRuntimeTests {
     // overflow: visible clips nothing, wherever the box lands.
     #expect(element("Spills out")?.visible == true)
     #expect(element("Spills out")?.actionability == .actionable)
+    // Positioned boxes escape a static clipping ancestor; a positioned one holds them.
+    #expect(element("Portal menu")?.visible == true)
+    #expect(element("Portal menu")?.actionability == .actionable)
+    #expect(element("Escaping popover")?.visible == true)
+    #expect(element("Held popover")?.visible == false)
   }
 
   @Test("The only exit from a collapsed row is exposed, named, and honest about itself")

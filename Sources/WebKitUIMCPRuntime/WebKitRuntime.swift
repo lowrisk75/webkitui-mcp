@@ -6264,11 +6264,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // geometry checks above still say it is laid out. A person sees nothing of it. The
     // element stays in the tree (its actionability already says a click cannot reach
     // it); this is what turns its visible flag off.
+    // Overflow clips only what an ancestor contains: an absolutely positioned box
+    // escapes every static ancestor up to its containing block, and a fixed box (a
+    // menu rendered through a portal) escapes them all short of a transformed one.
     const clippedByAncestor = surface => {
       let box = surface.getBoundingClientRect();
+      let position = getComputedStyle(surface).position;
       for (let cursor = composedParent(surface); cursor; cursor = composedParent(cursor)) {
-        if (cursor.nodeType !== 1 || cursor.localName === 'html') break;
+        if (cursor.nodeType !== 1 || cursor.localName === 'html' || cursor.localName === 'body') {
+          break;
+        }
         const style = getComputedStyle(cursor);
+        const containingBlock = style.transform !== 'none' || style.filter !== 'none'
+          || style.perspective !== 'none' || style.contain === 'paint'
+          || style.contain === 'strict' || style.contain === 'content';
+        if (position === 'fixed' && !containingBlock) continue;
+        if (position === 'absolute' && style.position === 'static' && !containingBlock) continue;
+        if (position === 'fixed' || position === 'absolute') position = style.position;
         const clipsX = style.overflowX !== 'visible';
         const clipsY = style.overflowY !== 'visible';
         if (!clipsX && !clipsY) continue;
