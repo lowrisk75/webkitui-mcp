@@ -1,7 +1,9 @@
+import CoreGraphics
 import CryptoKit
 import Darwin
 import Dispatch
 import Foundation
+import ImageIO
 import WebKitUIMCPCore
 import WebKitUIMCPRuntime
 
@@ -459,12 +461,14 @@ public final class WebKitMCPServer {
     do {
       let result = try await performToolCall(params: params, modern: modern)
       let failed = result.objectValue?["isError"] == .bool(true)
+      let structured = result.objectValue?["structuredContent"]?.objectValue ?? [:]
       await activityLog?.record(
         method: "tools/call",
         toolName: rawToolName,
         outcome: failed ? .failed : .succeeded,
         durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
-        errorType: failed ? "tool_error" : nil
+        errorType: failed ? Self.activityErrorType(structured) : nil,
+        resultState: failed ? nil : Self.activityResultState(structured)
       )
       return result
     } catch {
@@ -477,6 +481,71 @@ public final class WebKitMCPServer {
       )
       throw error
     }
+  }
+
+  /// True when every pixel of a downsampled copy is within a small tolerance of the
+  /// first. Downsampling to 32×32 keeps the check cheap on a Retina capture.
+  nonisolated static func isUniformImage(_ pngData: Data) -> Bool {
+    guard let source = CGImageSourceCreateWithData(pngData as CFData, nil),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+    else { return false }
+    let side = 32
+    var pixels = [UInt8](repeating: 0, count: side * side * 4)
+    let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+      guard
+        let context = CGContext(
+          data: buffer.baseAddress, width: side, height: side, bitsPerComponent: 8,
+          bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+      else { return false }
+      context.interpolationQuality = .medium
+      context.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+      return true
+    }
+    guard drawn else { return false }
+    let reference = Array(pixels[0..<4])
+    for offset in stride(from: 0, to: pixels.count, by: 4) {
+      for channel in 0..<4 where abs(Int(pixels[offset + channel]) - Int(reference[channel])) > 3 {
+        return false
+      }
+    }
+    return true
+  }
+
+  /// The error's name only: a specific code, else the leading identifier of the
+  /// message (`staleObservation`, `targetNotFound`). Never the rest of the message.
+  nonisolated static func activityErrorType(_ structured: [String: JSONValue]) -> String {
+    if let code = structured["code"]?.stringValue, code != "tool_error", !code.isEmpty {
+      return code
+    }
+    let name = (structured["message"]?.stringValue ?? "").prefix {
+      $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_")
+    }
+    return name.isEmpty ? "tool_error" : String(name.prefix(64))
+  }
+
+  /// Whether a call that returned normally did what its caller wanted, as far as
+  /// the result says. The journal records only this label, never the result.
+  nonisolated static func activityResultState(_ structured: [String: JSONValue]) -> String? {
+    switch structured["readiness"]?.stringValue {
+    case "deadline_reached": return "deadline_reached"
+    case "process_terminated": return "process_terminated"
+    default: break
+    }
+    if structured["image_uniform"] == .bool(true) { return "blank_capture" }
+    if let state = structured["action_state"]?.stringValue { return state }
+    // A synthesized enum with a payload encodes as its single case name.
+    if let verification = structured["verification"]?.objectValue,
+      verification.keys.contains("indeterminate")
+    {
+      return "indeterminate"
+    }
+    if let verification = structured["verification"]?.objectValue,
+      verification.keys.contains("pending")
+    {
+      return "verification_pending"
+    }
+    return nil
   }
 
   private func performToolCall(params: JSONValue?, modern: Bool) async throws -> JSONValue {
@@ -741,6 +810,10 @@ public final class WebKitMCPServer {
               "modal_present": .bool(capture.modalPresent),
               "rendered_interactive_count": .int(Int64(capture.renderedInteractiveCount)),
             ]),
+            // A single flat colour is almost never what a page with controls looks
+            // like. It is reported, not treated as an empty page: the observation stays
+            // the authority on content (a blank Play Console capture, 2026-09-23).
+            "image_uniform": .bool(Self.isUniformImage(capture.pngData)),
           ]),
         ]
         if modern { result["resultType"] = .string("complete") }
@@ -4506,17 +4579,47 @@ public final class WebKitMCPServer {
     return .object(result)
   }
 
-  private func toolError(_ message: String, modern: Bool) throws -> JSONValue {
+  /// What to do next for the refusals an agent meets most, keyed by the error's name.
+  /// A bare case name told the caller that something was wrong but not what to change.
+  nonisolated private static let knownErrorRemediations: [String: String] = [
+    "staleObservation":
+      "The page changed since that observation. Observe again and act on an element from the new observation.",
+    "targetNotFound":
+      "No element matches every fact the observation recorded for it. Observe again; if the element is listed, act on its new ID.",
+    "targetNotActionable":
+      "The element is present but cannot receive input (covered, disabled or off screen). Observe again; for a radio or checkbox, try focusing it and pressing Space.",
+    "preconditionUnsatisfied":
+      "A precondition you supplied is false on the current page, so nothing was dispatched. Observe again and check each precondition against what the page now shows.",
+    "preconditionUnknown":
+      "A precondition could not be evaluated on the current page, so nothing was dispatched. Observe again and use predicates on elements the observation lists.",
+  ]
+
+  nonisolated static func toolErrorFields(_ message: String) -> (code: String, remediation: String)
+  {
     let components = message.split(separator: ":", maxSplits: 1).map(String.init)
     let candidateCode = components.first ?? ""
-    let code =
+    let validCode =
       !candidateCode.isEmpty
-        && candidateCode.allSatisfy({ $0.isLowercase || $0.isNumber || $0 == "_" })
-      ? candidateCode : "tool_error"
-    let remediation =
-      components.count == 2
-      ? components[1].trimmingCharacters(in: .whitespacesAndNewlines)
-      : "Correct the reported condition and retry the same bounded operation."
+      && candidateCode.allSatisfy({ $0.isLowercase || $0.isNumber || $0 == "_" })
+    // Only a recognised `code: remediation` pair is split. A colon inside the message
+    // itself, such as `context_anchor:previous_sibling`, used to hand the caller the
+    // tail of the error as its remediation.
+    guard validCode else {
+      let name = String(message.prefix { $0.isLetter || $0.isNumber })
+      return (
+        "tool_error",
+        knownErrorRemediations[name]
+          ?? "Correct the reported condition and retry the same bounded operation."
+      )
+    }
+    guard components.count == 2 else {
+      return (candidateCode, "Correct the reported condition and retry the same bounded operation.")
+    }
+    return (candidateCode, components[1].trimmingCharacters(in: .whitespacesAndNewlines))
+  }
+
+  private func toolError(_ message: String, modern: Bool) throws -> JSONValue {
+    let (code, remediation) = Self.toolErrorFields(message)
     let structured: JSONValue = .object([
       "code": .string(code),
       "message": .string(message),

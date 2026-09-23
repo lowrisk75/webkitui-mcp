@@ -121,8 +121,8 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   evaluated, and frames beyond the bounded native registry, remain explicitly
   unreadable rather than being treated as empty page content.
 - Some identity providers require a complete browser surface and do not render
-  inside an app-embedded `WKWebView`. The exact App Store Connect to Apple
-  Account embedding returns `full_browser_required` with an internal
+  inside an app-embedded `WKWebView` (for example a WebAuthn-only step without the
+  browser passkey entitlement). Those return `full_browser_required` with an internal
   `safari_compatibility` requirement. `compatibility_start` opens Safari after confirmation, but provides no Safari
   observation/control and no automatic return to this MCP after login. Complete
   the entire blocked workflow manually in the external browser. WebKitUI never copies cookies,
@@ -360,11 +360,10 @@ that origin. A cross-origin redirect is not reported as an ambiguous WebKit
 failure: it returns `redirect_requires_human_approval` with source and target
 origins only.
 
-When App Store Connect embeds that restricted Apple Account origin, WebKitUI
-returns `full_browser_required` instead of opening a known-stalled handoff
-window. The single MCP reports the missing internal `safari_compatibility`
-backend. Until that integration is implemented and physically verified, the
-flow remains human-only and no Safari state is transferred.
+When App Store Connect embeds that restricted Apple Account origin, the sign-in
+takes the native human handoff like any other restricted origin. It used to return
+`full_browser_required`: the frame measured as stalled was a hidden-page defect of
+the parked window (fixed 2026-09-23), not an engine limit.
 
 Navigation blocks on an exact native macOS confirmation by default and returns
 a normal terminal tool result. Human handoff is

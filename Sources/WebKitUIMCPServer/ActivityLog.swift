@@ -15,6 +15,9 @@ public struct WebKitActivityEvent: Codable, Equatable, Identifiable, Sendable {
   public let outcome: WebKitActivityOutcome
   public let durationMilliseconds: Int
   public let errorType: String?
+  /// What the tool reported beyond transport success, from a closed vocabulary: a
+  /// reload that hit its deadline is `succeeded` as a call but not as a page load.
+  public let resultState: String?
 
   init(
     id: UUID = UUID(),
@@ -23,7 +26,8 @@ public struct WebKitActivityEvent: Codable, Equatable, Identifiable, Sendable {
     toolName: String?,
     outcome: WebKitActivityOutcome,
     durationMilliseconds: Int,
-    errorType: String?
+    errorType: String?,
+    resultState: String? = nil
   ) {
     self.schemaVersion = 1
     self.id = id
@@ -33,6 +37,7 @@ public struct WebKitActivityEvent: Codable, Equatable, Identifiable, Sendable {
     self.outcome = outcome
     self.durationMilliseconds = max(0, durationMilliseconds)
     self.errorType = errorType
+    self.resultState = resultState
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -44,6 +49,7 @@ public struct WebKitActivityEvent: Codable, Equatable, Identifiable, Sendable {
     case outcome
     case durationMilliseconds = "duration_ms"
     case errorType = "error_type"
+    case resultState = "result_state"
   }
 }
 
@@ -67,6 +73,15 @@ public actor WebKitActivityLog {
     "browser_session",
     "browser_transaction",
     "element_scroll_into_view",
+  ]
+
+  public static let allowedResultStates: Set<String> = [
+    "blank_capture",
+    "deadline_reached",
+    "indeterminate",
+    "process_terminated",
+    "verification_pending",
+    "verified_by_immediate_reconciliation",
   ]
 
   public nonisolated let directoryURL: URL
@@ -109,7 +124,8 @@ public actor WebKitActivityLog {
     toolName rawToolName: String?,
     outcome: WebKitActivityOutcome,
     durationMilliseconds: Int,
-    errorType rawErrorType: String? = nil
+    errorType rawErrorType: String? = nil,
+    resultState rawResultState: String? = nil
   ) {
     let method = Self.allowedMethods.contains(rawMethod) ? rawMethod : "unknown"
     let toolName = rawToolName.flatMap {
@@ -122,7 +138,10 @@ public actor WebKitActivityLog {
       toolName: toolName,
       outcome: outcome,
       durationMilliseconds: durationMilliseconds,
-      errorType: errorType
+      errorType: errorType,
+      resultState: rawResultState.flatMap {
+        Self.allowedResultStates.contains($0) ? $0 : nil
+      }
     )
     do {
       try append(event)

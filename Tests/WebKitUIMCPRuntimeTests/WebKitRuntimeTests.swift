@@ -3560,10 +3560,11 @@ struct WebKitRuntimeTests {
     #expect(status.classification == .fullBrowserRequired)
   }
 
-  @Test("Full-browser fallback is limited to the exact Apple authentication embedding pair")
-  func appleAuthenticationFullBrowserPolicyIsNarrow() {
+  @Test("Apple sign-in embedded in App Store Connect takes the native handoff")
+  func appleAuthenticationUsesNativeHandoff() {
+    // Once a full-browser route: its stalled frame was the hidden-page defect.
     #expect(
-      WebKitRuntime.requiresFullBrowserBackend(
+      !WebKitRuntime.requiresFullBrowserBackend(
         topLevelURL: URL(string: "https://appstoreconnect.apple.com/login"),
         restrictedFrameOrigin: "https://idmsa.apple.com"
       ))
@@ -4032,7 +4033,7 @@ struct WebKitRuntimeTests {
   func humanHandoffPresentsLiveRenderedWebView() async throws {
     let runtime = makeWindowHandoffRuntime()
     let stableWindow = try #require(runtime.webView.window)
-    #expect(!stableWindow.isVisible)
+    #expect(!runtime.humanControlSurfaceIsPresented)
     _ = try await runtime.loadHTML(
       """
       <!doctype html>
@@ -4429,6 +4430,84 @@ struct WebKitRuntimeTests {
     #expect(observation.elements[0].value?.segments.first?.text == "Lumen")
   }
 
+  @Test("AppKit fill replaces a non-empty rich-text editor exactly, paragraphs included")
+  func nativeRichTextFillReplacesExistingDraft() async throws {
+    let runtime = WebKitRuntime()
+    // Like Lexical: once focused, the editor restores its own caret at the end on the
+    // next task, discarding the selection the page was given. innerText separates
+    // block paragraphs with a blank line.
+    _ = try await runtime.loadHTML(
+      """
+      <div id="editor" contenteditable="true" role="textbox" aria-label="Body"
+        aria-multiline="true"><p>Old draft</p></div>
+      <script>
+      const editor = document.getElementById('editor');
+      editor.addEventListener('focus', () => setTimeout(() => {
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        getSelection().removeAllRanges();
+        getSelection().addRange(range);
+      }, 0));
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/submit"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let editor = try #require(
+      before.elements.first { $0.accessibleName?.segments.first?.text == "Body" })
+    let value = try ProvenancedText(
+      text: "First paragraph.\nSecond paragraph.",
+      source: ProvenanceSource(classification: .userIntent))
+    let result = try await runtime.perform(
+      observationID: before.observationID,
+      elementID: editor.elementID,
+      operation: .fill(value),
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.trustedUserGesture)
+    let text =
+      try await runtime.webView.evaluateJavaScript(
+        "JSON.stringify(document.getElementById('editor').innerText.trim())") as? String
+    #expect(text == #""First paragraph.\n\nSecond paragraph.""#)
+  }
+
+  @Test("A custom radio observed as actionable can be clicked natively")
+  func customRadioObservedActionableIsClickable() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <style>
+        .choice { display: flex; align-items: center; gap: 8px; padding: 10px;
+          position: relative; width: 120px; height: 20px; }
+        .choice input { position: absolute; inset: 0; opacity: 0; margin: 0; }
+      </style>
+      <div role="radiogroup" aria-label="Flair">
+        <label class="choice"><input type="radio" name="flair" value="none" checked>
+          <span>No flair</span></label>
+        <label class="choice"><input type="radio" name="flair" value="beta">
+          <span>Beta Test</span></label>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/flair"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let beta = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Beta Test" })
+    #expect(beta.actionable)
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: beta.elementID,
+      operation: .click,
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.dispatched)
+    let checked =
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('input[value=beta]').checked") as? Bool
+    #expect(checked == true)
+  }
+
   @Test("AppKit fill persists in an Apple-style searchable App ID selector")
   func nativeCustomSelectorFillActuation() async throws {
     let runtime = WebKitRuntime()
@@ -4504,6 +4583,75 @@ struct WebKitRuntimeTests {
       operation: .click,
       stabilityInterval: .milliseconds(10))
     #expect(secondResult.dispatched)
+  }
+
+  @Test("A previous-sibling anchor resolves past an aria-hidden neighbour it was observed past")
+  func previousSiblingAnchorSkipsAriaHiddenLikeObservation() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div role="tablist"><button role="tab">Releases</button><span
+        aria-hidden="true">‹</span><button role="tab" data-state="idle"
+        onclick="this.dataset.state='opened'">Testers</button></div>
+      <div role="tablist"><button role="tab">Tracks</button><span
+        aria-hidden="true">‹</span><button role="tab" data-state="idle"
+        onclick="this.dataset.state='opened'">Testers</button></div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/tracks"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let testers = observation.elements.filter {
+      $0.accessibleName?.segments.first?.text == "Testers"
+    }
+    #expect(testers.count == 2)
+    #expect(testers.allSatisfy { $0.locatorQuality.status == .unique })
+    #expect(
+      testers[0].contextAnchors.contains {
+        $0.kind == .previousSibling && $0.text.segments.first?.text == "Releases"
+      })
+
+    let first = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: testers[0].elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(10))
+    #expect(first.dispatched)
+    let refreshed = try await runtime.observe()
+    let second = try #require(
+      refreshed.elements.first { element in
+        element.contextAnchors.contains { $0.text.segments.first?.text == "Tracks" }
+          && element.accessibleName?.segments.first?.text == "Testers"
+      })
+    let secondResult = try await runtime.perform(
+      observationID: refreshed.observationID,
+      elementID: second.elementID,
+      operation: .click,
+      stabilityInterval: .milliseconds(10))
+    #expect(secondResult.dispatched)
+  }
+
+  @Test("The parked agent window still runs animation frames and reports a visible page")
+  func parkedWindowKeepsAnimationFramesRunning() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <p id="state">pending</p>
+      <script>
+        let frames = 0;
+        const tick = () => { frames += 1; if (frames < 30) requestAnimationFrame(tick); };
+        setTimeout(() => requestAnimationFrame(tick), Number(location.hash.slice(1) || 0));
+        setTimeout(() => {
+          document.getElementById('state').textContent =
+            `visibility=${document.visibilityState} frames=${frames}`;
+        }, Number(location.hash.slice(1) || 0) + 700);
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/frames"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    try await Task.sleep(for: .milliseconds(1_200))
+    let text = try await runtime.readText().bodyText
+    #expect(text.contains("visibility=visible"))
+    #expect(text.contains("frames=30"))
   }
 
   @Test("An authenticated attachment download returns a collision-safe integrity receipt")

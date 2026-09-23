@@ -1089,6 +1089,39 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     webView.navigationDelegate = self
     webView.uiDelegate = self
     _ = makeBrowserWindow()
+    keepPageVisibleWhileParked()
+    // Park now rather than on the first observation: a page loaded or navigated
+    // before anything observed it ran with its window ordered out, hidden.
+    ensureLayoutViewport()
+  }
+
+  /// An ordered-in window is retained by AppKit's window list, and it holds the web
+  /// view: without this a closed session kept its view, its web process and its
+  /// website data store alive for the life of the broker.
+  isolated deinit {
+    browserWindow?.orderOut(nil)
+    browserWindow?.contentView = nil
+    browserWindow?.close()
+  }
+
+  /// The parked layout host sits outside every display, so macOS reports it occluded
+  /// and WebKit marks the page hidden: `visibilityState` is `hidden` and animation
+  /// frames never run. A Material dialog waits on a frame to insert its content, so
+  /// after a handoff the backdrop covered the page and no dialog control ever
+  /// appeared (Play Console, 2026-09-23; measured `hidden`, 0 frames). No public API
+  /// decouples page visibility from window occlusion, so this uses WebKit's own
+  /// switch, checked before use; without it the page keeps the previous behaviour.
+  /// Distribution is a notarized direct download, where this is permitted.
+  private func keepPageVisibleWhileParked() {
+    let getter = Selector(("_windowOcclusionDetectionEnabled"))
+    let setter = Selector(("_setWindowOcclusionDetectionEnabled:"))
+    guard webView.responds(to: getter), webView.responds(to: setter),
+      let implementation = webView.method(for: setter)
+    else { return }
+    // Key-value coding cannot reach an underscored accessor, and `perform(_:with:)`
+    // would pass a non-nil object where the method expects NO.
+    typealias SetBool = @convention(c) (AnyObject, Selector, ObjCBool) -> Void
+    unsafeBitCast(implementation, to: SetBool.self)(webView, setter, false)
   }
 
   public func navigate(
@@ -4362,6 +4395,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     guard armed.count == 1, let candidate = armed.candidate else { return armed }
     guard candidate.geometryStable, candidate.actionable else { return armed }
 
+    // The arming script selected the old contents, but a rich-text editor restores
+    // its own caret on the task after focus: Reddit's composer kept its draft and
+    // the new text was appended to it (2026-09-23). Select All is WebKit's own
+    // editing command, scoped to the focused editable and issued in the same turn as
+    // the insertion, so it is what the insertion replaces.
+    webView.selectAll(nil)
     webView.insertText(value)
     let deadline = ContinuousClock.now + .seconds(1)
     while ContinuousClock.now < deadline {
@@ -4945,9 +4984,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   private static let restrictedAuthenticationHosts: Set<String> = ["idmsa.apple.com"]
-  private static let fullBrowserAuthenticationParents: [String: Set<String>] = [
-    "appstoreconnect.apple.com": ["idmsa.apple.com"]
-  ]
+  /// Embeddings whose authentication frame cannot work in this engine at all. App
+  /// Store Connect → idmsa used to be listed: measured on 2026-08-24 as a sign-in
+  /// frame stuck on its spinner, it was the hidden-page defect (no animation
+  /// frames while parked), not a WKWebView limit. With the page kept visible the
+  /// same route renders the Apple Account form (2026-09-23), so it now takes the
+  /// native human handoff like any other restricted origin. idmsa stays
+  /// restricted: the agent still cannot read, capture or fill it.
+  private static let fullBrowserAuthenticationParents: [String: Set<String>] = [:]
 
   private static func isRestrictedAuthenticationHost(_ rawHost: String?) -> Bool {
     guard
@@ -6371,6 +6415,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       return true;
     };
+    // Context anchors are re-derived here and compared with the text the observation
+    // recorded, so the neighbour must be chosen by the observation's rule, not the
+    // action rule above: aria-hidden is skipped, and only the element's own opacity
+    // hides it. The two rules differed and a Material tab whose previous sibling is an
+    // aria-hidden paginator was observed as unique, then refused as targetNotFound on
+    // every retry with no mutation (Play Console, 2026-09-23).
+    const isAnchorRendered = element => {
+      const box = element.getBoundingClientRect();
+      if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
+      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+        if (cursor.hidden || cursor.inert
+            || collapse(cursor.getAttribute?.('aria-hidden')).toLowerCase() === 'true') {
+          return false;
+        }
+        const style = getComputedStyle(cursor);
+        if (style.display === 'none' || style.visibility === 'hidden'
+            || style.visibility === 'collapse') return false;
+        if (Number(style.opacity) === 0 && cursor === element) return false;
+      }
+      return true;
+    };
     // A Material-style control renders in two halves: the real input, given no size
     // or clipped away, and the painted box beside it marked aria-hidden. Neither half
     // survives a visibility filter on its own, so the form observes as a group with no
@@ -6551,7 +6616,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
       const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
       for (const candidate of candidates) {
-        if (candidate === element || candidate.contains(element) || !isRendered(candidate)) continue;
+        if (candidate === element || candidate.contains(element) || !isAnchorRendered(candidate)) {
+          continue;
+        }
         const text = collapse(
           candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
         if (text && text !== collapse(nameOf(element))) return text;
@@ -6582,7 +6649,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       if (kind === 'previous_sibling') {
         let sibling = element.previousElementSibling;
-        while (sibling && !isRendered(sibling)) sibling = sibling.previousElementSibling;
+        while (sibling && !isAnchorRendered(sibling)) sibling = sibling.previousElementSibling;
         return collapse(sibling?.innerText || sibling?.textContent) || null;
       }
       return null;

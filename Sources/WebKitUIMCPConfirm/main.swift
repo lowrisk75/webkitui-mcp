@@ -331,7 +331,7 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
   }
 
   @objc private func approveAction() {
-    keyboardDiagnostic("approve")
+    keyboardDiagnostic("approve", source: Self.eventSource(NSApplication.shared.currentEvent))
     approved = true
     NSApplication.shared.stop(nil)
   }
@@ -361,8 +361,23 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
   }
 
   /// Opt-in local probe metadata only: never records request text or typed content.
+  /// Which input delivered an action. No current event means an accessibility press,
+  /// the path an automation agent takes (seen approving unattended, 2026-09-23).
+  private static func eventSource(_ event: NSEvent?) -> String {
+    guard let event else { return "accessibility" }
+    switch event.type {
+    case .keyDown: return "keyboard"
+    case .leftMouseDown, .leftMouseUp:
+      // A hardware click carries no posting process; a CGEvent posted by an agent does.
+      let poster = event.cgEvent?.getIntegerValueField(.eventSourceUnixProcessID) ?? 0
+      return poster == 0 ? "mouse" : "posted_mouse_pid_\(poster)"
+    default: return "event_\(event.type.rawValue)"
+    }
+  }
+
   private func keyboardDiagnostic(
-    _ phase: String, eventTimestamp: TimeInterval? = nil, allowed: Bool? = nil
+    _ phase: String, eventTimestamp: TimeInterval? = nil, allowed: Bool? = nil,
+    source: String? = nil
   ) {
     guard ProcessInfo.processInfo.environment["WEBKITUI_CONFIRM_KEYBOARD_DIAGNOSTICS"] == "1"
     else { return }
@@ -376,6 +391,7 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
       if let eventTimestamp { fields["pressed_after_seconds"] = eventTimestamp - start }
     }
     if let allowed { fields["allowed"] = allowed }
+    if let source { fields["source"] = source }
     if var data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]) {
       data.append(0x0A)
       try? FileHandle.standardError.write(contentsOf: data)
