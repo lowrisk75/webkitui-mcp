@@ -16,6 +16,10 @@ public enum WebKitRuntimeError: Error, Equatable, Sendable {
   case navigationTimedOut
   case webContentProcessTerminated
   case networkBoundaryDenied
+  /// A pending download was about to come from, or be redirected to, another origin
+  /// than the page that started it. Sanitized origins only; `stage` is `request` or
+  /// `response`.
+  case downloadOriginDenied(expectedOrigin: String, deniedOrigin: String, stage: String)
   case malformedInstrumentationResult
   case noDocument
   case invalidQuietWindow
@@ -997,6 +1001,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var restrictedAuthenticationFrameOrigin: String?
   private var restrictedWebAuthnOrigin: String?
   private var pendingCrossOriginNavigationRequest: URLRequest?
+  /// A refused cross-origin hop from a view that never committed a page. Human control
+  /// opens on it instead of an empty placeholder, so a person can finish a sign-in the
+  /// agent was not allowed to follow. It never leaves WebKitUI through MCP.
+  private var humanHandoffFallbackRequest: URLRequest?
   private let egressProxy: PinnedSOCKSProxy?
   /// Identity only, for tests that two sessions on one store share one proxy.
   var egressProxyIdentity: ObjectIdentifier? { egressProxy.map(ObjectIdentifier.init) }
@@ -1238,6 +1246,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   ) async throws -> WebKitNavigationResult {
     try requireAgentControl()
     pendingCrossOriginNavigationRequest = nil
+    humanHandoffFallbackRequest = nil
     guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
       throw WebKitRuntimeError.unsupportedURLScheme
     }
@@ -1302,7 +1311,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     return try await load(request: request, timeout: timeout, quietWindow: quietWindow)
   }
 
+  private func downloadOriginDenied(
+    _ expectedOrigin: SecurityOrigin, url: URL?, stage: String
+  ) -> WebKitRuntimeError {
+    .downloadOriginDenied(
+      expectedOrigin: Self.sanitizedOrigin(expectedOrigin),
+      deniedOrigin: url.flatMap(navigationOrigin(for:)).map(Self.sanitizedOrigin) ?? "unavailable",
+      stage: stage)
+  }
+
   public func discardPendingCrossOriginNavigation() {
+    if webView.url == nil, lastCommittedHTTPURL == nil {
+      humanHandoffFallbackRequest = pendingCrossOriginNavigationRequest
+    }
     pendingCrossOriginNavigationRequest = nil
   }
 
@@ -1933,6 +1954,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       try await Task.sleep(for: .milliseconds(150))
       loading = await visibleLoadingPlaceholderCount() > 0
     }
+    var snapshot = try await textSnapshot(maximumCharacters: maximumCharacters)
+    // A single-page app can be ready and quiet with nothing rendered yet, and no
+    // placeholder to wait on: the Volvo developer portal read as empty on the first
+    // call and full a few seconds later (Éclair session, 2026-09-26). An empty read
+    // gets the rest of the same bounded wait before it is believed.
+    while snapshot.contentState == .emptyOrUnusable, ContinuousClock.now < loadingDeadline {
+      try await Task.sleep(for: .milliseconds(150))
+      snapshot = try await textSnapshot(maximumCharacters: maximumCharacters)
+    }
+    snapshot.loadingIndicatorVisible = loading
+    return snapshot
+  }
+
+  private func textSnapshot(maximumCharacters: Int) async throws -> WebKitTextSnapshot {
     guard
       let json = try await webView.callAsyncJavaScript(
         Self.textSnapshotSource,
@@ -1941,9 +1976,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         contentWorld: instrumentationWorld
       ) as? String,
       let data = json.data(using: .utf8),
-      var snapshot = try? JSONDecoder().decode(WebKitTextSnapshot.self, from: data)
+      let snapshot = try? JSONDecoder().decode(WebKitTextSnapshot.self, from: data)
     else { throw WebKitRuntimeError.malformedInstrumentationResult }
-    snapshot.loadingIndicatorVisible = loading
     return snapshot
   }
 
@@ -3676,7 +3710,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     application.applicationIconImage = Self.humanControlApplicationIcon()
     let window = browserWindow ?? makeBrowserWindow()
     if webView.url == nil, lastCommittedHTTPURL == nil, !webView.isLoading {
-      webView.loadHTMLString(Self.emptyHandoffDocument, baseURL: nil)
+      if let request = humanHandoffFallbackRequest {
+        humanHandoffFallbackRequest = nil
+        webView.load(request)
+      } else {
+        webView.loadHTMLString(Self.emptyHandoffDocument, baseURL: nil)
+      }
     }
     let baseTitle = Self.localizedHandoff(
       "WebkitUIMCP — Human control", fallback: "WebkitUIMCP — Human control")
@@ -4068,11 +4107,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         authenticationUIClassification = .fullBrowserRequired
       }
     }
-    if let expectedOrigin = downloadExpectedOrigin {
+    // Only the main frame, a new window or an explicit download can become the file. A
+    // consent or analytics iframe loading meanwhile used to end the download as a bare
+    // networkBoundaryDenied (Volvo developer portal, 2026-09-26).
+    if let expectedOrigin = downloadExpectedOrigin,
+      navigationAction.targetFrame?.isMainFrame != false
+        || navigationAction.shouldPerformDownload
+    {
       guard let targetURL = navigationAction.request.url,
         navigationOrigin(for: targetURL) == expectedOrigin
       else {
-        finishDownload(.failure(WebKitRuntimeError.networkBoundaryDenied))
+        finishDownload(
+          .failure(
+            downloadOriginDenied(
+              expectedOrigin, url: navigationAction.request.url, stage: "request")))
         return .cancel
       }
       if navigationAction.shouldPerformDownload { return .download }
@@ -4142,12 +4190,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     _ webView: WKWebView,
     decidePolicyFor navigationResponse: WKNavigationResponse
   ) async -> WKNavigationResponsePolicy {
-    guard downloadContinuation != nil else { return .allow }
+    guard downloadContinuation != nil, navigationResponse.isForMainFrame else { return .allow }
     guard let responseURL = navigationResponse.response.url,
       let expectedOrigin = downloadExpectedOrigin,
       navigationOrigin(for: responseURL) == expectedOrigin
     else {
-      finishDownload(.failure(WebKitRuntimeError.networkBoundaryDenied))
+      finishDownload(
+        .failure(
+          downloadExpectedOrigin.map {
+            downloadOriginDenied($0, url: navigationResponse.response.url, stage: "response")
+          } ?? WebKitRuntimeError.networkBoundaryDenied))
       return .cancel
     }
     let disposition =
@@ -4712,6 +4764,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     return survey
   }
 
+  private static let nativeClickSettleAttempts = 3
+
   private func resolveAndPerformNativeClick(
     criteria: [[String: String]],
     physicalIdentity: String,
@@ -4725,15 +4779,29 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       armedNativeGestureTokens.removeValue(forKey: token)
       nativeGestureReceipts.removeValue(forKey: token)
     }
-    let armed = try await actionScript(
-      source: Self.armNativeClickSource,
-      arguments: [
-        "criteria": criteria,
-        "physicalIdentity": physicalIdentity,
-        "expectedCandidateCount": expectedCandidateCount,
-        "expectedBox": Self.boxDictionary(expectedBoundingBox),
-        "token": token,
-      ])
+    var arguments: [String: Any] = [
+      "criteria": criteria,
+      "physicalIdentity": physicalIdentity,
+      "expectedCandidateCount": expectedCandidateCount,
+      "expectedBox": Self.boxDictionary(expectedBoundingBox),
+      "token": token,
+    ]
+    var armed = try await actionScript(source: Self.armNativeClickSource, arguments: arguments)
+    // A page still settling (a banner sliding in, a font, a re-render) moves the one
+    // element it resolved to, and every click on it was refused (Volvo developer portal,
+    // 2026-09-26). Same element, same identity: it is clicked only once it has held
+    // still for a whole interval at its new place, within a few intervals. Nothing is
+    // armed while it moves.
+    var settleAttempts = 0
+    while settleAttempts < Self.nativeClickSettleAttempts, armed.count == 1,
+      let moved = armed.candidate, !moved.geometryStable,
+      moved.physicalIdentity == physicalIdentity
+    {
+      settleAttempts += 1
+      try await Task.sleep(for: .milliseconds(150))
+      arguments["expectedBox"] = Self.boxDictionary(moved.boundingBox)
+      armed = try await actionScript(source: Self.armNativeClickSource, arguments: arguments)
+    }
     guard armed.count == 1, let candidate = armed.candidate else { return armed }
     guard candidate.geometryStable, candidate.actionable else { return armed }
 
@@ -7632,12 +7700,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         candidates.push(element);
       }
     }
+    // A hidden live region or closed dialog is not on the page. Its textContent used to
+    // be reported as a region: a stale "Your session has ended — Sign in" on a portal
+    // where the person was signed in (Éclair session, 2026-09-26).
+    const hiddenSelector = '[hidden], [inert], [aria-hidden="true"], dialog:not([open])';
     const seen = new Set();
     const regions = [];
     for (const element of candidates) {
       if (remaining <= 0 || seen.has(element)) continue;
       seen.add(element);
-      const text = take(element.innerText || element.textContent);
+      if (element.closest(hiddenSelector) || element.getClientRects().length === 0) continue;
+      const text = take(element.innerText);
       if (!text) continue;
       regions.push({
         kind: element.getAttribute('role') || element.localName,

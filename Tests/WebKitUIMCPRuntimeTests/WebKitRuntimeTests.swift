@@ -802,6 +802,45 @@ struct WebKitRuntimeTests {
     #expect(stuck.loadingIndicatorVisible == true)
   }
 
+  @Test("read_text waits for an app shell that renders late, with no placeholder")
+  func readTextWaitsForLateRenderedShell() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div id="root"></div>
+      <script>
+        setTimeout(() => {
+          document.getElementById('root').innerHTML = '<h1>Getting started</h1>';
+        }, 800);
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/apis/docs/getting-started/"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let text = try await runtime.readText()
+    #expect(text.contentState == .usable)
+    #expect(text.bodyText.contains("Getting started"))
+  }
+
+  @Test("read_text reports no region for a hidden live region or a closed dialog")
+  func readTextSkipsHiddenRegions() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <main><p>Test access tokens</p></main>
+      <div aria-live="polite" hidden>Your session has ended — Sign in</div>
+      <dialog><div aria-live="assertive">Your session has ended</div></dialog>
+      <div aria-live="polite" aria-hidden="true">Signed out</div>
+      <div aria-live="polite" id="visible">Token copied</div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/test-access-tokens/"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let text = try await runtime.readText()
+    let regionText = text.regions.map(\.text).joined(separator: "\n")
+    #expect(!regionText.contains("session has ended"))
+    #expect(!regionText.contains("Signed out"))
+    #expect(regionText.contains("Token copied"))
+  }
+
   @Test("A window.open from script is reported and not followed")
   func scriptedWindowOpenIsNotFollowed() async throws {
     let runtime = WebKitRuntime()
@@ -3931,6 +3970,57 @@ struct WebKitRuntimeTests {
     #expect(!String(describing: resumed).contains(privateState))
   }
 
+  @Test("A sign-in round trip asks again per hop, and a refused hop opens human control on it")
+  func crossOriginRedirectChainAndHandoffFallback() async throws {
+    // docs → accounts → docs, the Google Forms shape (Éclair session, 2026-09-26).
+    let privateState = "private-chain-state-must-stay-inside-webkit"
+    // Written once, before either server is asked anything.
+    final class Port: @unchecked Sendable { var value: UInt16 = 0 }
+    let entryPort = Port()
+    let authenticationServer = try FormFixtureServer { _ in
+      FormFixtureServer.redirect(
+        to: URL(string: "http://127.0.0.1:\(entryPort.value)/form?state=\(privateState)")!)
+    }
+    let authenticationURL = URL(
+      string: "http://localhost:\(authenticationServer.port)/ServiceLogin")!
+    let entryServer = try FormFixtureServer { request in
+      request.contains("GET /form?")
+        ? FormFixtureServer.response(body: "<title>Form</title><main>Form</main>")
+        : FormFixtureServer.redirect(to: authenticationURL)
+    }
+    entryPort.value = entryServer.port
+    let entry = "http://127.0.0.1:\(entryServer.port)"
+    let authentication = "http://localhost:\(authenticationServer.port)"
+    let runtime = makeWindowHandoffRuntime()
+
+    await #expect(
+      throws: WebKitRuntimeError.crossOriginRedirectRequiresHuman(
+        fromOrigin: entry, toOrigin: authentication)
+    ) {
+      try await runtime.navigate(
+        to: URL(string: "\(entry)/viewform")!,
+        timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20),
+        constrainToInitialOrigin: true)
+    }
+    await #expect(
+      throws: WebKitRuntimeError.crossOriginRedirectRequiresHuman(
+        fromOrigin: authentication, toOrigin: entry)
+    ) {
+      try await runtime.continueApprovedCrossOriginNavigation(
+        timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(20))
+    }
+
+    runtime.discardPendingCrossOriginNavigation()
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: true)
+    for _ in 0..<fixtureSettlementPolls
+    where runtime.webView.url?.host != "127.0.0.1" || runtime.webView.isLoading {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(runtime.webView.url?.host == "127.0.0.1")
+    #expect(runtime.webView.url?.query == "state=\(privateState)")
+  }
+
   @Test("macOS 27 willSubmitForm does not cover programmatic requestSubmit")
   func formSubmissionAudit() async throws {
     let server = try FormFixtureServer()
@@ -4678,6 +4768,37 @@ struct WebKitRuntimeTests {
     #expect(text == #""First paragraph.\n\nSecond paragraph.""#)
   }
 
+  @Test("A native click waits for its element to settle when it moves while the click is armed")
+  func nativeClickFollowsSettledElementOnce() async throws {
+    // A banner sliding in above the target as the click starts, as on the Volvo portal
+    // (2026-09-26). The move lands between the action's own resolution and the arm.
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div id="top" style="height: 0; transition: height 120ms linear"></div>
+      <button id="pick" onclick="this.textContent = 'Picked'">Select API here...</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/apis"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let button = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Select API here..."
+      })
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.getElementById('top').style.height = '60px'")
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: button.elementID,
+      operation: .click,
+      dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.dispatched)
+    #expect(
+      try await runtime.webView.evaluateJavaScript(
+        "document.getElementById('pick').textContent") as? String == "Picked")
+  }
+
   @Test("A custom radio observed as actionable can be clicked natively")
   func customRadioObservedActionableIsClickable() async throws {
     let runtime = WebKitRuntime()
@@ -5050,6 +5171,62 @@ struct WebKitRuntimeTests {
     #expect(
       try String(contentsOf: directory.appendingPathComponent(receipt.filename), encoding: .utf8)
         == body)
+  }
+
+  @Test("A consent frame loading from another origin does not end a pending download")
+  func subframeNavigationDoesNotEndDownload() async throws {
+    // The Volvo developer portal shape: a script-driven button, and a third-party frame
+    // loading while the file is prepared (2026-09-26).
+    let body = "{\"openapi\":\"3.0.0\"}"
+    final class Port: @unchecked Sendable { var value: UInt16 = 0 }
+    let port = Port()
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /consent") {
+        return FormFixtureServer.response(body: "<p>Consent</p>")
+      }
+      return FormFixtureServer.response(
+        body: """
+          <button id="dl">Download specification</button>
+          <script>
+            document.getElementById('dl').addEventListener('click', () => {
+              const frame = document.createElement('iframe');
+              frame.src = 'http://localhost:\(port.value)/consent';
+              document.body.appendChild(frame);
+              setTimeout(() => {
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(
+                  new Blob(['\(body)'], { type: 'application/json' }));
+                link.download = 'spec.json';
+                document.body.appendChild(link);
+                link.click();
+              }, 150);
+            });
+          </script>
+          """)
+    }
+    port.value = server.port
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("webkitui-frame-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(),
+      egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { directory.appendingPathComponent($0) })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/specification/")!,
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let button = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Download specification"
+      })
+    let receipt = try await runtime.download(
+      observationID: observation.observationID,
+      elementID: button.elementID,
+      timeout: fixtureNavigationTimeout)
+    #expect(receipt.byteCount == UInt64(body.utf8.count))
   }
 
   @Test("A same-origin URL fallback preserves cookies and verifies a profile UUID")

@@ -2977,7 +2977,8 @@ public final class WebKitMCPServer {
       switch operationName {
       case "click":
         guard !target.submitsForm else {
-          throw MCPServerError.invalidParams("Use operation=submit for a form submit control")
+          throw MCPServerError.invalidParams(
+            "element_id is a native form submit control (submits_form=true); use operation=submit")
         }
         guard arguments["value"] == nil else {
           throw MCPServerError.invalidParams("click does not accept value")
@@ -3381,58 +3382,80 @@ public final class WebKitMCPServer {
       // cross-origin hop and the issued capability have to be given up before the error
       // leaves, or a refused flood would leave the runtime holding a redirect nobody
       // approved.
-      let redirectOutcome: NativeConfirmationOutcome
-      do {
-        redirectOutcome = try await rateLimitedConfirmation(
-          session: pending.session,
-          title: "Approve Cross-Origin Redirect",
-          message:
-            "Allow this exact redirect from \(fromOrigin) to \(toOrigin)? Its private path and query stay inside WebKitUI and are never exposed through MCP.",
-          approveLabel: "Continue")
-      } catch {
-        runtime.discardPendingCrossOriginNavigation()
-        await capabilityAuthority.revoke(capability)
-        throw error
-      }
-      guard redirectOutcome == .approved else {
-        runtime.discardPendingCrossOriginNavigation()
-        await capabilityAuthority.revoke(capability)
-        return try redirectApprovalResult(
-          fromOrigin: fromOrigin,
-          toOrigin: toOrigin,
-          modern: modern
-        )
-      }
-      do {
-        let result = try await runtime.continueApprovedCrossOriginNavigation(
-          timeout: .milliseconds(pending.timeoutMilliseconds),
-          quietWindow: .milliseconds(pending.quietWindowMilliseconds)
-        )
-        await capabilityAuthority.revoke(capability)
-        if let restriction = runtime.authenticationRestrictionStatus() {
-          if runtime.interactionControlState() == .agentControlled
-            || runtime.interactionControlState() == .freshlyReobserved
-          {
-            try runtime.requestHumanHandoff()
-            runtime.humanControlRequester = Self.displayClientName(clientName)
-            try runtime.beginHumanControl(presentWindow: presentHumanWindows)
-          }
-          return try toolResult(
-            structured: .object([
-              "status": .string("authentication_origin_requires_human_handoff"),
-              "origin": .string(restriction.origin),
-              "auth_ui_state": .string(restriction.classification.rawValue),
-              "environment": try .encoded(restriction.environment),
-              "control_state": .string(runtime.interactionControlState().rawValue),
-              "navigation": try navigationResultPayload(result),
-              "redirect_request_exposed_to_mcp": .bool(false),
-            ]),
-            modern: modern)
+      // Sign-in flows bounce between origins (docs.google.com → accounts.google.com →
+      // docs.google.com), and a second hop used to escape this handler as a raw error
+      // with nothing loaded, so the human handoff had no page to show (Éclair session,
+      // 2026-09-26). Each hop gets its own exact-origin confirmation, up to a bound.
+      var hop = (from: fromOrigin, to: toOrigin)
+      var approvedHops = 0
+      while true {
+        let redirectOutcome: NativeConfirmationOutcome
+        do {
+          redirectOutcome = try await rateLimitedConfirmation(
+            session: pending.session,
+            title: "Approve Cross-Origin Redirect",
+            message:
+              "Allow this exact redirect from \(hop.from) to \(hop.to)? Its private path and query stay inside WebKitUI and are never exposed through MCP.",
+            approveLabel: "Continue")
+        } catch {
+          runtime.discardPendingCrossOriginNavigation()
+          await capabilityAuthority.revoke(capability)
+          throw error
         }
-        return try toolResult(structured: navigationResultPayload(result), modern: modern)
-      } catch {
-        await capabilityAuthority.revoke(capability)
-        throw error
+        guard redirectOutcome == .approved else {
+          runtime.discardPendingCrossOriginNavigation()
+          await capabilityAuthority.revoke(capability)
+          return try redirectApprovalResult(
+            fromOrigin: hop.from,
+            toOrigin: hop.to,
+            modern: modern
+          )
+        }
+        approvedHops += 1
+        do {
+          let result = try await runtime.continueApprovedCrossOriginNavigation(
+            timeout: .milliseconds(pending.timeoutMilliseconds),
+            quietWindow: .milliseconds(pending.quietWindowMilliseconds)
+          )
+          await capabilityAuthority.revoke(capability)
+          if let restriction = runtime.authenticationRestrictionStatus() {
+            if runtime.interactionControlState() == .agentControlled
+              || runtime.interactionControlState() == .freshlyReobserved
+            {
+              try runtime.requestHumanHandoff()
+              runtime.humanControlRequester = Self.displayClientName(clientName)
+              try runtime.beginHumanControl(presentWindow: presentHumanWindows)
+            }
+            return try toolResult(
+              structured: .object([
+                "status": .string("authentication_origin_requires_human_handoff"),
+                "origin": .string(restriction.origin),
+                "auth_ui_state": .string(restriction.classification.rawValue),
+                "environment": try .encoded(restriction.environment),
+                "control_state": .string(runtime.interactionControlState().rawValue),
+                "navigation": try navigationResultPayload(result),
+                "redirect_request_exposed_to_mcp": .bool(false),
+              ]),
+              modern: modern)
+          }
+          return try toolResult(structured: navigationResultPayload(result), modern: modern)
+        } catch WebKitRuntimeError.crossOriginRedirectRequiresHuman(let nextFrom, let nextTo) {
+          observations.removeValue(forKey: pending.session)
+          guard approvedHops < Self.maximumApprovedRedirectHops else {
+            runtime.discardPendingCrossOriginNavigation()
+            await capabilityAuthority.revoke(capability)
+            return try redirectApprovalResult(
+              fromOrigin: nextFrom,
+              toOrigin: nextTo,
+              modern: modern,
+              chainLimitReached: true
+            )
+          }
+          hop = (from: nextFrom, to: nextTo)
+        } catch {
+          await capabilityAuthority.revoke(capability)
+          throw error
+        }
       }
     } catch {
       await capabilityAuthority.revoke(capability)
@@ -3440,19 +3463,30 @@ public final class WebKitMCPServer {
     }
   }
 
+  /// Cross-origin hops one navigation may take after its first approval. A sign-in
+  /// round trip needs two or three; more reads as a loop, not a flow.
+  static let maximumApprovedRedirectHops = 4
+
   func redirectApprovalResult(
     fromOrigin: String,
     toOrigin: String,
-    modern: Bool
+    modern: Bool,
+    chainLimitReached: Bool = false
   ) throws -> JSONValue {
-    try structuredToolError(
-      structured: .object([
-        "status": .string("redirect_requires_human_approval"),
-        "from_origin": .string(fromOrigin),
-        "to_origin": .string(toOrigin),
-      ]),
-      modern: modern
-    )
+    var structured: [String: JSONValue] = [
+      "status": .string("redirect_requires_human_approval"),
+      "from_origin": .string(fromOrigin),
+      "to_origin": .string(toOrigin),
+      "remediation": .string(
+        "Request browser_session operation=handoff: when no page is loaded, the human "
+          + "window opens on the refused destination so the person can continue there."),
+    ]
+    if chainLimitReached {
+      structured["redirect_chain_limit_reached"] = .bool(true)
+      structured["maximum_approved_redirect_hops"] = .int(
+        Int64(Self.maximumApprovedRedirectHops))
+    }
+    return try structuredToolError(structured: .object(structured), modern: modern)
   }
 
   /// One approved answer to the one panel a page is suspended on.
@@ -4522,6 +4556,8 @@ public final class WebKitMCPServer {
         "sensitive": .bool(element.sensitive),
         "actionable": .bool(element.actionable),
       ]
+      // Which of click or submit is legal depends on it, so it is never optional either.
+      if element.submitsForm { row["submits_form"] = .bool(true) }
       if !element.actionable {
         row["not_actionable_because"] = .string(element.actionability.rawValue)
       }
@@ -4654,6 +4690,7 @@ public final class WebKitMCPServer {
       "accessibleName": plain(element.accessibleName),
       "label": plain(element.label),
       "sensitive": .bool(element.sensitive),
+      "submitsForm": .bool(element.submitsForm),
       "actionable": .bool(element.actionable),
       "actionability": .string(element.actionability.rawValue),
       "stableAttributes": .object(
