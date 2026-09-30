@@ -105,6 +105,17 @@ extension WebKitControllerHolder {
   }
 }
 
+public struct WebKitSessionRemoval: Sendable, Equatable {
+  public enum Cause: String, Sendable {
+    /// `browser_session operation=close`.
+    case closed
+    /// Every owning client disconnected and none came back within the grace period.
+    case ownerDisconnectGraceExpired = "owner_disconnect_grace_expired"
+  }
+  public let cause: Cause
+  public let removedAt: Date
+}
+
 public enum WebKitSessionRegistryError: Error, Equatable, Sendable {
   case invalidMaximumSessions
   case capacityReached
@@ -236,6 +247,9 @@ public final class WebKitSessionRegistry {
   private let hostControllerLockURL: URL?
   private let runtimeFactory: (UUID?) throws -> WebKitRuntime
   private var sessions: [WebKitSessionHandle: WebKitRuntime] = [:]
+  /// Why a session this process held is gone. A handle missing from here was never
+  /// seen by this process, which after a restart is the answer too.
+  private var removedSessionCauses: [WebKitSessionHandle: WebKitSessionRemoval] = [:]
   // Resume capabilities belong to the host-owned browser authority, not to a
   // transient MCP transport. Only a one-way digest is retained in memory.
   private var handoffResumeCapabilities: [Data: HandoffResumeCapability] = [:]
@@ -249,6 +263,21 @@ public final class WebKitSessionRegistry {
   private var activeClientCalls: [UUID: Int] = [:]
   private var hostControllerLease: HostControllerLease?
   private let unownedLeaseGrace: Duration
+  public var unownedLeaseGraceSeconds: Int { Int(unownedLeaseGrace.components.seconds) }
+
+  public func removal(of handle: WebKitSessionHandle) -> WebKitSessionRemoval? {
+    removedSessionCauses[handle]
+  }
+
+  private func recordRemoval(_ handle: WebKitSessionHandle, cause: WebKitSessionRemoval.Cause) {
+    // Bounded: a long-lived broker must not grow a record per session ever opened.
+    if removedSessionCauses.count >= 64,
+      let oldest = removedSessionCauses.min(by: { $0.value.removedAt < $1.value.removedAt })
+    {
+      removedSessionCauses.removeValue(forKey: oldest.key)
+    }
+    removedSessionCauses[handle] = WebKitSessionRemoval(cause: cause, removedAt: Date())
+  }
   private var unownedLeaseYield: Task<Void, Never>?
 
   public convenience init(
@@ -327,6 +356,7 @@ public final class WebKitSessionRegistry {
       revokeHandoffResumeCapabilities(for: handle)
       handoffOwners.removeValue(forKey: handle)
     }
+    for handle in sessions.keys { recordRemoval(handle, cause: .ownerDisconnectGraceExpired) }
     sessions.removeAll()
     hostControllerLease = nil
     unownedLeaseYield = nil
@@ -458,6 +488,7 @@ public final class WebKitSessionRegistry {
     guard sessions.removeValue(forKey: handle) != nil else {
       throw WebKitSessionRegistryError.unknownSession
     }
+    recordRemoval(handle, cause: .closed)
     revokeHandoffResumeCapabilities(for: handle)
     handoffOwners.removeValue(forKey: handle)
     sessionOwners.removeValue(forKey: handle)

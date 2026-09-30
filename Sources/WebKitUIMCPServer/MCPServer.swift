@@ -458,6 +458,45 @@ public final class WebKitMCPServer {
     return encode(successResponse(id: request.id ?? .null, result: result, modern: modern))
   }
 
+  /// Names the one cause that applied, because the three possible ones call for
+  /// different next steps (AuroraPulse session, 2026-09-30).
+  private func sessionExpiredResult(params: JSONValue?, modern: Bool) throws -> JSONValue {
+    let rawHandle = params?.objectValue?["arguments"]?.objectValue?["session_id"]?.stringValue
+    let removal = rawHandle.flatMap(UUID.init(uuidString:))
+      .flatMap { registry.removal(of: WebKitSessionHandle(rawValue: $0)) }
+    let grace = registry.unownedLeaseGraceSeconds
+    let cause: String
+    let explanation: String
+    switch removal?.cause {
+    case .closed?:
+      cause = "closed"
+      explanation = "it was closed with browser_session operation=close"
+    case .ownerDisconnectGraceExpired?:
+      cause = "owner_disconnect_grace_expired"
+      explanation =
+        "its MCP client disconnected and did not reconnect within \(grace) seconds, so the "
+        + "session was released"
+    case nil:
+      cause = "unknown_to_this_app_process"
+      explanation =
+        "this WebKitUI app process never held it, which means the app restarted since it "
+        + "was opened"
+    }
+    return try structuredToolError(
+      structured: .object([
+        "code": .string("session_expired"),
+        "message": .string(
+          "session_expired: This session no longer exists: \(explanation). Open a new one "
+            + "with browser_session operation=open; earlier observation IDs are void. The "
+            + "persistent profile keeps sign-ins."),
+        "cause": .string(cause),
+        "removed_at": removal.map { .string(ISO8601DateFormatter().string(from: $0.removedAt)) }
+          ?? .null,
+        "owner_disconnect_grace_seconds": .int(Int64(grace)),
+      ]),
+      modern: modern)
+  }
+
   private func callTool(params: JSONValue?, modern: Bool) async throws -> JSONValue {
     let startedAt = Date()
     let rawToolName = params?.objectValue?["name"]?.stringValue
@@ -471,11 +510,7 @@ public final class WebKitMCPServer {
         // A handle that outlived its session used to surface as a bare JSON-RPC
         // "Internal error" (FPS/TSP session, 2026-09-23), which reads as a server fault
         // and says nothing about what to do next.
-        result = try toolError(
-          "session_expired: This session no longer exists: it was closed, released after "
-            + "its owner disconnected, or the WebKitUI app restarted. Open a new one with "
-            + "browser_session operation=open; earlier observation IDs are void.",
-          modern: modern)
+        result = try sessionExpiredResult(params: params, modern: modern)
       }
       let failed = result.objectValue?["isError"] == .bool(true)
       let structured = result.objectValue?["structuredContent"]?.objectValue ?? [:]
@@ -1267,11 +1302,27 @@ public final class WebKitMCPServer {
       guard
         arguments.keys.allSatisfy({
           $0 == "operation" || $0 == "profile_id" || $0 == "execution_policy"
-            || $0 == "wait_timeout_ms"
+            || $0 == "wait_timeout_ms" || $0 == "width" || $0 == "height"
         })
       else {
         throw MCPServerError.invalidParams(
-          "open accepts only operation, profile_id, execution_policy, and wait_timeout_ms")
+          "open accepts only operation, profile_id, execution_policy, wait_timeout_ms, "
+            + "width, and height")
+      }
+      // The schema advertises width and height for every operation, and open refused
+      // them (AuroraPulse session, 2026-09-30). Validated before anything is opened.
+      let requestedViewport: (width: Int, height: Int)?
+      if arguments["width"] != nil || arguments["height"] != nil {
+        requestedViewport = (
+          width: try boundedInteger(
+            arguments["width"], defaultValue: 1_280, range: WebKitRuntime.viewportWidthRange,
+            name: "width"),
+          height: try boundedInteger(
+            arguments["height"], defaultValue: 800, range: WebKitRuntime.viewportHeightRange,
+            name: "height")
+        )
+      } else {
+        requestedViewport = nil
       }
       let requestedProfile = arguments["profile_id"]?.stringValue ?? "default"
       let executionPolicy = arguments["execution_policy"]?.stringValue ?? "auto"
@@ -1326,23 +1377,32 @@ public final class WebKitMCPServer {
         runtime: try registry.runtime(for: handle),
         ledger: try transactionLedgerFactory.make(scope: requestedProfile)
       )
-      return try toolResult(
-        structured: .object([
-          "session_id": .string(handle.rawValue.uuidString),
-          "maximum_sessions": .int(Int64(registry.maximumSessions)),
-          "reused": .bool(opened.reused),
-          "client_control_state": .string(
-            controlAvailable ? "owned_by_this_client" : "owned_elsewhere"),
-          "control_available": .bool(controlAvailable),
-          "profile_id": .string(requestedProfile),
-          "execution_policy": .string(executionPolicy),
-          "selected_backend": .string("native_webkit"),
-          "capabilities": .array([
-            .string("authenticated_read"),
-            .string("trusted_local_write"),
-            .string("human_handoff"),
-          ]),
-        ]), modern: modern)
+      // Another client's session is never resized from here.
+      var viewport: JSONValue?
+      if let requestedViewport, controlAvailable {
+        let change = try await registry.runtime(for: handle).setViewport(
+          width: requestedViewport.width, height: requestedViewport.height)
+        if change.observationInvalidated { observations.removeValue(forKey: handle) }
+        viewport = try .encoded(change)
+      }
+      var openResult: [String: JSONValue] = [
+        "session_id": .string(handle.rawValue.uuidString),
+        "maximum_sessions": .int(Int64(registry.maximumSessions)),
+        "reused": .bool(opened.reused),
+        "client_control_state": .string(
+          controlAvailable ? "owned_by_this_client" : "owned_elsewhere"),
+        "control_available": .bool(controlAvailable),
+        "profile_id": .string(requestedProfile),
+        "execution_policy": .string(executionPolicy),
+        "selected_backend": .string("native_webkit"),
+        "capabilities": .array([
+          .string("authenticated_read"),
+          .string("trusted_local_write"),
+          .string("human_handoff"),
+        ]),
+      ]
+      if let viewport { openResult["viewport"] = viewport }
+      return try toolResult(structured: .object(openResult), modern: modern)
     case "profiles":
       guard arguments.keys.allSatisfy({ $0 == "operation" }) else {
         throw MCPServerError.invalidParams("profiles accepts only operation")
@@ -2564,7 +2624,7 @@ public final class WebKitMCPServer {
             "control_state": .string(runtime.interactionControlState().rawValue),
             "observation_compact": .bool(observationOptions.compact),
             "observation": try handoffObservationPayload(
-              observation, compact: observationOptions.compact),
+              observation, compact: observationOptions.compact, runtime: runtime),
           ]),
           modern: false
         )
@@ -2593,7 +2653,7 @@ public final class WebKitMCPServer {
           "control_state": .string(runtime.interactionControlState().rawValue),
           "observation_compact": .bool(observationOptions.compact),
           "observation": try handoffObservationPayload(
-            observation, compact: observationOptions.compact),
+            observation, compact: observationOptions.compact, runtime: runtime),
         ]), modern: modern)
     }
     guard params["inputResponses"] == nil else {
@@ -2825,7 +2885,7 @@ public final class WebKitMCPServer {
         "resumed": .bool(true),
         "observation_compact": .bool(observationOptions.compact),
         "observation": try handoffObservationPayload(
-          observation, compact: observationOptions.compact),
+          observation, compact: observationOptions.compact, runtime: runtime),
       ]), modern: modern)
   }
 
@@ -2850,12 +2910,20 @@ public final class WebKitMCPServer {
 
   private func handoffObservationPayload(
     _ observation: WebKitPageObservation,
-    compact: Bool
+    compact: Bool,
+    runtime: WebKitRuntime
   ) throws -> JSONValue {
-    if compact {
-      return compactObservation(observation, fields: Set(["role", "name", "href", "state"]))
-    }
-    return try .encoded(observation)
+    let payload: JSONValue =
+      compact
+      ? compactObservation(observation, fields: Set(["role", "name", "href", "state"]))
+      : try .encoded(observation)
+    // The open panel tells the person its file's name, size and SHA-256 go back to the
+    // client; resume is where the client learns them (AuroraPulse session, 2026-09-30).
+    guard case .object(var object) = payload,
+      let receipt = runtime.humanFileUploadReceiptSinceHandoff()
+    else { return payload }
+    object["human_file_upload_receipt"] = try .encoded(receipt)
+    return .object(object)
   }
 
   private func handoffWaitOnlyResult(
@@ -3836,16 +3904,24 @@ public final class WebKitMCPServer {
       !target.sensitive
     else { throw MCPServerError.invalidParams("upload target is unavailable") }
     try requireMainFrameActionTarget(target)
-    let tag = target.tag.segments.map(\.text).joined().lowercased()
-    guard tag == "input" else {
-      throw MCPServerError.invalidParams("browser_upload requires a file input control")
-    }
     let idempotencyKey = try requireString(
       arguments["idempotency_key"], named: "idempotency_key")
     guard
       let postcondition = try parseActPostcondition(arguments["postcondition"]) as ActPostcondition?
     else { throw MCPServerError.invalidParams("postcondition is required") }
     let candidates = try uploadCandidates(arguments)
+    // Kept even if this call is refused: a human handed the panel afterwards starts in
+    // the folder of the file the agent named.
+    runtime.proposeUploadFile(candidates.first?.url)
+    // Consoles hide the real input behind a styled "browse" control (CloudKit's Import
+    // Schema, AuroraPulse session, 2026-09-30). Such a control is accepted too; the
+    // runtime only lets the approved page's own main-frame panel take the files.
+    let tag = target.tag.segments.map(\.text).joined().lowercased()
+    let role = (target.role?.segments.map(\.text).joined() ?? "").lowercased()
+    guard tag == "input" || tag == "label" || tag == "button" || role == "button" else {
+      throw MCPServerError.invalidParams(
+        "browser_upload requires a file input, or a label or button that opens one")
+    }
 
     let label = String(
       ((target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text).joined() ?? "")
@@ -3885,6 +3961,21 @@ public final class WebKitMCPServer {
         dispatchMode: .nativeAppKit,
         expiresAt: Date().addingTimeInterval(60)
       ), modern: modern)
+    if !candidates.isEmpty, runtime.hasArmedUploadSelection() {
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("upload_panel_not_opened"),
+          "message": .string(
+            "The click was dispatched but opened no file panel, so no file was attached."),
+          "file_selected": .bool(false),
+          "remediation": .string(
+            "Observe again and target the control that opens the file chooser, or request "
+              + "browser_session operation=handoff: the panel then starts in the proposed "
+              + "file's folder."),
+          "action": result,
+        ]),
+        modern: modern)
+    }
     return Self.annotatingConfirmedDigests(result, confirmed: candidates.map(\.sha256))
   }
 

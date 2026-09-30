@@ -549,6 +549,102 @@ struct MCPServerTests {
     #expect(!encoded.contains(directory.path))
   }
 
+  @Test("Upload through a styled browse control attaches the confirmed file to the hidden input")
+  func uploadThroughBrowseControl() async throws {
+    // CloudKit's Import Schema dialog: the real input is hidden behind a "browse" span
+    // (AuroraPulse session, 2026-09-30).
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("cloudkit_schema.ckdb")
+    try Data("DEFINE SCHEMA".utf8).write(to: file, options: .atomic)
+
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Import Schema</h1>
+      <input id="schema" type="file" style="display:none"
+        onchange="document.querySelector('h1').textContent = 'Selected ' + this.files[0].name">
+      <span role="button" tabindex="0"
+        onclick="document.getElementById('schema').click()">browse</span>
+      """,
+      baseURL: URL(string: "https://icloud.fixture.invalid/dashboard")!,
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let response = try await toolCall(
+      server, id: 2, name: "browser_upload",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "idempotency_key": .string("cloudkit-schema-01"),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "browse")),
+        "file_paths": .array([.string(file.path)]),
+        "postcondition": .object([
+          "type": .string("heading_equals"),
+          "value": .string("Selected cloudkit_schema.ckdb"),
+        ]),
+      ])
+    let result = try object(response["result"])
+    #expect(result["isError"] != .bool(true))
+    let structured = try object(result["structuredContent"])
+    #expect(structured["file_selected"] == .bool(true))
+    #expect(
+      try object(structured["file_upload_receipt"])["filenames"]
+        == .array([.string("cloudkit_schema.ckdb")]))
+  }
+
+  @Test("A browse control that opens no panel says no file was attached")
+  func uploadThroughControlThatOpensNoPanel() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("schema.ckdb")
+    try Data("DEFINE SCHEMA".utf8).write(to: file, options: .atomic)
+
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<h1>Import</h1><button onclick=\"document.querySelector('h1').textContent='Clicked'\">"
+        + "browse</button>",
+      baseURL: URL(string: "https://icloud.fixture.invalid/dashboard")!,
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let response = try await toolCall(
+      server, id: 2, name: "browser_upload",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "idempotency_key": .string("no-panel-01"),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "browse")),
+        "file_paths": .array([.string(file.path)]),
+        "postcondition": .object([
+          "type": .string("heading_equals"), "value": .string("Clicked"),
+        ]),
+      ])
+    let result = try object(response["result"])
+    #expect(result["isError"] == .bool(true))
+    let structured = try object(result["structuredContent"])
+    #expect(structured["status"] == .string("upload_panel_not_opened"))
+    #expect(structured["file_selected"] == .bool(false))
+    #expect(!runtime.hasArmedUploadSelection())
+  }
+
   @Test("Upload refuses a digest that does not match the local file before confirming")
   func uploadRejectsMismatchedDigestBeforeConfirmation() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -833,6 +929,29 @@ struct MCPServerTests {
     await server.relinquishClientResources()
     #expect(registry.count == 0)
     #expect(registry.externalHostControllerHolder() == nil)
+  }
+
+  @Test("open accepts the width and height its schema advertises and sizes the viewport")
+  func openAppliesRequestedViewport() async throws {
+    // AuroraPulse session, 2026-09-30: open refused them, then set_viewport was needed.
+    let registry = try WebKitSessionRegistry()
+    let server = WebKitMCPServer(registry: registry)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("open"), "width": .int(1500), "height": .int(1400),
+      ])
+    let result = try object(response["result"])
+    #expect(result["isError"] == nil)
+    let structured = try object(result["structuredContent"])
+    let viewport = try object(structured["viewport"])
+    #expect(viewport["width"] == .int(1500))
+    #expect(viewport["height"] == .int(1400))
+
+    let refused = try await toolCall(
+      server, id: 2, name: "browser_session",
+      arguments: ["operation": .string("open"), "width": .int(10)])
+    #expect(try object(refused["error"])["code"] == .int(-32602))
   }
 
   @Test("Download reports an active human handoff without attempting the action")
@@ -2016,7 +2135,19 @@ struct MCPServerTests {
       let result = try object(response["result"])
       #expect(result["isError"] == .bool(true))
       #expect(try object(result["structuredContent"])["code"] == .string("session_expired"))
+      #expect(
+        try object(result["structuredContent"])["cause"]
+          == .string("unknown_to_this_app_process"))
     }
+    // A closed one says it was closed (AuroraPulse session, 2026-09-30).
+    let closed = try registry.open()
+    try registry.close(closed)
+    let response = try await toolCall(
+      server, id: 3, name: "browser_observe",
+      arguments: ["session_id": .string(closed.rawValue.uuidString)])
+    let structured = try object(try object(response["result"])["structuredContent"])
+    #expect(structured["cause"] == .string("closed"))
+    #expect(structured["removed_at"] != .null)
   }
 
   @Test("A click WebKit asked a new window for says so, and the next action does not inherit it")

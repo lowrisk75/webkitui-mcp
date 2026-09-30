@@ -1014,6 +1014,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private let uploadSelectionProvider: (@MainActor @Sendable (Bool, Bool) async -> [URL]?)?
   private var lastUploadReceipt: WebKitFileUploadReceipt?
   private var armedUploadSelection: [URL]?
+  /// The origin of the page the upload was approved on. Only a panel that page's own
+  /// main frame opens may consume the armed files.
+  private var armedUploadOrigin: SecurityOrigin?
+  /// A file the agent proposed, for the human open panel to start beside. Only its
+  /// folder and name are used, locally; neither is sent anywhere.
+  private var proposedUploadFile: URL?
+  private var humanControlBeganNanoseconds: UInt64?
   private var filePickerVisible = false
   private var downloadContinuation: CheckedContinuation<WebKitDownloadReceipt, any Error>?
   private var downloadExpectedOrigin: SecurityOrigin?
@@ -1247,6 +1254,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     try requireAgentControl()
     pendingCrossOriginNavigationRequest = nil
     humanHandoffFallbackRequest = nil
+    proposedUploadFile = nil
     guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
       throw WebKitRuntimeError.unsupportedURLScheme
     }
@@ -2854,11 +2862,27 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   public func isFilePickerVisible() -> Bool { filePickerVisible }
 
+  /// The file a person chose in an open panel during the latest human control, if any.
+  public func humanFileUploadReceiptSinceHandoff() -> WebKitFileUploadReceipt? {
+    guard let receipt = lastUploadReceipt, receipt.selectedByHuman,
+      let began = humanControlBeganNanoseconds, receipt.monotonicNanoseconds >= began
+    else { return nil }
+    return receipt
+  }
+
   /// Arms a single-use file-panel selection. The next panel this runtime opens
   /// consumes it; the selection is spent whether or not it passed validation, so an
   /// approved selection can never satisfy a second panel opened by the site.
   public func armUploadSelection(_ urls: [URL]) {
     armedUploadSelection = urls
+    armedUploadOrigin = (webView.url ?? lastCommittedHTTPURL).flatMap(navigationOrigin(for:))
+  }
+
+  /// Where a human open panel starts. It opened in whatever folder was used last,
+  /// another project's, while the agent had named the exact file (AuroraPulse session,
+  /// 2026-09-30).
+  public func proposeUploadFile(_ url: URL?) {
+    proposedUploadFile = url?.isFileURL == true ? url : nil
   }
 
   public func hasArmedUploadSelection() -> Bool { armedUploadSelection != nil }
@@ -2866,6 +2890,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// Discards an armed selection that no panel consumed.
   public func disarmUploadSelection() {
     armedUploadSelection = nil
+    armedUploadOrigin = nil
   }
 
   /// WebKit asks for a web view here for `window.open()` and for a `target="_blank"`
@@ -3256,7 +3281,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if let armed = armedUploadSelection {
       // Spent unconditionally: a rejected or partial selection must not survive
       // into a second panel.
-      armedUploadSelection = nil
+      let approvedOrigin = armedUploadOrigin
+      disarmUploadSelection()
+      // The click that opens the panel may now be a styled "browse" control rather than
+      // the file input itself, so the panel is checked instead: the approved page's own
+      // main frame, and no more files than the control accepts.
+      guard frame.isMainFrame,
+        let approvedOrigin,
+        (webView.url ?? lastCommittedHTTPURL).flatMap(navigationOrigin(for:)) == approvedOrigin,
+        parameters.allowsMultipleSelection || armed.count == 1
+      else {
+        lastUploadReceipt = nil
+        return nil
+      }
       selectionMode = .agentConfirmed
       selectedURLs = armed
     } else if let uploadSelectionProvider {
@@ -3272,6 +3309,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       panel.resolvesAliases = true
       panel.message =
         "Choose the exact local file. Its name, size, and SHA-256 will be returned to the MCP client; its local path and contents will not."
+      if let proposed = proposedUploadFile {
+        panel.directoryURL = proposed.deletingLastPathComponent()
+        panel.message += "\nThe agent proposed: \(proposed.lastPathComponent)"
+      }
       panel.prompt = "Choose"
       let response: NSApplication.ModalResponse
       if let window = browserWindow, browserWindowIsOnScreen {
@@ -3584,6 +3625,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     guard controlState == .handoffRequested else {
       throw WebKitRuntimeError.invalidControlTransition
     }
+    humanControlBeganNanoseconds = DispatchTime.now().uptimeNanoseconds
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
     topLevelOriginLock = nil
