@@ -188,8 +188,11 @@ final class AdversarialFixtureHarness {
       if let postcondition {
         arguments["postcondition"] = postcondition
       } else if ["click", "submit", "press_key", "blur", "commit_input"].contains(operation) {
+        // These tests decline the action and inspect the confirmation document. A
+        // huge hostile label deliberately truncates semantics, so an appearance
+        // predicate would correctly refuse before reaching the boundary under test.
         arguments["postcondition"] = .object([
-          "type": .string("semantic_text_appears"),
+          "type": .string("title_equals"),
           "value": .string("THIS ACTION WAS NOT DISPATCHED"),
         ])
       }

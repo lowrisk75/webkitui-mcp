@@ -1545,6 +1545,44 @@ struct WebKitRuntimeTests {
     #expect(checkedNames == ["Payments and transfers"])
   }
 
+  @Test("Console observations identify overlays, inline handlers and equivalent link wrappers")
+  func cloudConsoleControlsAndCoverage() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      """
+      <div role="button" style="width:200px;height:30px"><a href="/records" style="display:block;width:100%;height:100%">Records</a></div>
+      <div role="button" tabindex="0"><a href="/distinct">Distinct</a></div>
+      <span onclick="this.textContent='Configured'">Configurer l’identifiant</span>
+      <div style="position:relative;width:120px;height:40px">
+        <button style="position:absolute;inset:0">Covered</button>
+        <div id="blocking-overlay" role="dialog" style="position:absolute;inset:0;background:white"></div>
+      </div>
+      """, baseURL: URL(string: "https://example.test/console"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let records = observation.elements.filter {
+      $0.accessibleName?.segments.first?.text == "Records"
+    }
+    #expect(records.count == 1)
+    #expect(records.first?.role?.segments.first?.text == "link")
+    #expect(
+      observation.elements.filter { $0.accessibleName?.segments.first?.text == "Distinct" }.count
+        == 2)
+    let covered = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Covered" })
+    #expect(covered.actionability == .covered)
+    #expect(covered.coveredBy?.segments.first?.text == "div#blocking-overlay role=dialog")
+    let filtered = try await runtime.observe(nameContains: "Configurer l'identifiant")
+    #expect(filtered.elements.count == 1)
+    #expect(!filtered.isComplete)
+    let control = try #require(filtered.elements.first)
+    #expect(control.role?.segments.first?.text == "button")
+    _ = try await runtime.perform(
+      observationID: filtered.observationID, elementID: control.elementID, operation: .click)
+    let after = try await runtime.observe()
+    #expect(after.elements.contains { $0.accessibleName?.segments.first?.text == "Configured" })
+  }
+
   @Test("Every control says whether it can be acted on, and why not")
   func actionabilityIsReportedPerElement() async throws {
     // locatorQuality answers whether the address is unique. It was read as whether the

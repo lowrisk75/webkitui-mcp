@@ -396,6 +396,22 @@ and approve the native resume dialog. MCP 2026-07-28 clients continue to use
 multi-round `input_required` results.
 
 Use `browser_session { operation: "handoff" }` when a human must control the same local WebKit session. Declining resume leaves human control active.
+If a previous handoff token survives while agent control is active, `status` and
+`handoff_start` point to `handoff` for recovery. A local confirmation is required
+before invalidating the old token and starting a new human handoff. A confirmed
+tokenless resume also invalidates earlier tokens. Another client's handoff remains
+excluded, and human work in progress is reported as wait-only.
+When a click's cross-origin navigation is refused, the action result and `status`
+report a `navigation_blocker` containing only the source and destination origins
+and a human-handoff instruction. The click is not automatically replayed, and the
+private authentication request is not exposed.
+Semantic appearance postconditions require an unfiltered, untruncated baseline:
+otherwise `postcondition_baseline_incomplete` refuses the action before dispatch.
+Observe again with enough elements and field characters to establish absence.
+Covered controls name the hit-tested covering element in `coveredBy` (compact:
+`covered_by`). Name filters normalize common apostrophes; visible inline `onclick`
+controls are included even without a pointer cursor. Identically sized link wrappers
+without independent state or explicit handlers are omitted in favour of their link.
 The handoff window becomes a regular foreground Mac app with a Dock icon and
 uses the same rendered view as semantic observation and capture.
 

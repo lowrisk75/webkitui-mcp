@@ -1175,9 +1175,8 @@ public final class WebKitMCPServer {
       "Call browser_session operation=handoff with session_id \(sessionID): the operation "
       + "that hands control to a person is the same one that takes it back. It shows one "
       + "local confirmation and, once that is accepted, returns agent control with a fresh "
-      + "observation. Nothing resumes on its own. No resume_token is involved — "
-      + "handoff_start, handoff_status and handoff_resume are a separate token route, and "
-      + "this handoff never issued a token."
+      + "observation. Nothing resumes on its own. This recovery does not require a "
+      + "resume_token and invalidates any earlier token after approval."
     let message: String
     let remediation: String
     let callerAction: String
@@ -1484,10 +1483,25 @@ public final class WebKitMCPServer {
       let sessionOwnerState = try registry.sessionOwnershipState(
         for: handle, owner: clientAuthorityID)
       statusObject["session_owner_state"] = .string(sessionOwnerState)
+      if registry.hasActiveHandoffResumeCapability(for: handle),
+        statusObject["handoff_owner_state"] != .string("owned_elsewhere"),
+        [.agentControlled, .freshlyReobserved].contains(status.controlState)
+      {
+        statusObject["caller_action"] = .string("recover_handoff")
+        statusObject["recovery_tool"] = .string("browser_session")
+        statusObject["recovery_operation"] = .string("handoff")
+        statusObject["recovery_confirmation_required"] = .bool(true)
+        statusObject["remediation"] = .string(
+          "An earlier handoff token remains active under agent control. Call operation=handoff for local confirmation before replacing it; no token is required."
+        )
+      }
       // The control guidance above describes agent versus human, not which client.
       // Read beside owned_elsewhere, "control_available: true / The agent holds this
       // session" told a second client it could act (Home Assistant session, 2026-09-23).
       if sessionOwnerState == "owned_elsewhere" {
+        statusObject["recovery_tool"] = .null
+        statusObject["recovery_operation"] = .null
+        statusObject["recovery_confirmation_required"] = .bool(false)
         statusObject["control_available"] = .bool(false)
         statusObject["wait_only"] = .bool(true)
         statusObject["message"] = .string("Another client's agent holds this session.")
@@ -1509,6 +1523,19 @@ public final class WebKitMCPServer {
       // Host names only: a client can tell whether this profile is already signed in
       // to an origin without any cookie ever leaving the store.
       let statusRuntime = try registry.runtime(for: handle)
+      if let blocker = crossOriginHandoffDiagnostic(runtime: statusRuntime) {
+        statusObject["navigation_blocker"] = .object(blocker)
+        if sessionOwnerState != "owned_elsewhere",
+          statusObject["handoff_owner_state"] != .string("owned_elsewhere"),
+          [.agentControlled, .freshlyReobserved].contains(status.controlState)
+        {
+          statusObject["caller_action"] = .string("request_human_handoff")
+          statusObject["recovery_tool"] = .string("browser_session")
+          statusObject["recovery_operation"] = .string("handoff")
+          statusObject["recovery_confirmation_required"] = .bool(true)
+          statusObject["remediation"] = blocker["safe_next_step"]
+        }
+      }
       statusObject["authenticated_origins"] = .array(
         await statusRuntime.authenticatedOrigins().map(JSONValue.string))
       statusObject["file_picker_visible"] = .bool(
@@ -2580,7 +2607,32 @@ public final class WebKitMCPServer {
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
     guard try registry.claimHandoffOwnership(for: handle, owner: clientAuthorityID) else {
-      return try handoffWaitOnlyResult(runtime: runtime, modern: modern)
+      return try handoffWaitOnlyResult(handle: handle, runtime: runtime, modern: modern)
+    }
+    if registry.hasActiveHandoffResumeCapability(for: handle),
+      [.agentControlled, .freshlyReobserved].contains(runtime.interactionControlState())
+    {
+      guard params["requestState"] == nil, params["inputResponses"] == nil else {
+        throw MCPServerError.invalidParams("Start handoff recovery with a fresh handoff request")
+      }
+      guard
+        try await rateLimitedConfirmation(
+          session: handle, title: "Recover Browser Handoff",
+          message:
+            "An earlier resume token remains active although the browser is under agent control. "
+            + "Invalidate that token and start a new human handoff in this window?",
+          approveLabel: "Recover Handoff") == .approved
+      else {
+        return try toolError(
+          "Handoff recovery declined; the earlier token remains valid.", modern: modern)
+      }
+      guard [.agentControlled, .freshlyReobserved].contains(runtime.interactionControlState()),
+        try registry.handoffOwnershipState(for: handle, owner: clientAuthorityID)
+          == "owned_by_this_client"
+      else {
+        return try handoffWaitOnlyResult(handle: handle, runtime: runtime, modern: modern)
+      }
+      registry.revokeHandoffResumeCapabilities(for: handle)
     }
     if !modern {
       guard params["requestState"] == nil, params["inputResponses"] == nil else {
@@ -2615,6 +2667,9 @@ public final class WebKitMCPServer {
             "Human control remains active until an explicit resume confirmation", modern: false)
         }
         try runtime.requestAgentResume()
+        // A confirmed tokenless resume also ends any earlier token-based handoff.
+        // Retire it before observing: a failed observation must not revive that handoff.
+        registry.revokeHandoffResumeCapabilities(for: handle)
         let observation = try await runtime.resumeAfterHumanControl(
           maximumElements: observationOptions.maximumElements)
         registry.releaseHandoffOwnership(for: handle, owner: clientAuthorityID)
@@ -2644,6 +2699,8 @@ public final class WebKitMCPServer {
           "Human control remains active until an explicit resume confirmation", modern: true)
       }
       try runtime.requestAgentResume()
+      // The round-trip protocol must retire the token at the same control boundary.
+      registry.revokeHandoffResumeCapabilities(for: handle)
       let observation = try await runtime.resumeAfterHumanControl(
         maximumElements: observationOptions.maximumElements)
       registry.releaseHandoffOwnership(for: handle, owner: clientAuthorityID)
@@ -2731,11 +2788,13 @@ public final class WebKitMCPServer {
     }
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
-    guard try registry.claimHandoffOwnership(for: handle, owner: clientAuthorityID) else {
-      return try handoffWaitOnlyResult(runtime: runtime, modern: modern)
-    }
+    // Do not claim an orphaned token merely to return a refusal: that made a read of
+    // status change from inactive to owned_by_this_client without issuing any token.
     if registry.hasActiveHandoffResumeCapability(for: handle) {
-      return try handoffWaitOnlyResult(runtime: runtime, modern: modern)
+      return try handoffWaitOnlyResult(handle: handle, runtime: runtime, modern: modern)
+    }
+    guard try registry.claimHandoffOwnership(for: handle, owner: clientAuthorityID) else {
+      return try handoffWaitOnlyResult(handle: handle, runtime: runtime, modern: modern)
     }
     switch runtime.interactionControlState() {
     case .agentControlled, .freshlyReobserved:
@@ -2926,20 +2985,47 @@ public final class WebKitMCPServer {
     return .object(object)
   }
 
+  private func crossOriginHandoffDiagnostic(runtime: WebKitRuntime) -> [String: JSONValue]? {
+    guard let refused = runtime.refusedCrossOriginNavigation() else { return nil }
+    return [
+      "status": .string("cross_origin_navigation_requires_human_handoff"),
+      "from_origin": .string(refused.fromOrigin),
+      "to_origin": .string(refused.toOrigin),
+      "navigation_allowed": .bool(false),
+      "safe_next_step": .string(
+        "The page's cross-origin navigation was refused. Call browser_session operation=handoff to complete the step in the native window. Do not replay the click automatically. If an earlier token remains active, recovery requires local confirmation."
+      ),
+    ]
+  }
+
   private func handoffWaitOnlyResult(
+    handle: WebKitSessionHandle,
     runtime: WebKitRuntime,
     modern: Bool
   ) throws -> JSONValue {
-    try toolResult(
+    let owner = try registry.handoffOwnershipState(for: handle, owner: clientAuthorityID)
+    let waiting =
+      owner == "owned_elsewhere"
+      || [.humanControlled, .handoffRequested, .resumeRequested].contains(
+        runtime.interactionControlState())
+    return try toolResult(
       structured: .object([
         "status": .string("handoff_already_active"),
         "control_state": .string(runtime.interactionControlState().rawValue),
         "resume_token_state": .string("not_issued"),
         "handoff_start_available": .bool(false),
-        "wait_only": .bool(true),
+        "wait_only": .bool(waiting),
+        "handoff_owner_state": .string(owner),
+        "recovery_tool": waiting ? .null : .string("browser_session"),
+        "recovery_operation": waiting ? .null : .string("handoff"),
+        "recovery_confirmation_required": .bool(!waiting),
         "blocking": .bool(false),
         "instructions": .string(
-          "Another client already owns the active handoff. Wait for agent control to return. Do not ask the user to return control and do not start another handoff."
+          owner == "owned_elsewhere"
+            ? "Another client owns this handoff. Wait for that client to finish; do not take over."
+            : waiting
+              ? "Human control is still active. Wait for Done — Return Control. Use the valid token to resume, or operation=handoff for a confirmed recovery after the human step completes."
+              : "An earlier handoff token is still active. Use operation=handoff for locally confirmed recovery without that token. The earlier token is invalidated only after approval."
         ),
       ]), modern: modern)
   }
@@ -3137,6 +3223,7 @@ public final class WebKitMCPServer {
           "operation must be click, fill, submit, select_option, hover, press_key, blur, or "
             + "commit_input")
       }
+      try validatePostconditionBaseline(postcondition, observation: observation)
       // A sensitive control publishes no selected option, so this postcondition has
       // nothing to be verified against and never will have. Refused here, with the
       // reason, rather than dispatched and left to fail as an unverifiable comparison —
@@ -4287,10 +4374,25 @@ public final class WebKitMCPServer {
     }
   }
 
+  private func validatePostconditionBaseline(
+    _ postcondition: ActPostcondition?, observation: WebKitPageObservation
+  ) throws {
+    if let postcondition, !observation.isComplete {
+      switch postcondition {
+      case .semanticTextAppears, .semanticTextContains, .dialogAppears, .panelOpen:
+        throw MCPServerError.invalidParams(
+          "postcondition_baseline_incomplete: this observation is filtered, paginated, truncated, or has unreadable content. Observe without role/name filters and with enough elements/field characters before asking whether new semantic content appeared."
+        )
+      default: break
+      }
+    }
+  }
+
   private func executeActuation(
     _ pending: PendingActuation, modern: Bool
   ) async throws -> JSONValue {
     let runtime = try registry.runtime(for: pending.session)
+    try validatePostconditionBaseline(pending.postcondition, observation: pending.observation)
     let coordinator =
       coordinators[pending.session] ?? WebKitTransactionCoordinator(runtime: runtime)
     coordinators[pending.session] = coordinator
@@ -4482,18 +4584,24 @@ public final class WebKitMCPServer {
       case .indeterminate: state = "indeterminate"
       case .pending: state = "verification_pending"
       }
-      return try toolResult(
-        structured: .object([
-          "action_state": .string(state),
-          "verification": try .encoded(verification),
-          "dispatch_error": .string(underlyingDescription),
-          "action_replayed": .bool(false),
-          "safe_next_step": .string(
-            state == "verified_by_immediate_reconciliation"
-              ? "none"
-              : "Inspect the current page or provider state; never replay this action automatically."
-          ),
-        ]), modern: modern)
+      var structured: [String: JSONValue] = [
+        "action_state": .string(state),
+        "verification": try .encoded(verification),
+        "dispatch_error": .string(underlyingDescription),
+        "action_replayed": .bool(false),
+        "safe_next_step": .string(
+          state == "verified_by_immediate_reconciliation"
+            ? "none"
+            : "Inspect the current page or provider state; never replay this action automatically."),
+      ]
+      if let event = runtime.latestNavigationAuditEvent(),
+        event.monotonicNanoseconds >= dispatchFloorNanoseconds,
+        let blocker = crossOriginHandoffDiagnostic(runtime: runtime)
+      {
+        structured["navigation_blocker"] = .object(blocker)
+        structured["safe_next_step"] = blocker["safe_next_step"]
+      }
+      return try toolResult(structured: .object(structured), modern: modern)
     }
     var structured: [String: JSONValue] = [
       "action": try .encoded(result.action),
@@ -4507,6 +4615,13 @@ public final class WebKitMCPServer {
         result.action.trustedUserGesture ? "no" : "unknown_site_requirement"),
       "trusted_human_gesture_handoff_available": .bool(!result.action.trustedUserGesture),
     ]
+    if let event = runtime.latestNavigationAuditEvent(),
+      event.monotonicNanoseconds >= dispatchFloorNanoseconds,
+      let blocker = crossOriginHandoffDiagnostic(runtime: runtime)
+    {
+      structured["navigation_blocker"] = .object(blocker)
+      structured["safe_next_step"] = blocker["safe_next_step"]
+    }
     if let uploadReceipt = runtime.latestFileUploadReceipt(),
       uploadReceipt.monotonicNanoseconds >= dispatchFloorNanoseconds
     {
@@ -4649,6 +4764,7 @@ public final class WebKitMCPServer {
       ]
       // Which of click or submit is legal depends on it, so it is never optional either.
       if element.submitsForm { row["submits_form"] = .bool(true) }
+      if let coveredBy = element.coveredBy { row["covered_by"] = plain(coveredBy) }
       if !element.actionable {
         row["not_actionable_because"] = .string(element.actionability.rawValue)
       }

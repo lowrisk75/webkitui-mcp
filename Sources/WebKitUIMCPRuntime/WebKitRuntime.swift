@@ -303,6 +303,7 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let stableAttributes: [String: ProvenancedText]
   public let visible: Bool
   public let actionability: ObservedActionability
+  public var coveredBy: ProvenancedText? = nil
   public var actionable: Bool { actionability == .actionable }
   /// Eligible frame-local dispatch modes, not a promise of success: the live target
   /// still has to pass exact-frame, state, uniqueness, and geometry checks. `nil` on
@@ -401,6 +402,8 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let totalElementCount: Int
   public let elementOffset: Int
   public let nextElementOffset: Int?
+  /// A role/name projection cannot prove that content is absent elsewhere on the page.
+  public var semanticScopeFiltered: Bool? = nil
   /// The page held more than this observation returned. An agent that reads a partial
   /// observation as the whole page concludes things are absent that are on screen —
   /// which is how a complete declaration was reported to a user as missing.
@@ -412,7 +415,8 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// Everything on this page was both returned and legible. Anything less has to be
   /// said out loud, or an absence gets reported as a fact.
   public var isComplete: Bool {
-    !isPartial && unreadableFrameCount == 0 && pendingDialog == nil
+    !isPartial && semanticScopeFiltered != true && !semanticTextTruncated
+      && unreadableFrameCount == 0 && pendingDialog == nil
   }
   public let semanticTextTruncated: Bool
   public let crossOriginFramesOpaque: Bool
@@ -1803,6 +1807,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         actionability: embedded
           ? .crossOriginFrameNativeGeometryUnavailable
           : ObservedActionability(rawValue: element.actionability) ?? .actionable,
+        coveredBy: try element.coveredBy.map {
+          try ProvenancedText(text: $0, source: contentSource)
+        },
         frameActionModes: embedded ? Self.frameActionModes(for: element) : nil,
         boundingBoxCoordinateSpace: embedded ? .frameViewport : nil,
         boundingBox: element.boundingBox,
@@ -1878,6 +1885,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       elementOffset: elementOffset,
       nextElementOffset: elementOffset + elements.count < totalElementCount
         ? elementOffset + elements.count : nil,
+      semanticScopeFiltered: !roles.isEmpty || !(nameContains ?? "").isEmpty,
       unreadableFrameCount: unreadableFrameCount,
       semanticTextTruncated: capturedGroups.contains { $0.raw.semanticTextTruncated },
       crossOriginFramesOpaque: unreadableFrameCount > 0,
@@ -2831,6 +2839,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   public func latestNavigationAuditEvent() -> WebKitNavigationAuditEvent? {
     navigationAuditEvents.last
+  }
+
+  /// Only origins leave the runtime. The retained request may contain authentication
+  /// state and is never part of this diagnostic or its recovery instructions.
+  public func refusedCrossOriginNavigation() -> (fromOrigin: String, toOrigin: String)? {
+    guard case .crossOriginRedirectRequiresHuman(let from, let to) = navigationFailure,
+      let event = navigationAuditEvents.last, !event.allowed
+    else { return nil }
+    return (from, to)
   }
 
   public func navigationAuditEventCount() -> Int { navigationAuditEvents.count }
@@ -6438,7 +6455,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (explicit) return explicit;
       if (hasImplicitTabSemantics(element)) return 'tab';
       if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
-      if (element.localName === 'button') return 'button';
+      if (element.localName === 'button' || element.hasAttribute('onclick')) return 'button';
       if (/^h[1-6]$/.test(element.localName)) return 'heading';
       if (element.localName === 'table') return 'table';
       if (element.localName === 'tr') return 'row';
@@ -6599,10 +6616,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
       'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
       'table', 'tr', 'th', 'td',
-      '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true"]', '[tabindex]'
+      '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true"]', '[tabindex]', '[onclick]'
     ].join(',');
     const allowedRoles = new Set(Array.isArray(roleFilters) ? roleFilters : []);
-    const wantedName = collapse(nameFilter).toLowerCase();
+    const searchName = value => collapse(value).toLowerCase().replace(/[’‘ʼ]/g, "'");
+    const wantedName = searchName(nameFilter);
     const semanticElements = deepQueryAll(document, selector);
     const pointerElements = deepQueryAll(document, 'a:not([href]), div, li, span')
       .filter(isPointerControl);
@@ -6652,6 +6670,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     };
     const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
       .filter(element => {
+        // A wrapper with no independent state/action around one identically sized link
+        // exposes the same hit target twice. Keep the link and its destination.
+        if (element.getAttribute('role') === 'button'
+            && !element.matches('[onclick], [tabindex], [aria-expanded], [aria-pressed], [aria-controls], [aria-disabled]')) {
+          const links = deepQueryAll(element, 'a[href]');
+          if (links.length === 1 && collapse(nameOf(element)) === collapse(nameOf(links[0]))) {
+            const a = element.getBoundingClientRect(), b = links[0].getBoundingClientRect();
+            if (a.width > 0 && a.height > 0
+                && ['x', 'y', 'width', 'height'].every(key => Math.abs(a[key] - b[key]) < 0.5)) {
+              return false;
+            }
+          }
+        }
         if (!controlSurfaceOf(element)) {
           if (hiddenOnlyBySemantics(element)) {
             ariaHiddenDropCount += 1;
@@ -6667,7 +6698,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         }
         const role = collapse(roleOf(element)).toLowerCase();
         if (allowedRoles.size > 0 && !allowedRoles.has(role)) return false;
-        const name = collapse(nameOf(element)).toLowerCase();
+        const name = searchName(nameOf(element));
         return !wantedName || name.includes(wantedName);
       });
     const elements = matchingElements
@@ -6866,6 +6897,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           visible: actionability !== 'no_layout_box' && actionability !== 'not_visible'
             && !clippedByAncestor(surface),
           actionability,
+          coveredBy: actionability === 'covered' ? (() => {
+            const hit = hitAtCentreOfLocal(surface, box);
+            if (!hit) return null;
+            const id = stableAttributesOf(hit, false).id;
+            return bounded(`${hit.localName}${id ? '#' + id : ''}${hit.getAttribute('role') ? ' role=' + hit.getAttribute('role') : ''}`);
+          })() : null,
           boundingBox: {
             x: reportedBox.x, y: reportedBox.y,
             width: reportedBox.width, height: reportedBox.height
@@ -7054,7 +7091,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (explicit) return explicit;
       if (hasImplicitTabSemantics(element)) return 'tab';
       if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
-      if (element.localName === 'button') return 'button';
+      if (element.localName === 'button' || element.hasAttribute('onclick')) return 'button';
       if (/^h[1-6]$/.test(element.localName)) return 'heading';
       if (element.localName === 'table') return 'table';
       if (element.localName === 'tr') return 'row';
@@ -8467,6 +8504,7 @@ private struct RawElement: Decodable {
   let stableAttributes: [String: String]
   let visible: Bool
   let actionability: String
+  let coveredBy: String?
   let boundingBox: ObservedBoundingBox
 }
 

@@ -3003,6 +3003,99 @@ struct MCPServerTests {
     #expect(message.contains("handoff"))
   }
 
+  @Test("A refused click navigation exposes origin-only human recovery in its result and status")
+  func refusedClickNavigationNamesHumanRecovery() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button onclick=\"location.href='https://auth.example.test/private-path?state=private-secret'\">Sign in</button>",
+      baseURL: URL(string: "https://example.test/login"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    try runtime.markHumanStepCompleted()
+    try runtime.requestAgentResume()
+    _ = try await runtime.resumeAfterHumanControl()
+    let server = WebKitMCPServer(registry: registry, presentHumanWindows: false)
+    let sessionID = JSONValue.string(handle.rawValue.uuidString)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe", arguments: ["session_id": sessionID])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let element = try object(try array(observation["elements"]).first)
+    let arguments: [String: JSONValue] = [
+      "session_id": sessionID,
+      "observation_id": observation["observationID"]!,
+      "element_id": element["elementID"]!,
+      "operation": .string("click"), "approval_mode": .string("mcp"),
+      "idempotency_key": .string("refused-login"),
+      "postcondition": .object([
+        "type": .string("url_contains"), "value": .string("auth.example.test"),
+      ]),
+    ]
+    let prepared = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
+    let requestState = try string(try object(prepared["result"])["requestState"])
+    let acted = try await roundTripToolCall(
+      server, id: 3, name: "browser_act", arguments: arguments,
+      requestState: requestState, action: "accept", confirm: true)
+    let result = try object(try object(acted["result"])["structuredContent"])
+    let encodedResult = String(
+      decoding: try JSONEncoder().encode(JSONValue.object(result)), as: UTF8.self)
+    #expect(!encodedResult.contains("private-secret"))
+    #expect(!encodedResult.contains("private-path"))
+    let blocker = try object(result["navigation_blocker"])
+    #expect(blocker["to_origin"] == .string("https://auth.example.test"))
+    #expect(blocker["navigation_allowed"] == .bool(false))
+    #expect(runtime.webView.url?.host == "example.test")
+    let status = try await toolCall(
+      server, id: 4, name: "browser_session",
+      arguments: ["operation": .string("status"), "session_id": sessionID])
+    let state = try object(try object(status["result"])["structuredContent"])
+    #expect(state["navigation_blocker"] == result["navigation_blocker"])
+    #expect(state["recovery_operation"] == .string("handoff"))
+    let encoded = String(decoding: try JSONEncoder().encode(JSONValue.object(state)), as: UTF8.self)
+    #expect(!encoded.contains("private-secret"))
+    #expect(!encoded.contains("private-path"))
+    _ = try await runtime.loadHTML(
+      "<button>Recovered</button>", baseURL: URL(string: "https://example.test/recovered"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    #expect(runtime.refusedCrossOriginNavigation() == nil)
+  }
+
+  @Test("A filtered baseline cannot prove that text appeared and refuses before confirmation")
+  func filteredBaselineCannotProveNewText() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Open</button><button>Already present</button>",
+      baseURL: URL(string: "https://example.test/filtered"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: [
+        "session_id": session, "name_contains": .string("Open"),
+      ])
+    let observation = try object(try object(response["result"])["structuredContent"])
+    let target = try object(try array(observation["elements"]).first)
+    let attempted = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": observation["observationID"]!,
+        "element_id": target["elementID"]!, "operation": .string("click"),
+        "approval_mode": .string("native"), "idempotency_key": .string("filtered-false-positive"),
+        "postcondition": .object([
+          "type": .string("semantic_text_appears"), "value": .string("Already present"),
+        ]),
+      ])
+    let error = try object(attempted["error"])
+    #expect(try string(error["message"]).contains("postcondition_baseline_incomplete"))
+    #expect(presenter.requests.isEmpty)
+  }
+
   @Test("A confirmed MCP click verifies newly appearing same-page semantic text")
   func semanticPostconditionActuation() async throws {
     let registry = try WebKitSessionRegistry()
@@ -4397,6 +4490,116 @@ struct MCPServerTests {
     let holder = try object(structured["holder"])
     #expect(holder["client_name"] == .string("claude-code"))
     #expect(holder["client_version"] == .string("2.1.7"))
+  }
+
+  @Test(
+    "Confirmed tokenless resume retires the earlier token and permits the next handoff",
+    arguments: [false, true])
+  func tokenlessResumeRetiresEarlierToken(modern: Bool) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Continue</button>", baseURL: URL(string: "https://example.test/handoff"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: ConfirmationPresenterStub(responses: [false, true]))
+    let sessionID = JSONValue.string(handle.rawValue.uuidString)
+    let started = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff_start"), "session_id": sessionID])
+    let token = try string(
+      try object(try object(started["result"])["structuredContent"])["resume_token"])
+    try runtime.markHumanStepCompleted()
+    let arguments: [String: JSONValue] = [
+      "operation": .string("handoff"), "session_id": sessionID,
+    ]
+    for accepted in [false, true] {
+      if modern {
+        let requested = try await toolCall(
+          server, id: 2, name: "browser_session", arguments: arguments)
+        let state = try string(try object(requested["result"])["requestState"])
+        _ = try await roundTripToolCall(
+          server, id: 3, name: "browser_session", arguments: arguments,
+          requestState: state, action: accepted ? "accept" : "decline",
+          confirm: accepted)
+      } else {
+        _ = try await legacyToolCall(
+          server, id: 2, name: "browser_session", arguments: arguments)
+      }
+      #expect(registry.handoffResumeCapabilityIsActive(token, for: handle) == !accepted)
+    }
+    #expect(runtime.interactionControlState() == .freshlyReobserved)
+    let next = try await toolCall(
+      server, id: 4, name: "browser_session",
+      arguments: ["operation": .string("handoff_start"), "session_id": sessionID])
+    let nextState = try object(try object(next["result"])["structuredContent"])
+    #expect(nextState["resume_token_state"] == .string("active"))
+    #expect(nextState["resume_token"] != .string(token))
+    #expect(runtime.interactionControlState() == .humanControlled)
+  }
+
+  @Test(
+    "Orphaned handoff recovery preserves ownership and requires local confirmation",
+    arguments: [false, true])
+  func orphanedHandoffRecoveryRequiresConfirmation(modern: Bool) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Continue</button>", baseURL: URL(string: "https://example.test/handoff"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let previous = WebKitMCPServer(registry: registry, presentHumanWindows: false)
+    let sessionID = JSONValue.string(handle.rawValue.uuidString)
+    let startArguments: [String: JSONValue] = [
+      "operation": .string("handoff_start"), "session_id": sessionID,
+    ]
+    let started = try await toolCall(
+      previous, id: 1, name: "browser_session", arguments: startArguments)
+    let token = try string(
+      try object(try object(started["result"])["structuredContent"])["resume_token"])
+    let presenter = ConfirmationPresenterStub(responses: [false, true])
+    let current = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false, confirmationPresenter: presenter)
+    let blocked = try await toolCall(
+      current, id: 2, name: "browser_session", arguments: startArguments)
+    #expect(
+      try object(try object(blocked["result"])["structuredContent"])["code"]
+        == .string("session_in_use"))
+    #expect(presenter.requests.isEmpty)
+
+    // Model an older broker that resumed without retiring its token, then disconnected.
+    try runtime.markHumanStepCompleted()
+    try runtime.requestAgentResume()
+    _ = try await runtime.resumeAfterHumanControl()
+    await previous.prepareForClientReconnect()
+    let refused = try await toolCall(
+      current, id: 3, name: "browser_session", arguments: startArguments)
+    let refusal = try object(try object(refused["result"])["structuredContent"])
+    #expect(refusal["handoff_owner_state"] == .string("inactive"))
+    #expect(refusal["wait_only"] == .bool(false))
+    #expect(refusal["recovery_operation"] == .string("handoff"))
+    let status = try await toolCall(
+      current, id: 4, name: "browser_session",
+      arguments: ["operation": .string("status"), "session_id": sessionID])
+    let state = try object(try object(status["result"])["structuredContent"])
+    #expect(state["handoff_owner_state"] == .string("inactive"))
+    #expect(state["recovery_operation"] == .string("handoff"))
+    let recovery: [String: JSONValue] = [
+      "operation": .string("handoff"), "session_id": sessionID,
+    ]
+    for accepted in [false, true] {
+      if modern {
+        _ = try await toolCall(current, id: 5, name: "browser_session", arguments: recovery)
+      } else {
+        _ = try await legacyToolCall(current, id: 5, name: "browser_session", arguments: recovery)
+      }
+      #expect(registry.handoffResumeCapabilityIsActive(token, for: handle) == !accepted)
+      #expect(
+        runtime.interactionControlState() == (accepted ? .humanControlled : .freshlyReobserved))
+    }
+    #expect(presenter.requests.count == 2)
   }
 
   @Test("Non-blocking handoff survives a transport reconnect and consumes its token once")
