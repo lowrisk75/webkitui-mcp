@@ -4702,6 +4702,50 @@ struct MCPServerTests {
     #expect(presenter.requests.count == 2)
   }
 
+  @Test("Completed human handoff releases client ownership on disconnect without losing its token")
+  func completedHumanHandoffDisconnectReleasesOwnership() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Continue</button>", baseURL: URL(string: "https://example.test/handoff"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let owner = WebKitMCPServer(registry: registry, presentHumanWindows: false)
+    let next = WebKitMCPServer(registry: registry, presentHumanWindows: false)
+    let sessionID = JSONValue.string(handle.rawValue.uuidString)
+    let started = try await toolCall(
+      owner, id: 1, name: "browser_session",
+      arguments: ["operation": .string("handoff_start"), "session_id": sessionID])
+    let token = try string(
+      try object(try object(started["result"])["structuredContent"])["resume_token"])
+    try runtime.markHumanStepCompleted()
+    let statusArguments: [String: JSONValue] = [
+      "operation": .string("status"), "session_id": sessionID,
+    ]
+    let blocked = try await toolCall(
+      next, id: 2, name: "browser_session", arguments: statusArguments)
+    let before = try object(try object(blocked["result"])["structuredContent"])
+    #expect(before["session_owner_state"] == .string("owned_elsewhere"))
+    #expect(before["handoff_owner_state"] == .string("owned_elsewhere"))
+    #expect(before["wait_only"] == .bool(true))
+    let holder = try object(before["holder"])
+    #expect(holder["pid_is_this_broker"] == .bool(true))
+    #expect(holder["pid_scope"] == .string("server_process"))
+    #expect(before["ownership_basis"] == .string("client_connection_identity"))
+
+    await owner.prepareForClientReconnect()
+    #expect(registry.count == 1)
+    #expect(runtime.interactionControlState() == .humanStepCompleted)
+    #expect(registry.handoffResumeCapabilityIsActive(token, for: handle))
+    let available = try await toolCall(
+      next, id: 3, name: "browser_session", arguments: statusArguments)
+    let after = try object(try object(available["result"])["structuredContent"])
+    #expect(after["session_owner_state"] == .string("inactive"))
+    #expect(after["handoff_owner_state"] == .string("inactive"))
+    #expect(after["wait_only"] == .bool(false))
+    #expect(after["handoff_resume_token_active"] == .bool(true))
+  }
+
   @Test("Non-blocking handoff survives a transport reconnect and consumes its token once")
   func nonBlockingHandoffLifecycle() async throws {
     let registry = try WebKitSessionRegistry()
