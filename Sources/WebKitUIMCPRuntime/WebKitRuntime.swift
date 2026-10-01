@@ -139,6 +139,18 @@ public struct AuthenticationEnvironmentSnapshot: Codable, Equatable, Sendable {
   public let webAuthnAnyRelyingPartyEntitlementConfigured: Bool
 }
 
+/// Privacy-safe health of a restricted authentication surface. These facts describe
+/// rendering only: they contain no text, URL, field value, identifier, or network data,
+/// and they never establish that authentication succeeded or that a provider failed.
+public struct AuthenticationUIHealthSnapshot: Codable, Equatable, Sendable {
+  public let documentComplete: Bool
+  public let hasProgressIndicator: Bool
+  public let hasVisibleAuthenticationControl: Bool
+  public let hasInvisibleAuthenticationControl: Bool
+  public let hasRenderedFooter: Bool
+  public let hasRenderedNonFooterContent: Bool
+}
+
 public enum InteractionControlState: String, Codable, Equatable, Sendable {
   case agentControlled = "agent_controlled"
   case handoffRequested = "handoff_requested"
@@ -1002,6 +1014,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// suppression.
   private var suppressedNewWindowRequest: WebKitSuppressedNewWindowRequest?
   private var authenticationUIClassification: AuthenticationUIClassification?
+  private var authenticationUIHealth: AuthenticationUIHealthSnapshot?
   private var restrictedAuthenticationFrameOrigin: String?
   private var restrictedWebAuthnOrigin: String?
   private var pendingCrossOriginNavigationRequest: URLRequest?
@@ -3553,12 +3566,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     )
   }
 
-  /// Returns the exact private URL only to the in-process compatibility
-  /// presenter. Callers must never serialize, log, or place it in an MCP
-  /// confirmation; paths and queries may contain authentication state.
+  public func authenticationUIHealthSnapshot() -> AuthenticationUIHealthSnapshot? {
+    guard restrictedAuthenticationOrigin() != nil else { return nil }
+    return authenticationUIHealth
+  }
+
+  /// Returns the exact private URL only to the in-process compatibility presenter.
+  /// Every restricted authentication state may offer this explicit fallback: an
+  /// embedded form can be unusable without proving a full-browser requirement.
+  /// Callers must never serialize, log, or place the URL in an MCP confirmation;
+  /// paths and queries may contain authentication state.
   public func privateFullBrowserHandoffURL() throws -> URL {
     guard
-      authenticationRestrictionStatus()?.classification == .fullBrowserRequired,
+      authenticationRestrictionStatus() != nil,
       let url = webView.url ?? lastCommittedHTTPURL,
       url.scheme?.lowercased() == "https",
       url.host != nil
@@ -3789,6 +3809,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     webView.isHidden = false
     webView.alphaValue = 1
     attachHumanControlView(to: window)
+    bringHumanControlWindowToFront(window, application: application)
+  }
+
+  private func bringHumanControlWindowToFront(
+    _ window: NSWindow, application: NSApplication = .shared
+  ) {
     // The window is parked outside every display so pages lay out without being
     // shown. Handing control to a human must undo that, or the user is asked to act
     // in a window that is nowhere on screen.
@@ -3848,6 +3874,19 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   /// True once a human can actually see and act in the browser window.
   public var humanControlSurfaceIsPresented: Bool { browserWindowIsOnScreen }
+
+  /// Re-presents the existing human-control surface without changing authority. This
+  /// is intentionally unavailable under agent control so it cannot become a general
+  /// remote focus primitive.
+  @discardableResult
+  public func focusHumanControlWindow() throws -> Bool {
+    guard controlState == .humanControlled || controlState == .humanStepCompleted else {
+      throw WebKitRuntimeError.invalidControlTransition
+    }
+    guard let window = browserWindow else { return false }
+    bringHumanControlWindowToFront(window)
+    return humanControlSurfaceIsPresented
+  }
 
   private static let emptyHandoffDocument = """
     <!doctype html>
@@ -5262,6 +5301,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     navigationFailure = nil
     processTerminated = false
     authenticationUIClassification = nil
+    authenticationUIHealth = nil
     restrictedAuthenticationFrameOrigin = nil
     restrictedWebAuthnOrigin = nil
     pendingCrossOriginNavigationRequest = nil
@@ -5573,6 +5613,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     {
       restrictedWebAuthnOrigin = Self.sanitizedOrigin(for: url)
       authenticationUIClassification = .fullBrowserRequired
+      authenticationUIHealth = nil
       return
     }
     guard
@@ -5585,10 +5626,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       let data = json.data(using: .utf8),
       let state = try? JSONDecoder().decode(RawAuthenticationUIState.self, from: data)
     else {
+      authenticationUIHealth = nil
       authenticationUIClassification =
         restrictedAuthenticationOrigin() == nil ? nil : .humanHandoffRequired
       return
     }
+    authenticationUIHealth = AuthenticationUIHealthSnapshot(
+      documentComplete: state.readyState == "complete",
+      hasProgressIndicator: state.hasProgressIndicator,
+      hasVisibleAuthenticationControl: state.hasVisibleAuthenticationControl,
+      hasInvisibleAuthenticationControl: state.hasInvisibleAuthenticationControl,
+      hasRenderedFooter: state.hasRenderedFooter,
+      hasRenderedNonFooterContent: state.hasRenderedNonFooterContent)
     if state.hasWebAuthnControl,
       !Self.webAuthnAnyRelyingPartyEntitlementConfigured(),
       let url = webView.url ?? lastCommittedHTTPURL
@@ -5599,6 +5648,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     guard restrictedAuthenticationOrigin() != nil else {
       authenticationUIClassification = nil
+      authenticationUIHealth = nil
       return
     }
     if Self.requiresFullBrowserBackend(
@@ -5608,8 +5658,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       authenticationUIClassification = .fullBrowserRequired
     } else {
       authenticationUIClassification =
-        state.readyState == "complete" && state.hasProgressIndicator
-          && state.hasInvisibleAuthenticationControl && !state.hasVisibleAuthenticationControl
+        state.readyState == "complete" && !state.hasVisibleAuthenticationControl
+          && ((state.hasProgressIndicator && state.hasInvisibleAuthenticationControl)
+            || (state.hasRenderedFooter && !state.hasRenderedNonFooterContent))
         ? .authUINotReady : .humanHandoffRequired
     }
   }
@@ -6118,6 +6169,20 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         element.getAttribute('aria-label') || element.textContent || element.value));
     });
     const bodyHasWebAuthnText = webAuthnText.test(collapse(document.body?.innerText));
+    const renderedFooters = deepQueryAll(document, 'footer, [role="contentinfo"]')
+      .filter(isRendered);
+    const renderedNonFooterContent = deepQueryAll(document, '*').some(element => {
+      if (element.matches('html, head, body, script, style, link, meta, noscript, template')) {
+        return false;
+      }
+      if (element.closest('footer, [role="contentinfo"]')) return false;
+      if (!isRendered(element)) return false;
+      const hasDirectText = Array.from(element.childNodes).some(node =>
+        node.nodeType === Node.TEXT_NODE && collapse(node.textContent).length > 0);
+      const hasOwnLabel = collapse(element.getAttribute('aria-label')).length > 0;
+      return hasDirectText || hasOwnLabel
+        || element.matches('input, select, textarea, button, a[href], [role="button"]');
+    });
     const forms = deepQueryAll(document, 'form');
     const formHasOnlyInvisibleControls = forms.some(form => {
       const controls = deepQueryAll(form, 'input, select, textarea, button');
@@ -6130,7 +6195,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       hasVisibleAuthenticationControl: authenticationControls.some(isRendered),
       hasInvisibleAuthenticationControl:
         authenticationControls.some(element => !isRendered(element)) || formHasOnlyInvisibleControls,
-      hasWebAuthnControl: webAuthnControls.some(isRendered) || bodyHasWebAuthnText
+      hasWebAuthnControl: webAuthnControls.some(isRendered) || bodyHasWebAuthnText,
+      hasRenderedFooter: renderedFooters.length > 0,
+      hasRenderedNonFooterContent: renderedNonFooterContent
     });
     """
 
@@ -8475,6 +8542,8 @@ private struct RawAuthenticationUIState: Decodable {
   let hasVisibleAuthenticationControl: Bool
   let hasInvisibleAuthenticationControl: Bool
   let hasWebAuthnControl: Bool
+  let hasRenderedFooter: Bool
+  let hasRenderedNonFooterContent: Bool
 }
 
 private struct RawElement: Decodable {

@@ -44,6 +44,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   server-owned native macOS confirmation dialog; the model cannot supply or
   forge the approval value.
 - Local human handoff: `handoff_start` immediately returns an opaque session-bound resume token while the actual WebKit session becomes a visible window. `handoff_status` is non-blocking; `handoff_resume` consumes the token only after local confirmation and returns a fresh observation. The agent remains locked out throughout human control.
+- An active human-control window can be brought forward again with `handoff_focus` without changing who controls the page. Session status says whether that surface is currently presented, and restricted authentication status exposes only bounded rendering booleans—never page text, field values, private URL components, or network payloads.
 - The packaged handoff app installs a native Edit menu, so standard first-responder
   shortcuts such as Command-X/C/V/A work inside WebKit form controls.
 - MCP sessions use a loopback SOCKS5 boundary, one per profile and shared by its sessions, with failover disabled: hostnames are resolved once, public addresses are pinned, and private/reserved destinations plus non-TCP SOCKS commands fail closed.
@@ -130,10 +131,14 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Some identity providers require a complete browser surface and do not render
   inside an app-embedded `WKWebView` (for example a WebAuthn-only step without the
   browser passkey entitlement). Those return `full_browser_required` with an internal
-  `safari_compatibility` requirement. `compatibility_start` opens Safari after confirmation, but provides no Safari
-  observation/control and no automatic return to this MCP after login. Complete
-  the entire blocked workflow manually in the external browser. WebKitUI never copies cookies,
-  passkeys, AutoFill data, or credentials between backends.
+  `safari_compatibility` requirement. Any already-restricted authentication origin may
+  also use `compatibility_start` as an explicit manual fallback when its native human
+  handoff is present but unusable. The operation opens the exact private URL in Safari
+  only after native confirmation; it never auto-switches merely because a page timed out,
+  never replaces the native handoff, provides no Safari observation/control, and cannot
+  return a Safari login to this MCP session. Complete the blocked workflow manually in
+  the external browser. WebKitUI never copies cookies, passkeys, AutoFill data, or
+  credentials between backends.
 - `takeSnapshot` may omit GPU-composited effects.
 - No exactly-once or rollback claim for an uncooperative website.
 - Low concurrency is intentional because WKWebView has no per-view hard memory quota.

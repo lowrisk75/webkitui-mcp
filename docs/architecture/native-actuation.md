@@ -48,13 +48,20 @@ and directs the caller to independent provider/backend evidence before retrying.
 
 ## Local human handoff
 
-`browser_session(operation: "handoff_start")` transfers the persistent `WKWebView` into a visible local window and immediately returns a random session-bound token. `handoff_status` polls without blocking or changing control. `handoff_resume` still requires local native confirmation, consumes the token before requesting agent control, invalidates old addresses, and returns a fresh observation. The older multi-round `handoff` remains for compatibility. While control is human, navigation, observation, capture, locator resolution, transaction reconciliation, and actuation from the agent fail closed.
+`browser_session(operation: "handoff_start")` transfers the persistent `WKWebView` into a visible local window and immediately returns a random session-bound token. `handoff_status` polls without blocking or changing control. `handoff_focus` only brings that existing human-control window forward; it does not recreate the handoff UI, navigate, or transfer control. `handoff_resume` still requires local native confirmation, consumes the token before requesting agent control, invalidates old addresses, and returns a fresh observation. The older multi-round `handoff` remains for compatibility. While control is human, navigation, observation, capture, locator resolution, transaction reconciliation, and actuation from the agent fail closed.
 
 The user performs login, MFA, CAPTCHA, or sensitive entry directly in WebKit. A decline leaves human control active. An accepted, exact-state-bound response hides the window, invalidates all prior element symbols, and returns a new full observation. If WebKit's content process terminated during handoff, the runtime reloads the host-owned last HTTP(S) URL from the persistent data store before re-observing. A test-only WebKit process-kill selector now exercises the real public termination callback, verifies that no action is replayed, and preserves an authenticated `HttpOnly` cookie, `localStorage`, and `sessionStorage` across 10/10 local fixture runs in the same view/data-store lifetime. JavaScript heap state, GPU/network-process failure, host-process restart, richer storage, and in-flight server writes remain separate unmeasured cases.
 
 Restricted authentication origins cannot be returned to agent control. Resume
 fails closed while the live URL remains restricted; the window stays human
 controlled. Status and error results expose only the canonical origin and a
-bounded classification such as `auth_ui_not_ready`.
+bounded classification such as `auth_ui_not_ready`. They may also expose a
+boolean-only snapshot from the last navigation settlement describing whether a
+progress indicator, visible or hidden authentication control, footer, or other
+rendered content was present. No page text, control value, path, query, or
+fragment is included. An explicit, locally confirmed Safari compatibility
+handoff remains available for any already-restricted authentication origin; it
+never triggers automatically and does not replace or observe the native WebKit
+handoff.
 
 The local audit contains only state transitions, document/observation identifiers, and monotonic timestamps. It never serializes page text or input values.

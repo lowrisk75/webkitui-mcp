@@ -1153,6 +1153,10 @@ public final class WebKitMCPServer {
             : "complete_sensitive_step_in_native_handoff"),
         "session_transfer_supported": .bool(false),
         "credential_transfer_supported": .bool(false),
+        "safari_compatibility_available": .bool(true),
+        "ui_health": try runtime.authenticationUIHealthSnapshot().map(JSONValue.encoded) ?? .null,
+        "ui_health_is_live": .bool(false),
+        "ui_health_scope": .string("last_navigation_settlement_before_handoff"),
       ]),
       modern: modern
     )
@@ -1523,6 +1527,26 @@ public final class WebKitMCPServer {
       // Host names only: a client can tell whether this profile is already signed in
       // to an origin without any cookie ever leaving the store.
       let statusRuntime = try registry.runtime(for: handle)
+      statusObject["human_control_surface_presented"] = .bool(
+        [.humanControlled, .humanStepCompleted].contains(status.controlState)
+          && statusRuntime.humanControlSurfaceIsPresented)
+      if let restriction = statusRuntime.authenticationRestrictionStatus() {
+        statusObject["safari_compatibility_available"] = .bool(true)
+        statusObject["authentication_restriction"] = .object([
+          "origin": .string(restriction.origin),
+          "auth_ui_state": .string(restriction.classification.rawValue),
+          "ui_health": try statusRuntime.authenticationUIHealthSnapshot().map(JSONValue.encoded)
+            ?? .null,
+          "ui_health_is_live": .bool(
+            ![.humanControlled, .humanStepCompleted].contains(status.controlState)),
+          "ui_health_scope": .string(
+            [.humanControlled, .humanStepCompleted].contains(status.controlState)
+              ? "last_navigation_settlement_before_handoff" : "latest_navigation_settlement"),
+        ])
+      } else {
+        statusObject["safari_compatibility_available"] = .bool(false)
+        statusObject["authentication_restriction"] = .null
+      }
       if let blocker = crossOriginHandoffDiagnostic(runtime: statusRuntime) {
         statusObject["navigation_blocker"] = .object(blocker)
         if sessionOwnerState != "owned_elsewhere",
@@ -1614,6 +1638,8 @@ public final class WebKitMCPServer {
       return try asynchronousHandoffStatus(arguments: arguments, modern: modern)
     case "handoff_resume":
       return try await asynchronousHandoffResume(arguments: arguments, modern: modern)
+    case "handoff_focus":
+      return try focusHumanHandoff(arguments: arguments, modern: modern)
     case "compatibility_start":
       await revokeGoalDelegation(for: try sessionHandle(arguments))
       return try await safariCompatibilityStart(arguments: arguments, modern: modern)
@@ -1625,7 +1651,7 @@ public final class WebKitMCPServer {
       return try await goalDelegationRevoke(arguments: arguments, modern: modern)
     default:
       throw MCPServerError.invalidParams(
-        "operation must be open, profiles, status, set_viewport, back, forward, reload, close, client_handoff, handoff, handoff_start, handoff_status, handoff_resume, compatibility_start, goal_delegation_start, goal_delegation_status, goal_delegation_revoke, or confirmation_cancel"
+        "operation must be open, profiles, status, set_viewport, back, forward, reload, close, client_handoff, handoff, handoff_start, handoff_status, handoff_resume, handoff_focus, compatibility_start, goal_delegation_start, goal_delegation_status, goal_delegation_revoke, or confirmation_cancel"
       )
     }
   }
@@ -2223,10 +2249,7 @@ public final class WebKitMCPServer {
     }
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
-    guard
-      let restriction = runtime.authenticationRestrictionStatus(),
-      restriction.classification == .fullBrowserRequired
-    else {
+    guard let restriction = runtime.authenticationRestrictionStatus() else {
       return try structuredToolError(
         structured: .object([
           "status": .string("compatibility_not_required"),
@@ -2238,9 +2261,10 @@ public final class WebKitMCPServer {
     guard
       try await rateLimitedConfirmation(
         session: handle,
-        title: "Continue Authentication in Safari",
+        title: "Open Authentication in Safari",
         message:
-          "Open \(restriction.origin) in Safari for passkey or security-key authentication?\n\n"
+          "Open \(restriction.origin) in Safari as a manual authentication fallback?\n\n"
+          + "The native WebKit handoff remains available and is not replaced. "
           + "Cookies, credentials, MFA codes, paths, and query parameters are not exposed "
           + "through MCP or copied from WebKitUI.",
         approveLabel: "Open in Safari"
@@ -2282,6 +2306,9 @@ public final class WebKitMCPServer {
         "cookie_transfer_supported": .bool(false),
         "credential_transfer_supported": .bool(false),
         "credentials_exposed_to_mcp": .bool(false),
+        "fallback_from": .string(restriction.classification.rawValue),
+        "native_handoff_remains_active": .bool(
+          [.humanControlled, .humanStepCompleted].contains(runtime.interactionControlState())),
         "instructions": .string(
           "Continue and finish the workflow manually in Safari. This operation only opens Safari: "
             + "WebKitUI cannot observe or control Safari, and authentication there does not "
@@ -2290,6 +2317,36 @@ public final class WebKitMCPServer {
         ),
       ]),
       modern: modern)
+  }
+
+  private func focusHumanHandoff(
+    arguments: [String: JSONValue], modern: Bool
+  ) throws -> JSONValue {
+    guard arguments.keys.allSatisfy({ $0 == "operation" || $0 == "session_id" }) else {
+      throw MCPServerError.invalidParams("handoff_focus accepts only operation and session_id")
+    }
+    let handle = try sessionHandle(arguments)
+    let runtime = try registry.runtime(for: handle)
+    guard
+      runtime.interactionControlState() == .humanControlled
+        || runtime.interactionControlState() == .humanStepCompleted
+    else {
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("handoff_focus_unavailable"),
+          "surface_presented": .bool(false),
+          "control_state": .string(runtime.interactionControlState().rawValue),
+          "message": .string("No human-control window is active for this session."),
+        ]), modern: modern)
+    }
+    let presented = try runtime.focusHumanControlWindow()
+    return try toolResult(
+      structured: .object([
+        "status": .string(
+          presented ? "human_control_surface_focused" : "human_control_surface_unavailable"),
+        "surface_presented": .bool(presented),
+        "control_state": .string(runtime.interactionControlState().rawValue),
+      ]), modern: modern)
   }
 
   private func navigateTool(
@@ -5706,7 +5763,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_session",
       description:
-        "List persistent profiles, open, inspect, resize, recover, close, or transfer one bounded session behind the single WebKitUI MCP authority. set_viewport changes only the CSS-pixel layout and invalidates a prior observation; width is 320–3840 and height is 240–2160. It does not emulate a mobile device: the public macOS SDK exposes no WKWebView ContentMode API, and set_emulated_media is deliberately unsupported. back, forward, and reload take their exact destination from WKBackForwardList, require native confirmation, and invalidate the observation; an absent entry is an explicit refusal, and reload is refused after a form submission to prevent replay. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private authentication URL in Safari only after native confirmation; cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation under the same bounds. Profile listing never exposes cookies or credentials.",
+        "List persistent profiles, open, inspect, resize, recover, close, or transfer one bounded session behind the single WebKitUI MCP authority. set_viewport changes only the CSS-pixel layout and invalidates a prior observation; width is 320–3840 and height is 240–2160. It does not emulate a mobile device: the public macOS SDK exposes no WKWebView ContentMode API, and set_emulated_media is deliberately unsupported. back, forward, and reload take their exact destination from WKBackForwardList, require native confirmation, and invalidate the observation; an absent entry is an explicit refusal, and reload is refused after a form submission to prevent replay. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private restricted-authentication URL in Safari only after native confirmation; it is an optional manual fallback and never replaces native handoff. Cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. handoff_focus re-presents only an already-active human-control window and changes no authority. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation under the same bounds. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
@@ -5715,7 +5772,8 @@ public final class WebKitMCPServer {
             .string("set_viewport"), .string("back"), .string("forward"), .string("reload"),
             .string("client_handoff"),
             .string("handoff"), .string("handoff_start"), .string("handoff_status"),
-            .string("handoff_resume"), .string("compatibility_start"),
+            .string("handoff_resume"), .string("handoff_focus"),
+            .string("compatibility_start"),
             .string("goal_delegation_start"), .string("goal_delegation_status"),
             .string("goal_delegation_revoke"),
             .string("confirmation_cancel"),

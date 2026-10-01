@@ -1414,6 +1414,106 @@ struct MCPServerTests {
     #expect(!encoded.contains("two-factor"))
   }
 
+  @Test("Safari compatibility is an explicit fallback for an unusable Apple handoff")
+  func safariCompatibilityFallbackFromNativeAppleHandoff() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    let privateState = "apple-private-query-state"
+    _ = try await runtime.loadHTML(
+      "<footer>Privacy Terms</footer>",
+      baseURL: URL(
+        string: "https://idmsa.apple.com/IDMSWebAuth/signin?state=\(privateState)"),
+      timeout: .seconds(3),
+      quietWindow: .milliseconds(40)
+    )
+    #expect(runtime.authenticationRestrictionStatus()?.classification == .authUINotReady)
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    let confirmation = ConfirmationPresenterStub(responses: [true])
+    let safari = SafariCompatibilityPresenterStub()
+    let server = WebKitMCPServer(
+      registry: registry,
+      presentHumanWindows: false,
+      confirmationPresenter: confirmation,
+      safariCompatibilityPresenter: safari
+    )
+
+    let response = try await toolCall(
+      server,
+      id: 1,
+      name: "browser_session",
+      arguments: [
+        "operation": .string("compatibility_start"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ]
+    )
+    let result = try object(response["result"])
+    #expect(result["isError"] == nil)
+    let structured = try object(result["structuredContent"])
+    #expect(structured["status"] == .string("safari_compatibility_handoff_started"))
+    #expect(structured["fallback_from"] == .string("auth_ui_not_ready"))
+    #expect(structured["native_handoff_remains_active"] == .bool(true))
+    #expect(safari.openedURLs.first?.query == "state=\(privateState)")
+    let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+    #expect(!encoded.contains(privateState))
+    #expect(!encoded.contains("IDMSWebAuth"))
+  }
+
+  @Test("Status exposes safe authentication health and a scoped handoff focus operation")
+  func authenticationStatusAndHandoffFocus() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<footer>Privacy Terms</footer>",
+      baseURL: URL(string: "https://idmsa.apple.com/private?state=secret"),
+      timeout: .seconds(3),
+      quietWindow: .milliseconds(40)
+    )
+    let server = WebKitMCPServer(registry: registry, presentHumanWindows: false)
+    let sessionID = JSONValue.string(handle.rawValue.uuidString)
+    let unavailableResponse = try await toolCall(
+      server, id: 0, name: "browser_session",
+      arguments: ["operation": .string("handoff_focus"), "session_id": sessionID])
+    let unavailableResult = try object(unavailableResponse["result"])
+    #expect(unavailableResult["isError"] == .bool(true))
+    let unavailable = try object(unavailableResult["structuredContent"])
+    #expect(unavailable["status"] == .string("handoff_focus_unavailable"))
+    #expect(unavailable["surface_presented"] == .bool(false))
+
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+
+    let statusResponse = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: ["operation": .string("status"), "session_id": sessionID])
+    let status = try object(try object(statusResponse["result"])["structuredContent"])
+    #expect(status["human_control_surface_presented"] == .bool(false))
+    #expect(status["safari_compatibility_available"] == .bool(true))
+    let auth = try object(status["authentication_restriction"])
+    #expect(auth["origin"] == .string("https://idmsa.apple.com"))
+    #expect(auth["auth_ui_state"] == .string("auth_ui_not_ready"))
+    let health = try object(auth["ui_health"])
+    #expect(auth["ui_health_is_live"] == .bool(false))
+    #expect(
+      auth["ui_health_scope"] == .string("last_navigation_settlement_before_handoff"))
+    #expect(health["documentComplete"] == .bool(true))
+    #expect(health["hasRenderedFooter"] == .bool(true))
+    #expect(health["hasRenderedNonFooterContent"] == .bool(false))
+    let encodedStatus = String(decoding: try JSONEncoder().encode(status), as: UTF8.self)
+    #expect(!encodedStatus.contains("state=secret"))
+    #expect(!encodedStatus.contains("/private"))
+
+    let focusResponse = try await toolCall(
+      server, id: 2, name: "browser_session",
+      arguments: ["operation": .string("handoff_focus"), "session_id": sessionID])
+    let focus = try object(try object(focusResponse["result"])["structuredContent"])
+    #expect(focus["status"] == .string("human_control_surface_focused"))
+    #expect(focus["surface_presented"] == .bool(true))
+    #expect(runtime.humanControlSurfaceIsPresented)
+  }
+
   @Test("Cross-origin redirects return only sanitized origins")
   func redirectRequiresHumanApprovalResult() throws {
     let server = try WebKitMCPServer()

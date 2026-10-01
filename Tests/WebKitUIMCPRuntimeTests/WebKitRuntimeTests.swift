@@ -3690,6 +3690,36 @@ struct WebKitRuntimeTests {
     #expect(!String(describing: result).contains(secret))
   }
 
+  @Test("A settled authentication document containing only its footer is explicitly unready")
+  func footerOnlyAuthenticationUIIsUnready() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html>
+      <style>
+        html, body { margin: 0; width: 100%; height: 100%; }
+        footer { position: fixed; inset: auto 0 0; height: 80px; }
+      </style>
+      <div id='page-shell'>
+        <footer><a href='/privacy'>Privacy</a><a href='/terms'>Terms</a></footer>
+      </div>
+      """,
+      baseURL: URL(string: "https://idmsa.apple.com/IDMSWebAuth/signin?state=private"),
+      timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40)
+    )
+
+    let status = try #require(runtime.authenticationRestrictionStatus())
+    #expect(status.classification == .authUINotReady)
+    let health = try #require(runtime.authenticationUIHealthSnapshot())
+    #expect(health.documentComplete)
+    #expect(health.hasRenderedFooter)
+    #expect(!health.hasRenderedNonFooterContent)
+    #expect(!health.hasVisibleAuthenticationControl)
+    #expect(!health.hasInvisibleAuthenticationControl)
+    #expect(!health.hasProgressIndicator)
+  }
+
   @Test("A restricted authentication child frame refuses, hands off, and resumes once it is gone")
   func restrictedAuthenticationChildFrameHandoffAndResume() async throws {
     let secret = "child-query-state-must-never-escape"
@@ -4388,6 +4418,11 @@ struct WebKitRuntimeTests {
     let window = try #require(runtime.webView.window)
     #expect(window === stableWindow)
     #expect(window.title == "WebkitUIMCP — Human control")
+
+    window.orderOut(nil)
+    #expect(!runtime.humanControlSurfaceIsPresented)
+    #expect(try runtime.focusHumanControlWindow())
+    #expect(runtime.humanControlSurfaceIsPresented)
     #expect(window.isVisible)
     #expect(window.alphaValue == 1)
     #expect(runtime.webView.isDescendant(of: try #require(window.contentView)))
