@@ -3800,8 +3800,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       "WebkitUIMCP — Human control", fallback: "WebkitUIMCP — Human control")
     // The agent's own name for itself: quoted and labelled, so a client calling itself
     // "SiliconPass — enter your password" cannot pass that off as the window's purpose.
+    // Show only the origin: authenticated paths and query values do not belong
+    // in a window title that can appear in Mission Control or screenshots.
+    let site = (webView.url ?? lastCommittedHTTPURL)?.host
+    let siteTitle = site.map { "\(baseTitle) — \($0)" } ?? baseTitle
     window.title =
-      humanControlRequester.map { "\(baseTitle) — agent “\($0)” (self-reported)" } ?? baseTitle
+      humanControlRequester.map { "\(siteTitle) — agent “\($0)” (self-reported)" } ?? siteTitle
     window.ignoresMouseEvents = false
     window.collectionBehavior.remove(.stationary)
     window.collectionBehavior.remove(.ignoresCycle)
@@ -6576,7 +6580,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       walk(root);
       return collapse(parts.join(' ')).slice(0, 200);
     };
+    // A submit input paints its value as its caption; innerText is empty. Only
+    // button-like inputs borrow that value, never editable or hidden field values.
+    const inputButtonName = element => element.localName === 'input'
+      && ['button', 'submit', 'reset'].includes(element.type)
+      ? collapse(element.value) : null;
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
+      || inputButtonName(element)
       || collapse(element.getAttribute('placeholder'))
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
       || collapse(element.innerText) || shadowTextOf(element) || null;
@@ -6616,7 +6626,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       if (legendText) anchors.push({ kind: 'fieldset_legend', text: legendText });
 
       const region = element.closest(
-        'section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
+        'dialog, [role="dialog"], [role="alertdialog"], section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
       const regionText = safeContextValue(
         region?.getAttribute('aria-label') || directLabelledText(region));
       if (regionText) anchors.push({ kind: 'labelled_region', text: regionText });
@@ -7202,7 +7212,13 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       walk(root);
       return collapse(parts.join(' ')).slice(0, 200);
     };
+    // A submit input paints its value as its caption; innerText is empty. Only
+    // button-like inputs borrow that value, never editable or hidden field values.
+    const inputButtonName = element => element.localName === 'input'
+      && ['button', 'submit', 'reset'].includes(element.type)
+      ? collapse(element.value) : null;
     const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
+      || inputButtonName(element)
       || collapse(element.getAttribute('placeholder'))
       || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
       || collapse(element.innerText) || shadowTextOf(element) || null;
@@ -7451,7 +7467,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       if (kind === 'labelled_region') {
         const region = element.closest(
-          'section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
+          'dialog, [role="dialog"], [role="alertdialog"], section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
         return collapse(region?.getAttribute('aria-label') || directLabelledText(region)) || null;
       }
       if (kind === 'nearest_heading') {

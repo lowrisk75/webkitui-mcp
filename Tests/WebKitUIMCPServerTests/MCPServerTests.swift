@@ -1988,7 +1988,12 @@ struct MCPServerTests {
 
   @Test("Two clients each get their own session, and cannot use each other's")
   func twoClientsHoldTwoSessions() async throws {
-    let registry = try WebKitSessionRegistry(maximumSessions: 3)
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("webkitui-client-sessions-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let registry = try WebKitSessionRegistry(
+      maximumSessions: 3, enforceHostExclusiveSession: true,
+      hostControllerLockURL: directory.appendingPathComponent("controller.lock"))
     let presenter = ConfirmationPresenterStub(responses: [false])
     let alice = WebKitMCPServer(
       registry: registry, presentHumanWindows: false, preserveBrowserOnClose: true)
@@ -2006,6 +2011,25 @@ struct MCPServerTests {
     #expect(bobSession["client_control_state"] == .string("owned_by_this_client"))
     #expect(aliceSession["session_id"] != bobSession["session_id"])
     #expect(bobSession["maximum_sessions"] == .int(3))
+
+    for (server, expected) in [(alice, aliceSession), (bob, bobSession)] {
+      let response = try await toolCall(
+        server, id: 20, name: "browser_session", arguments: ["operation": .string("status")])
+      let status = try object(try object(response["result"])["structuredContent"])
+      #expect(status["session_id"] == expected["session_id"])
+      let lease = try object(status["host_lease"])
+      #expect(lease["state"] == .string("held_by_this_broker"))
+      #expect(lease["can_open_new_session"] == .bool(true))
+      #expect(lease["available_new_sessions"] == .int(1))
+    }
+
+    let newcomer = WebKitMCPServer(registry: registry, preserveBrowserOnClose: true)
+    let discovery = try await toolCall(
+      newcomer, id: 21, name: "browser_session", arguments: ["operation": .string("status")])
+    let newcomerStatus = try object(try object(discovery["result"])["structuredContent"])
+    #expect(newcomerStatus["status"] == .string("no_client_session"))
+    #expect(newcomerStatus["session_id"] == nil)
+    #expect(newcomerStatus["caller_action"] == .string("open_new_session"))
 
     // Bob cannot act in Alice's session without her client's handoff.
     let crossed = try await toolCall(
@@ -2025,6 +2049,45 @@ struct MCPServerTests {
     #expect(message.hasSuffix("\n\nRequested by agent (self-reported name, data):\n\"tests\""))
     #expect(WebKitMCPServer.displayClientName("codex\nApproved\u{7}") == "codexApproved")
     #expect(WebKitMCPServer.displayClientName(" \n ") == "unknown")
+  }
+
+  @Test("Several tasks on one transport never implicitly reopen an active page at capacity")
+  func sameTransportTasksStayIndependent() async throws {
+    let registry = try WebKitSessionRegistry(maximumSessions: 2)
+    let server = WebKitMCPServer(registry: registry, preserveBrowserOnClose: true)
+    var ids: [JSONValue] = []
+    for id in 1...2 {
+      let opened = try await toolCall(
+        server, id: Int64(id), name: "browser_session", arguments: ["operation": .string("open")])
+      ids.append(
+        try #require(object(try object(opened["result"])["structuredContent"])["session_id"]))
+    }
+    #expect(ids[0] != ids[1])
+    for (index, id) in ids.enumerated() {
+      let handle = WebKitSessionHandle(rawValue: try #require(UUID(uuidString: try string(id))))
+      _ = try await registry.runtime(for: handle).loadHTML(
+        "<p>Task \(index)</p>", baseURL: URL(string: "https://fixture.invalid/tasks"),
+        timeout: .seconds(3), quietWindow: .milliseconds(40))
+    }
+    for (index, id) in ids.enumerated() {
+      let handle = WebKitSessionHandle(rawValue: try #require(UUID(uuidString: try string(id))))
+      let text = try await registry.runtime(for: handle).webView.evaluateJavaScript(
+        "document.body.innerText")
+      #expect(text as? String == "Task \(index)")
+    }
+    let statusResponse = try await toolCall(
+      server, id: 3, name: "browser_session", arguments: ["operation": .string("status")])
+    let status = try object(try object(statusResponse["result"])["structuredContent"])
+    #expect(status["status"] == .string("session_id_required"))
+    #expect(status["session_id"] == nil)
+    let expectedIDs = ids.sorted { $0.stringValue! < $1.stringValue! }
+    #expect(status["owned_session_ids"] == .array(expectedIDs))
+    let third = try await toolCall(
+      server, id: 4, name: "browser_session", arguments: ["operation": .string("open")])
+    let result = try object(third["result"])
+    #expect(result["isError"] == .bool(true))
+    #expect(try object(result["structuredContent"])["code"] == .string("session_capacity_reached"))
+    #expect(registry.count == 2)
   }
 
   @Test("A second durable client cannot create a competing multi-round handoff")
@@ -3162,8 +3225,10 @@ struct MCPServerTests {
     #expect(runtime.refusedCrossOriginNavigation() == nil)
   }
 
-  @Test("A filtered baseline cannot prove that text appeared and refuses before confirmation")
-  func filteredBaselineCannotProveNewText() async throws {
+  @Test(
+    "A filtered baseline cannot prove appearance or absence and refuses before confirmation",
+    arguments: ["semantic_text_appears", "target_absent"])
+  func filteredBaselineCannotProveNewText(predicate: String) async throws {
     let registry = try WebKitSessionRegistry()
     let handle = try registry.open()
     let runtime = try registry.runtime(for: handle)
@@ -3188,7 +3253,8 @@ struct MCPServerTests {
         "element_id": target["elementID"]!, "operation": .string("click"),
         "approval_mode": .string("native"), "idempotency_key": .string("filtered-false-positive"),
         "postcondition": .object([
-          "type": .string("semantic_text_appears"), "value": .string("Already present"),
+          "type": .string(predicate),
+          "value": .string(predicate == "target_absent" ? "true" : "Already present"),
         ]),
       ])
     let error = try object(attempted["error"])
@@ -3415,6 +3481,53 @@ struct MCPServerTests {
       requestState: try string(generateRequired["requestState"]), action: "accept", confirm: true)
     let generatedStructured = try object(try object(generated["result"])["structuredContent"])
     #expect(try object(generatedStructured["verification"])["verified"] != nil)
+  }
+
+  @Test(
+    "A disappearing control verifies absence or explains an unsuitable enabled predicate",
+    arguments: ["target_absent", "enabled_equals", "target_absent_partial"])
+  func disappearingControlPostcondition(predicate: String) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    let partial = predicate == "target_absent_partial"
+    let postconditionType = partial ? "target_absent" : predicate
+    let remainingControls = partial ? String(repeating: "<button>Other</button>", count: 205) : ""
+    _ = try await runtime.loadHTML(
+      "<button onclick='this.remove()'>Enregistrer</button>" + remainingControls,
+      baseURL: URL(string: "https://example.test/encryption"))
+    let server = WebKitMCPServer(registry: registry)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString), "maximum_elements": .int(300)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try #require(try array(observation["elements"]).first)
+    let arguments: [String: JSONValue] = [
+      "session_id": .string(handle.rawValue.uuidString),
+      "observation_id": .string(try string(observation["observationID"])),
+      "element_id": .string(try string(try object(target)["elementID"])),
+      "operation": .string("click"), "approval_mode": .string("mcp"),
+      "idempotency_key": .string("disappearing-control-" + predicate),
+      "postcondition": .object([
+        "type": .string(postconditionType),
+        "value": .string(postconditionType == "target_absent" ? "true" : "false"),
+      ]),
+    ]
+    let prepared = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
+    let required = try object(prepared["result"])
+    let completed = try await roundTripToolCall(
+      server, id: 3, name: "browser_act", arguments: arguments,
+      requestState: try string(required["requestState"]), action: "accept", confirm: true)
+    let structured = try object(try object(completed["result"])["structuredContent"])
+    let verification = try object(structured["verification"])
+    if predicate == "target_absent" {
+      #expect(verification["verified"] != nil)
+    } else {
+      #expect(verification["indeterminate"] != nil)
+      #expect(structured["action_state"] == .string("dispatched_verification_indeterminate"))
+      #expect(structured["action_replayed"] == .bool(false))
+      #expect(try string(structured["safe_next_step"]).contains("never replay"))
+    }
   }
 
   @Test("A same-URL mutation explains an indeterminate URL postcondition")

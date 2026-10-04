@@ -61,7 +61,7 @@ public final class WebKitTransactionCoordinator {
     actionOrigins[plan.idempotencyKey] = resolvedActionOrigin
     let transactionObservation = TransactionObservation(
       state: try transactionState(observation, origin: resolvedActionOrigin),
-      completeness: .complete)
+      completeness: observation.isComplete ? .complete : .partial)
     _ = try await ledger.prepare(
       plan,
       observation: transactionObservation,
@@ -142,7 +142,7 @@ public final class WebKitTransactionCoordinator {
           idempotencyKey: plan.idempotencyKey,
           observation: TransactionObservation(
             state: try transactionState(latest, origin: resolvedActionOrigin),
-            completeness: .complete
+            completeness: latest.isComplete ? .complete : .partial
           ),
           monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
         )
@@ -264,7 +264,7 @@ public final class WebKitTransactionCoordinator {
           state: try transactionState(
             current,
             origin: origin),
-          completeness: .complete),
+          completeness: current.isComplete ? .complete : .partial),
         monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds)
     } catch {
       return try await ledger.reconcile(
@@ -288,7 +288,8 @@ public final class WebKitTransactionCoordinator {
     return try await ledger.reconcile(
       idempotencyKey: idempotencyKey,
       observation: TransactionObservation(
-        state: try transactionState(observation, origin: origin), completeness: .complete),
+        state: try transactionState(observation, origin: origin),
+        completeness: observation.isComplete ? .complete : .partial),
       monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
     )
   }

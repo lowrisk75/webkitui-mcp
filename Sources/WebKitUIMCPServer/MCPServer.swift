@@ -69,6 +69,7 @@ public final class WebKitMCPServer {
     case checkedEquals(Bool)
     case selectedEquals(Bool)
     case enabledEquals(Bool)
+    case targetAbsent
     case valueEquals(String)
     case validationState(String)
     case characterCountEquals(Int)
@@ -92,6 +93,7 @@ public final class WebKitMCPServer {
       case .checkedEquals(let value): "target checked equals \(value)"
       case .selectedEquals(let value): "target selected equals \(value)"
       case .enabledEquals(let value): "target enabled equals \(value)"
+      case .targetAbsent: "the original semantic target disappears"
       case .valueEquals(let value): "target value equals \(value)"
       case .validationState(let value): "target validation state equals \(value)"
       case .characterCountEquals(let value): "target character count equals \(value)"
@@ -161,6 +163,11 @@ public final class WebKitMCPServer {
       case .checkedEquals(let value): return targetField("@checked", String(value))
       case .selectedEquals(let value): return targetField("@selected", String(value))
       case .enabledEquals(let value): return targetField("@enabled", String(value))
+      case .targetAbsent:
+        return .entryAbsent(
+          .init(
+            frameID: target.frameIsMain == false ? "embedded" : "main",
+            elementID: semanticID, field: "@present"))
       case .valueEquals(let value): return targetField("@value", value)
       case .validationState(let value): return targetField("@validation_state", value)
       case .characterCountEquals(let value): return targetField("@character_count", String(value))
@@ -955,6 +962,16 @@ public final class WebKitMCPServer {
           "wait_only": .bool(true),
         ]),
         modern: modern)
+    } catch WebKitSessionRegistryError.capacityReached {
+      return try structuredToolError(
+        structured: .object([
+          "code": .string("session_capacity_reached"),
+          "message": .string("No independent WebKit session slot is available."),
+          "remediation": .string(
+            "Keep this task's existing session_id, or wait for a session to close before opening a new task. Never reuse another task's active page."
+          ),
+          "host_lease": hostControllerLeaseSummary(),
+        ]), modern: modern)
     } catch WebKitRuntimeError.humanControlActive {
       // Reported from a real session: a person logged in by hand, the native window said
       // it was waiting for the agent, and every later call came back as the bare string
@@ -1363,6 +1380,15 @@ public final class WebKitMCPServer {
           reused: false
         )
       let handle = opened.handle
+      // A transport may serve several tasks. At capacity, openOrReuse can return
+      // an owned handle; never turn a new open into permission to navigate a page
+      // this same transport is already using for another task.
+      if opened.reused,
+        try registry.sessionOwnershipState(for: handle, owner: clientAuthorityID)
+          == "owned_by_this_client"
+      {
+        throw WebKitSessionRegistryError.capacityReached
+      }
       var controlAvailable = try registry.claimSessionOwnership(
         for: handle, owner: clientAuthorityID, holder: clientHolder(policy: executionPolicy))
       // Reusing a session another client holds returned at once, whatever wait the
@@ -1438,10 +1464,41 @@ public final class WebKitMCPServer {
       guard arguments.keys.allSatisfy({ $0 == "operation" || $0 == "session_id" }) else {
         throw MCPServerError.invalidParams("status accepts only operation and session_id")
       }
+      if arguments["session_id"] == nil {
+        let owned = registry.openSessionHandles()
+          .filter {
+            (try? registry.sessionOwnershipState(for: $0, owner: clientAuthorityID))
+              == "owned_by_this_client"
+          }
+          .sorted(by: { $0.rawValue.uuidString < $1.rawValue.uuidString })
+        if owned.count > 1
+          || (owned.isEmpty && registry.count > 0 && registry.count < registry.maximumSessions)
+        {
+          return try toolResult(
+            structured: .object([
+              "status": .string(owned.isEmpty ? "no_client_session" : "session_id_required"),
+              "owned_session_ids": .array(owned.map { .string($0.rawValue.uuidString) }),
+              "host_lease": hostControllerLeaseSummary(),
+              "caller_action": .string(
+                owned.isEmpty ? "open_new_session" : "use_explicit_session_id"),
+              "remediation": .string(
+                owned.isEmpty
+                  ? "Call browser_session operation=open to obtain your own independent WebKit page."
+                  : "Use the exact session_id returned by open for this task; status does not select a page when this client owns several."
+              ),
+            ]), modern: modern)
+        }
+      }
       let handle: WebKitSessionHandle
       if arguments["session_id"] != nil {
         handle = try sessionHandle(arguments)
-      } else if let existing = registry.existingHandle {
+      } else if let existing = registry.openSessionHandles()
+        .sorted(by: { $0.rawValue.uuidString < $1.rawValue.uuidString })
+        .first(where: {
+          (try? registry.sessionOwnershipState(for: $0, owner: clientAuthorityID))
+            == "owned_by_this_client"
+        }) ?? registry.existingHandle
+      {
         handle = existing
       } else {
         if let holder = registry.externalHostControllerHolder() {
@@ -1466,6 +1523,7 @@ public final class WebKitMCPServer {
       let status = try registry.status(handle)
       var statusObject = try requireObject(.encoded(status), named: "session status")
       statusObject["session_id"] = .string(handle.rawValue.uuidString)
+      statusObject["host_lease"] = hostControllerLeaseSummary()
       // The same sentences the blocked call itself returns. An agent that reads
       // `humanControlActive` looks here next, and what it found here used to contradict
       // what it had just been told.
@@ -1514,6 +1572,12 @@ public final class WebKitMCPServer {
             + "or request browser_session operation=client_handoff for local human "
             + "confirmation.")
         statusObject["caller_action"] = .string("wait_or_client_handoff")
+        if registry.count < registry.maximumSessions {
+          statusObject["remediation"] = .string(
+            "Call browser_session operation=open to obtain your own independent WebKit page. "
+              + "Do not navigate or act with this other client's session_id.")
+          statusObject["caller_action"] = .string("open_new_session")
+        }
       }
       statusObject["holder"] = holderValue(try registry.sessionOwner(for: handle))
       statusObject["ownership_basis"] = .string("client_connection_identity")
@@ -1881,15 +1945,24 @@ public final class WebKitMCPServer {
 
   /// The host lease as a client can see it before opening anything.
   private func hostControllerLeaseSummary() -> JSONValue {
-    let holder = registry.externalHostControllerHolder()
+    // The lock is process-wide. Reading our broker's own lock as an external
+    // client lease wrongly told peers to wait while there was room for them.
+    let holder = registry.count == 0 ? registry.externalHostControllerHolder() : nil
+    let available = max(0, registry.maximumSessions - registry.count)
     return .object([
       "exclusive": .bool(true),
       "state": .string(
-        holder == nil ? (registry.count > 0 ? "held_by_this_client" : "free") : "held_elsewhere"),
+        holder == nil ? (registry.count > 0 ? "held_by_this_broker" : "free") : "held_elsewhere"),
       "holder": holderValue(holder),
+      "maximum_sessions": .int(Int64(registry.maximumSessions)),
+      "active_sessions": .int(Int64(registry.count)),
+      "available_new_sessions": .int(Int64(holder == nil ? available : 0)),
+      "can_open_new_session": .bool(holder == nil && available > 0),
       "remediation": .string(
         holder == nil
-          ? "Open a session normally."
+          ? (available > 0
+            ? "Open your own independent WebKit session normally; sessions on the same profile share sign-ins."
+            : "All session slots are occupied. Open may reuse an unowned session; otherwise wait for a client to release its session.")
           : "Only the holding client releasing its session frees the host. Retry open with "
             + "wait_timeout_ms up to 60000; a server whose client has exited releases it "
             + "automatically within a few seconds."),
@@ -2893,7 +2966,7 @@ public final class WebKitMCPServer {
         "expires_at": .string(ISO8601DateFormatter().string(from: capability.expiresAt)),
         "blocking": .bool(false),
         "instructions": .string(
-          "Complete the sensitive step in the live WebKit window, then select Done — Return Control there. Poll handoff_status until human_step_completed=true, then call handoff_resume with this single-session token."
+          "Complete the sensitive step in the live WebKit window. If it is not visible, call handoff_focus for this session. Then select Done — Return Control there. Poll handoff_status until human_step_completed=true, then call handoff_resume with this single-session token."
         ),
       ]), modern: modern)
   }
@@ -4377,6 +4450,11 @@ public final class WebKitMCPServer {
           "semantic_text_contains must contain 1 to 512 characters")
       }
       return .semanticTextContains(expected)
+    case "target_absent":
+      guard expected == "true" else {
+        throw MCPServerError.invalidParams("target_absent requires value=true")
+      }
+      return .targetAbsent
     case "checked_equals", "selected_equals", "enabled_equals":
       guard let boolean = ["true": true, "false": false][expected.lowercased()] else {
         throw MCPServerError.invalidParams("boolean state postconditions require true or false")
@@ -4439,9 +4517,9 @@ public final class WebKitMCPServer {
   ) throws {
     if let postcondition, !observation.isComplete {
       switch postcondition {
-      case .semanticTextAppears, .semanticTextContains, .dialogAppears, .panelOpen:
+      case .targetAbsent, .semanticTextAppears, .semanticTextContains, .dialogAppears, .panelOpen:
         throw MCPServerError.invalidParams(
-          "postcondition_baseline_incomplete: this observation is filtered, paginated, truncated, or has unreadable content. Observe without role/name filters and with enough elements/field characters before asking whether new semantic content appeared."
+          "postcondition_baseline_incomplete: this observation is filtered, paginated, truncated, or has unreadable content. Observe without role/name filters and with enough elements/field characters before asking whether semantic content appeared or a target disappeared."
         )
       default: break
       }
@@ -4675,6 +4753,17 @@ public final class WebKitMCPServer {
         result.action.trustedUserGesture ? "no" : "unknown_site_requirement"),
       "trusted_human_gesture_handoff_available": .bool(!result.action.trustedUserGesture),
     ]
+    if case .indeterminate = result.verification {
+      structured["action_state"] = .string("dispatched_verification_indeterminate")
+      structured["action_replayed"] = .bool(false)
+      structured["safe_next_step"] = .string(
+        "Dispatch occurred, but the requested postcondition was not proved. Observe or reconcile; never replay automatically. enabled_equals=false requires the same target to remain present and disabled. For a disappearing or renamed control, use target_absent=true; use heading or semantic text postconditions to verify the resulting page context."
+      )
+      structured["suggested_postconditions"] = .array([
+        .string("target_absent"), .string("heading_equals"),
+        .string("semantic_text_appears"), .string("semantic_text_contains"),
+      ])
+    }
     if let event = runtime.latestNavigationAuditEvent(),
       event.monotonicNanoseconds >= dispatchFloorNanoseconds,
       let blocker = crossOriginHandoffDiagnostic(runtime: runtime)
@@ -4764,7 +4853,9 @@ public final class WebKitMCPServer {
         "tools": .object(["listChanged": .bool(false)])
       ]),
       "serverInfo": serverInfo(),
-      "instructions": .string("Explicit browser session handles; observation IDs are ephemeral."),
+      "instructions": .string(
+        "Open a separate browser session for each independent task and retain its exact session_id. Never adopt another task's page from status. Sessions on the same profile share sign-ins; observation IDs are ephemeral."
+      ),
     ])
   }
 
@@ -5292,9 +5383,18 @@ public final class WebKitMCPServer {
   private static let actPostconditionSchema: JSONValue = .object([
     "type": .string("object"),
     "description": .string(
-      "Required for click and submit; forbidden for fill, whose exact value is verified automatically."
+      "Required for click and submit; forbidden for fill, whose exact value is verified automatically. target_absent with value=true verifies that the original semantic identity is absent from a complete observation; it does not prove server persistence. enabled_equals=false requires a target that remains present and disabled."
     ),
     "oneOf": .array([
+      .object([
+        "type": .string("object"),
+        "properties": .object([
+          "type": .object(["const": .string("target_absent")]),
+          "value": .object(["const": .string("true")]),
+        ]),
+        "required": .array([.string("type"), .string("value")]),
+        "additionalProperties": .bool(false),
+      ]),
       .object([
         "type": .string("object"),
         "properties": .object([
@@ -5766,7 +5866,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_session",
       description:
-        "List persistent profiles, open, inspect, resize, recover, close, or transfer one bounded session behind the single WebKitUI MCP authority. set_viewport changes only the CSS-pixel layout and invalidates a prior observation; width is 320–3840 and height is 240–2160. It does not emulate a mobile device: the public macOS SDK exposes no WKWebView ContentMode API, and set_emulated_media is deliberately unsupported. back, forward, and reload take their exact destination from WKBackForwardList, require native confirmation, and invalidate the observation; an absent entry is an explicit refusal, and reload is refused after a form submission to prevent replay. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private restricted-authentication URL in Safari only after native confirmation; it is an optional manual fallback and never replaces native handoff. Cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. handoff_focus re-presents only an already-active human-control window and changes no authority. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation under the same bounds. Profile listing never exposes cookies or credentials.",
+        "List persistent profiles, open, inspect, resize, recover, close, or transfer one bounded session behind the single WebKitUI MCP authority. For each independent task, call open and retain its exact session_id; sessions on the same profile share sign-ins. Never adopt a different task's page from status. A full broker refuses reopening an active page already owned by this client. set_viewport changes only the CSS-pixel layout and invalidates a prior observation; width is 320–3840 and height is 240–2160. It does not emulate a mobile device: the public macOS SDK exposes no WKWebView ContentMode API, and set_emulated_media is deliberately unsupported. back, forward, and reload take their exact destination from WKBackForwardList, require native confirmation, and invalidate the observation; an absent entry is an explicit refusal, and reload is refused after a form submission to prevent replay. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private restricted-authentication URL in Safari only after native confirmation; it is an optional manual fallback and never replaces native handoff. Cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. handoff_focus re-presents only an already-active human-control window and changes no authority. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation under the same bounds. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),

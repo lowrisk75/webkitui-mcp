@@ -4417,7 +4417,7 @@ struct WebKitRuntimeTests {
 
     let window = try #require(runtime.webView.window)
     #expect(window === stableWindow)
-    #expect(window.title == "WebkitUIMCP — Human control")
+    #expect(window.title == "WebkitUIMCP — Human control — fixture.invalid")
 
     window.orderOut(nil)
     #expect(!runtime.humanControlSurfaceIsPresented)
@@ -5714,6 +5714,65 @@ struct WebKitRuntimeTests {
       ])
     #expect(tabs.map(\.selected) == [true, false, false])
     #expect(tabs.allSatisfy { $0.locatorQuality.status == .unique })
+  }
+
+  @Test("Submit input labels and dialog context distinguish the active Save control")
+  func submitInputDialogSemantics() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <button disabled>Enregistrer</button>
+      <dialog open aria-label="Documents sur le chiffrement">
+        <input type="submit" value="Enregistrer" onclick="this.dataset.state='saved'">
+        <input type="button" value="Annuler">
+      </dialog>
+      <input type="text" value="private-field-value">
+      """,
+      baseURL: URL(string: "https://fixture.invalid/encryption"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe(roles: ["button"], nameContains: "Enregistrer")
+    #expect(observation.elements.count == 2)
+    let save = try #require(observation.elements.first { !$0.disabled })
+    #expect(save.accessibleName?.segments.first?.text == "Enregistrer")
+    #expect(
+      save.contextAnchors.contains {
+        $0.kind == .labelledRegion && $0.text.segments.first?.text == "Documents sur le chiffrement"
+      })
+    let result = try await runtime.perform(
+      observationID: observation.observationID, elementID: save.elementID,
+      operation: .click, dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    let state =
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('input[type=submit]').dataset.state") as? String
+    #expect(state == "saved")
+    let privateName = try await runtime.observe(nameContains: "private-field-value")
+    #expect(privateName.elements.isEmpty)
+  }
+
+  @Test("Semantic presence survives duplicate controls and partial observations stay unknown")
+  func semanticPresenceIsConservative() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<button>Save</button><button>Save</button><button>Other</button>",
+      baseURL: URL(string: "https://fixture.invalid/presence"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let full = try await runtime.observe()
+    let key = ObservationFieldKey(
+      frameID: "main", elementID: full.elements[0].locatorRecipe.semanticIdentity,
+      field: "@present")
+    let present = try full.canonicalState()
+    #expect(
+      try ObservationPredicate.entryAbsent(key).evaluate(
+        in: TransactionObservation(state: present, completeness: .complete)) == .unsatisfied)
+    let partial = try await runtime.observe(
+      maximumElements: 1, roles: ["button"], nameContains: "Other")
+    #expect(!partial.isComplete)
+    #expect(
+      try ObservationPredicate.entryAbsent(key).evaluate(
+        in: TransactionObservation(state: try partial.canonicalState(), completeness: .partial))
+        == .unknown)
   }
 
   @Test("Element scrolling reports its nearest nested scroll region")

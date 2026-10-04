@@ -58,6 +58,12 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   client disconnects, or through a human-confirmed `client_handoff`. Native
   confirmations are shown one at a time across the app, and each names the
   requesting agent as a quoted, self-reported name.
+- Each independent task must call `browser_session(operation: "open")` and keep
+  its returned `session_id` for all page operations. On a shared transport, a
+  full broker refuses an open that would return an already-owned page. Status
+  without an ID selects the caller's sole session; when it owns several, it asks
+  for an explicit ID. A new client with spare capacity is directed to open its
+  own page. Host lease metadata reports the broker's remaining session slots.
 - While a person holds the human control window, a pop-up the page opens (a sign-in
   with Google or Apple, say) is a real window sharing the page's profile, protected
   proxy and `window.opener`, at most four; all close when the agent resumes. Under
@@ -90,7 +96,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 
 ## Deliberate limits
 
-- `browser_act` exposes click, native submit-control click, bounded non-sensitive input/textarea fill, Enter/Tab/Escape, blur, explicit input commit, and answering the one JavaScript `alert`/`confirm`/`prompt` dialog a page is suspended on (`dialog_accept`, `dialog_dismiss`, `dialog_accept_value`). A pending dialog is reported in the observation as untrusted site content, blocks every other operation until it is answered, is never answered automatically, and resolves to an explicit indeterminate outcome if nobody answers it. `beforeunload` is out of scope: the public macOS SDK exposes no before-unload panel to an embedder. Native approval also routes public text fills through AppKit insertion with a measured trusted `input` receipt. Fill verifies both the freshly re-resolved semantic target's exact value and that its live validation state is not invalid. Other actions support exact URL or URL prefix, title, heading, exact/contains semantic text, checked, selected, enabled, value, validation state, character count, bounded state attributes, dialog, named panel, or selected-option postconditions. A same-URL SPA mutation returns `same_url_page_state_changed` guidance instead of implying success. UI state never proves backend commit.
+- `browser_act` exposes click, native submit-control click, bounded non-sensitive input/textarea fill, Enter/Tab/Escape, blur, explicit input commit, and answering the one JavaScript `alert`/`confirm`/`prompt` dialog a page is suspended on (`dialog_accept`, `dialog_dismiss`, `dialog_accept_value`). A pending dialog is reported in the observation as untrusted site content, blocks every other operation until it is answered, is never answered automatically, and resolves to an explicit indeterminate outcome if nobody answers it. `beforeunload` is out of scope: the public macOS SDK exposes no before-unload panel to an embedder. Native approval also routes public text fills through AppKit insertion with a measured trusted `input` receipt. Fill verifies both the freshly re-resolved semantic target's exact value and that its live validation state is not invalid. Other actions support exact URL or URL prefix, title, heading, exact/contains semantic text, checked, selected, enabled, semantic target absence (`target_absent` with `value="true"`), value, validation state, character count, bounded state attributes, dialog, named panel, or selected-option postconditions. A same-URL SPA mutation returns `same_url_page_state_changed` guidance instead of implying success. UI state never proves backend commit.
 - `browser_download` converts authenticated attachment responses to `WKDownload` from either a fresh observed control or a protected same-origin URL fallback. It requires exact native confirmation plus a save-panel destination, never overwrites an existing file, and succeeds only after an on-disk receipt reports the HTTP status, suggested/final filename, MIME type, byte count, SHA-256, and decoded provisioning-profile UUID when available. Cookies, headers, and the absolute local destination path stay outside MCP.
 - macOS file inputs use WebKit's native open-panel delegate. Selected regular files are bounded to 10 files and 50 MiB each; receipts may expose filenames, byte counts and SHA-256 values, but never local paths or file contents. A file-selection receipt is not provider acceptance: the action's independent postcondition must still verify the uploaded preview or saved state.
 - Fill dispatches normal `input`/`change` events, so site handlers may autosave or cause server effects. It is destructive and human-confirmed; password controls require local human handoff.
@@ -292,7 +298,7 @@ scripts/package-preview.sh dist
 scripts/verify-package-preview.sh dist
 ```
 
-Unzip `WebKitUI-MCP-0.6.22-preview.zip`, move `WebKitUI MCP.app` to the
+Unzip `WebKitUI-MCP-0.6.24-preview.zip`, move `WebKitUI MCP.app` to the
 Applications folder, and open it. In the status window:
 
 1. Enable **Launch at Login**. macOS may require approval in System Settings.
@@ -410,7 +416,7 @@ When a click's cross-origin navigation is refused, the action result and `status
 report a `navigation_blocker` containing only the source and destination origins
 and a human-handoff instruction. The click is not automatically replayed, and the
 private authentication request is not exposed.
-Semantic appearance postconditions require an unfiltered, untruncated baseline:
+Semantic appearance and target absence postconditions require an unfiltered, untruncated baseline:
 otherwise `postcondition_baseline_incomplete` refuses the action before dispatch.
 Observe again with enough elements and field characters to establish absence.
 Covered controls name the hit-tested covering element in `coveredBy` (compact:
@@ -462,3 +468,5 @@ The model cannot mint capability handles. Page content never becomes trusted pol
 Navigation actor attribution uses the first main-frame navigation within two
 seconds of an action. It is diagnostic evidence, not proof of causality or
 authorization: autonomous or more delayed navigation can be misattributed.
+
+A disappearing or renamed Save/Done control cannot satisfy `enabled_equals=false`: that predicate requires the original semantic target to remain present and disabled. Use `target_absent` with `value="true"` for disappearance, or a heading/text predicate for the resulting page. Absence is proved only by a complete observation; it means the original semantic identity is no longer observed, and does not prove server-side persistence. An indeterminate result after dispatch requires inspection or receipt reconciliation, never automatic replay.

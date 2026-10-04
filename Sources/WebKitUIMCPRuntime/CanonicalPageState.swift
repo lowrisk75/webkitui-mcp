@@ -35,6 +35,16 @@ extension WebKitPageObservation {
       }
     ).mapValues(\.count)
 
+    // Presence is recorded once even when several controls share an identity.
+    // A duplicate must never be mistaken for a control that disappeared.
+    for identity in semanticIdentityCounts.keys {
+      entries.append(
+        .init(
+          key: ObservationFieldKey(
+            frameID: identity.frameID, elementID: identity.identity, field: "@present"),
+          value: try ProvenancedText(text: "true", source: toolSource)))
+    }
+
     for element in elements {
       entries.append(.init(key: elementKey(element, "@tag"), value: element.tag))
       if let value = element.role {
