@@ -1,0 +1,12 @@
+{
+  "sensitive_entitlements_equal": {
+    "keychain-access-groups": true,
+    "com.apple.security.application-groups": true,
+    "com.apple.application-identifier": true,
+    "com.apple.developer.team-identifier": true,
+    "com.apple.developer.icloud-container-identifiers": true
+  },
+  "candidate_has_debug_entitlement": false,
+  "candidate_signature_valid": true,
+  "candidate_binary_sha256": "dd7099f132031e49502b437aea718dacb265072abd98649c4d23f169b3b7e451"
+}

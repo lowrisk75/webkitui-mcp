@@ -1,0 +1,30 @@
+{
+  "manifest_version": "0.3",
+  "name": "webkitui-mcp",
+  "display_name": "WebKitUI MCP — Native WebKit for Mac",
+  "version": "0.6.24",
+  "description": "Connect your AI agent to native WebKit on Mac, with persistent sign-ins and human approval.",
+  "long_description": "Native WebKit browser automation for Apple silicon Macs running macOS 15 or later. Navigate websites, inspect rendered content, interact with controls and download files through MCP. Persistent WebKit profiles keep their own sign-ins; Safari cookies are not imported. Native confirmation keeps people involved in actions, and human handoff lets you complete private steps in the browser.\n\nSETUP REQUIRED: This bundle contains the signed stdio relay, not the companion app. First download WebKitUI MCP 0.6.24 from the linked GitHub release, move the app to Applications and open it. Keep the companion running while using this connector. The connector uses the companion's default local Unix socket. No public server endpoint is provided.\n\nDeveloper Preview. Source available under Business Source License 1.1. Commercial production use requires a separate agreement; see the bundled LICENSE and LICENSING.md. No activation key is required for uses granted by that licence.",
+  "author": {
+    "name": "LorisLabs",
+    "url": "https://github.com/lowrisk75"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lowrisk75/webkitui-mcp.git"
+  },
+  "homepage": "https://github.com/lowrisk75/webkitui-mcp",
+  "documentation": "https://github.com/lowrisk75/webkitui-mcp/releases/tag/v0.6.24",
+  "support": "https://github.com/lowrisk75/webkitui-mcp/issues",
+  "license": "BUSL-1.1",
+  "compatibility": {"platforms": ["darwin"]},
+  "keywords": ["mcp", "webkit", "macos", "apple-silicon", "browser-automation", "human-in-the-loop"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/webkitui-mcp-relay",
+    "mcp_config": {
+      "command": "${__dirname}/server/webkitui-mcp-relay",
+      "args": ["${HOME}/Library/Application Support/WebkitUIMCP/mcp.sock"]
+    }
+  }
+}

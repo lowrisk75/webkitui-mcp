@@ -199,3 +199,36 @@
 "Agent in control" = "Contrôle agent";
 "%ld more active" = "%ld autre(s) active(s)";
 "The sign-in form changed before SiliconPass could fill it. Try again." = "Le formulaire a changé avant que SiliconPass ne le remplisse. Réessayez.";
+"Save Browser Download" = "Enregistrer le téléchargement";
+"Save" = "Enregistrer";
+"Choose a folder, then click Save. Download completion will be verified separately." = "Choisissez un dossier, puis cliquez sur Enregistrer. La fin du téléchargement sera vérifiée séparément.";
+"Find in Page" = "Rechercher dans la page";
+"Previous Match" = "Correspondance précédente";
+"Next Match" = "Correspondance suivante";
+"Match Found" = "Correspondance trouvée";
+"No Match" = "Aucune correspondance";
+"Search Unavailable" = "Recherche indisponible";
+"Always Allow…" = "Toujours autoriser…";
+"Navigation — this session" = "Navigation — cette session";
+"Navigation — remember for this site" = "Navigation — mémoriser pour ce site";
+"Navigation + clicks/typing — this session" = "Navigation + clics/saisies — cette session";
+"Navigation + clicks/typing — remember for this site" = "Navigation + clics/saisies — mémoriser pour ce site";
+"Revoke Remembered Site Permissions" = "Révoquer les autorisations mémorisées";
+"Site permissions revoked" = "Autorisations des sites révoquées";
+"Session and permanent permissions were cleared. Future actions will ask again." = "Les autorisations de session et permanentes ont été effacées. Les prochaines actions demanderont à nouveau votre accord.";
+"Could not clear remembered site permissions" = "Impossible d’effacer les autorisations mémorisées";
+"Do not continue automation until permissions have been cleared." = "Ne poursuivez pas l’automatisation tant que les autorisations n’ont pas été effacées.";
+"Remembered permission scope:" = "Périmètre de l’autorisation mémorisée :";
+"Browser profile:" = "Profil du navigateur :";
+"Navigation + clicks/typing can send, modify or delete data. The site may not disclose these effects." = "La navigation et les clics/saisies peuvent envoyer, modifier ou supprimer des données. Le site ne signale pas toujours ces effets.";
+"Session permissions apply only to this client and session. Permanent permissions apply to ALL agents using this browser profile." = "Une autorisation de session concerne uniquement ce client et cette session. Les autorisations permanentes concernent TOUS les agents utilisant ce profil de navigateur.";
+"Downloads, uploads, native form submissions, authentication and control transfers still require separate approval." = "Les téléchargements, envois de fichiers, soumissions de formulaires natifs, authentifications et transferts de contrôle nécessitent toujours une autorisation distincte.";
+"Revoke permissions from the WebKitUI MCP application menu. Cancel or Approve Once does not remember anything." = "Révoquez les autorisations depuis le menu de l’application WebKitUI MCP. Annuler ou Approuver une fois ne mémorise rien.";
+
+"Navigation finished. If your step is complete, select Done — Return Control." = "Navigation terminée. Si votre étape est terminée, cliquez sur Terminé — Rendre le contrôle.";
+
+"CAPTCHA / accessibility" = "CAPTCHA / accessibilité";
+
+"Focus website" = "Activer le site";
+
+"Solve the CAPTCHA yourself on the website. Use Tab and Shift-Tab to reach its controls, then Return or Space. If offered, choose the site's audio or accessibility option; audio availability depends on the provider. If it fails, use the site's help or contact support. The agent does not read, transcribe or solve the challenge. When the site confirms completion, select Done — Return Control." = "Résolvez vous-même le CAPTCHA sur le site. Utilisez Tab et Maj-Tab pour atteindre ses commandes, puis Entrée ou Espace. Si elle est proposée, choisissez l’option audio ou d’accessibilité du site ; sa disponibilité dépend du fournisseur. En cas d’échec, utilisez l’aide du site ou contactez son assistance. L’agent ne lit, ne transcrit et ne résout pas le défi. Quand le site confirme la réussite, cliquez sur Terminé — Rendre le contrôle.";

@@ -14,7 +14,8 @@ release_build=$(plutil -extract CFBundleVersion raw "$release_plist")
 manifest="$output_dir/SOURCE-MANIFEST.sha256"
 provenance="$output_dir/ReleaseProvenance.plist"
 inputs=$(mktemp /private/tmp/webkitui-provenance-inputs.XXXXXX)
-trap 'rm -f "$inputs"' EXIT HUP INT TERM
+printf 'RESOURCE_CREATED=provenance-input-list:%s\n' "$inputs" >&2
+trap 'rm -f "$inputs"; printf "RESOURCE_REMOVED=provenance-input-list:%s\n" "$inputs" >&2' EXIT HUP INT TERM
 
 cd "$workspace_dir"
 mkdir -p "$output_dir"
@@ -23,6 +24,7 @@ find \
   Package.swift package.json package-lock.json \
   README.md LICENSE LICENSING.md THIRD_PARTY_NOTICES.md \
   docs/network-boundary.md docs/release-maintenance-policy.md \
+  docs/scoped-interaction-workflows.md docs/examples \
   Sources Tests Support/AquaApp Support/Packaging scripts \
   \( -type f -o -type l \) ! -name '.DS_Store' ! -name '*.pyc' ! -path '*/__pycache__/*' -print0 \
   | LC_ALL=C sort -zu > "$inputs"

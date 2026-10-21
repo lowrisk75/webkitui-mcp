@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import Security
+import WebKitUIMCPConfirmPolicy
 
 /// Where the confirmation helper must sit. `doctor` and the presenter have to
 /// agree: a doctor that resolved its own executable differently reported
@@ -37,12 +38,27 @@ public enum NativeConfirmationHelperLocation {
 
 enum NativeConfirmationOutcome: String, Equatable, Sendable {
   case approved
+  case approvedSessionNavigation
+  case approvedPersistentNavigation
+  case approvedSessionInteractions
+  case approvedPersistentInteractions
   case declined
   case timedOut = "timed_out"
+  case queueTimedOut = "queue_timed_out"
   case cancelled
   case failed
   /// The panel was shown but never visible (covered, or on another Space).
   case hidden
+
+  var rememberedChoice: RememberedApprovalChoice? {
+    switch self {
+    case .approvedSessionNavigation: .sessionNavigation
+    case .approvedPersistentNavigation: .persistentNavigation
+    case .approvedSessionInteractions: .sessionInteractions
+    case .approvedPersistentInteractions: .persistentInteractions
+    default: nil
+    }
+  }
 }
 
 enum NativeConfirmationState: String, Equatable, Sendable {
@@ -53,9 +69,24 @@ enum NativeConfirmationState: String, Equatable, Sendable {
 @MainActor
 protocol BrowserConfirmationPresenting: AnyObject {
   var state: NativeConfirmationState { get }
+  var presentationReceipt: ConfirmationPresentationReceipt? { get }
   func confirm(title: String, message: String, approveLabel: String) async
     -> NativeConfirmationOutcome
   func cancel()
+  func rePresent(requestID: UUID) -> Bool
+  func confirmRemembering(
+    title: String, message: String, approveLabel: String, allowPersistent: Bool
+  ) async -> NativeConfirmationOutcome
+}
+
+extension BrowserConfirmationPresenting {
+  var presentationReceipt: ConfirmationPresentationReceipt? { nil }
+  func rePresent(requestID: UUID) -> Bool { false }
+  func confirmRemembering(
+    title: String, message: String, approveLabel: String, allowPersistent: Bool
+  ) async -> NativeConfirmationOutcome {
+    await confirm(title: title, message: message, approveLabel: approveLabel)
+  }
 }
 
 @MainActor
@@ -68,8 +99,19 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   private let timeout: Duration
   private var activeProcess: Process?
   private var cancellationRequested = false
+  private var refocusCount = 0
+  private var lastRefocus: ContinuousClock.Instant?
   private var waitingForTurn = false
   private let turnWaitLimit: Duration
+  private var completedReceipt: ConfirmationPresentationReceipt?
+  private var activeReceipt: (buffer: ConfirmationReceiptBuffer, request: UUID, pid: Int32)?
+  var presentationReceipt: ConfirmationPresentationReceipt? {
+    guard let activeReceipt else { return completedReceipt }
+    return Self.validatedReceipt(
+      activeReceipt.buffer.snapshot(), requestID: activeReceipt.request,
+      helperPID: activeReceipt.pid)
+  }
+  nonisolated static let maximumReceiptBytes = 16_384
 
   var state: NativeConfirmationState {
     activeProcess == nil && !waitingForTurn ? .idle : .pending
@@ -92,7 +134,28 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   func confirm(title: String, message: String, approveLabel: String) async
     -> NativeConfirmationOutcome
   {
+    await performConfirmation(
+      title: title, message: message, approveLabel: approveLabel, allowRemembering: false,
+      allowPersistent: false)
+  }
+
+  func confirmRemembering(
+    title: String, message: String, approveLabel: String, allowPersistent: Bool
+  ) async -> NativeConfirmationOutcome {
+    await performConfirmation(
+      title: title, message: message, approveLabel: approveLabel, allowRemembering: true,
+      allowPersistent: allowPersistent)
+  }
+
+  private func performConfirmation(
+    title: String, message: String, approveLabel: String, allowRemembering: Bool,
+    allowPersistent: Bool
+  ) async -> NativeConfirmationOutcome {
     guard activeProcess == nil, !waitingForTurn else { return .failed }
+    completedReceipt = nil
+    refocusCount = 0
+    lastRefocus = nil
+    let requestID = UUID()
     // One panel on screen at a time for the whole app: with several agents, two
     // confirmations asked for together used to open two panels on top of each other,
     // and the person could approve the one they had not read. The wait does not count
@@ -104,7 +167,7 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     // a request nobody is waiting for any more.
     let acquired = await ConfirmationTurnstile.shared.acquire(timeout: turnWaitLimit)
     waitingForTurn = false
-    guard acquired else { return .timedOut }
+    guard acquired else { return .queueTimedOut }
     defer { ConfirmationTurnstile.shared.release() }
     if cancellationRequested {
       cancellationRequested = false
@@ -114,9 +177,12 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     do {
       payload = try JSONEncoder().encode(
         NativeConfirmationRequest(
+          requestID: requestID,
           title: title,
           message: message,
-          approveLabel: approveLabel
+          approveLabel: approveLabel,
+          allowRemembering: allowRemembering,
+          allowPersistent: allowPersistent
         ))
     } catch {
       return .failed
@@ -124,23 +190,48 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     guard helperVerification(helperURL) else { return .failed }
     let process = Process()
     let input = Pipe()
+    let output = Pipe()
+    let receiptBuffer = ConfirmationReceiptBuffer()
     process.executableURL = helperURL
     process.arguments = Self.helperArguments
     process.environment = Self.helperEnvironment(from: ProcessInfo.processInfo.environment)
     process.standardInput = input
-    process.standardOutput = FileHandle.nullDevice
+    process.standardOutput = output
     process.standardError = FileHandle.nullDevice
     do {
       try process.run()
+      try? output.fileHandleForWriting.close()
+      let descriptor = output.fileHandleForReading.fileDescriptor
+      let flags = fcntl(descriptor, F_GETFL)
+      guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+        process.terminate()
+        _ = await Self.wait(for: process, timeout: .milliseconds(100))
+        return .failed
+      }
+      output.fileHandleForReading.readabilityHandler = { handle in
+        receiptBuffer.drain(handle.fileDescriptor)
+      }
+      var runningIsVerified = false
+      defer {
+        output.fileHandleForReading.readabilityHandler = nil
+        receiptBuffer.drain(descriptor)
+        if runningIsVerified {
+          completedReceipt = Self.validatedReceipt(
+            receiptBuffer.snapshot(), requestID: requestID, helperPID: process.processIdentifier)
+        }
+        activeReceipt = nil
+      }
       let runningIsTrusted =
         runningHelperVerification?(process.processIdentifier)
         ?? Self.verifyRunningHelper(process.processIdentifier, matches: helperURL)
       guard runningIsTrusted else {
         process.terminate()
         try? input.fileHandleForWriting.close()
-        process.waitUntilExit()
+        _ = await Self.wait(for: process, timeout: .milliseconds(100))
         return .failed
       }
+      runningIsVerified = true
+      activeReceipt = (receiptBuffer, requestID, process.processIdentifier)
       try Self.writePayload(payload, to: input.fileHandleForWriting)
       try input.fileHandleForWriting.close()
       activeProcess = process
@@ -149,11 +240,18 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
         activeProcess = nil
         cancellationRequested = false
       }
-      let waitOutcome = await Self.wait(for: process, timeout: timeout)
+      let waitOutcome = await Self.wait(
+        for: process, timeout: timeout, cancellation: { self.cancellationRequested })
       if waitOutcome == .timedOut { return .timedOut }
-      if cancellationRequested { return .cancelled }
+      if waitOutcome == .cancelled || cancellationRequested || Task.isCancelled {
+        return .cancelled
+      }
     } catch {
       try? input.fileHandleForWriting.close()
+      if process.isRunning {
+        process.terminate()
+        _ = await Self.wait(for: process, timeout: .milliseconds(100))
+      }
       return .failed
     }
     guard process.terminationReason == .exit else { return .failed }
@@ -161,6 +259,18 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     if process.terminationStatus == 2 { return .declined }
     if process.terminationStatus == 3 { return .cancelled }
     if process.terminationStatus == 4 { return .hidden }
+    if let choice = RememberedApprovalChoice(rawValue: process.terminationStatus) {
+      guard allowRemembering, !choice.persistent || allowPersistent,
+        let receipt = completedReceipt, receipt.decision == .approve,
+        receipt.windowVisible, receipt.onActiveSpace, receipt.intersectsScreen
+      else { return .failed }
+      switch choice {
+      case .sessionNavigation: return .approvedSessionNavigation
+      case .persistentNavigation: return .approvedPersistentNavigation
+      case .sessionInteractions: return .approvedSessionInteractions
+      case .persistentInteractions: return .approvedPersistentInteractions
+      }
+    }
     return .failed
   }
 
@@ -178,32 +288,75 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
     activeProcess?.terminate()
   }
 
-  private static func wait(for process: Process, timeout: Duration) async
+  /// Presentation only: exact currently running helper/request, no decision,
+  /// deadline extension, new prompt or browser dispatch. Bound focus flooding.
+  func rePresent(requestID: UUID) -> Bool {
+    guard !cancellationRequested, let process = activeProcess, process.isRunning,
+      let activeReceipt, activeReceipt.request == requestID,
+      let receipt = presentationReceipt, receipt.requestID == requestID,
+      receipt.helperPID == process.processIdentifier, receipt.decision == nil,
+      refocusCount < 3,
+      lastRefocus.map({ $0.duration(to: .now) >= .seconds(1) }) ?? true,
+      runningHelperVerification?(process.processIdentifier)
+        ?? Self.verifyRunningHelper(process.processIdentifier, matches: helperURL)
+    else { return false }
+    guard Darwin.kill(process.processIdentifier, SIGUSR1) == 0 else { return false }
+    refocusCount += 1
+    lastRefocus = .now
+    return true
+  }
+
+  private static func wait(
+    for process: Process, timeout: Duration, cancellation: () -> Bool = { false }
+  ) async
     -> NativeConfirmationOutcome
   {
-    let box = SendableProcess(process)
-    return await withTaskGroup(of: NativeConfirmationOutcome.self) { group in
-      group.addTask {
-        box.process.waitUntilExit()
-        return .declined
-      }
-      group.addTask {
-        do {
-          try await Task.sleep(for: timeout)
-          return .timedOut
-        } catch {
-          return .cancelled
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while process.isRunning {
+      let cancelled = Task.isCancelled || cancellation()
+      if cancelled || clock.now >= deadline {
+        let outcome: NativeConfirmationOutcome = cancelled ? .cancelled : .timedOut
+        process.terminate()
+        let grace = clock.now.advanced(by: .milliseconds(500))
+        while process.isRunning, clock.now < grace {
+          await Task.detached { try? await Task.sleep(for: .milliseconds(20)) }.value
         }
+        // Only the exact subprocess we launched; never a broker or user's app.
+        if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+        let reapDeadline = clock.now.advanced(by: .milliseconds(500))
+        while process.isRunning, clock.now < reapDeadline {
+          await Task.detached { try? await Task.sleep(for: .milliseconds(20)) }.value
+        }
+        return outcome
       }
-      let first = await group.next() ?? .failed
-      if first == .timedOut, box.process.isRunning { box.process.terminate() }
-      group.cancelAll()
-      return first
+      try? await Task.sleep(for: .milliseconds(20))
     }
+    return .declined
   }
 
   static var helperArguments: [String] {
     ["--protocol-version", helperProtocolVersion, "--request-stdin"]
+  }
+
+  static func validatedReceipt(_ data: Data, requestID: UUID, helperPID: Int32)
+    -> ConfirmationPresentationReceipt?
+  {
+    guard data.count <= maximumReceiptBytes else { return nil }
+    let lines = data.split(separator: 0x0A)
+    guard lines.count <= 32 else { return nil }
+    var latest: ConfirmationPresentationReceipt?
+    for line in lines {
+      guard
+        let receipt = try? JSONDecoder().decode(
+          ConfirmationPresentationReceipt.self, from: Data(line)),
+        receipt.requestID == requestID, receipt.helperPID == helperPID,
+        receipt.windowNumber > 0, receipt.monotonicNanoseconds > 0,
+        receipt.monotonicNanoseconds >= (latest?.monotonicNanoseconds ?? 0)
+      else { return nil }
+      latest = receipt
+    }
+    return latest
   }
 
   static func writePayload(_ payload: Data, to input: FileHandle) throws {
@@ -340,15 +493,44 @@ final class NativeBrowserConfirmationPresenter: BrowserConfirmationPresenting {
   }
 }
 
-private final class SendableProcess: @unchecked Sendable {
-  let process: Process
-  init(_ process: Process) { self.process = process }
-}
-
 private struct NativeConfirmationRequest: Encodable {
+  let requestID: UUID
   let title: String
   let message: String
   let approveLabel: String
+  let allowRemembering: Bool
+  let allowPersistent: Bool
+}
+
+private final class ConfirmationReceiptBuffer: @unchecked Sendable {
+  private let lock = NSLock()
+  private var data = Data()
+  private var overflow = false
+
+  func drain(_ descriptor: Int32) {
+    lock.lock()
+    defer { lock.unlock() }
+    var bytes = [UInt8](repeating: 0, count: 4096)
+    var drained = 0
+    while true {
+      let count = Darwin.read(descriptor, &bytes, bytes.count)
+      guard count > 0 else { return }
+      drained += count
+      if data.count + count <= NativeBrowserConfirmationPresenter.maximumReceiptBytes, !overflow {
+        data.append(contentsOf: bytes.prefix(count))
+      } else {
+        overflow = true
+      }
+      if drained >= 65_536 { return }
+    }
+  }
+
+  func snapshot() -> Data {
+    lock.lock()
+    defer { lock.unlock() }
+    return overflow
+      ? Data(repeating: 0, count: NativeBrowserConfirmationPresenter.maximumReceiptBytes + 1) : data
+  }
 }
 
 /// First come, first shown: the single native confirmation slot of the app, shared by

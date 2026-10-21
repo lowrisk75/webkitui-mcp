@@ -1,0 +1,15 @@
+{
+  "version": "0.6.42",
+  "build": "642",
+  "live_discovery_version_verified": true,
+  "new_resume_contract_advertised": true,
+  "installed_bytes_match_verified_archive": true,
+  "old_broker_pids_exited": [
+    7217
+  ],
+  "retained_broker_pid": 68230,
+  "rollback": "/Users/kevin/GitHub/webkitui-mcp/dist/local-0.6.42-745E07FF/rollback/WebKitUI MCP.app",
+  "foreign_session_opened_or_changed": false,
+  "notarization_or_publication_performed": false,
+  "load_diagnosis_advertised": true
+}

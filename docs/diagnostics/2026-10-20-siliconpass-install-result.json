@@ -1,0 +1,20 @@
+{
+  "sensitive_entitlements_equal": {
+    "keychain-access-groups": true,
+    "com.apple.security.application-groups": true,
+    "com.apple.application-identifier": true,
+    "com.apple.developer.team-identifier": true,
+    "com.apple.developer.icloud-container-identifiers": true
+  },
+  "candidate_has_debug_entitlement": false,
+  "candidate_signature_valid": true,
+  "candidate_binary_sha256": "dd7099f132031e49502b437aea718dacb265072abd98649c4d23f169b3b7e451",
+  "installed": true,
+  "retained_pid": 25762,
+  "rollback": "/Users/kevin/GitHub/webkitui-mcp/dist/siliconpass-apple-origin-20261020/rollback/SiliconPass.app",
+  "old_processes_exited": [
+    84308
+  ],
+  "vault_read_or_changed_by_installer": false,
+  "live_fill_not_automatically_retried": true
+}

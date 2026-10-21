@@ -43,6 +43,26 @@ The ledger and its Keychain anchor form one anti-rollback state: deleting or
 restoring only the file fails closed. An explicit reset must remove both and
 must warn that doing so also removes local replay memory.
 
+## Rendered text filtering and limits
+
+Known credential fields and recognized credential configuration rows/form values
+are filtered inside the browser before semantic observations, text reads and
+locator facts are returned. Filtering includes aggregate names and ancestor text;
+it does not trust a site's "Variable" label as proof a token is public. Public
+configuration names/types and independent action controls remain visible where
+they can be separated safely. Inventory limits fail closed instead of returning
+unfiltered text. Sensitive-fill restrictions are not relaxed by this filter.
+
+This is not a guarantee that every secret in arbitrary unstructured site content
+or screenshots is detected. Do not serialize raw page payloads for diagnostics;
+visual exports need their own review. Live provider markup must be qualified.
+
+`observation_is_complete` covers discovered collector results, not proof that every
+visible clickable control was discovered. `observation_completeness_scope` states
+that limit explicitly. Truncation/opaque-frame/global postcondition gates remain.
+Visible href-less anchors are candidates without an invented link role; a rendered
+candidate or pointer cursor is not proof its handler will perform the desired action.
+
 ## Diagnostic rules
 
 - `doctor` reports booleans, versions, paths and recovery actions, never cookie,

@@ -22,6 +22,33 @@ public struct CredentialBrokerWireReceipt: Codable, Equatable, Sendable {
 public enum CredentialBrokerClientError: Error, Equatable, Sendable {
   case unavailable
   case invalidReply
+  case transport(stage: CredentialBrokerCallStage, code: CredentialBrokerFailureCode)
+}
+
+public enum CredentialBrokerCallStage: String, Codable, Sendable {
+  case request, delivery
+}
+
+public enum CredentialBrokerFailureCode: String, Codable, Sendable {
+  case unavailable, cancelled, stale, rejected
+  case timedOut = "timed_out"
+  case invalidReply = "invalid_reply"
+  case unexpectedFailure = "unexpected_failure"
+  case providerFailed = "provider_failed"
+}
+
+enum CredentialBrokerTimeoutPolicy {
+  static let request: Duration = .seconds(15)
+  // The provider's native selection/create UI has a 300-second deadline; allow
+  // its reply to arrive, without changing its one-shot grant or authentication.
+  static let delivery: Duration = .seconds(330)
+}
+
+final class CredentialSinkLifetime: @unchecked Sendable {
+  private let lock = NSLock()
+  private var active = true
+  var isActive: Bool { lock.withLock { active } }
+  func invalidate() { lock.withLock { active = false } }
 }
 
 @MainActor
@@ -136,46 +163,86 @@ private protocol CredentialSinkExportedXPCProtocol {
   )
 }
 
-private final class DataReplyGate: @unchecked Sendable {
+final class DataReplyGate: @unchecked Sendable {
   private let lock = NSLock()
+  private var completed = false
+  private var result: (Data?, String?) = (nil, nil)
+  private var timeoutTask: Task<Void, Never>?
   private var completion: (@Sendable ((Data?, String?)) -> Void)?
-
-  init(completion: @escaping @Sendable ((Data?, String?)) -> Void) {
-    self.completion = completion
-  }
 
   func finish(data: Data?, error: String?) {
     let callback = lock.withLock { () -> (@Sendable ((Data?, String?)) -> Void)? in
+      guard !completed else { return nil }
+      completed = true
+      result = (data, error)
+      timeoutTask?.cancel()
+      timeoutTask = nil
       defer { completion = nil }
       return completion
     }
     callback?((data, error))
   }
+
+  func wait(
+    timeout: Duration,
+    start: (@escaping @Sendable (Data?, String?) -> Void) -> Void
+  ) async -> (Data?, String?) {
+    await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        let immediate = lock.withLock { () -> (Data?, String?)? in
+          if completed { return result }
+          completion = { continuation.resume(returning: $0) }
+          return nil
+        }
+        if let immediate {
+          continuation.resume(returning: immediate)
+          return
+        }
+        let timer = Task { [weak self] in
+          do { try await Task.sleep(for: timeout) } catch { return }
+          self?.finish(data: nil, error: "timeout")
+        }
+        lock.withLock {
+          if completed { timer.cancel() } else { timeoutTask = timer }
+        }
+        guard lock.withLock({ !completed }) else { return }
+        start { [weak self] data, error in self?.finish(data: data, error: error) }
+      }
+    } onCancel: {
+      self.finish(data: nil, error: "cancelled")
+    }
+  }
 }
 
-private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCProtocol,
+final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCProtocol,
   @unchecked Sendable
 {
   private let runtime: WebKitRuntime
   private let expectedBinding: CredentialSinkFormBinding?
   private let expectedRotationBinding: CredentialSinkRotationBinding?
   private let humanRequested: Bool
+  private let lifetime: CredentialSinkLifetime
 
   init(
     runtime: WebKitRuntime, expectedBinding: CredentialSinkFormBinding,
-    humanRequested: Bool = false
+    humanRequested: Bool = false, lifetime: CredentialSinkLifetime = CredentialSinkLifetime()
   ) {
     self.runtime = runtime
     self.expectedBinding = expectedBinding
     expectedRotationBinding = nil
     self.humanRequested = humanRequested
+    self.lifetime = lifetime
   }
 
-  init(runtime: WebKitRuntime, expectedRotationBinding: CredentialSinkRotationBinding) {
+  init(
+    runtime: WebKitRuntime, expectedRotationBinding: CredentialSinkRotationBinding,
+    lifetime: CredentialSinkLifetime = CredentialSinkLifetime()
+  ) {
     self.runtime = runtime
     expectedBinding = nil
     self.expectedRotationBinding = expectedRotationBinding
     humanRequested = false
+    self.lifetime = lifetime
   }
 
   func fillSyntheticCredential(
@@ -184,8 +251,12 @@ private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCPro
     password: Data,
     withReply reply: @escaping @Sendable (String?) -> Void
   ) {
-    Task { @MainActor [runtime, expectedBinding, humanRequested] in
+    Task { @MainActor [runtime, expectedBinding, humanRequested, lifetime] in
       do {
+        guard lifetime.isActive else {
+          reply("stale")
+          return
+        }
         let binding = try JSONDecoder().decode(CredentialSinkFormBinding.self, from: bindingData)
         guard let expectedBinding, binding == expectedBinding else {
           reply("stale")
@@ -222,8 +293,12 @@ private final class CredentialSinkExport: NSObject, CredentialSinkExportedXPCPro
     newPassword: Data,
     withReply reply: @escaping @Sendable (String?) -> Void
   ) {
-    Task { @MainActor [runtime, expectedRotationBinding] in
+    Task { @MainActor [runtime, expectedRotationBinding, lifetime] in
       do {
+        guard lifetime.isActive else {
+          reply("stale")
+          return
+        }
         let binding = try JSONDecoder().decode(
           CredentialSinkRotationBinding.self,
           from: bindingData
@@ -322,8 +397,10 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     encoder.outputFormatting = [.sortedKeys]
     let bindingData = try encoder.encode(binding)
 
+    let lifetime = CredentialSinkLifetime()
     let sinkExport = CredentialSinkExport(
-      runtime: runtime, expectedBinding: binding, humanRequested: humanRequested)
+      runtime: runtime, expectedBinding: binding, humanRequested: humanRequested, lifetime: lifetime
+    )
     let sinkDelegate = CredentialSinkListenerDelegate(
       exportedObject: sinkExport,
       secretProviderRequirement: peerRequirements.secretProvider
@@ -331,7 +408,10 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     let sinkListener = NSXPCListener.anonymous()
     sinkListener.delegate = sinkDelegate
     sinkListener.resume()
-    defer { sinkListener.suspend() }
+    defer {
+      lifetime.invalidate()
+      sinkListener.invalidate()
+    }
     let sinkEndpoint = CredentialSinkEndpointBox(sinkListener.endpoint)
 
     let connection = NSXPCConnection(
@@ -343,7 +423,9 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     connection.resume()
     defer { connection.invalidate() }
 
-    let requestReply = await call(connection: connection) { broker, reply in
+    let requestReply = await call(
+      connection: connection, timeout: CredentialBrokerTimeoutPolicy.request
+    ) { broker, reply in
       broker.requestSyntheticFill(
         bindingData,
         sinkEndpoint: sinkEndpoint.endpoint,
@@ -351,10 +433,12 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
       )
     }
     guard requestReply.1 == nil, let requestData = requestReply.0 else {
-      throw CredentialBrokerClientError.unavailable
+      throw Self.failure(requestReply.1, stage: .request)
     }
 
-    let deliveryReply = await call(connection: connection) { broker, reply in
+    let deliveryReply = await call(
+      connection: connection, timeout: CredentialBrokerTimeoutPolicy.delivery
+    ) { broker, reply in
       broker.deliverSyntheticFill(
         requestData,
         liveBindingData: bindingData,
@@ -362,14 +446,14 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
       )
     }
     guard deliveryReply.1 == nil, let receiptData = deliveryReply.0 else {
-      throw CredentialBrokerClientError.unavailable
+      throw Self.failure(deliveryReply.1, stage: .delivery)
     }
     guard
       let receipt = try? JSONDecoder().decode(
         CredentialBrokerWireReceipt.self,
         from: receiptData
       )
-    else { throw CredentialBrokerClientError.invalidReply }
+    else { throw CredentialBrokerClientError.transport(stage: .delivery, code: .invalidReply) }
     return receipt
   }
 
@@ -380,9 +464,10 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let bindingData = try encoder.encode(binding)
+    let lifetime = CredentialSinkLifetime()
     let sinkExport = CredentialSinkExport(
       runtime: runtime,
-      expectedRotationBinding: binding
+      expectedRotationBinding: binding, lifetime: lifetime
     )
     let sinkDelegate = CredentialSinkListenerDelegate(
       exportedObject: sinkExport,
@@ -391,7 +476,10 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     let sinkListener = NSXPCListener.anonymous()
     sinkListener.delegate = sinkDelegate
     sinkListener.resume()
-    defer { sinkListener.suspend() }
+    defer {
+      lifetime.invalidate()
+      sinkListener.invalidate()
+    }
     let sinkEndpoint = CredentialSinkEndpointBox(sinkListener.endpoint)
 
     let connection = NSXPCConnection(
@@ -405,7 +493,9 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
     connection.resume()
     defer { connection.invalidate() }
 
-    let requestReply = await call(connection: connection) { broker, reply in
+    let requestReply = await call(
+      connection: connection, timeout: CredentialBrokerTimeoutPolicy.request
+    ) { broker, reply in
       broker.requestPasswordRotation(
         bindingData,
         sinkEndpoint: sinkEndpoint.endpoint,
@@ -413,38 +503,42 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
       )
     }
     guard requestReply.1 == nil, let requestData = requestReply.0 else {
-      throw CredentialBrokerClientError.unavailable
+      throw Self.failure(requestReply.1, stage: .request)
     }
-    let deliveryReply = await call(connection: connection) { broker, reply in
+    let deliveryReply = await call(
+      connection: connection, timeout: CredentialBrokerTimeoutPolicy.delivery
+    ) { broker, reply in
       broker.deliverPasswordRotation(
         requestData,
         liveBindingData: bindingData,
         withReply: reply
       )
     }
-    guard deliveryReply.1 == nil, let receiptData = deliveryReply.0,
+    guard deliveryReply.1 == nil, let receiptData = deliveryReply.0 else {
+      throw Self.failure(deliveryReply.1, stage: .delivery)
+    }
+    guard
       let receipt = try? JSONDecoder().decode(
         CredentialBrokerWireReceipt.self,
         from: receiptData
       )
-    else { throw CredentialBrokerClientError.invalidReply }
+    else { throw CredentialBrokerClientError.transport(stage: .delivery, code: .invalidReply) }
     return receipt
   }
 
   private nonisolated func call(
     connection: NSXPCConnection,
+    timeout: Duration,
     operation:
       @escaping @Sendable (
         CredentialBrokerRemoteXPCProtocol,
         @escaping @Sendable (Data?, String?) -> Void
       ) -> Void
   ) async -> (Data?, String?) {
-    await withCheckedContinuation { (continuation: CheckedContinuation<(Data?, String?), Never>) in
-      let gate = DataReplyGate { result in continuation.resume(returning: result) }
-      Task {
-        try? await Task.sleep(for: .seconds(15))
-        gate.finish(data: nil, error: "timeout")
-      }
+    let gate = DataReplyGate()
+    connection.interruptionHandler = { gate.finish(data: nil, error: "unavailable") }
+    connection.invalidationHandler = { gate.finish(data: nil, error: "unavailable") }
+    return await gate.wait(timeout: timeout) { reply in
       let proxy = connection.remoteObjectProxyWithErrorHandler { _ in
         gate.finish(data: nil, error: "unavailable")
       }
@@ -452,9 +546,22 @@ public final class SyntheticCredentialBrokerXPCClient: CredentialBrokerFilling {
         gate.finish(data: nil, error: "unavailable")
         return
       }
-      operation(broker) { data, error in
-        gate.finish(data: data, error: error)
-      }
+      operation(broker, reply)
     }
+  }
+
+  private nonisolated static func failure(
+    _ wireError: String?, stage: CredentialBrokerCallStage
+  ) -> CredentialBrokerClientError {
+    let code: CredentialBrokerFailureCode
+    switch wireError {
+    case "timeout": code = .timedOut
+    case "unavailable": code = .unavailable
+    case "cancelled": code = .cancelled
+    case "stale": code = .stale
+    case nil: code = .invalidReply
+    default: code = .rejected
+    }
+    return .transport(stage: stage, code: code)
   }
 }

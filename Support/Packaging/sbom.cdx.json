@@ -53,6 +53,22 @@
           "value": "native-preview-archive"
         }
       ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "pkg:generic/siliconpass-vault-mcp@0.2.4",
+      "name": "SiliconPass Vault MCP Connector",
+      "version": "0.2.4",
+      "properties": [
+        {
+          "name": "com.lorislab.distribution",
+          "value": "embedded-pinned-external-component"
+        },
+        {
+          "name": "com.lorislab.connector.protocol-version",
+          "value": "0.1.0"
+        }
+      ]
     }
   ],
   "dependencies": [
@@ -61,7 +77,8 @@
       "dependsOn": [
         "pkg:generic/webkitui-mcp-broker@0.6.6",
         "pkg:generic/webkitui-mcp-confirm@0.6.6",
-        "pkg:generic/webkitui-mcp-relay@0.6.6"
+        "pkg:generic/webkitui-mcp-relay@0.6.6",
+        "pkg:generic/siliconpass-vault-mcp@0.2.4"
       ]
     },
     {
@@ -74,6 +91,10 @@
     },
     {
       "ref": "pkg:generic/webkitui-mcp-relay@0.6.6",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:generic/siliconpass-vault-mcp@0.2.4",
       "dependsOn": []
     }
   ]

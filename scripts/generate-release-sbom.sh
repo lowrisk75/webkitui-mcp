@@ -18,6 +18,10 @@ timestamp=$(date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ')
 broker_sha=$(plutil -extract UnsignedBrokerSHA256 raw "$provenance")
 helper_sha=$(plutil -extract UnsignedConfirmationHelperSHA256 raw "$provenance")
 relay_sha=$(plutil -extract UnsignedEmbeddedRelaySHA256 raw "$provenance")
+siliconpass_sha=$(plutil -extract SiliconPassMCPInputSHA256 raw "$provenance")
+# The SBOM component is the connector binary, so it carries the connector's own
+# version; the manager version that ships it is a separate pin in provenance.
+siliconpass_version=$(plutil -extract SiliconPassConnectorVersion raw "$provenance")
 version=$(plutil -extract Version raw "$provenance")
 
 jq \
@@ -25,6 +29,8 @@ jq \
   --arg broker_sha "$broker_sha" \
   --arg helper_sha "$helper_sha" \
   --arg relay_sha "$relay_sha" \
+  --arg siliconpass_sha "$siliconpass_sha" \
+  --arg siliconpass_version "$siliconpass_version" \
   --arg version "$version" \
   '
     walk(
@@ -44,6 +50,11 @@ jq \
     | .components[0].hashes = [{"alg": "SHA-256", "content": $broker_sha}]
     | .components[1].hashes = [{"alg": "SHA-256", "content": $helper_sha}]
     | .components[2].hashes = [{"alg": "SHA-256", "content": $relay_sha}]
+    | .components[3]["bom-ref"] = "pkg:generic/siliconpass-vault-mcp@" + $siliconpass_version
+    | .components[3].version = $siliconpass_version
+    | .components[3].hashes = [{"alg": "SHA-256", "content": $siliconpass_sha}]
+    | .dependencies[0].dependsOn[3] = .components[3]["bom-ref"]
+    | .dependencies[4].ref = .components[3]["bom-ref"]
   ' "$template" > "$output"
 
 jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.6"' "$output" >/dev/null

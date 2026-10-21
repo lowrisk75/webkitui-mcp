@@ -1,0 +1,23 @@
+[
+  {
+    "mode": "pending-disconnect",
+    "exit_code": 0,
+    "requests": 1,
+    "completion_ms": 285,
+    "replayed": false
+  },
+  {
+    "mode": "stdin-eof-valid-reply",
+    "exit_code": 0,
+    "requests": 1,
+    "completion_ms": 295,
+    "replayed": false
+  },
+  {
+    "mode": "initialize-timeout",
+    "exit_code": 0,
+    "requests": 1,
+    "completion_ms": 10028,
+    "replayed": false
+  }
+]

@@ -3,6 +3,7 @@ import Foundation
 import Network
 import Testing
 import WebKit
+import WebKitUIMCPConfirmPolicy
 import WebKitUIMCPCore
 
 @testable import WebKitUIMCPRuntime
@@ -130,9 +131,11 @@ private final class InProcessSyntheticBrokerStub: CredentialBrokerFilling {
 @MainActor
 private final class FixedStatusCredentialBrokerStub: CredentialBrokerFilling {
   let status: CredentialBrokerWireStatus
+  let error: Error?
 
-  init(status: CredentialBrokerWireStatus) {
+  init(status: CredentialBrokerWireStatus, error: Error? = nil) {
     self.status = status
+    self.error = error
   }
 
   func fill(
@@ -141,6 +144,7 @@ private final class FixedStatusCredentialBrokerStub: CredentialBrokerFilling {
   ) async throws -> CredentialBrokerWireReceipt {
     _ = binding
     _ = runtime
+    if let error { throw error }
     return CredentialBrokerWireReceipt(status: status)
   }
 }
@@ -150,6 +154,10 @@ private final class ConfirmationPresenterStub: BrowserConfirmationPresenting {
   private(set) var requests: [(title: String, message: String, approveLabel: String)] = []
   private var responses: [Bool]
   var state: NativeConfirmationState = .idle
+  var beforeResponse: (@MainActor () async -> Void)?
+  var forcedOutcome: NativeConfirmationOutcome?
+  var presentationReceipt: ConfirmationPresentationReceipt?
+  var focusRequests: [UUID] = []
 
   init(responses: [Bool], state: NativeConfirmationState = .idle) {
     self.responses = responses
@@ -160,10 +168,45 @@ private final class ConfirmationPresenterStub: BrowserConfirmationPresenting {
     -> NativeConfirmationOutcome
   {
     requests.append((title, message, approveLabel))
+    await beforeResponse?()
+    if let forcedOutcome { return forcedOutcome }
     return responses.isEmpty || !responses.removeFirst() ? .declined : .approved
   }
 
   func cancel() { state = .idle }
+  func rePresent(requestID: UUID) -> Bool {
+    guard state == .pending, presentationReceipt?.requestID == requestID else { return false }
+    focusRequests.append(requestID)
+    return true
+  }
+}
+
+/// Holds WebKit's real open-panel delegate pending without presenting a system UI.
+@MainActor
+private final class SuspendedUploadPanel {
+  private var continuation: CheckedContinuation<[URL]?, Never>?
+  private var opening: Task<Void, Never>?
+
+  func selection() async -> [URL]? {
+    await withCheckedContinuation { continuation = $0 }
+  }
+
+  func open(on runtime: WebKitRuntime) async -> Bool {
+    opening = Task {
+      _ = try? await runtime.webView.evaluateJavaScript("document.querySelector('input').click()")
+    }
+    for _ in 0..<100 {
+      if runtime.isFilePickerVisible() { return true }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    return false
+  }
+
+  func close() {
+    continuation?.resume(returning: nil)
+    continuation = nil
+    opening?.cancel()
+  }
 }
 
 @MainActor
@@ -481,6 +524,104 @@ struct MCPServerTests {
     #expect(properties["expected_provisioning_profile_uuid"] != nil)
   }
 
+  @Test("Act schema exposes postcondition fields and all runtime predicate forms")
+  func actPostconditionContract() async throws {
+    let server = try WebKitMCPServer()
+    let listed = try await call(
+      server, id: 1, method: "tools/list", params: .object([:]), modern: true)
+    let tools = try array(try object(listed["result"])["tools"])
+    let act = try object(
+      try #require(tools.first { (try? object($0)["name"]) == .string("browser_act") }))
+    let properties = try object(try object(act["inputSchema"])["properties"])
+    let schema = try object(act["inputSchema"])
+    #expect(schema["allOf"] == nil)
+    #expect(schema["oneOf"] == nil)
+    let operations = try array(try object(properties["operation"])["enum"])
+    #expect(operations.count == 11)
+    func containsComposition(_ value: JSONValue) -> Bool {
+      switch value {
+      case .object(let fields):
+        return !Set(fields.keys).isDisjoint(with: ["oneOf", "allOf", "anyOf", "if", "then", "else"])
+          || fields.values.contains(where: containsComposition)
+      case .array(let values): return values.contains(where: containsComposition)
+      default: return false
+      }
+    }
+    for tool in tools {
+      #expect(!containsComposition(try #require(try object(tool)["inputSchema"])))
+    }
+    let postcondition = try object(properties["postcondition"])
+    let fields = try object(postcondition["properties"])
+    #expect(try object(fields["value"])["type"] == .string("string"))
+    let types = try array(try object(fields["type"])["enum"])
+    #expect(types.count == 21)
+    #expect(postcondition["oneOf"] == nil)
+    for type in ["url_prefix", "validation_state", "character_count_equals", "panel_open"] {
+      #expect(types.contains(.string(type)))
+    }
+    #expect(postcondition["required"] == .array([.string("type"), .string("value")]))
+    #expect(try string(postcondition["description"]).contains("panel_open/dialog_appears"))
+    #expect(try string(postcondition["description"]).contains("semantic_text_appears is exact"))
+    #expect(
+      try string(try object(properties["value"])["description"]).contains("contentEditable=true"))
+  }
+
+  @Test("Interaction schemas expose targeted scroll, explicit dialog scope and exact pending focus")
+  func interactionScopeContract() async throws {
+    let server = try WebKitMCPServer()
+    let listed = try await call(
+      server, id: 1, method: "tools/list", params: .object([:]), modern: true)
+    let tools = try array(try object(listed["result"])["tools"])
+    func properties(_ name: String) throws -> [String: JSONValue] {
+      let tool = try object(
+        try #require(tools.first { (try? object($0)["name"]) == .string(name) }))
+      return try object(try object(tool["inputSchema"])["properties"])
+    }
+    let scroll = try properties("browser_scroll")
+    #expect(scroll["observation_id"] != nil && scroll["element_id"] != nil)
+    let observe = try properties("browser_observe")
+    #expect(observe["scope_observation_id"] != nil && observe["scope_element_id"] != nil)
+    let session = try properties("browser_session")
+    #expect(
+      try array(try object(session["operation"])["enum"]).contains(.string("confirmation_focus")))
+    #expect(try object(session["confirmation_request_id"])["format"] == .string("uuid"))
+  }
+
+  @Test("Compact MCP observations expose a scroll target and scrolling invalidates it")
+  func observedContainerScrollOnWire() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<div aria-label='Choices' style='width:180px;height:100px;overflow:auto'><div style='height:900px'>Content</div></div><div style='height:1800px'>Background</div>",
+      baseURL: URL(string: "https://scroll.fixture.invalid"), timeout: .seconds(15),
+      quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(registry: registry)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let reply = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": session, "compact": .bool(true)])
+    let observed = try object(try object(reply["result"])["structuredContent"])
+    let rows = try array(observed["elements"])
+    let target = try object(
+      try #require(rows.first { (try? object($0)["scrollable"]) == .bool(true) }))
+    let arguments: [String: JSONValue] = [
+      "session_id": session,
+      "observation_id": observed["observationID"]!, "element_id": target["elementID"]!,
+      "delta_y": .int(200),
+    ]
+    let scrolled = try await toolCall(server, id: 2, name: "browser_scroll", arguments: arguments)
+    let result = try object(try object(scrolled["result"])["structuredContent"])
+    #expect(result["actualDeltaY"] == .double(200) || result["actualDeltaY"] == .int(200))
+    #expect(result["observationInvalidated"] == .bool(true))
+    #expect(try await runtime.webView.evaluateJavaScript("scrollY") as? Double == 0)
+    let stale = try await toolCall(server, id: 3, name: "browser_scroll", arguments: arguments)
+    #expect(stale["error"] != nil || (try? object(stale["result"])["isError"]) == .bool(true))
+    #expect(
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('[aria-label=Choices]').scrollTop") as? Double == 200)
+  }
+
   @Test("Upload attaches a confirmed local file and proves its preview postcondition")
   func uploadAttachesConfirmedLocalFile() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -602,8 +743,9 @@ struct MCPServerTests {
         == .array([.string("cloudkit_schema.ckdb")]))
   }
 
-  @Test("A browse control that opens no panel says no file was attached")
-  func uploadThroughControlThatOpensNoPanel() async throws {
+  @Test(
+    "A browse control that opens no panel preserves dispatch uncertainty", arguments: [false, true])
+  func uploadThroughControlThatOpensNoPanel(suppressGestureReceipt: Bool) async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
       UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -615,10 +757,25 @@ struct MCPServerTests {
     let handle = try registry.open()
     let runtime = try registry.runtime(for: handle)
     _ = try await runtime.loadHTML(
-      "<h1>Import</h1><button onclick=\"document.querySelector('h1').textContent='Clicked'\">"
-        + "browse</button>",
+      """
+      <h1>Import</h1><button onclick="document.querySelector('h1').textContent='Clicked'">browse</button>
+      <script>
+      if (\(suppressGestureReceipt)) {
+        document.addEventListener('click', event => {
+          event.stopImmediatePropagation();
+          document.querySelector('h1').textContent='Clicked';
+        }, true);
+      }
+      </script>
+      """,
       baseURL: URL(string: "https://icloud.fixture.invalid/dashboard")!,
       timeout: .seconds(3), quietWindow: .milliseconds(40))
+    if suppressGestureReceipt {
+      // Suppress transport, not propagation: the early recorder must observe
+      // genuine native events even when the page stops propagation.
+      runtime.webView.configuration.userContentController.removeScriptMessageHandler(
+        forName: "webkituiNativeGesture", contentWorld: .world(name: "WebKitUIMCP.Instrumentation"))
+    }
     let presenter = ConfirmationPresenterStub(responses: [true])
     let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
     let observed = try await toolCall(
@@ -640,9 +797,190 @@ struct MCPServerTests {
     let result = try object(response["result"])
     #expect(result["isError"] == .bool(true))
     let structured = try object(result["structuredContent"])
-    #expect(structured["status"] == .string("upload_panel_not_opened"))
+    #expect(
+      structured["status"]
+        == .string(
+          suppressGestureReceipt ? "upload_selection_indeterminate" : "upload_panel_not_opened"))
     #expect(structured["file_selected"] == .bool(false))
+    #expect(structured["file_picker_visible"] == .bool(false))
+    #expect(!String(describing: structured["message"]).contains("The click was dispatched"))
+    if suppressGestureReceipt {
+      let action = try object(try object(structured["action"])["structuredContent"])
+      #expect(action["dispatch_error"] == .string("nativeGestureReceiptUnavailable"))
+    }
     #expect(!runtime.hasArmedUploadSelection())
+  }
+
+  @Test("A pending file panel refuses upload without another click", arguments: [false, true])
+  func uploadRefusesPendingFilePanel(opensDuringConfirmation: Bool) async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("asset.png")
+    try Data("synthetic-asset".utf8).write(to: file)
+    let panel = SuspendedUploadPanel()
+    defer { panel.close() }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      uploadSelectionProvider: { _, _ in await panel.selection() })
+    let registry = try WebKitSessionRegistry(runtimeFactory: { _ in runtime })
+    let handle = try registry.open()
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Import</h1><input aria-label="Asset" type="file">
+      <button onclick="window.uploadClicks=(window.uploadClicks||0)+1;
+        document.querySelector('h1').textContent='Clicked'">browse</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/upload")!,
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    if opensDuringConfirmation {
+      presenter.beforeResponse = { #expect(await panel.open(on: runtime)) }
+    } else {
+      #expect(await panel.open(on: runtime))
+    }
+    let response = try await toolCall(
+      server, id: 2, name: "browser_upload",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "browse")),
+        "idempotency_key": .string("pending-panel"),
+        "file_paths": .array([.string(file.path)]),
+        "postcondition": .object([
+          "type": .string("heading_equals"), "value": .string("Clicked"),
+        ]),
+      ])
+    let result = try object(response["result"])
+    let structured = try object(result["structuredContent"])
+    #expect(result["isError"] == .bool(true))
+    #expect(structured["status"] == .string("upload_panel_already_open"))
+    #expect(structured["file_picker_visible"] == .bool(true))
+    #expect(structured["dispatched"] == .bool(false))
+    #expect(structured["file_selected"] == .bool(false))
+    #expect(presenter.requests.count == (opensDuringConfirmation ? 1 : 0))
+    #expect(!runtime.hasArmedUploadSelection())
+    #expect(runtime.latestFileUploadReceipt() == nil)
+    #expect(runtime.isFilePickerVisible())
+    let clicks = try await runtime.webView.evaluateJavaScript("window.uploadClicks||0") as? Int
+    #expect(clicks == 0)
+  }
+
+  @Test(
+    "Direct menu upload attaches four files even without a gesture receipt",
+    arguments: [false, true])
+  func uploadFourFilesFromMenu(suppressGestureReceipt: Bool) async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let files = (1...4).map { directory.appendingPathComponent("creative-\($0).png") }
+    var digests: [String] = []
+    for (index, file) in files.enumerated() {
+      let bytes = Data("synthetic-png-\(index)".utf8)
+      try bytes.write(to: file)
+      digests.append(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
+    }
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <h1>22 ressources</h1>
+      <button aria-label="Ajouter" onclick="document.getElementById('upload').hidden=false">+</button>
+      <button id="upload" hidden onclick="document.querySelector('input').click()">
+        Charger des ressources créatives</button>
+      <input type="file" multiple style="display:none"
+        onchange="document.querySelector('h1').textContent=(22+this.files.length)+' ressources';
+          document.querySelector('p').textContent=Array.from(this.files,f=>f.name).join(', ')">
+      <p></p>
+      <script>
+      if (\(suppressGestureReceipt)) {
+        document.addEventListener('click', event => {
+          if (event.target.id === 'upload') {
+            event.stopImmediatePropagation();
+            document.querySelector('input').click();
+          }
+        }, true);
+      }
+      </script>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/asset-library")!,
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true, true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let initial = try await toolCall(
+      server, id: 1, name: "browser_observe", arguments: ["session_id": session])
+    let initialObservation = try object(try object(initial["result"])["structuredContent"])
+    let menu = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": session,
+        "observation_id": .string(try string(initialObservation["observationID"])),
+        "element_id": .string(try elementID(in: initialObservation, named: "Ajouter")),
+        "operation": .string("click"), "approval_mode": .string("native"),
+        "idempotency_key": .string("open-creative-menu"),
+        "postcondition": .object([
+          "type": .string("semantic_text_appears"),
+          "value": .string("Charger des ressources créatives"),
+        ]),
+      ])
+    #expect(try object(menu["result"])["isError"] != .bool(true))
+    #expect(!runtime.isFilePickerVisible())
+    if suppressGestureReceipt {
+      runtime.webView.configuration.userContentController.removeScriptMessageHandler(
+        forName: "webkituiNativeGesture", contentWorld: .world(name: "WebKitUIMCP.Instrumentation"))
+    }
+    let observed = try await toolCall(
+      server, id: 3, name: "browser_observe", arguments: ["session_id": session])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let response = try await toolCall(
+      server, id: 4, name: "browser_upload",
+      arguments: [
+        "session_id": session,
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(
+          try elementID(in: observation, named: "Charger des ressources créatives")),
+        "idempotency_key": .string("four-creatives"),
+        "file_paths": .array(files.map { .string($0.path) }),
+        "expected_sha256": .array(digests.map(JSONValue.string)),
+        "postcondition": .object([
+          "type": .string("heading_equals"), "value": .string("26 ressources"),
+        ]),
+      ])
+    let result = try object(response["result"])
+    #expect(result["isError"] != .bool(true))
+    let structured = try object(result["structuredContent"])
+    #expect(structured["file_selected"] == .bool(true))
+    #expect(structured["confirmed_digests_match"] == .string("true"))
+    let receipt = try object(structured["file_upload_receipt"])
+    #expect(receipt["fileCount"] == .int(4))
+    #expect(receipt["filenames"] == .array(files.map { .string($0.lastPathComponent) }))
+    #expect(receipt["sha256"] == .array(digests.map(JSONValue.string)))
+    #expect(!String(describing: result).contains(directory.path))
+    #expect(!runtime.hasArmedUploadSelection())
+    #expect(presenter.requests.count == 2)
+    if suppressGestureReceipt {
+      #expect(structured["dispatch_error"] == .string("nativeGestureReceiptUnavailable"))
+      #expect(structured["action_state"] == .string("verified_by_immediate_reconciliation"))
+      #expect(structured["trusted_gesture_state"] != .string("trusted"))
+    }
+    let readback =
+      try await runtime.webView.evaluateJavaScript(
+        "Array.from(document.querySelector('input').files,f=>f.name)") as? [String]
+    #expect(readback == files.map(\.lastPathComponent))
+    let reread = try await toolCall(
+      server, id: 5, name: "browser_observe", arguments: ["session_id": session])
+    let finalObservation = try object(try object(reread["result"])["structuredContent"])
+    #expect(try elementID(in: finalObservation, named: "26 ressources").isEmpty == false)
   }
 
   @Test("Upload refuses a digest that does not match the local file before confirming")
@@ -1116,6 +1454,8 @@ struct MCPServerTests {
     #expect(elements.count == 150)
     #expect(try object(elements[0])["locatorRecipe"] == nil)
     #expect(try object(elements[0])["locatorQuality"] != nil)
+    #expect(try object(elements[0])["contentEditable"] == nil)
+    #expect(try object(elements[0])["fillCapability"] == nil)
     #expect(encoded.count <= 1_048_576)
   }
 
@@ -1167,6 +1507,156 @@ struct MCPServerTests {
     let text = try object(try object(read["result"])["structuredContent"])
     #expect(text["bodyText"] == .string(""))
     #expect(text["content_state"] == .string("empty_or_unusable"))
+  }
+
+  @Test("Compact state attributes and picker capabilities match full sanitized evidence")
+  func compactStateAndFillCapabilities() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <button aria-expanded='false' onclick="this.setAttribute('aria-expanded','true')">Duo</button>
+      <input role='combobox' aria-label='Readonly picker' readonly>
+      <input aria-label='Token name' name='token_name'>
+      <input aria-label='Secret token' value='synthetic-wire-secret-640' aria-expanded='true'>
+      """, baseURL: URL(string: "https://fixture.invalid/compact-states"),
+      timeout: .seconds(15), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true, true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let compact = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: [
+        "session_id": session, "compact": .bool(true),
+        "fields": .array([.string("name"), .string("state")]),
+      ])
+    let observation = try object(try object(compact["result"])["structuredContent"])
+    let rows = try array(observation["elements"]).map { try object($0) }
+    #expect(try object(rows[0]["stateAttributes"])["aria-expanded"] == .string("false"))
+    #expect(rows[1]["fillCapability"] == .string("readonly"))
+    #expect(rows[2]["fillCapability"] == .string("editable"))
+    #expect(rows[2]["sensitive"] == .bool(false))
+    #expect(rows[3]["fillCapability"] == .string("sensitive"))
+    #expect(rows[3]["stateAttributes"] == .object([:]))
+    let refused = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": observation["observationID"]!,
+        "element_id": rows[1]["elementID"]!, "operation": .string("fill"),
+        "value": .string("no typing"), "idempotency_key": .string("readonly-picker-640"),
+        "approval_mode": .string("native"),
+      ])
+    #expect(refused["error"] != nil || (try? object(refused["result"])["isError"]) == .bool(true))
+    #expect(presenter.requests.isEmpty)
+    let inspected = try await toolCall(
+      server, id: 3, name: "browser_inspect_element",
+      arguments: [
+        "session_id": session, "observation_id": observation["observationID"]!,
+        "element_id": rows[0]["elementID"]!,
+      ])
+    let inspection = try object(try object(inspected["result"])["structuredContent"])
+    #expect(try object(inspection["stateAttributes"])["aria-expanded"] == .string("false"))
+    let acted = try await toolCall(
+      server, id: 4, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": observation["observationID"]!,
+        "element_id": rows[0]["elementID"]!, "operation": .string("click"),
+        "idempotency_key": .string("expand-duo-640"), "approval_mode": .string("native"),
+        "postcondition": .object([
+          "type": .string("attribute_equals"),
+          "attribute": .string("aria-expanded"), "value": .string("true"),
+        ]),
+      ])
+    #expect(try object(acted["result"])["isError"] != .bool(true))
+    #expect(presenter.requests.count == 1)
+    let full = try await toolCall(
+      server, id: 5, name: "browser_observe",
+      arguments: [
+        "session_id": session, "compact": .bool(false),
+      ])
+    let fullObservation = try object(try object(full["result"])["structuredContent"])
+    let fullRows = try array(fullObservation["elements"]).map { try object($0) }
+    let expanded = try object(try object(fullRows[0]["stateAttributes"])["aria-expanded"])
+    #expect(try object(try array(expanded["segments"])[0])["text"] == .string("true"))
+    #expect(fullObservation["observationID"] != observation["observationID"])
+    for response in [compact, inspected, full, acted] {
+      #expect(
+        !String(decoding: try JSONEncoder().encode(response), as: UTF8.self)
+          .contains("synthetic-wire-secret-640"))
+    }
+    let filtered = try await toolCall(
+      server, id: 6, name: "browser_observe",
+      arguments: [
+        "session_id": session, "compact": .bool(true), "fields": .array([.string("name")]),
+      ])
+    let filteredObservation = try object(try object(filtered["result"])["structuredContent"])
+    #expect(try object(try array(filteredObservation["elements"])[0])["stateAttributes"] == nil)
+  }
+
+  @Test("An editable controlled picker rejecting text stays indeterminate and is never replayed")
+  func controlledPickerRejectionIsNotSuccess() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <input role='combobox' aria-label='Bucket picker' value='Existing choice'
+        oninput="window.inputCount=(window.inputCount||0)+1;this.value='Existing choice'">
+      """, baseURL: URL(string: "https://fixture.invalid/controlled-picker"),
+      timeout: .seconds(15), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: [
+        "session_id": session
+      ])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let row = try object(try array(observation["elements"])[0])
+    #expect(row["fillCapability"] == .string("editable"))
+    let arguments: [String: JSONValue] = [
+      "session_id": session, "observation_id": observation["observationID"]!,
+      "element_id": row["elementID"]!, "operation": .string("fill"),
+      "value": .string("Different choice"), "idempotency_key": .string("controlled-picker-640"),
+      "approval_mode": .string("native"),
+    ]
+    let acted = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
+    let receipt = try object(try object(acted["result"])["structuredContent"])
+    #expect(receipt["action_state"] == .string("dispatched_verification_indeterminate"))
+    #expect(receipt["action_replayed"] == .bool(false))
+    let count = try await runtime.webView.evaluateJavaScript("window.inputCount") as? Int
+    #expect((count ?? 0) > 0)
+    let repeated = try await toolCall(server, id: 3, name: "browser_act", arguments: arguments)
+    let refusal = try object(try object(repeated["result"])["structuredContent"])
+    #expect(refusal["code"] == .string("idempotency_key_already_used"))
+    #expect(refusal["automatic_retry_allowed"] == .bool(false))
+    let afterCount = try await runtime.webView.evaluateJavaScript("window.inputCount") as? Int
+    #expect(afterCount == count)
+    #expect(presenter.requests.count == 1)
+  }
+
+  @Test(
+    "Handoff operations reject foreign timing/shape parameters before any prompt",
+    arguments: [
+      "handoff", "handoff_start", "handoff_status", "handoff_resume", "handoff_focus",
+      "confirmation_focus", "confirmation_cancel", "compatibility_start", "client_handoff",
+    ])
+  func handoffArgumentMatrix(operation: String) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string(operation), "session_id": .string(handle.rawValue.uuidString),
+        "timeout_ms": .int(1000),
+      ])
+    #expect(response["error"] != nil || (try? object(response["result"])["isError"]) == .bool(true))
+    #expect(presenter.requests.isEmpty)
+    #expect(try registry.runtime(for: handle).interactionControlState() == .agentControlled)
   }
 
   @Test("Modern compact observations factor provenance and avoid duplicate JSON text")
@@ -1344,6 +1834,64 @@ struct MCPServerTests {
         == .string("continue_in_safari_or_another_full_browser"))
     #expect(structured["session_transfer_supported"] == .bool(false))
     #expect(structured["credential_transfer_supported"] == .bool(false))
+  }
+
+  @Test(
+    "Manual Safari fallback works for ordinary origins and respects rejection",
+    arguments: [false, true])
+  func safariCompatibilityOrdinaryOrigin(approved: Bool) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    let url = try #require(
+      URL(string: "https://hpanel.fixture.invalid/private?token=SAFARI-PRIVATE-CANARY"))
+    _ = try await runtime.loadHTML(
+      "<p>Local panel fixture</p>", baseURL: url,
+      timeout: .seconds(5), quietWindow: .milliseconds(40))
+    #expect(runtime.authenticationRestrictionStatus() == nil)
+    let safari = SafariCompatibilityPresenterStub()
+    let presenter = ConfirmationPresenterStub(responses: [approved])
+    let server = WebKitMCPServer(
+      registry: registry, confirmationPresenter: presenter,
+      safariCompatibilityPresenter: safari)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("compatibility_start"),
+        "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let result = try object(try object(response["result"])["structuredContent"])
+    #expect(result["opened"] == .bool(approved))
+    #expect(presenter.requests.count == 1)
+    #expect(!presenter.requests[0].message.contains("SAFARI-PRIVATE-CANARY"))
+    #expect(safari.openedURLs == (approved ? [url] : []))
+    #expect(
+      !String(decoding: try JSONEncoder().encode(response), as: UTF8.self).contains(
+        "SAFARI-PRIVATE-CANARY"))
+    #expect(runtime.interactionControlState() == .agentControlled)
+  }
+
+  @Test("Session diagnosis returns only structural loading hints")
+  func sessionLoadDiagnosis() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<input type=password value=LOAD-DIAG-PRIVATE-CANARY>",
+      baseURL: URL(string: "https://fixture.invalid/private?token=LOAD-DIAG-PRIVATE-CANARY"),
+      timeout: .seconds(5), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(registry: registry)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("diagnose"), "session_id": .string(handle.rawValue.uuidString),
+      ])
+    let result = try object(try object(response["result"])["structuredContent"])
+    #expect(try object(result["diagnostics"])["documentReadyState"] == .string("complete"))
+    #expect(result["origin"] == .string("https://fixture.invalid"))
+    #expect(
+      !String(decoding: try JSONEncoder().encode(response), as: UTF8.self).contains(
+        "LOAD-DIAG-PRIVATE-CANARY"))
   }
 
   @Test("Safari compatibility handoff keeps the private URL outside MCP")
@@ -1642,6 +2190,579 @@ struct MCPServerTests {
     #expect(presenter.state == .idle)
   }
 
+  @Test("MCP confirmation focus is session/request bound and cannot dispatch or approve")
+  func nativeConfirmationFocusIsBound() async throws {
+    let registry = try WebKitSessionRegistry(maximumSessions: 2)
+    let handle = try registry.open()
+    let other = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<h1>Initial</h1><button onclick=\"document.querySelector('h1').textContent='Changed'\">Change</button>",
+      baseURL: URL(string: "https://focus.fixture.invalid"), timeout: .seconds(15),
+      quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [false])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    defer { presenter.beforeResponse = nil }
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    presenter.beforeResponse = {
+      presenter.state = .pending
+      let requestID = UUID()
+      presenter.presentationReceipt = ConfirmationPresentationReceipt(
+        requestID: requestID, helperPID: 42, phase: .sampled, monotonicNanoseconds: 1,
+        windowNumber: 7, windowVisible: true, appKitVisible: true, keyWindow: false,
+        onActiveSpace: true, intersectsScreen: true)
+      for (index, selectedSession, selectedRequest, expected) in [
+        (10, JSONValue.string(other.rawValue.uuidString), requestID, false),
+        (11, session, UUID(), false), (12, session, requestID, true),
+      ] {
+        let reply = try? await toolCall(
+          server, id: Int64(index), name: "browser_session",
+          arguments: [
+            "operation": .string("confirmation_focus"), "session_id": selectedSession,
+            "confirmation_request_id": .string(selectedRequest.uuidString),
+          ])
+        let content = try? object(try object(reply?["result"])["structuredContent"])
+        #expect(content?["focus_requested"] == .bool(expected))
+        #expect(content?["approval_granted"] == .bool(false))
+        #expect(content?["action_dispatched"] == .bool(false))
+        #expect(content?["timeout_extended"] == .bool(false))
+      }
+      #expect(presenter.focusRequests == [requestID])
+    }
+    let reply = try await toolCall(
+      server, id: 1, name: "browser_observe", arguments: ["session_id": session])
+    let observed = try object(try object(reply["result"])["structuredContent"])
+    _ = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": observed["observationID"]!,
+        "element_id": .string(try elementID(in: observed, named: "Change")),
+        "operation": .string("click"),
+        "idempotency_key": .string("focus-declined-639"),
+        "postcondition": .object(["type": .string("heading_equals"), "value": .string("Changed")]),
+      ])
+    #expect(presenter.requests.count == 1)
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.querySelector('h1').textContent")
+        as? String == "Initial")
+  }
+
+  @Test(
+    "Timeout diagnostics never invent presentation or navigate",
+    arguments: [NativeConfirmationOutcome.timedOut, .queueTimedOut])
+  func confirmationTimeoutDoesNotInventPresentation(outcome: NativeConfirmationOutcome) async throws
+  {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    let presenter = ConfirmationPresenterStub(responses: [])
+    presenter.forcedOutcome = outcome
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_navigate",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "url": .string("https://fixture.invalid/not-dispatched"),
+      ])
+    let result = try object(response["result"])
+    #expect(result["isError"] == .bool(true))
+    let content = try object(result["structuredContent"])
+    #expect(content["confirmation_outcome"] == .string(outcome.rawValue))
+    #expect(content["confirmation_presented"] == (outcome == .queueTimedOut ? .bool(false) : .null))
+    #expect(content["confirmation_presentation"] == .null)
+    #expect(runtime.navigationAuditEventCount() == 0)
+    #expect(presenter.requests.first?.title.contains(runtime.humanControlSessionLabel) == true)
+  }
+
+  @Test(
+    "Download confirmation distinguishes refusal from delivery failure",
+    arguments: [
+      NativeConfirmationOutcome.declined, .timedOut, .queueTimedOut, .cancelled, .failed, .hidden,
+    ])
+  func downloadConfirmationOutcomeIsHonest(outcome: NativeConfirmationOutcome) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button>Download</button>",
+      baseURL: URL(string: "https://fixture.invalid/export"), timeout: .seconds(3),
+      quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [])
+    presenter.forcedOutcome = outcome
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let response = try await toolCall(
+      server, id: 1, name: "browser_download",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "idempotency_key": .string("local-download-once"),
+        "url": .string("https://fixture.invalid/export.json"),
+      ])
+    let result = try object(response["result"])
+    let content = try object(result["structuredContent"])
+    #expect(result["isError"] == .bool(true))
+    #expect(
+      content["code"]
+        == .string(outcome == .declined ? "declined_by_user" : "confirmation_unavailable"))
+    if outcome != .declined {
+      #expect(content["confirmation_outcome"] == .string(outcome.rawValue))
+    }
+    #expect(runtime.navigationAuditEventCount() == 1)
+  }
+
+  @Test("A refused download reports bounded dispatch stage without claiming a click")
+  func refusedDownloadHasStageEvidence() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button aria-label='Export fixture'>Export fixture</button><div style='position:fixed;inset:0;background:white'>Cover</div>",
+      baseURL: URL(string: "https://fixture.invalid/covered"), timeout: .seconds(3),
+      quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, confirmationPresenter: ConfirmationPresenterStub(responses: [true]))
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let response = try await toolCall(
+      server, id: 2, name: "browser_download",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "idempotency_key": .string("covered-download-only"),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "Export fixture")),
+      ])
+    let result = try object(response["result"])
+    #expect(result["isError"] == .bool(true))
+    let content = try object(result["structuredContent"])
+    #expect(content["code"] == .string("target_not_actionable"))
+    #expect(content["native_dispatch_attempted"] == .bool(false))
+    #expect(content["native_gesture_verified"] == .bool(false))
+    #expect(content["download_started"] == .bool(false))
+    #expect(content["automatic_retry_allowed"] == .bool(false))
+  }
+
+  @Test("Configuration canaries reach no observation, text, inspector or native confirmation bytes")
+  func configurationPrivacyOnWire() async throws {
+    let canary = "synthetic-wire-secret-canary-638-not-a-key"
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Configuration</h1><table><tr aria-label='CLOUDKIT_API_TOKEN \(canary)'>
+      <td>CLOUDKIT_API_TOKEN</td><td>\(canary)</td>
+      <td><button onclick="document.querySelector('h1').textContent='Public result'">Edit</button></td>
+      </tr></table>
+      """, baseURL: URL(string: "https://privacy.fixture.invalid"),
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": session, "compact": .bool(false)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    #expect(
+      observation["observation_completeness_scope"] == .string("discovered_collector_results_only"))
+    let target = try elementID(in: observation, named: "Edit")
+    let inspected = try await toolCall(
+      server, id: 2, name: "browser_inspect_element",
+      arguments: [
+        "session_id": session, "observation_id": observation["observationID"]!,
+        "element_id": .string(target),
+      ])
+    let text = try await toolCall(
+      server, id: 3, name: "browser_read_text",
+      arguments: ["session_id": session])
+    let acted = try await toolCall(
+      server, id: 4, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": observation["observationID"]!,
+        "element_id": .string(target), "operation": .string("click"),
+        "idempotency_key": .string("privacy-wire-only-638"),
+        "approval_mode": .string("native"),
+        "postcondition": .object([
+          "type": .string("heading_equals"), "value": .string("Public result"),
+        ]),
+      ])
+    #expect(try object(acted["result"])["isError"] != .bool(true))
+    #expect(presenter.requests.count == 1)
+    for reply in [observed, inspected, text, acted] {
+      #expect(!String(decoding: try JSONEncoder().encode(reply), as: UTF8.self).contains(canary))
+    }
+    let request = try #require(presenter.requests.first)
+    #expect(!request.message.contains(canary))
+    _ = try await runtime.webView.evaluateJavaScript(
+      "const field=document.createElement('input'); field.type='password'; field.name='password'; field.value='x'.repeat(65537); document.body.appendChild(field); null"
+    )
+    for (index, name) in ["browser_observe", "browser_read_text"].enumerated() {
+      let refused = try await toolCall(
+        server, id: Int64(5 + index), name: name,
+        arguments: ["session_id": session])
+      let result = try object(refused["result"])
+      #expect(result["isError"] == .bool(true))
+      let content = try object(result["structuredContent"])
+      #expect(content["code"] == .string("privacy_scan_limit_exceeded"))
+      #expect(content["automatic_retry_allowed"] == .bool(false))
+      #expect(!String(decoding: try JSONEncoder().encode(refused), as: UTF8.self).contains(canary))
+    }
+  }
+
+  @Test(
+    "An explicit dialog scope supports a bounded wizard transition without global absence claims")
+  func scopedDialogWizard() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Outside heading</h1>
+      <div role='dialog' aria-label='Collection' id='wizard'>
+        <h2>First step</h2><p>\(String(repeating: "Long public paragraph. ", count: 300))</p>
+        <button onclick="document.querySelector('#wizard h2').textContent='Second step'">Continue</button>
+      </div>
+      """, baseURL: URL(string: "https://scope.fixture.invalid"),
+      timeout: .seconds(15), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let fullReply = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": session])
+    let full = try object(try object(fullReply["result"])["structuredContent"])
+    #expect(full["observation_is_complete"] == .bool(false))
+    // Only the paragraph text was cut; every element was discovered.
+    #expect(full["observation_is_structurally_complete"] == .bool(true))
+    let fullTarget = try elementID(in: full, named: "Continue")
+    let globalTextRefused = try await toolCall(
+      server, id: 10, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": full["observationID"]!,
+        "element_id": .string(fullTarget), "operation": .string("click"),
+        "idempotency_key": .string("global-text-refused-639"),
+        "postcondition": .object([
+          "type": .string("semantic_text_contains"), "value": .string("Second step"),
+        ]),
+      ])
+    #expect(
+      String(decoding: try JSONEncoder().encode(globalTextRefused), as: UTF8.self).contains(
+        "postcondition_baseline_incomplete"))
+    #expect(presenter.requests.isEmpty)
+    let root = try elementID(in: full, named: "Collection")
+    let scopedReply = try await toolCall(
+      server, id: 2, name: "browser_observe",
+      arguments: [
+        "session_id": session, "scope_observation_id": full["observationID"]!,
+        "scope_element_id": .string(root),
+      ])
+    let scoped = try object(try object(scopedReply["result"])["structuredContent"])
+    #expect(scoped["aggregateTextOmitted"] == .bool(true))
+    #expect(scoped["semantic_text_complete"] == .bool(false))
+    #expect(scoped["observation_is_complete"] == .bool(true))
+    #expect(
+      scoped["observation_completeness_scope"] == .string("observed_dialog_collector_results_only"))
+    let target = try elementID(in: scoped, named: "Continue")
+    let textRefused = try await toolCall(
+      server, id: 11, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": scoped["observationID"]!,
+        "element_id": .string(target), "operation": .string("click"),
+        "idempotency_key": .string("omitted-text-refused-639"),
+        "postcondition": .object([
+          "type": .string("semantic_text_contains"), "value": .string("Missing text"),
+        ]),
+      ])
+    #expect(
+      String(decoding: try JSONEncoder().encode(textRefused), as: UTF8.self).contains(
+        "postcondition_baseline_incomplete"))
+    #expect(presenter.requests.isEmpty)
+    let acted = try await toolCall(
+      server, id: 3, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": scoped["observationID"]!,
+        "element_id": .string(target), "operation": .string("click"),
+        "idempotency_key": .string("scoped-wizard-639"),
+        "postcondition": .object([
+          "type": .string("heading_equals"), "value": .string("Second step"),
+        ]),
+      ])
+    #expect(try object(acted["result"])["isError"] != .bool(true))
+    #expect(presenter.requests.count == 1)
+    #expect(
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('#wizard h2').textContent") as? String == "Second step")
+  }
+
+  /// App Store Connect overflows the field bound on every page (sidebar, footer), so a
+  /// target_absent claim was refused on every page. Cut text says nothing about
+  /// whether a button still exists.
+  @Test("Truncated field text alone does not refuse or weaken a target_absent claim")
+  func truncatedTextStillVerifiesAbsence() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Privacy</h1><p>\(String(repeating: "Long public footer. ", count: 300))</p>
+      <button onclick="this.remove()">OK</button>
+      """,
+      baseURL: URL(string: "https://truncated.fixture.invalid"),
+      timeout: .seconds(15), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let reply = try await toolCall(
+      server, id: 1, name: "browser_observe", arguments: ["session_id": session])
+    let observation = try object(try object(reply["result"])["structuredContent"])
+    #expect(observation["semanticTextTruncated"] == .bool(true))
+    #expect(observation["observation_is_complete"] == .bool(false))
+    #expect(observation["observation_is_structurally_complete"] == .bool(true))
+    let target = try elementID(in: observation, named: "OK")
+    let acted = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": observation["observationID"]!,
+        "element_id": .string(target), "operation": .string("click"),
+        "idempotency_key": .string("truncated-absence-639"),
+        "postcondition": .object(["type": .string("target_absent"), "value": .string("true")]),
+      ])
+    let result = try object(try object(acted["result"])["structuredContent"])
+    #expect(result["action_state"] == nil)
+    let verification = try object(result["verification"])
+    #expect(verification.keys.contains("verified"))
+    #expect(presenter.requests.count == 1)
+  }
+
+  @Test("Losing a dialog scope after dispatch is indeterminate, never verified absence")
+  func scopedDialogLossIsUnknown() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<div role='dialog' aria-label='Local wizard'><button onclick='this.parentElement.remove()'>Close wizard</button></div>",
+      baseURL: URL(string: "https://scope-loss.fixture.invalid"),
+      timeout: .seconds(15), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let fullReply = try await toolCall(
+      server, id: 1, name: "browser_observe", arguments: ["session_id": session])
+    let full = try object(try object(fullReply["result"])["structuredContent"])
+    let root = try elementID(in: full, named: "Local wizard")
+    let scopedReply = try await toolCall(
+      server, id: 2, name: "browser_observe",
+      arguments: [
+        "session_id": session, "scope_observation_id": full["observationID"]!,
+        "scope_element_id": .string(root),
+      ])
+    let scoped = try object(try object(scopedReply["result"])["structuredContent"])
+    let target = try elementID(in: scoped, named: "Close wizard")
+    let acted = try await toolCall(
+      server, id: 3, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": scoped["observationID"]!,
+        "element_id": .string(target), "operation": .string("click"),
+        "idempotency_key": .string("scope-loss-639"),
+        "postcondition": .object(["type": .string("target_absent"), "value": .string("true")]),
+      ])
+    let result = try object(try object(acted["result"])["structuredContent"])
+    #expect(result["action_state"] == .string("dispatched_verification_indeterminate"))
+    #expect(result["action_replayed"] == .bool(false))
+    #expect(presenter.requests.count == 1)
+  }
+
+  @Test("MCP arguments cannot create a remembered permission")
+  func rememberedPermissionCannotBeCreatedByToolArguments() async throws {
+    let server = try WebKitMCPServer()
+    let response = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "operation": .string("always_allow"), "origin": .string("https://fixture.invalid"),
+      ])
+    if let error = response["error"] {
+      #expect(try object(error)["code"] == .int(-32602))
+    } else {
+      #expect(try object(response["result"])["isError"] == .bool(true))
+    }
+  }
+
+  @Test(
+    "A locally selected session permission skips only its selected scope", arguments: [false, true])
+  func rememberedSessionPermissionIsScoped(interactions: Bool) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<label>Name<input name='public-name'></label>",
+      baseURL: URL(string: "https://fixture.invalid/input"), timeout: .seconds(3),
+      quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(responses: [])
+    presenter.forcedOutcome =
+      interactions ? .approvedSessionInteractions : .approvedSessionNavigation
+    let approvals = SiteApprovalStore()
+    let server = WebKitMCPServer(
+      registry: registry, confirmationPresenter: presenter, siteApprovals: approvals)
+    for index in Int64(0)..<3 {
+      if index == 1 { presenter.forcedOutcome = .declined }
+      if index == 2 { try? approvals.revokeAll() }
+      let observed = try await toolCall(
+        server, id: 10 + index * 2, name: "browser_observe",
+        arguments: ["session_id": .string(handle.rawValue.uuidString)])
+      let observation = try object(try object(observed["result"])["structuredContent"])
+      let response = try await toolCall(
+        server, id: 11 + index * 2, name: "browser_act",
+        arguments: [
+          "session_id": .string(handle.rawValue.uuidString),
+          "operation": .string("fill"), "value": .string("Fixture \(index)"),
+          "idempotency_key": .string("remember-fixture-\(index)"),
+          "observation_id": .string(try string(observation["observationID"])),
+          "element_id": .string(try elementID(in: observation, named: "Name")),
+        ])
+      let result = try object(response["result"])
+      let shouldPass = index == 0 || (index == 1 && interactions)
+      #expect((result["isError"] != .bool(true)) == shouldPass)
+      if index == 1 && interactions {
+        #expect(
+          try object(result["structuredContent"])["authorization_source"]
+            == .string("remembered_session"))
+        #expect(presenter.requests.count == 1)
+      }
+    }
+    #expect(presenter.requests.count == (interactions ? 2 : 3))
+  }
+
+  @Test("A download timeout exposes trusted dispatch without claiming a transfer")
+  func timedOutDownloadHasStageEvidence() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<h1>Export form</h1><button>Export fixture</button>",
+      baseURL: URL(string: "https://fixture.invalid/export"), timeout: .seconds(3),
+      quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, confirmationPresenter: ConfirmationPresenterStub(responses: [true]))
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let response = try await toolCall(
+      server, id: 2, name: "browser_download",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "idempotency_key": .string("timeout-fixture-only"),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "Export fixture")),
+      ])
+    let result = try object(response["result"])
+    #expect(result["isError"] == .bool(true))
+    let content = try object(result["structuredContent"])
+    #expect(content["status"] == .string("download_timeout"))
+    #expect(content["reason"] == .string("download_receipt_timed_out"))
+    #expect(content["native_dispatch_attempted"] == .bool(true))
+    #expect(content["native_gesture_verified"] == .bool(true))
+    #expect(content["download_started"] == .bool(false))
+    #expect(content["destination_selection_started"] == .bool(false))
+    #expect(content["download_window_created"] == .bool(false))
+    #expect(content["new_window_source_main_frame"] == .bool(false))
+    #expect(content["new_window_target_absent"] == .bool(false))
+    #expect(content["automatic_retry_allowed"] == .bool(false))
+  }
+
+  @Test("A refused export window retains request-local diagnostics")
+  func refusedDownloadWindowHasStageEvidence() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<h1>Preserved form</h1><button onclick=\"setTimeout(() => { window.open('', '_blank'); window.open('', '_blank'); }, 100)\">Export fixture</button>",
+      baseURL: URL(string: "https://fixture.invalid/export"), timeout: .seconds(3),
+      quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(
+      registry: registry, confirmationPresenter: ConfirmationPresenterStub(responses: [true]))
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let response = try await toolCall(
+      server, id: 2, name: "browser_download",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "idempotency_key": .string("duplicate-window-fixture-only"),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try elementID(in: observation, named: "Export fixture")),
+      ])
+    let result = try object(response["result"])
+    #expect(result["isError"] == .bool(true))
+    let content = try object(result["structuredContent"])
+    #expect(content["status"] == .string("download_failed"))
+    #expect(content["reason"] == .string("download_window_duplicate"))
+    #expect(content["native_dispatch_attempted"] == .bool(true))
+    #expect(content["new_window_requested"] == .bool(true))
+    #expect(content["new_window_source_main_frame"] == .bool(true))
+    #expect(content["download_window_created"] == .bool(true))
+    #expect(content["artifact_exists"] == .bool(false))
+    #expect(content["automatic_retry_allowed"] == .bool(false))
+    #expect(try await runtime.readText().bodyText.contains("Preserved form"))
+  }
+
+  @Test("A native action after reconnect and completed handoff still needs its own confirmation")
+  func confirmationAfterHandoffResumeRemainsBound() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<button onclick=\"this.textContent='Changed'\">Next</button>",
+      baseURL: URL(string: "https://fixture.invalid/resume-confirmation"),
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(registry: registry, presentHumanWindows: false)
+    let sessionID = handle.rawValue.uuidString
+    let start = try await toolCall(
+      server, id: 1, name: "browser_session",
+      arguments: [
+        "session_id": .string(sessionID), "operation": .string("handoff_start"),
+      ])
+    let token = try string(
+      try object(try object(start["result"])["structuredContent"])["resume_token"])
+    try runtime.markHumanStepCompleted()
+    await server.prepareForClientReconnect()
+    let presenter = ConfirmationPresenterStub(responses: [false])
+    let reconnected = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: presenter)
+    _ = try await toolCall(
+      reconnected, id: 2, name: "browser_session",
+      arguments: [
+        "session_id": .string(sessionID), "operation": .string("handoff_resume"),
+        "resume_token": .string(token),
+      ])
+    let observed = try await toolCall(
+      reconnected, id: 3, name: "browser_observe",
+      arguments: [
+        "session_id": .string(sessionID)
+      ])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try element(in: observation, named: "Next")
+    let refused = try await toolCall(
+      reconnected, id: 4, name: "browser_act",
+      arguments: [
+        "session_id": .string(sessionID), "operation": .string("click"),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(target["elementID"])),
+        "approval_mode": .string("native"), "idempotency_key": .string("after-handoff-once"),
+        "postcondition": .object([
+          "type": .string("semantic_text_appears"), "value": .string("Changed"),
+        ]),
+      ])
+    #expect(try object(refused["result"])["isError"] == .bool(true))
+    #expect(presenter.requests.count == 1)
+    #expect(presenter.requests.first?.title.contains(runtime.humanControlSessionLabel) == true)
+    #expect(
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('button').textContent === 'Next'") as? Bool == true)
+  }
+
   @Test("Profiles advertise only executable policies and disclose privacy limits")
   func profilesAdvertiseOnlyExecutablePolicies() async throws {
     let server = try WebKitMCPServer()
@@ -1919,7 +3040,7 @@ struct MCPServerTests {
     #expect(handoffState["status"] == .string("ownership_transferred"))
     #expect(handoffState["control_available"] == .bool(true))
     #expect(presenter.requests.count == 1)
-    #expect(presenter.requests.first?.title == "Transfer WebKitUI Control")
+    #expect(presenter.requests.first?.title.hasPrefix("Transfer WebKitUI Control [") == true)
 
     let oldOwner = try await toolCall(
       firstClient, id: 3, name: "browser_observe",
@@ -2642,6 +3763,187 @@ struct MCPServerTests {
     #expect(input?.value?.segments.first?.text == longFormValue)
   }
 
+  @Test("A confirmed fill accepts an empty field without an observable value key")
+  func emptyFieldWithoutValueEntryIsVerified() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <label>Start date <input type='date'></label>
+      <script>
+        document.querySelector('input').addEventListener('input', event => {
+          event.currentTarget.type = 'text';
+        });
+      </script>
+      """,
+      baseURL: URL(string: "https://example.test/groups"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let runtimeObservation = try await runtime.observe()
+    let runtimeInputs = runtimeObservation.elements.filter {
+      $0.tag.segments.map(\.text).joined() == "input"
+    }
+    #expect(runtimeInputs.count == 1)
+    let targetID = try #require(runtimeInputs.first).elementID
+    let semanticValueKey = ObservationFieldKey(
+      frameID: "main",
+      elementID: try #require(runtimeInputs.first).locatorRecipe.semanticIdentity,
+      field: "@value")
+    let baseline = try runtimeObservation.canonicalState()
+    #expect(!baseline.entries.contains { $0.key == semanticValueKey })
+
+    let server = WebKitMCPServer(registry: registry)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+
+    let arguments: [String: JSONValue] = [
+      "session_id": .string(handle.rawValue.uuidString),
+      "observation_id": .string(try string(observation["observationID"])),
+      "element_id": .string(targetID),
+      "operation": .string("fill"),
+      "value": .string("2026-10-11"),
+      "approval_mode": .string("mcp"),
+      "idempotency_key": .string("fill-empty-without-value-entry-once"),
+    ]
+    let prepared = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
+    let required = try object(prepared["result"])
+    let completed = try await roundTripToolCall(
+      server, id: 3, name: "browser_act", arguments: arguments,
+      requestState: try string(required["requestState"]), action: "accept", confirm: true)
+    let structured = try object(try object(completed["result"])["structuredContent"])
+    #expect(try object(structured["verification"])["verified"] != nil)
+
+    let value =
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('input').value") as? String
+    #expect(value == "2026-10-11")
+  }
+
+  @Test("Framed fill verifies exact value only after confirmation", arguments: [false, true])
+  func sameOriginFrameFillIsVerified(native: Bool) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <title>Local IAM form</title>
+      <iframe width="600" height="200" srcdoc="
+        &lt;h2&gt;Public profile&lt;/h2&gt;
+        &lt;label&gt;Display name &lt;input name='public-name'&gt;&lt;/label&gt;
+        &lt;input aria-label='Other field' name='public-name' value='untouched'&gt;
+      "></iframe>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/framed-profile"),
+      timeout: .seconds(15), quietWindow: .milliseconds(100))
+    let presenter = ConfirmationPresenterStub(responses: [true])
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try element(in: observation, named: "Display name")
+    let arguments: [String: JSONValue] = [
+      "session_id": .string(handle.rawValue.uuidString),
+      "observation_id": .string(try string(observation["observationID"])),
+      "element_id": .string(try string(target["elementID"])),
+      "operation": .string("fill"), "value": .string("Local reader"),
+      "approval_mode": .string(native ? "native" : "mcp"),
+      "idempotency_key": .string("framed-fill-once"),
+    ]
+    let prepared = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
+    let completed: [String: JSONValue]
+    if native {
+      completed = prepared
+      #expect(presenter.requests.count == 1)
+    } else {
+      let required = try object(prepared["result"])
+      completed = try await roundTripToolCall(
+        server, id: 3, name: "browser_act", arguments: arguments,
+        requestState: try string(required["requestState"]), action: "accept", confirm: true)
+    }
+    let structured = try object(try object(completed["result"])["structuredContent"])
+    #expect(try object(structured["verification"])["verified"] != nil)
+    let after = try await runtime.observe()
+    #expect(
+      after.elements.first { $0.accessibleName?.segments.first?.text == "Display name" }?
+        .value?.segments.map(\.text).joined() == "Local reader")
+    #expect(
+      after.elements.first { $0.accessibleName?.segments.first?.text == "Other field" }?
+        .value?.segments.map(\.text).joined() == "untouched")
+  }
+
+  @Test(
+    "Framed native fill refuses cancellation, coverage or unstable geometry after approval",
+    arguments: ["cancel", "move", "cover"])
+  func sameOriginFrameFillRevalidatesApproval(change: String) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      """
+      <iframe width="600" height="200" srcdoc="
+        &lt;label&gt;Display name &lt;input name='public-name' value='keep'&gt;&lt;/label&gt;
+      "></iframe>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/framed-approval"),
+      timeout: .seconds(15), quietWindow: .milliseconds(100))
+    let presenter = ConfirmationPresenterStub(responses: [change != "cancel"])
+    presenter.beforeResponse = {
+      if change == "move" {
+        _ = try? await runtime.webView.evaluateJavaScript(
+          """
+          const d = document.querySelector('iframe').contentDocument;
+          const style = d.createElement('style');
+          style.textContent = '@keyframes move { from { transform:translateY(0) } to { transform:translateY(100px) } } input { animation:move 1s linear infinite }';
+          d.head.append(style);
+          """)
+      } else if change == "cover" {
+        _ = try? await runtime.webView.evaluateJavaScript(
+          """
+          const d = document.querySelector('iframe').contentDocument;
+          const cover = d.createElement('div');
+          cover.style = 'position:fixed;inset:0;background:white;z-index:999';
+          d.body.append(cover);
+          """)
+      }
+    }
+    let server = WebKitMCPServer(registry: registry, confirmationPresenter: presenter)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let target = try element(in: observation, named: "Display name")
+    let completed = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "element_id": .string(try string(target["elementID"])),
+        "operation": .string("fill"), "value": .string("replacement"),
+        "approval_mode": .string("native"),
+        "idempotency_key": .string("framed-approval-once"),
+      ])
+    let result = try object(completed["result"])
+    if change == "cover" {
+      // Keep the existing unknown-dispatch contract: no success claim or replay.
+      let structured = try object(result["structuredContent"])
+      #expect(structured["action_state"] == .string("indeterminate"))
+      #expect(try object(structured["verification"])["indeterminate"] != nil)
+      #expect(structured["action_replayed"] == .bool(false))
+      #expect(try string(structured["dispatch_error"]).contains("targetNotActionable"))
+    } else {
+      #expect(result["isError"] == .bool(true))
+    }
+    #expect(presenter.requests.count == 1)
+    let unchanged =
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('iframe').contentDocument.querySelector('input').value === 'keep'")
+      as? Bool
+    #expect(unchanged == true)
+  }
+
   @Test("An exact fill stays indeterminate while the live field is invalid")
   func invalidFillIsNotVerified() async throws {
     let registry = try WebKitSessionRegistry()
@@ -2760,22 +4062,46 @@ struct MCPServerTests {
     #expect(try object(structured["verification"])["verified"] != nil)
   }
 
-  @Test("A confirmed fill supports a long semantic contenteditable textbox")
-  func verifiedContenteditableFill() async throws {
+  @Test(
+    "A confirmed fill supports semantic and roleless contenteditable editors",
+    arguments: [
+      "contenteditable='true' role='textbox' aria-label='Post body'",
+      "contenteditable='true'",
+      "contenteditable=''",
+      "contenteditable='plaintext-only'",
+    ])
+  func verifiedContenteditableFill(attributes: String) async throws {
     let registry = try WebKitSessionRegistry()
     let handle = try registry.open()
     let runtime = try registry.runtime(for: handle)
     runtime.webView.loadHTMLString(
-      "<div role='textbox' contenteditable='true' aria-label='Post body' style='width:400px;height:120px'>Draft</div>",
+      "<div id='betaAppLocalizations[fr-fr].description' name='betaAppLocalizations[fr-fr].description' \(attributes) style='width:400px;height:120px'>Draft</div>",
       baseURL: URL(string: "https://example.test/submit"))
     while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let original = try #require(try await runtime.observe().elements.first)
     let server = WebKitMCPServer(registry: registry)
     let observed = try await toolCall(
       server, id: 1, name: "browser_observe",
       arguments: ["session_id": .string(handle.rawValue.uuidString)])
     let observation = try object(try object(observed["result"])["structuredContent"])
     let element = try object(try array(observation["elements"]).first)
-    let value = String(repeating: "Long form paragraph. ", count: 40) + "Done."
+    #expect(element["contentEditable"] == .bool(true))
+    if !attributes.contains("role=") {
+      #expect(element["accessibleName"] == nil || element["accessibleName"] == .null)
+    }
+    let inspected = try await toolCall(
+      server, id: 10, name: "browser_inspect_element",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": observation["observationID"]!,
+        "element_id": element["elementID"]!,
+      ])
+    #expect(
+      try object(try object(inspected["result"])["structuredContent"])["contentEditable"]
+        == .bool(true))
+    let value =
+      String(String(repeating: "Description publique. ", count: 77).prefix(1617)) + "Fin ici"
+    #expect(value.count == 1624)
     let arguments: [String: JSONValue] = [
       "session_id": .string(handle.rawValue.uuidString),
       "observation_id": .string(try string(observation["observationID"])),
@@ -2791,9 +4117,60 @@ struct MCPServerTests {
       server, id: 3, name: "browser_act", arguments: arguments,
       requestState: try string(required["requestState"]), action: "accept", confirm: true)
     let structured = try object(try object(completed["result"])["structuredContent"])
-    #expect(try object(structured["verification"])["verified"] != nil)
+    #expect(try object(structured["verification"])["verified"] != nil, "\(structured)")
     let after = try await runtime.observe()
     #expect(after.elements.first?.value?.segments.first?.text == value)
+    #expect(
+      after.elements.first?.locatorRecipe.semanticIdentity
+        == original.locatorRecipe.semanticIdentity)
+  }
+
+  @Test(
+    "Fill refuses noneditable wrappers and sensitive roleless editors before confirmation",
+    arguments: [
+      "<div tabindex='0' style='width:400px;height:120px'><div contenteditable='true'>Draft</div></div>",
+      "<div contenteditable='false' tabindex='0' style='width:400px;height:120px'>Draft</div>",
+      "<div contenteditable='true' name='password' style='width:400px;height:120px'>Draft</div>",
+    ])
+  func rolelessFillRefusals(html: String) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      html, baseURL: URL(string: "https://example.test/beta"),
+      timeout: .seconds(5), quietWindow: .milliseconds(40))
+    let server = WebKitMCPServer(registry: registry)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString)
+      ])
+    let observedResult = try #require(observed["result"], "\(observed)")
+    let structured = try #require(
+      try object(observedResult)["structuredContent"], "\(observedResult)")
+    let observation = try object(structured)
+    let rows = try #require(observation["elements"], "\(observation)")
+    let elements = try array(rows).map { try object($0) }
+    let element = try #require(
+      elements.first {
+        html.contains("password")
+          ? $0["sensitive"] == .bool(true) : $0["contentEditable"] != .bool(true)
+      }, "\(elements)")
+    let result = try await toolCall(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": observation["observationID"]!,
+        "element_id": element["elementID"]!,
+        "operation": .string("fill"), "value": .string("Replacement"),
+        "approval_mode": .string("mcp"), "idempotency_key": .string("refused-roleless-fill"),
+      ])
+    let error = try #require(result["error"], "\(result)")
+    #expect(try object(error)["code"] == .int(-32602))
+    #expect(result["result"] == nil)
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.body.textContent") as? String
+        == "Draft")
   }
 
   @Test("A native submit control requires submit and verifies its postcondition")
@@ -3258,7 +4635,11 @@ struct MCPServerTests {
         ]),
       ])
     let error = try object(attempted["error"])
-    #expect(try string(error["message"]).contains("postcondition_baseline_incomplete"))
+    let message = try string(error["message"])
+    #expect(message.contains("postcondition_baseline_incomplete"))
+    #expect(message.contains("do not retry the same global condition"))
+    #expect(message.contains("heading_contains"))
+    #expect(message.contains("target-local state"))
     #expect(presenter.requests.isEmpty)
   }
 
@@ -4113,7 +5494,8 @@ struct MCPServerTests {
     )
     #expect(try object(legacy["result"])["isError"] == .bool(true))
     #expect(confirmationPresenter.requests.count == 1)
-    #expect(confirmationPresenter.requests.first?.title == "Approve Web Navigation")
+    #expect(
+      confirmationPresenter.requests.first?.title.hasPrefix("Approve Web Navigation [") == true)
     #expect(
       confirmationPresenter.requests.first?.message.contains("https://example.com/account") == true)
   }
@@ -4143,7 +5525,7 @@ struct MCPServerTests {
     #expect(startResult["remaining_navigations"] == .int(30))
     #expect(startResult["hard_stops_enforced"] == .bool(true))
     #expect(presenter.requests.count == 1)
-    #expect(presenter.requests[0].title == "Delegate Browser Goal")
+    #expect(presenter.requests[0].title.hasPrefix("Delegate Browser Goal ["))
 
     let status = try await toolCall(
       server, id: 2, name: "browser_session",
@@ -4192,7 +5574,7 @@ struct MCPServerTests {
       ])
     #expect(try object(denied["result"])["isError"] == .bool(true))
     #expect(presenter.requests.count == 2)
-    #expect(presenter.requests[1].title == "Approve Web Navigation")
+    #expect(presenter.requests[1].title.hasPrefix("Approve Web Navigation ["))
 
     let status = try await toolCall(
       server, id: 3, name: "browser_session",
@@ -4227,7 +5609,8 @@ struct MCPServerTests {
     let result = try object(denied["result"])
     #expect(result["isError"] == .bool(true))
     #expect(confirmationPresenter.requests.count == 1)
-    #expect(confirmationPresenter.requests.first?.title == "Approve Web Navigation")
+    #expect(
+      confirmationPresenter.requests.first?.title.hasPrefix("Approve Web Navigation [") == true)
     #expect(
       confirmationPresenter.requests.first?.message.contains("https://example.com/account")
         == true)
@@ -4859,6 +6242,141 @@ struct MCPServerTests {
     #expect(after["handoff_resume_token_active"] == .bool(true))
   }
 
+  @Test(
+    "Privacy-failed resume preserves navigation confirmation and filtering",
+    arguments: ["async", "legacy", "roundtrip"])
+  func privacyFailedResumeRecovery(protocolMode: String) async throws {
+    let fixture = try HistoryFixtureServer()
+    let registry = try WebKitSessionRegistry(runtimeFactory: { _ in
+      WebKitRuntime(
+        websiteDataStore: .nonPersistent(), egressProxy: nil,
+        managesApplicationActivationPolicy: false)
+    })
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    let source = URL(string: "http://127.0.0.1:\(fixture.port)/first")!
+    _ = try await runtime.loadHTML(
+      "<button onclick='document.body.dataset.writes=1'>Save</button><input type='password'>",
+      baseURL: source, timeout: .seconds(10), quietWindow: .milliseconds(40))
+    let presenter = ConfirmationPresenterStub(
+      responses: protocolMode == "legacy" ? [true, false, true] : [false, true])
+    let server = WebKitMCPServer(
+      registry: registry, presentHumanWindows: false,
+      confirmationPresenter: presenter)
+    let session = JSONValue.string(handle.rawValue.uuidString)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": session])
+    let old = try object(try object(observed["result"])["structuredContent"])
+    let target = try elementID(in: old, named: "Save")
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('input').value='private-canary-'.repeat(6000)")
+    let handoff: [String: JSONValue] = ["operation": .string("handoff"), "session_id": session]
+    var token: String?
+    var state: String?
+    if protocolMode == "legacy" {
+      _ = try await legacyToolCall(server, id: 2, name: "browser_session", arguments: handoff)
+    } else if protocolMode == "roundtrip" {
+      let started = try await toolCall(server, id: 2, name: "browser_session", arguments: handoff)
+      state = try string(try object(started["result"])["requestState"])
+    } else {
+      let started = try await toolCall(
+        server, id: 2, name: "browser_session",
+        arguments: ["operation": .string("handoff_start"), "session_id": session])
+      token = try string(
+        try object(try object(started["result"])["structuredContent"])["resume_token"])
+    }
+    try runtime.markHumanStepCompleted()
+    let resumed: [String: JSONValue]
+    if protocolMode == "legacy" {
+      resumed = try await legacyToolCall(server, id: 3, name: "browser_session", arguments: handoff)
+    } else if let state {
+      resumed = try await roundTripToolCall(
+        server, id: 3, name: "browser_session",
+        arguments: handoff, requestState: state, action: "accept", confirm: true)
+    } else {
+      resumed = try await toolCall(
+        server, id: 3, name: "browser_session",
+        arguments: [
+          "operation": .string("handoff_resume"), "session_id": session,
+          "resume_token": .string(try #require(token)), "maximum_elements": .int(5),
+        ])
+    }
+    let result = try object(try object(resumed["result"])["structuredContent"])
+    #expect(try object(resumed["result"])["isError"] != .bool(true))
+    #expect(result["resumed"] == .bool(true))
+    #expect(result["control_state"] == .string("agent_controlled"))
+    #expect(result["status"] == .string("resumed_observation_unavailable"))
+    #expect(result["observation"] == .null)
+    #expect(result["observation_available"] == .bool(false))
+    #expect(result["action_replayed"] == .bool(false))
+    #expect(result["remote_save_verified"] == .bool(false))
+    #expect(try object(result["privacy_budget"])["category"] == .string("characters"))
+    #expect(try object(result["privacy_budget"])["limit"] == .int(65536))
+    if let token { #expect(!registry.handoffResumeCapabilityIsActive(token, for: handle)) }
+    #expect(!registry.hasActiveHandoffResumeCapability(for: handle))
+    #expect(
+      !String(decoding: try JSONEncoder().encode(resumed), as: UTF8.self).contains("private-canary")
+    )
+    let filtered = try await toolCall(
+      server, id: 4, name: "browser_observe", arguments: ["session_id": session])
+    #expect(
+      try object(try object(filtered["result"])["structuredContent"])["code"]
+        == .string("privacy_scan_limit_exceeded"))
+    let stale = try await toolCall(
+      server, id: 5, name: "browser_act",
+      arguments: [
+        "session_id": session, "observation_id": old["observationID"]!,
+        "element_id": .string(target),
+        "operation": .string("click"), "approval_mode": .string("native"),
+        "idempotency_key": .string("privacy-recovery-stale"),
+        "postcondition": .object([
+          "type": .string("semantic_text_appears"), "value": .string("Saved"),
+        ]),
+      ])
+    if stale["error"] == nil {
+      #expect(try object(stale["result"])["isError"] == .bool(true))
+    }
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.body.dataset.writes || '0'") as? String
+        == "0")
+    let destination = "https://recovery.fixture.invalid/second"
+    let navigation: [String: JSONValue] = [
+      "session_id": session, "url": .string(destination), "approval_mode": .string("native"),
+      "timeout_ms": .int(100), "quiet_window_ms": .int(20),
+    ]
+    let countBefore = presenter.requests.count
+    let declined = try await toolCall(
+      server, id: 6, name: "browser_navigate", arguments: navigation)
+    #expect(try object(declined["result"])["isError"] == .bool(true))
+    #expect(runtime.webView.url == source)
+    #expect(presenter.requests.count == countBefore + 1)
+    _ = try await toolCall(server, id: 7, name: "browser_navigate", arguments: navigation)
+    #expect(presenter.requests.count == countBefore + 2)
+    #expect(presenter.requests.last?.message.contains(destination) == true)
+    #expect(runtime.interactionControlState() == .agentControlled)
+    #expect(runtime.latestNavigationAuditEvent()?.toOrigin == "https://recovery.fixture.invalid")
+    #expect(runtime.latestNavigationAuditEvent()?.actor == .agentNavigation)
+    // The public API intentionally refuses loopback destinations. The reserved
+    // .invalid destination above tests confirmed dispatch without a third-party
+    // request. Use the runtime fixture transport to verify a completed navigation.
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(fixture.port)/second")!,
+      timeout: .seconds(10), quietWindow: .milliseconds(40), constrainToInitialOrigin: true)
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.body.insertAdjacentHTML('beforeend', '<input name=password type=password value=private-canary-filter><p>private-canary-filter</p>')"
+    )
+    let fresh = try await toolCall(
+      server, id: 8, name: "browser_observe", arguments: ["session_id": session])
+    #expect(try object(fresh["result"])["isError"] != .bool(true))
+    #expect(
+      !String(decoding: try JSONEncoder().encode(fresh), as: UTF8.self).contains(
+        "private-canary-filter"))
+    #expect(
+      try object(try object(fresh["result"])["structuredContent"])["observationID"]
+        != old["observationID"])
+  }
+
   @Test("Non-blocking handoff survives a transport reconnect and consumes its token once")
   func nonBlockingHandoffLifecycle() async throws {
     let registry = try WebKitSessionRegistry()
@@ -4896,6 +6414,11 @@ struct MCPServerTests {
     #expect(poll["resume_token_state"] == .string("active"))
     #expect(poll["ready_for_resume_request"] == .bool(false))
     #expect(poll["human_step_completed"] == .bool(false))
+    #expect(poll["human_navigation_completed"] == .bool(false))
+    // A navigation completion is a hint only, even when the page looks finished.
+    runtime.webView(runtime.webView, didFinish: nil)
+    #expect(runtime.humanControlNavigationCompleted)
+    #expect(runtime.interactionControlState() == .humanControlled)
 
     let declined = try await toolCall(
       reconnectedServer, id: 3, name: "browser_session",
@@ -5231,6 +6754,71 @@ struct MCPServerTests {
         == .string(
           "Unlock this Mac and retry from an interactive session using the authentication method offered by macOS. Closed-lid availability is device-specific and is not inferred."
         ))
+  }
+
+  @Test(
+    "Credential failures preserve safe recovery categories without leaking errors",
+    arguments: ["unavailable", "timeout", "invalid", "unexpected", "provider"])
+  func siliconPassFailureRecovery(_ failure: String) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    _ = try await runtime.loadHTML(
+      "<input id='u' autocomplete='username'><input id='p' type='password' autocomplete='current-password'>",
+      baseURL: URL(string: "https://fixture.invalid/login"),
+      timeout: .seconds(2), quietWindow: .milliseconds(40))
+    let error: Error?
+    let expectedCode: String
+    switch failure {
+    case "unavailable":
+      error = CredentialBrokerClientError.transport(stage: .request, code: .unavailable)
+      expectedCode = "unavailable"
+    case "timeout":
+      error = CredentialBrokerClientError.transport(stage: .delivery, code: .timedOut)
+      expectedCode = "timed_out"
+    case "invalid":
+      error = CredentialBrokerClientError.transport(stage: .delivery, code: .invalidReply)
+      expectedCode = "invalid_reply"
+    case "provider":
+      error = nil
+      expectedCode = "provider_failed"
+    default:
+      error = NSError(
+        domain: "private-error-canary", code: 7,
+        userInfo: [NSLocalizedDescriptionKey: "private-error-canary"])
+      expectedCode = "unexpected_failure"
+    }
+    let server = WebKitMCPServer(
+      registry: registry,
+      credentialBroker: FixedStatusCredentialBrokerStub(status: .failed, error: error))
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": .string(handle.rawValue.uuidString)])
+    let observation = try object(try object(observed["result"])["structuredContent"])
+    let response = try await toolCall(
+      server, id: 2, name: "browser_fill_siliconpass",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString),
+        "observation_id": .string(try string(observation["observationID"])),
+        "username_element_id": .string("e1"), "password_element_id": .string("e2"),
+      ])
+    let result = try object(try object(response["result"])["structuredContent"])
+    #expect(try object(response["result"])["isError"] == .bool(true))
+    #expect(result["code"] == .string("credential_broker_" + expectedCode))
+    #expect(try string(result["recovery"]).contains("operation=handoff_start"))
+    #expect(result["requires_human_handoff"] == .bool(true))
+    #expect(result["automatic_retry"] == .bool(false))
+    #expect(result["retryable"] == .bool(false))
+    #expect(result["secret_released_to_mcp"] == .bool(false))
+    #expect(
+      result["sink_delivery_state"] == .string(failure == "unavailable" ? "not_started" : "unknown")
+    )
+    #expect(
+      !String(decoding: try JSONEncoder().encode(response), as: UTF8.self).contains(
+        "private-error-canary"))
+    #expect(
+      try await runtime.webView.evaluateJavaScript("JSON.stringify([u.value,p.value])") as? String
+        == "[\"\",\"\"]")
   }
 
   @Test("Malformed requests and tool arguments fail at the right boundary")
@@ -5576,6 +7164,9 @@ struct MCPServerTests {
     let structured = try object(try object(response["result"])["structuredContent"])
 
     #expect(structured["historyOperation"] == .string("back"))
+    #expect(structured["readiness_scope"] == .string("document_completion_and_mutation_quiescence"))
+    #expect(structured["business_readiness"] == .string("not_verified"))
+    #expect(structured["remote_persistence_verified"] == .bool(false))
     #expect(structured["observationInvalidated"] == .bool(true))
     #expect(runtime.webView.url?.path == "/first")
     #expect(presenter.requests.count == 1)

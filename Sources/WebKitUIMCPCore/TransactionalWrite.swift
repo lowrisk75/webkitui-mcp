@@ -8,12 +8,23 @@ public enum ObservationCompleteness: String, Codable, Sendable {
 
 public struct TransactionObservation: Sendable {
   public let state: CanonicalObservationState
+  /// Structural completeness: every element was discovered and returned. It decides
+  /// whether an absent entry proves absence.
   public let completeness: ObservationCompleteness
+  /// Field text was returned whole. A text that was cut at the character bound can hide
+  /// the expected words, so a negative text conclusion needs this as well.
+  public let textComplete: Bool
 
-  public init(state: CanonicalObservationState, completeness: ObservationCompleteness) {
+  public init(
+    state: CanonicalObservationState, completeness: ObservationCompleteness,
+    textComplete: Bool = true
+  ) {
     self.state = state
     self.completeness = completeness
+    self.textComplete = textComplete
   }
+
+  var textIsComplete: Bool { completeness == .complete && textComplete }
 }
 
 public enum PredicateResult: String, Codable, Equatable, Sendable {
@@ -100,21 +111,21 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
       return try Self.digest(of: value) == expectedDigest ? .satisfied : .unsatisfied
     case .entryTextDigest(let key, let expectedDigest):
       guard let value = values[key] else {
-        return observation.completeness == .complete ? .unsatisfied : .unknown
+        return observation.textIsComplete ? .unsatisfied : .unknown
       }
       let text = value.segments.map(\.text).joined()
       let digest = Self.textDigest(of: text)
       return digest == expectedDigest ? .satisfied : .unsatisfied
     case .entryTextNotDigest(let key, let previousDigest):
       guard let value = values[key] else {
-        return observation.completeness == .complete ? .unsatisfied : .unknown
+        return observation.textIsComplete ? .unsatisfied : .unknown
       }
       let text = value.segments.map(\.text).joined()
       let digest = Self.textDigest(of: text)
       return digest != previousDigest ? .satisfied : .unsatisfied
     case .entryTextPrefixDigest(let key, let expectedDigest, let expectedLength):
       guard let value = values[key] else {
-        return observation.completeness == .complete ? .unsatisfied : .unknown
+        return observation.textIsComplete ? .unsatisfied : .unknown
       }
       let bytes = Array(value.segments.map(\.text).joined().utf8)
       guard bytes.count >= expectedLength else { return .unsatisfied }
@@ -128,7 +139,7 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
         return Self.textDigest(of: text) == expectedDigest
       }
       if found { return .satisfied }
-      return observation.completeness == .complete ? .unsatisfied : .unknown
+      return observation.textIsComplete ? .unsatisfied : .unknown
     case .anyEntryTextContainsDigest(
       let fields, let expectedDigest, let expectedLength, let expectedRolling):
       let allowedFields = Set(fields.map(\.rawValue))
@@ -152,7 +163,7 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
             &+ UInt64(bytes[offset + expectedLength]) &+ 1
         }
       }
-      return observation.completeness == .complete ? .unsatisfied : .unknown
+      return observation.textIsComplete ? .unsatisfied : .unknown
     }
   }
 }

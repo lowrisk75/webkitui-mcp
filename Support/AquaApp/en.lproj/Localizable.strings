@@ -199,3 +199,36 @@
 "Agent in control" = "Agent in control";
 "%ld more active" = "%ld more active";
 "The sign-in form changed before SiliconPass could fill it. Try again." = "The sign-in form changed before SiliconPass could fill it. Try again.";
+"Save Browser Download" = "Save Browser Download";
+"Save" = "Save";
+"Choose a folder, then click Save. Download completion will be verified separately." = "Choose a folder, then click Save. Download completion will be verified separately.";
+"Find in Page" = "Find in Page";
+"Previous Match" = "Previous Match";
+"Next Match" = "Next Match";
+"Match Found" = "Match Found";
+"No Match" = "No Match";
+"Search Unavailable" = "Search Unavailable";
+"Always Allow…" = "Always Allow…";
+"Navigation — this session" = "Navigation — this session";
+"Navigation — remember for this site" = "Navigation — remember for this site";
+"Navigation + clicks/typing — this session" = "Navigation + clicks/typing — this session";
+"Navigation + clicks/typing — remember for this site" = "Navigation + clicks/typing — remember for this site";
+"Revoke Remembered Site Permissions" = "Revoke Remembered Site Permissions";
+"Site permissions revoked" = "Site permissions revoked";
+"Session and permanent permissions were cleared. Future actions will ask again." = "Session and permanent permissions were cleared. Future actions will ask again.";
+"Could not clear remembered site permissions" = "Could not clear remembered site permissions";
+"Do not continue automation until permissions have been cleared." = "Do not continue automation until permissions have been cleared.";
+"Remembered permission scope:" = "Remembered permission scope:";
+"Browser profile:" = "Browser profile:";
+"Navigation + clicks/typing can send, modify or delete data. The site may not disclose these effects." = "Navigation + clicks/typing can send, modify or delete data. The site may not disclose these effects.";
+"Session permissions apply only to this client and session. Permanent permissions apply to ALL agents using this browser profile." = "Session permissions apply only to this client and session. Permanent permissions apply to ALL agents using this browser profile.";
+"Downloads, uploads, native form submissions, authentication and control transfers still require separate approval." = "Downloads, uploads, native form submissions, authentication and control transfers still require separate approval.";
+"Revoke permissions from the WebKitUI MCP application menu. Cancel or Approve Once does not remember anything." = "Revoke permissions from the WebKitUI MCP application menu. Cancel or Approve Once does not remember anything.";
+
+"Navigation finished. If your step is complete, select Done — Return Control." = "Navigation finished. If your step is complete, select Done — Return Control.";
+
+"CAPTCHA / accessibility" = "CAPTCHA / accessibility";
+
+"Focus website" = "Focus website";
+
+"Solve the CAPTCHA yourself on the website. Use Tab and Shift-Tab to reach its controls, then Return or Space. If offered, choose the site's audio or accessibility option; audio availability depends on the provider. If it fails, use the site's help or contact support. The agent does not read, transcribe or solve the challenge. When the site confirms completion, select Done — Return Control." = "Solve the CAPTCHA yourself on the website. Use Tab and Shift-Tab to reach its controls, then Return or Space. If offered, choose the site's audio or accessibility option; audio availability depends on the provider. If it fails, use the site's help or contact support. The agent does not read, transcribe or solve the challenge. When the site confirms completion, select Done — Return Control.";

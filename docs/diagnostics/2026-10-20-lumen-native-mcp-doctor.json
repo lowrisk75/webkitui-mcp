@@ -1,0 +1,33 @@
+{
+  "commercialLicense": {
+    "requiredForPermittedEvaluation": false,
+    "state": "none"
+  },
+  "credentialAuthorization": {
+    "available": false,
+    "biometry": "none",
+    "closedLidBehavior": "not_inferred_check_locally",
+    "errorCode": "4099",
+    "macOSFallback": "system_managed_device_owner_authentication",
+    "policy": "device_owner_authentication",
+    "requiredAction": "Run from an unlocked interactive Mac session and complete the authentication method offered by macOS. Closed-lid availability must be checked on this Mac.",
+    "unavailableBehavior": "fail_closed_without_secret_release_or_automatic_retry"
+  },
+  "nativeConfirmation": {
+    "expectedPlacement": "beside_webkitui_mcp_executable",
+    "helperAvailable": true,
+    "requiredAction": null
+  },
+  "ok": true,
+  "privacy": {
+    "browserDataRead": false,
+    "credentialsRead": false,
+    "networkRequestMade": false
+  },
+  "readiness": "ready_without_siliconpass_fill",
+  "runtime": {
+    "architecture": "arm64",
+    "macOS": "Version 27.0.1 (assemblage 26A434)"
+  }
+}
+

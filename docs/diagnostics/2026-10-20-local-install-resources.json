@@ -1,0 +1,36 @@
+{
+  "root": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7",
+  "resources": {
+    "root": "5044306D-F4DE-4319-ACDA-F7C31DB67BE7",
+    "source": "290EB9A3-81AC-4468-A2CB-B5C514AE56B5",
+    "build": "DB1205A3-73FB-470F-B809-483C13314CEB",
+    "package": "0C2D3682-0BEE-41E2-91AE-4427C6B05762",
+    "sign": "DD0710EE-4D59-402F-8219-B05F22414F8A",
+    "verify1": "45F2336A-DD67-4712-9311-B1552B4A2755",
+    "verify2": "672A13B5-A162-4583-99E4-1BA08204E55C",
+    "dependency": "8A480E17-5D1D-49F9-9B20-FC585FE221A7"
+  },
+  "source": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-290EB9A3-81AC-4468-A2CB-B5C514AE56B5",
+  "build": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-DB1205A3-73FB-470F-B809-483C13314CEB",
+  "package": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-0C2D3682-0BEE-41E2-91AE-4427C6B05762",
+  "sign": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-DD0710EE-4D59-402F-8219-B05F22414F8A",
+  "verify1": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-45F2336A-DD67-4712-9311-B1552B4A2755",
+  "verify2": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-672A13B5-A162-4583-99E4-1BA08204E55C",
+  "dependency": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-8A480E17-5D1D-49F9-9B20-FC585FE221A7",
+  "final_states": {
+    "root": "released",
+    "source": "released",
+    "build": "released",
+    "package": "released",
+    "sign": "released",
+    "verify1": "released",
+    "verify2": "released",
+    "dependency": "released"
+  },
+  "retained_production_broker": {
+    "pid": 7217,
+    "resource_id": "EAD78147-E609-46D9-B6EC-39FFA0750B9F",
+    "state": "retained",
+    "purpose": "Installed production broker; do not stop as mission cleanup"
+  }
+}

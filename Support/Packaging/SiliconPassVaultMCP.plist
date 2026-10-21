@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>ConnectorIdentifier</key>
+	<string>com.lorislab.siliconpass.vault-mcp</string>
+	<key>ConnectorInputSHA256</key>
+	<string>867ad2e359ef61c2e861e232afc240427a7e8fb5e008b78d29cbdc23f9e57efd</string>
+	<key>ConnectorTextSHA256</key>
+	<string>35b5b4aaf4aa3e2ccc00ed1e2bac2f8993b003f14929ff1de1ed4327cbb3810f</string>
+	<key>ConnectorVersion</key>
+	<string>0.3.0</string>
+	<key>ExpectedTeamIdentifier</key>
+	<string>TDV6D5L785</string>
+	<key>ManagerBuild</key>
+	<string>22</string>
+	<key>ManagerBundleIdentifier</key>
+	<string>com.lorislab.siliconpass.credential-broker-manager</string>
+	<key>ManagerVersion</key>
+	<string>0.2.5</string>
+	<key>SchemaVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>

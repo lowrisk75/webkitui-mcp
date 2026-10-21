@@ -1,0 +1,29 @@
+{
+  "verified_root_identity": [
+    16777244,
+    43165918,
+    1792503870
+  ],
+  "removed_mission_root": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052",
+  "source_archive": "/Users/kevin/GitHub/webkitui-mcp/dist/local-0.6.42-745E07FF/source-snapshot-0.6.42.tar.gz",
+  "source_archive_sha256": "9bd33f5218aa9389b0d225e64b32256b9e848281d83f4558a64f4469402717e1",
+  "installed_service_retained_pid": 68230,
+  "rollback_retained": "/Users/kevin/GitHub/webkitui-mcp/dist/local-0.6.42-745E07FF/rollback/WebKitUI MCP.app",
+  "other_mission_resources_touched": false,
+  "verified_directory_resource_ids": [
+    "21959C6C-2621-43A7-9B51-8AC335138AAF",
+    "32D90D9B-B20A-4CA8-A1C9-F99DE7972052",
+    "496C242C-A95C-490B-A4E6-3C934A57CF78",
+    "622AD528-9A14-49B3-A6E7-7CB2BC5CA8BB",
+    "716D3A31-2CDC-4EBE-ACC4-0A218ADF980F",
+    "84357A79-391A-47E2-A6BD-A652F75C0EDA",
+    "924E039E-B23F-4277-861B-4ACE5F3387F8",
+    "BC05A8F6-3655-4647-AD2F-76DFFD198EA1",
+    "C25EF3A8-3E8E-42FA-8AEF-D66E7619B646",
+    "D269C554-7E04-4EB7-8DBD-47FF6ED20A20",
+    "F7AB9E38-F5C3-4608-A9E4-1CBAEA845C1A",
+    "FF0DF453-F157-4789-9E7C-76900B4DA5CD"
+  ],
+  "siliconpass_production_pid_retained": 25762,
+  "siliconpass_evidence": "/Users/kevin/GitHub/webkitui-mcp/dist/siliconpass-apple-origin-20261020"
+}

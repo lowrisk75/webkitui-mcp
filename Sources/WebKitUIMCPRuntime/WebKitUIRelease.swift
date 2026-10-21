@@ -1,4 +1,4 @@
 public enum WebKitUIRelease {
-  public static let version = "0.6.24"
-  public static let build = "624"
+  public static let version = "0.6.42"
+  public static let build = "642"
 }

@@ -10,7 +10,8 @@ app=$1
 expected_team=$2
 workspace_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 scratch_dir=$(mktemp -d /private/tmp/webkitui-pre-notary-verify.XXXXXX)
-trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
+printf 'RESOURCE_CREATED=signature-verification-stage:%s\n' "$scratch_dir"
+trap 'rm -rf "$scratch_dir"; printf "RESOURCE_REMOVED=signature-verification-stage:%s\n" "$scratch_dir"' EXIT HUP INT TERM
 version=$(plutil -extract CFBundleShortVersionString raw \
   "$workspace_dir/Support/AquaApp/Info.plist")
 build=$(plutil -extract CFBundleVersion raw "$workspace_dir/Support/AquaApp/Info.plist")
@@ -18,6 +19,9 @@ broker="$app/Contents/MacOS/webkitui-mcp-aqua-broker"
 helper="$app/Contents/MacOS/webkitui-mcp-confirm"
 embedded_relay="$app/Contents/MacOS/webkitui-mcp-relay"
 resources="$app/Contents/Resources"
+siliconpass_connector="$resources/CredentialBroker/siliconpass-vault-mcp"
+siliconpass_bundle="$resources/CredentialBroker/SiliconPass_SiliconPassCredentialBroker.bundle"
+siliconpass_policy="$resources/SiliconPassVaultMCP.plist"
 licensing_bundle="$resources/WebKitUIMCP_WebKitUIMCPLicensing.bundle"
 provenance="$resources/ReleaseProvenance.plist"
 source_manifest="$resources/SOURCE-MANIFEST.sha256"
@@ -26,6 +30,7 @@ test -d "$app"
 test -x "$broker"
 test -x "$helper"
 test -x "$embedded_relay"
+test -x "$siliconpass_connector"
 test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = \
   "com.lorislab.webkitui-mcp.aqua"
 test "$(plutil -extract CFBundleDisplayName raw "$app/Contents/Info.plist")" = "WebKitUI MCP"
@@ -38,7 +43,7 @@ plutil -lint "$app/Contents/Info.plist" "$resources/PrivacyInfo.xcprivacy" "$pro
 for required in \
   LICENSE LICENSING.md THIRD_PARTY_NOTICES.md RELEASE-MAINTENANCE.md \
   NETWORK-BOUNDARY.md sbom.cdx.json \
-  ReleaseProvenance.plist SOURCE-MANIFEST.sha256; do
+  ReleaseProvenance.plist SOURCE-MANIFEST.sha256 SiliconPassVaultMCP.plist; do
   test -s "$resources/$required"
 done
 test "$(plutil -extract SchemaVersion raw "$provenance")" = "2"
@@ -56,10 +61,18 @@ test -n "$(plutil -extract XcodeVersion raw "$provenance")"
 test -n "$(plutil -extract SDKVersion raw "$provenance")"
 printf '%s\n' "$(plutil -extract SourceEpoch raw "$provenance")" | grep -Eq '^[0-9]+$'
 for field in \
-  UnsignedBrokerSHA256 UnsignedConfirmationHelperSHA256 UnsignedEmbeddedRelaySHA256; do
+  UnsignedBrokerSHA256 UnsignedConfirmationHelperSHA256 UnsignedEmbeddedRelaySHA256 \
+  SiliconPassMCPInputSHA256; do
   printf '%s\n' "$(plutil -extract "$field" raw "$provenance")" \
     | grep -Eq '^[0-9a-f]{64}$'
 done
+test "$(plutil -extract SiliconPassConnectorVersion raw "$provenance")" = \
+  "$(plutil -extract ConnectorVersion raw "$siliconpass_policy")"
+test "$(plutil -extract SiliconPassManagerVersion raw "$provenance")" = \
+  "$(plutil -extract ManagerVersion raw "$siliconpass_policy")"
+test "$(plutil -extract SiliconPassManagerBuild raw "$provenance")" = \
+  "$(plutil -extract ManagerBuild raw "$siliconpass_policy")"
+cmp "$siliconpass_policy" "$workspace_dir/Support/Packaging/SiliconPassVaultMCP.plist"
 manifest_sha=$(shasum -a 256 "$source_manifest" | awk '{print $1}')
 test "$manifest_sha" = \
   "$(plutil -extract SourceManifestSHA256 raw "$provenance")"
@@ -92,12 +105,14 @@ jq -e \
   --arg broker "$(plutil -extract UnsignedBrokerSHA256 raw "$provenance")" \
   --arg helper "$(plutil -extract UnsignedConfirmationHelperSHA256 raw "$provenance")" \
   --arg relay "$(plutil -extract UnsignedEmbeddedRelaySHA256 raw "$provenance")" \
+  --arg siliconpass "$(plutil -extract SiliconPassMCPInputSHA256 raw "$provenance")" \
   '
     .metadata.supplier.name == "LorisLabs"
     and (.metadata.tools.components | length > 0)
     and .components[0].hashes[0].content == $broker
     and .components[1].hashes[0].content == $helper
     and .components[2].hashes[0].content == $relay
+    and .components[3].hashes[0].content == $siliconpass
   ' "$resources/sbom.cdx.json" >/dev/null
 test -s "$resources/AppIcon.icns"
 file "$resources/AppIcon.icns" | grep -q 'Mac OS X icon'
@@ -107,6 +122,8 @@ test -s "$licensing_bundle/Contents/Resources/lorislabs-license-public.pem"
 file "$broker" | grep -q 'arm64'
 file "$helper" | grep -q 'arm64'
 file "$embedded_relay" | grep -q 'arm64'
+"$workspace_dir/scripts/verify-siliconpass-vault-mcp.sh" \
+  "$siliconpass_connector" "$siliconpass_bundle" "$siliconpass_policy" embedded
 otool -L "$broker" | grep -q '/ServiceManagement.framework/'
 
 setup_command=$("$broker" --print-setup-command)
@@ -116,7 +133,7 @@ printf '%s\n' "$setup_command" | grep -Fq \
 codesign --verify --deep --strict --all-architectures --verbose=2 "$app"
 
 entitlement_index=0
-for code in "$app" "$broker" "$helper" "$embedded_relay"; do
+for code in "$app" "$broker" "$helper" "$embedded_relay" "$siliconpass_connector"; do
   details=$(codesign -dv --verbose=4 "$code" 2>&1)
   printf '%s\n' "$details" | grep -q "TeamIdentifier=$expected_team"
   printf '%s\n' "$details" | grep -q 'Authority=Developer ID Application:'
@@ -139,23 +156,30 @@ done
 app_details=$(codesign -dv --verbose=4 "$app" 2>&1)
 printf '%s\n' "$app_details" | grep -q 'Sealed Resources version='
 
+node "$workspace_dir/scripts/verify-confirmation-event-loop.mjs" "$helper"
+node "$workspace_dir/scripts/verify-confirmation-refocus.mjs" "$helper"
+for permission_mode in session-only persistent; do
+  "$helper" --verify-permission-menu "$permission_mode" \
+    | jq -e '.permission_menu_verified == true and .default_grant == false and .input_posted == false' >/dev/null
+done
+printf '%s\n' 'Permission menu layout/key loop passed; no input or grant created.'
+
 # Every check above passed on a build whose confirmation helper died on launch:
 # AppKit throws on a window collection behavior naming two mutually exclusive
 # flags, so the panel never drew and no navigation could ever be approved. A
 # signature says nothing about whether the thing runs. Start it for real.
 confirmation_probe="$scratch_dir/confirmation-probe.json"
-cat > "$confirmation_probe" <<'PROBE'
-{"title":"Pre-notarization probe","message":"Destination: https://example.invalid/","approveLabel":"Navigate"}
-PROBE
+probe_request_id=$(uuidgen)
+jq -n --arg requestID "$probe_request_id" \
+  '{requestID: $requestID, title: "Test local WebKitUI [LOCAL]", message: "Synthetic packaging check. No website or real action. Cancel this panel.", approveLabel: "Test only"}' \
+  > "$confirmation_probe"
 "$helper" --protocol-version 1 --request-stdin < "$confirmation_probe" \
-  >/dev/null 2>"$scratch_dir/confirmation-probe.err" &
+  >"$scratch_dir/confirmation-probe.out" 2>"$scratch_dir/confirmation-probe.err" &
 probe_pid=$!
+printf 'RESOURCE_CREATED=local-confirmation-probe:%s\n' "$probe_pid"
 probe_started=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
-# Up to three seconds: a panel still up has presented. One a person answered —
-# Navigate (0) or Cancel (2) — has presented too: nothing can be clicked before it is
-# drawn, and the keyboard is disarmed for its first second. Only an exit too fast for
-# a person, or any other status, means the helper died before drawing. A person
-# approving the probe used to fail the whole signed build.
+# Liveness alone is not presentation or human perception. Require the helper's
+# request/PID-bound metadata below; an exit status never grants browser authority.
 probe_presented=0
 probe_ticks=0
 while [ "$probe_ticks" -lt 30 ]; do
@@ -177,16 +201,25 @@ else
   if { [ "$probe_status" -eq 0 ] || [ "$probe_status" -eq 2 ]; } \
     && perl -e "exit(!($probe_elapsed >= 0.5))"; then
     probe_presented=1
-    printf '%s\n' \
-      "confirmation probe was answered by a person after ${probe_elapsed}s; it presented."
+    printf '%s\n' "confirmation helper returned a decision after ${probe_elapsed}s."
   fi
 fi
+printf 'RESOURCE_STOPPED=local-confirmation-probe:%s\n' "$probe_pid"
 if [ "$probe_presented" -ne 1 ]; then
   printf '%s\n' \
     "confirmation helper exited with ${probe_status:-?} instead of presenting a prompt:" >&2
   cat "$scratch_dir/confirmation-probe.err" >&2
   exit 1
 fi
+test "$(wc -c < "$scratch_dir/confirmation-probe.out")" -le 16384
+jq -se --arg id "$probe_request_id" --argjson pid "$probe_pid" '
+  length > 0 and length <= 32
+  and all(.[]; (.requestID | ascii_downcase) == ($id | ascii_downcase)
+    and .helperPID == $pid and .windowNumber > 0)
+  and any(.[]; .windowVisible == true and .appKitVisible == true
+    and .onActiveSpace == true and .intersectsScreen == true)
+' "$scratch_dir/confirmation-probe.out" >/dev/null
+printf '%s\n' "Bound native presentation metadata passed; human perception remains a separate gate."
 
 printf '%s\n' \
   "Pre-notarization verification passed for WebKitUI MCP $version ($build), Team $expected_team. No upload was performed."

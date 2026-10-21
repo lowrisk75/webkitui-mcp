@@ -3,7 +3,10 @@ import Foundation
 
 @main
 struct WebKitUIMCPRelay {
+  private static let originalParent = getppid()
+
   static func main() {
+    _ = originalParent
     signal(SIGPIPE, SIG_IGN)
     guard CommandLine.arguments.count == 2 else {
       diagnostic("relay requires one Unix socket path")
@@ -16,8 +19,10 @@ struct WebKitUIMCPRelay {
     // name and version were lost ("unknown-client" as lease holder) and the protocol
     // version was never negotiated on the new connection.
     var handshake: Data?
-    while let line = Swift.readLine() {
-      let request = Data((line + "\n").utf8)
+    var inputBuffer = Data()
+    while true {
+      let request: Data
+      do { request = try readLine(from: STDIN_FILENO, buffer: &inputBuffer) } catch { break }
       let identifier = requestIdentifier(in: request)
       let isHandshake = requestMethod(in: request) == "initialize"
       if isHandshake { handshake = request }
@@ -31,7 +36,7 @@ struct WebKitUIMCPRelay {
             // Replayed silently: the client already has its answer to this request.
             do {
               try writeAll(handshake, to: fresh)
-              _ = try readLine(from: fresh, buffer: &responseBuffer)
+              _ = try readLine(from: fresh, buffer: &responseBuffer, timeoutSeconds: 10)
             } catch {
               Darwin.close(fresh)
               descriptor = nil
@@ -64,7 +69,9 @@ struct WebKitUIMCPRelay {
       }
       guard identifier.present, let liveDescriptor = descriptor else { continue }
       do {
-        let response = try readLine(from: liveDescriptor, buffer: &responseBuffer)
+        let response = try readLine(
+          from: liveDescriptor, buffer: &responseBuffer,
+          timeoutSeconds: isHandshake ? 10 : nil)
         try writeAll(response, to: STDOUT_FILENO)
       } catch {
         Darwin.close(liveDescriptor)
@@ -74,7 +81,7 @@ struct WebKitUIMCPRelay {
           id: identifier,
           code: -32_098,
           message:
-            "WebKitUI MCP app restarted after dispatch; request outcome unknown and was not replayed"
+            "WebKitUI MCP response unavailable after dispatch; request outcome unknown and was not replayed"
         )
       }
     }
@@ -136,7 +143,10 @@ struct WebKitUIMCPRelay {
     }
   }
 
-  private static func readLine(from descriptor: Int32, buffer: inout Data) throws -> Data {
+  private static func readLine(
+    from descriptor: Int32, buffer: inout Data, timeoutSeconds: TimeInterval? = nil
+  ) throws -> Data {
+    let deadline = timeoutSeconds.map { ProcessInfo.processInfo.systemUptime + $0 }
     var chunk = [UInt8](repeating: 0, count: 16_384)
     while true {
       if let newline = buffer.firstIndex(of: 0x0A) {
@@ -144,6 +154,7 @@ struct WebKitUIMCPRelay {
         buffer.removeSubrange(...newline)
         return line
       }
+      try waitForInput(from: descriptor, deadline: deadline)
       let count = chunk.withUnsafeMutableBytes {
         Darwin.read(descriptor, $0.baseAddress, $0.count)
       }
@@ -151,6 +162,35 @@ struct WebKitUIMCPRelay {
       guard count > 0 else { throw RelayError.connectionLost }
       buffer.append(contentsOf: chunk.prefix(count))
       guard buffer.count <= 8 * 1_024 * 1_024 else { throw RelayError.frameTooLarge }
+    }
+  }
+
+  /// Observe the actual client lifetime while a broker reply or stdin is idle.
+  /// stdin EOF alone is not cancellation: piped clients may still await a reply.
+  private static func waitForInput(from descriptor: Int32, deadline: TimeInterval?) throws {
+    while true {
+      guard getppid() == originalParent else { throw RelayError.clientDisconnected }
+      if let deadline, ProcessInfo.processInfo.systemUptime >= deadline {
+        throw RelayError.responseTimedOut
+      }
+      // Darwin only reports a pipe's missing reader when write readiness is
+      // requested. Check separately so writable stdout cannot cause a busy loop.
+      var output = pollfd(fd: STDOUT_FILENO, events: Int16(POLLOUT), revents: 0)
+      let outputResult = poll(&output, 1, 0)
+      if outputResult < 0 && errno == EINTR { continue }
+      guard outputResult >= 0 else { throw RelayError.connectionLost }
+      let disconnected = Int16(POLLHUP | POLLERR | POLLNVAL)
+      guard output.revents & disconnected == 0 else {
+        throw RelayError.clientDisconnected
+      }
+      var descriptors = [pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)]
+      let result = poll(&descriptors, nfds_t(descriptors.count), 250)
+      if result < 0 && errno == EINTR { continue }
+      guard result >= 0 else { throw RelayError.connectionLost }
+      if descriptors[0].revents & Int16(POLLIN | POLLHUP) != 0 { return }
+      guard descriptors[0].revents & Int16(POLLERR | POLLNVAL) == 0 else {
+        throw RelayError.connectionLost
+      }
     }
   }
 
@@ -184,6 +224,8 @@ struct WebKitUIMCPRelay {
 }
 
 private enum RelayError: Error {
+  case clientDisconnected
+  case responseTimedOut
   case connectionLost
   case connectionFailed
   case frameTooLarge

@@ -284,6 +284,15 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   public let characterCount: Int?
   public let sensitive: Bool
   public let submitsForm: Bool
+  /// Measured DOM editability, including inherited editing and plaintext-only.
+  /// True only for editable targets; absent otherwise to preserve the wire budget
+  /// and compatibility with observations encoded before this field existed.
+  /// This is a target capability, never permission to bypass confirmation.
+  public var contentEditable: Bool? = nil
+  /// Measured scroll capability, never an invented ARIA role or click authority.
+  public var scrollable: Bool? = nil
+  /// DOM typing capability, not a promise of framework acceptance or persistence.
+  public var fillCapability: String? = nil
   public let disabled: Bool
   public let checked: Bool?
   public let selected: Bool?
@@ -402,6 +411,16 @@ public struct WebKitPermissionDenial: Codable, Equatable, Sendable {
   public let lastDeniedAtMonotonicNanoseconds: UInt64
 }
 
+/// Native-held scope: callers can obtain one only from a freshly observed dialog.
+/// Its physical identity is never serialized or accepted as an MCP argument.
+public struct WebKitObservationScope: Sendable {
+  public let scopeID: String
+  public fileprivate(set) var maximumElements = 200
+  public fileprivate(set) var maximumFieldCharacters = 4_096
+  fileprivate let documentID: String
+  fileprivate let physicalIdentity: String
+}
+
 public struct WebKitPageObservation: Codable, Equatable, Sendable {
   public let observationID: String
   public let generation: UInt64
@@ -424,13 +443,25 @@ public struct WebKitPageObservation: Codable, Equatable, Sendable {
   /// registered cross-origin frames are evaluated independently; failures and native
   /// registry overflow stay explicit so a partial page is never reported as complete.
   public let unreadableFrameCount: Int
-  /// Everything on this page was both returned and legible. Anything less has to be
-  /// said out loud, or an absence gets reported as a fact.
+  /// All discovered collector results were returned and legible. This does not
+  /// prove that every visible DOM control was discovered by the collector.
   public var isComplete: Bool {
-    !isPartial && semanticScopeFiltered != true && !semanticTextTruncated
+    isStructurallyComplete && !semanticTextTruncated
+  }
+  /// Every discovered element was returned and legible; only field text may have been
+  /// cut at the character bound. Whether a target exists, a dialog is open or a panel
+  /// is expanded does not depend on how long its text is, so a structural claim stays
+  /// answerable on a page whose sidebar or footer overflows the bound — App Store
+  /// Connect does on every page — while a claim about text content does not.
+  public var isStructurallyComplete: Bool {
+    !isPartial && semanticScopeFiltered != true
       && unreadableFrameCount == 0 && pendingDialog == nil
   }
   public let semanticTextTruncated: Bool
+  public var verificationScopeID: String? = nil
+  /// Scoped structural reads omit oversized aggregate duplicates, not leaf fields.
+  /// They cannot support semantic-text appearance/absence claims over that text.
+  public var aggregateTextOmitted: Bool? = nil
   public let crossOriginFramesOpaque: Bool
   /// Controls the raw DOM renders, counted independently of the semantic matcher.
   public let renderedInteractiveCount: Int
@@ -501,6 +532,11 @@ public struct WebKitScrollResult: Codable, Equatable, Sendable {
   public let reachedTop: Bool
   public let reachedBottom: Bool
   public let observationInvalidated: Bool
+  public var beforeX: Double? = nil
+  public var beforeY: Double? = nil
+  public var actualDeltaX: Double? = nil
+  public var actualDeltaY: Double? = nil
+  public var targetElementID: String? = nil
 }
 
 public struct WebKitTextRegion: Codable, Equatable, Sendable {
@@ -914,10 +950,33 @@ public struct WebKitSuppressedNewWindowRequest: Codable, Equatable, Sendable {
   // window whatever shape the site wanted it in.
 }
 
-/// AppKit keeps titled windows on a display, which would drag the offscreen layout
-/// host back into view. Declining the constraint is what lets the window stay parked
-/// outside every screen while WebKit still lays its content out.
+/// Bounded request-local download metadata. No page text, paths or credentials.
+public struct WebKitDownloadAttemptDiagnostics: Sendable {
+  public fileprivate(set) var stage = "target_resolution"
+  public fileprivate(set) var nativeDispatchAttempted = false
+  public fileprivate(set) var nativeGestureVerified = false
+  public fileprivate(set) var downloadStarted = false
+  public fileprivate(set) var navigationActionSeen = false
+  public fileprivate(set) var navigationResponseSeen = false
+  public fileprivate(set) var newWindowRequested = false
+  public fileprivate(set) var suppressedDataPreview = false
+  public fileprivate(set) var dataAttachmentRequested = false
+  public fileprivate(set) var newWindowSourceMainFrame = false
+  public fileprivate(set) var newWindowTargetAbsent = false
+  public fileprivate(set) var downloadWindowCreated = false
+  public fileprivate(set) var destinationSelectionStarted = false
+  public fileprivate(set) var pageURLChanged = false
+  public fileprivate(set) var mainFrameNavigationCommitted = false
+}
+
+/// AppKit keeps titled windows on a display. Declining that constraint keeps the
+/// layout host parked offscreen while WebKit still lays its content out.
 private final class UnconstrainedWindow: NSWindow {
+  var nativePageCommand: ((NSEvent) -> Bool)?
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    if nativePageCommand?(event) == true { return true }
+    return super.performKeyEquivalent(with: event)
+  }
   override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
     frameRect
   }
@@ -953,6 +1012,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var navigationAuditEvents: [WebKitNavigationAuditEvent] = []
   private var processTerminated = false
   private var latestObservationID: String?
+  private var latestObservationScope: WebKitObservationScope?
   private var latestTargets: [String: ObservedTargetRecord] = [:]
   private var addressingCounters = AddressingCounterSnapshot()
   private var controlState: InteractionControlState = .agentControlled
@@ -960,6 +1020,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var browserWindow: NSWindow?
   private weak var humanControlInstruction: NSTextField?
   private weak var humanControlCompletionButton: NSButton?
+  private weak var humanCaptchaHelp: NSStackView?
+  public private(set) var captchaWidgetRequestObserved = false
   private weak var humanCredentialButton: NSButton?
   /// Real pop-ups, only while a person holds the window.
   let humanPopups = HumanPopupWindows()
@@ -972,6 +1034,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// The agent that owns this session, as it named itself, shown in the human control
   /// window's title so a person with several windows open knows whose step it is.
   public var humanControlRequester: String?
+  /// Display-only session correlation; never a capability or authority token.
+  public internal(set) var humanControlSessionLabel = String(UUID().uuidString.prefix(8))
   /// The one form the person asked to fill, in the frame that holds it. Cleared
   /// when the fill completes, fails, or control changes hands.
   private var pendingHumanCredentialFill:
@@ -1037,9 +1101,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// A file the agent proposed, for the human open panel to start beside. Only its
   /// folder and name are used, locally; neither is sent anywhere.
   private var proposedUploadFile: URL?
+  public private(set) var humanControlNavigationCompleted = false
   private var humanControlBeganNanoseconds: UInt64?
   private var filePickerVisible = false
   private var downloadContinuation: CheckedContinuation<WebKitDownloadReceipt, any Error>?
+  private var downloadRequestID: UUID?
+  private var downloadAttemptDiagnostics = WebKitDownloadAttemptDiagnostics()
+  private var downloadInitialDocumentURL: URL?
+  private var downloadAttemptObserver:
+    (@MainActor @Sendable (WebKitDownloadAttemptDiagnostics) -> Void)?
+  private let nativeDestinationPresenter = NativeDownloadDestinationPresenter()
+  private var pageFindController: NativePageFindController?
   private var downloadExpectedOrigin: SecurityOrigin?
   private var downloadDestination: URL?
   private var downloadMIMEType: String?
@@ -1050,6 +1122,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private var downloadActionVerified = false
   private var completedDownloadReceipt: WebKitDownloadReceipt?
   private var activeDownload: WKDownload?
+  private var downloadWindow: ManagedDownloadWindow?
   private var downloadTimeoutTask: Task<Void, Never>?
   /// How long one unanswered JavaScript panel is held before it resolves indeterminate.
   /// It exists so that a panel nobody answers bounds every wait behind it instead of
@@ -1122,6 +1195,14 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     let world = WKContentWorld.world(name: "WebKitUIMCP.Instrumentation")
     contentController.addUserScript(
       WKUserScript(
+        source: Self.nativeClickRecorderSource,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false,
+        in: world
+      )
+    )
+    contentController.addUserScript(
+      WKUserScript(
         source: Self.frameRegistrationSource,
         injectionTime: .atDocumentStart,
         forMainFrameOnly: false,
@@ -1136,6 +1217,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         in: world
       )
     )
+    contentController.addUserScript(
+      WKUserScript(
+        source: BrowserLoadDiagnosticScripts.bootstrap, injectionTime: .atDocumentStart,
+        forMainFrameOnly: true, in: world))
     configuration.userContentController = contentController
     configuration.websiteDataStore = websiteDataStore
     // The agent lands on pages nobody picked by hand, so WebKit's own fraudulent-site
@@ -1234,6 +1319,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// view: without this a closed session kept its view, its web process and its
   /// website data store alive for the life of the broker.
   isolated deinit {
+    nativeDestinationPresenter.cancel()
+    pageFindController?.close()
     tailnetGrantsObserver.map(NotificationCenter.default.removeObserver)
     humanControlActivationObserver.map(NotificationCenter.default.removeObserver)
     humanPopups.closeAll()
@@ -1564,13 +1651,29 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// control — a month, a title, a quantity, a set of provinces — to arrive whole.
   public static let maximumPublishedOptions = 64
 
+  public func dialogObservationScope(
+    observationID: String, elementID: String
+  ) throws -> WebKitObservationScope {
+    _ = try locatorRecipe(observationID: observationID, elementID: elementID)
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    try requireMainFrameActionTarget(target)
+    return WebKitObservationScope(
+      scopeID: UUID().uuidString, documentID: documentID, physicalIdentity: target.physicalIdentity)
+  }
+
+  public func observationScope(observationID: String) throws -> WebKitObservationScope? {
+    guard observationID == latestObservationID else { throw WebKitRuntimeError.staleObservation }
+    return latestObservationScope
+  }
+
   public func observe(
     maximumElements: Int = 200,
     elementOffset: Int = 0,
     maximumFieldCharacters: Int = 4_096,
     roles: [String] = [],
     nameContains: String? = nil,
-    hydrationTimeout: Duration = .seconds(30)
+    hydrationTimeout: Duration = .seconds(30),
+    scope: WebKitObservationScope? = nil
   ) async throws -> WebKitPageObservation {
     try requireObservationControl()
     guard maximumElements > 0, elementOffset >= 0, maximumFieldCharacters > 0 else {
@@ -1581,6 +1684,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     guard !processTerminated else { throw WebKitRuntimeError.webContentProcessTerminated }
     let observedDocumentID = documentID
+    guard scope == nil || scope?.documentID == documentID else {
+      throw WebKitRuntimeError.staleObservation
+    }
     await bindFrameCapabilitiesToIsolatedWorld()
     let observedFrameRegistrationGeneration = frameRegistrationGeneration
 
@@ -1601,15 +1707,29 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       "elementOffset": 0,
       "maximumFieldCharacters": maximumFieldCharacters,
       "maximumOptions": Self.maximumPublishedOptions,
+      "scopePhysicalIdentity": scope?.physicalIdentity ?? "",
     ]
     func captureRawObservation(in frame: WKFrameInfo? = nil) async throws -> RawObservation {
       if let frame {
         return try await captureFrameRawObservation(
           script: script, arguments: arguments, frame: frame, timeout: .seconds(2))
       }
+      let value: Any?
+      do {
+        value = try await webView.callAsyncJavaScript(
+          script, arguments: arguments, in: frame, contentWorld: instrumentationWorld)
+      } catch {
+        let native = error as NSError
+        if native.domain == WKError.errorDomain,
+          (native.userInfo["WKJavaScriptExceptionMessage"] as? String)?
+            .contains("observation_scope_unavailable") == true
+        {
+          throw WebKitRuntimeError.staleObservation
+        }
+        throw error
+      }
       guard
-        let json = try await webView.callAsyncJavaScript(
-          script, arguments: arguments, in: frame, contentWorld: instrumentationWorld) as? String,
+        let json = value as? String,
         let data = json.data(using: .utf8),
         let decoded = try? JSONDecoder().decode(RawObservation.self, from: data)
       else { throw WebKitRuntimeError.malformedInstrumentationResult }
@@ -1644,7 +1764,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     let registeredFrames = registeredFrameCapabilities.filter {
       $0.documentID == documentID && !$0.isMainFrame
     }
-    for frame in registeredFrames where !walkedFrameCapabilityIDs.contains(frame.capabilityID) {
+    for frame in registeredFrames
+    where scope == nil && !walkedFrameCapabilityIDs.contains(frame.capabilityID) {
       do {
         let frameRaw = try await captureRawObservation(in: frame.frameInfo)
         guard
@@ -1788,6 +1909,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         characterCount: element.characterCount,
         sensitive: element.sensitive,
         submitsForm: element.submitsForm,
+        contentEditable: element.contentEditable ? true : nil,
+        scrollable: element.scrollable == true ? true : nil,
+        fillCapability: element.fillCapability,
         disabled: element.disabled,
         checked: element.checked,
         selected: element.selected,
@@ -1831,6 +1955,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       )
     }
     latestObservationID = observationID
+    var capturedScope = scope
+    capturedScope?.maximumElements = maximumElements
+    capturedScope?.maximumFieldCharacters = maximumFieldCharacters
+    latestObservationScope = capturedScope
     latestTargets = Dictionary(
       uniqueKeysWithValues: zip(elements, selectedElements).enumerated().map {
         index, pair in
@@ -1901,6 +2029,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       semanticScopeFiltered: !roles.isEmpty || !(nameContains ?? "").isEmpty,
       unreadableFrameCount: unreadableFrameCount,
       semanticTextTruncated: capturedGroups.contains { $0.raw.semanticTextTruncated },
+      verificationScopeID: scope?.scopeID,
+      aggregateTextOmitted: raw.aggregateTextOmitted == true ? true : nil,
       crossOriginFramesOpaque: unreadableFrameCount > 0,
       renderedInteractiveCount: saturatedSum(
         capturedGroups.map(\.raw.renderedInteractiveCount)),
@@ -1964,6 +2094,67 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "criteria": criteria, "physicalIdentity": "", "expectedCandidateCount": 0,
       ]
     )
+  }
+
+  public func scrollContainer(
+    observationID: String, elementID: String, deltaX: Double, deltaY: Double
+  ) async throws -> WebKitScrollResult {
+    try requireAgentControl()
+    guard deltaX.isFinite, deltaY.isFinite, abs(deltaX) <= 2_000, abs(deltaY) <= 2_000 else {
+      throw WebKitRuntimeError.malformedInstrumentationResult
+    }
+    let recipe = try locatorRecipe(observationID: observationID, elementID: elementID)
+    guard let target = latestTargets[elementID] else { throw WebKitRuntimeError.unknownElement }
+    try requireMainFrameActionTarget(target)
+    do {
+      var result = try await performScroll(
+        source: Self.containerScrollSource,
+        arguments: [
+          "criteria": locatorCriteria(
+            recipe, expectedEnabled: !target.disabled,
+            maximumFieldCharacters: target.maximumFieldCharacters),
+          "physicalIdentity": target.physicalIdentity,
+          "expectedCandidateCount": target.observedCandidateCount,
+          "deltaX": deltaX, "deltaY": deltaY,
+        ])
+      result.targetElementID = elementID
+      return result
+    } catch {
+      let native = error as NSError
+      if native.domain == WKError.errorDomain,
+        (native.userInfo["WKJavaScriptExceptionMessage"] as? String)?
+          .contains("scroll_target_changed") == true
+      {
+        throw WebKitRuntimeError.staleObservation
+      }
+      throw error
+    }
+  }
+
+  /// Only fixed categories and saturated counters cross the privacy boundary.
+  /// Raw JavaScript exception messages may contain page data and are never returned.
+  public static func privacyInventoryLimitDiagnostic(_ error: any Error)
+    -> WebKitPrivacyInventoryLimitDiagnostic?
+  {
+    guard isPrivacyInventoryLimit(error) else { return nil }
+    let message = (error as NSError).userInfo["WKJavaScriptExceptionMessage"] as? String ?? ""
+    for (category, limit) in [("values", 256), ("characters", 65536), ("roots", 64)] {
+      let marker = "privacy_scan_limit_exceeded:" + category
+      if message == marker || message == "Error: " + marker {
+        return WebKitPrivacyInventoryLimitDiagnostic(
+          category: category, limit: limit, observedCountAtLeast: limit + 1)
+      }
+    }
+    return WebKitPrivacyInventoryLimitDiagnostic(
+      category: "unknown", limit: nil, observedCountAtLeast: nil)
+  }
+
+  public static func isPrivacyInventoryLimit(_ error: any Error) -> Bool {
+    let native = error as NSError
+    return native.domain == WKError.errorDomain
+      && native.code == WKError.Code.javaScriptExceptionOccurred.rawValue
+      && (native.userInfo["WKJavaScriptExceptionMessage"] as? String)?
+        .contains("privacy_scan_limit_exceeded") == true
   }
 
   public func readText(maximumCharacters: Int = 20_000) async throws -> WebKitTextSnapshot {
@@ -2945,6 +3136,48 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     for navigationAction: WKNavigationAction,
     windowFeatures: WKWindowFeatures
   ) -> WKWebView? {
+    if downloadContinuation != nil {
+      downloadAttemptDiagnostics.newWindowRequested = true
+      downloadAttemptDiagnostics.newWindowSourceMainFrame = navigationAction.sourceFrame.isMainFrame
+      downloadAttemptDiagnostics.newWindowTargetAbsent = navigationAction.targetFrame == nil
+    }
+    if let requestID = downloadRequestID, let expectedOrigin = downloadExpectedOrigin {
+      // Preserve WebKit's original request and opener relationship. Replaying its
+      // URL in the parent loses blank-window exports and can destroy the form.
+      let source = URL(
+        string: Self.agentSafeSecurityOrigin(navigationAction.sourceFrame.securityOrigin))
+      // The approved control can live in a same-origin iframe. Its native
+      // coordinates and trusted click are verified by perform; isMainFrame is
+      // not an origin boundary. Keep the opener, origin and single-window checks.
+      let refusal: String?
+      if webView !== self.webView {
+        refusal = "download_window_opener_mismatch"
+      } else if source.flatMap(navigationOrigin(for:)) != expectedOrigin {
+        refusal = "download_window_origin_mismatch"
+      } else if downloadWindow != nil,
+        Self.exportDataKind(navigationAction.request.url) == .preview,
+        (navigationAction.request.httpMethod ?? "GET").uppercased() == "GET"
+      {
+        // OVH opens a plain-text preview after FileSaver starts its export.
+        // Suppress this ancillary view without cancelling the one approved file.
+        downloadAttemptDiagnostics.suppressedDataPreview = true
+        return nil
+      } else if downloadWindow != nil {
+        refusal = "download_window_duplicate"
+      } else {
+        refusal = nil
+      }
+      if let refusal {
+        finishDownload(.failure(WebKitRuntimeError.downloadFailed(refusal)))
+        return nil
+      }
+      let destination = ManagedDownloadWindow(
+        owner: self, requestID: requestID,
+        configuration: configuration)
+      downloadWindow = destination
+      downloadAttemptDiagnostics.downloadWindowCreated = true
+      return destination.view
+    }
     // `windowFeatures` is read and dropped. Its every field is site-authored, and this
     // record is exported: the shape a page wanted for a window it is not getting is not
     // worth carrying unlabelled site content for.
@@ -3402,7 +3635,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     observationID: String,
     elementID: String,
     expectedProvisioningProfileUUID: String? = nil,
-    timeout: Duration = .seconds(120)
+    timeout: Duration = .seconds(120),
+    onAttemptFinished: (@MainActor @Sendable (WebKitDownloadAttemptDiagnostics) -> Void)? = nil
   ) async throws -> WebKitDownloadReceipt {
     try requireAgentControl()
     guard downloadContinuation == nil else { throw WebKitRuntimeError.downloadInProgress }
@@ -3412,21 +3646,25 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     return try await beginDownloadRequest(
       origin: origin,
       expectedProvisioningProfileUUID: expectedProvisioningProfileUUID,
-      timeout: timeout
+      timeout: timeout,
+      onAttemptFinished: onAttemptFinished
     ) {
+      let requestID = self.downloadRequestID
       Task { @MainActor [weak self] in
-        guard let self else { return }
+        guard let self, self.downloadRequestID == requestID else { return }
         do {
           _ = try await self.perform(
             observationID: observationID,
             elementID: elementID,
             operation: .click,
             dispatchMode: .nativeAppKit)
+          guard self.downloadRequestID == requestID else { return }
           self.downloadActionVerified = true
           if let receipt = self.completedDownloadReceipt {
             self.finishDownload(.success(receipt))
           }
         } catch {
+          guard self.downloadRequestID == requestID else { return }
           self.finishDownload(.failure(error))
         }
       }
@@ -3463,9 +3701,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     origin: SecurityOrigin,
     expectedProvisioningProfileUUID: String?,
     timeout: Duration,
+    onAttemptFinished: (@MainActor @Sendable (WebKitDownloadAttemptDiagnostics) -> Void)? = nil,
     trigger: () -> Void
   ) async throws -> WebKitDownloadReceipt {
     try await withCheckedThrowingContinuation { continuation in
+      let requestID = UUID()
+      downloadAttemptDiagnostics = WebKitDownloadAttemptDiagnostics()
+      downloadInitialDocumentURL = webView.url
+      downloadAttemptObserver = onAttemptFinished
+      downloadRequestID = requestID
       downloadContinuation = continuation
       downloadExpectedOrigin = origin
       downloadDestination = nil
@@ -3477,8 +3721,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       downloadActionVerified = false
       completedDownloadReceipt = nil
       downloadTimeoutTask = Task { @MainActor [weak self] in
-        try? await Task.sleep(for: timeout)
-        guard let self else { return }
+        do {
+          try await Task.sleep(for: timeout)
+        } catch {
+          return
+        }
+        guard let self, self.downloadRequestID == requestID else { return }
         self.finishDownload(
           .failure(WebKitRuntimeError.downloadReceiptTimedOut(started: self.downloadStarted)))
       }
@@ -3576,14 +3824,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// embedded form can be unusable without proving a full-browser requirement.
   /// Callers must never serialize, log, or place the URL in an MCP confirmation;
   /// paths and queries may contain authentication state.
-  public func privateFullBrowserHandoffURL() throws -> URL {
+  public func privateFullBrowserHandoffURL(allowUnrestrictedOrigin: Bool = false) throws -> URL {
     guard
-      authenticationRestrictionStatus() != nil,
+      allowUnrestrictedOrigin || authenticationRestrictionStatus() != nil,
       let url = webView.url ?? lastCommittedHTTPURL,
-      url.scheme?.lowercased() == "https",
-      url.host != nil
+      let scheme = url.scheme?.lowercased(),
+      allowUnrestrictedOrigin ? ["http", "https"].contains(scheme) : scheme == "https",
+      url.host != nil, url.user == nil, url.password == nil
     else { throw WebKitRuntimeError.authenticationOriginRequiresHuman("unavailable") }
     return url
+  }
+
+  public func loadDiagnostics() async throws -> BrowserLoadDiagnostics {
+    try requireAgentControl()
+    guard
+      let json = try await webView.callAsyncJavaScript(
+        BrowserLoadDiagnosticScripts.snapshot, arguments: [:], in: nil,
+        contentWorld: instrumentationWorld) as? String,
+      let data = json.data(using: .utf8)
+    else { throw WebKitRuntimeError.malformedInstrumentationResult }
+    return try JSONDecoder().decode(BrowserLoadDiagnostics.self, from: data)
   }
 
   public func authenticationEnvironmentSnapshot() -> AuthenticationEnvironmentSnapshot {
@@ -3662,6 +3922,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     guard controlState == .handoffRequested else {
       throw WebKitRuntimeError.invalidControlTransition
     }
+    humanControlNavigationCompleted = false
     humanControlBeganNanoseconds = DispatchTime.now().uptimeNanoseconds
     latestObservationID = nil
     latestTargets.removeAll(keepingCapacity: true)
@@ -3705,7 +3966,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       throw WebKitRuntimeError.authenticationOriginRequiresHuman(origin)
     }
     if let window = browserWindow {
-      // Give the page its whole viewport back. The handoff bar is 54 points tall and
+      // Give the page its whole viewport back. The handoff bar takes part of the viewport and
       // was never removed, so a page kept laying out against a viewport that short for
       // the rest of the session — a dialog opened afterwards came back with every
       // element crushed to a fraction of a pixel against that edge, and reported as
@@ -3748,6 +4009,18 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       defer: false
     )
     window.isReleasedWhenClosed = false
+    window.nativePageCommand = { [weak self, weak window] event in
+      guard let self, let window, self.controlState == .humanControlled,
+        self.browserWindowIsOnScreen, window.attachedSheet == nil
+      else { return false }
+      if self.pageFindController == nil {
+        self.pageFindController = NativePageFindController(webView: self.webView, parent: window) {
+          [weak self] in
+          self?.controlState == .humanControlled && self?.browserWindowIsOnScreen == true
+        }
+      }
+      return self.pageFindController?.handleKeyEquivalent(event) ?? false
+    }
     window.center()
     attachWebView(to: window)
     window.orderOut(nil)
@@ -3803,7 +4076,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // Show only the origin: authenticated paths and query values do not belong
     // in a window title that can appear in Mission Control or screenshots.
     let site = (webView.url ?? lastCommittedHTTPURL)?.host
-    let siteTitle = site.map { "\(baseTitle) — \($0)" } ?? baseTitle
+    let identifiedTitle = "\(baseTitle) [\(humanControlSessionLabel)]"
+    let siteTitle = site.map { "\(identifiedTitle) — \($0)" } ?? identifiedTitle
     window.title =
       humanControlRequester.map { "\(siteTitle) — agent “\($0)” (self-reported)" } ?? siteTitle
     window.ignoresMouseEvents = false
@@ -3952,7 +4226,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         "Marks the private step complete so the requesting agent can resume this session.",
         fallback:
           "Marks the private step complete so the requesting agent can resume this session."))
-    var controlViews: [NSView] = [instruction]
+    instruction.lineBreakMode = .byWordWrapping
+    instruction.maximumNumberOfLines = 0
+    let captcha = NSButton(
+      title: Self.localizedHandoff("CAPTCHA / accessibility", fallback: "CAPTCHA / accessibility"),
+      target: self, action: #selector(toggleCaptchaHelp))
+    captcha.bezelStyle = .rounded
+    captcha.setAccessibilityIdentifier("webkitui.handoff.captcha.help")
+    var controlViews: [NSView] = [captcha]
+    let sessionLabel = NSTextField(labelWithString: "Session \(humanControlSessionLabel)")
+    sessionLabel.setAccessibilityIdentifier("webkitui.handoff.session")
+    controlViews.append(sessionLabel)
     if humanCredentialFiller != nil {
       let fill = NSButton(
         title: Self.localizedHandoff(
@@ -3973,17 +4257,44 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       controlViews.append(fill)
     }
     controlViews.append(done)
-    let controls = NSStackView(views: controlViews)
+    let helpText = NSTextField(
+      wrappingLabelWithString: Self.localizedHandoff(
+        "Solve the CAPTCHA yourself on the website. Use Tab and Shift-Tab to reach its controls, then Return or Space. If offered, choose the site's audio or accessibility option; audio availability depends on the provider. If it fails, use the site's help or contact support. The agent does not read, transcribe or solve the challenge. When the site confirms completion, select Done — Return Control.",
+        fallback:
+          "Solve the CAPTCHA yourself on the website. Use Tab and Shift-Tab to reach its controls, then Return or Space. If offered, choose the site's audio or accessibility option; audio availability depends on the provider. If it fails, use the site's help or contact support. The agent does not read, transcribe or solve the challenge. When the site confirms completion, select Done — Return Control."
+      ))
+    helpText.setAccessibilityIdentifier("webkitui.handoff.captcha.instructions")
+    let focus = NSButton(
+      title: Self.localizedHandoff("Focus website", fallback: "Focus website"),
+      target: self, action: #selector(focusHumanWebsite))
+    focus.bezelStyle = .rounded
+    focus.setAccessibilityIdentifier("webkitui.handoff.captcha.focus")
+    let help = NSStackView(views: [helpText, focus])
+    help.orientation = .vertical
+    help.alignment = .leading
+    help.spacing = 8
+    help.isHidden = !captchaWidgetRequestObserved
+    humanCaptchaHelp = help
+    let identity = NSStackView(views: Array(controlViews.prefix(2)))
+    identity.orientation = .horizontal
+    identity.alignment = .centerY
+    identity.spacing = 12
+    let controls = NSStackView(views: Array(controlViews.dropFirst(2)))
     controls.orientation = .horizontal
     controls.alignment = .centerY
     controls.distribution = .fill
     controls.spacing = 12
-    controls.translatesAutoresizingMaskIntoConstraints = false
+    let content = NSStackView(views: [instruction, identity, controls, help])
+    content.orientation = .vertical
+    content.alignment = .leading
+    content.spacing = 8
+    content.detachesHiddenViews = true
+    content.translatesAutoresizingMaskIntoConstraints = false
     webView.translatesAutoresizingMaskIntoConstraints = false
     bar.translatesAutoresizingMaskIntoConstraints = false
     root.addSubview(webView)
     root.addSubview(bar)
-    bar.addSubview(controls)
+    bar.addSubview(content)
     window.contentView = root
     humanControlInstruction = instruction
     humanControlCompletionButton = done
@@ -3995,11 +4306,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       bar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
       bar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
       bar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-      bar.heightAnchor.constraint(equalToConstant: 54),
-      controls.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 16),
-      controls.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -16),
-      controls.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+      content.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 16),
+      content.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -16),
+      content.topAnchor.constraint(equalTo: bar.topAnchor, constant: 12),
+      content.bottomAnchor.constraint(equalTo: bar.bottomAnchor, constant: -12),
+      instruction.widthAnchor.constraint(equalTo: content.widthAnchor),
+      help.widthAnchor.constraint(equalTo: content.widthAnchor),
+      helpText.widthAnchor.constraint(equalTo: help.widthAnchor),
     ])
+  }
+
+  @objc private func toggleCaptchaHelp() {
+    guard controlState == .humanControlled || controlState == .humanStepCompleted else { return }
+    humanCaptchaHelp?.isHidden.toggle()
+    browserWindow?.contentView?.layoutSubtreeIfNeeded()
+  }
+
+  @objc private func focusHumanWebsite() {
+    guard controlState == .humanControlled, humanControlSurfaceIsPresented else { return }
+    // Only native focus changes. No synthetic key, click, script, audio or submission.
+    browserWindow?.makeFirstResponder(webView)
   }
 
   @objc private func completeHumanStep() {
@@ -4044,6 +4370,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   private static let handoffLogger = Logger(
     subsystem: "com.lorislab.webkitui-mcp", category: "human-handoff")
 
+  public static var humanControlReturnButtonLabel: String {
+    localizedHandoff("Done — Return Control", fallback: "Done — Return Control")
+  }
+
   private static func localizedHandoff(_ key: String, fallback: String) -> String {
     Bundle.main.localizedString(forKey: key, value: fallback, table: nil)
   }
@@ -4082,8 +4412,16 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       return try await observe(maximumElements: maximumElements)
     } catch {
       if controlState == .resumeRequested {
-        presentHumanControlWindow()
-        transition(to: .humanControlled, observationID: nil)
+        if Self.isPrivacyInventoryLimit(error) {
+          // The person already authorized authority return. Extraction failure must
+          // not trap that authority on a document which cannot be observed. Keep
+          // every target invalid; exact-destination navigation remains confirmed.
+          invalidateCurrentObservation()
+          transition(to: .agentControlled, observationID: nil)
+        } else {
+          presentHumanControlWindow()
+          transition(to: .humanControlled, observationID: nil)
+        }
       }
       throw error
     }
@@ -4197,6 +4535,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     _ webView: WKWebView,
     decidePolicyFor navigationAction: WKNavigationAction
   ) async -> WKNavigationActionPolicy {
+    if let url = navigationAction.request.url, CaptchaAccessibility.isWidgetRequest(url) {
+      captchaWidgetRequestObserved = true
+      humanCaptchaHelp?.isHidden = false
+    }
     if navigationAction.targetFrame?.isMainFrame == false,
       let targetURL = navigationAction.request.url,
       Self.isRestrictedAuthenticationHost(targetURL.host)
@@ -4209,6 +4551,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         authenticationUIClassification = .fullBrowserRequired
       }
     }
+    if let expectedOrigin = downloadExpectedOrigin, downloadWindow != nil,
+      Self.exportDataKind(navigationAction.request.url) == .preview,
+      (navigationAction.request.httpMethod ?? "GET").uppercased() == "GET",
+      URL(string: Self.agentSafeSecurityOrigin(navigationAction.sourceFrame.securityOrigin))
+        .flatMap(navigationOrigin(for:)) == expectedOrigin
+    {
+      downloadAttemptDiagnostics.suppressedDataPreview = true
+      return .cancel
+    }
     // Only the main frame, a new window or an explicit download can become the file. A
     // consent or analytics iframe loading meanwhile used to end the download as a bare
     // networkBoundaryDenied (Volvo developer portal, 2026-09-26).
@@ -4216,6 +4567,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       navigationAction.targetFrame?.isMainFrame != false
         || navigationAction.shouldPerformDownload
     {
+      downloadAttemptDiagnostics.navigationActionSeen = true
       guard let targetURL = navigationAction.request.url,
         navigationOrigin(for: targetURL) == expectedOrigin
       else {
@@ -4225,7 +4577,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
               expectedOrigin, url: navigationAction.request.url, stage: "request")))
         return .cancel
       }
-      if navigationAction.shouldPerformDownload { return .download }
+      // An explicitly requested export may assign a same-origin Blob to location
+      // instead of creating an <a download>. Convert it before WebKit replaces
+      // the current document with a JSON/text/PDF viewer. The origin check above
+      // still applies; without an active managed request this branch is absent.
+      if navigationAction.shouldPerformDownload
+        || navigationAction.request.url?.scheme?.lowercased() == "blob"
+      {
+        return .download
+      }
     }
     // WebKit's own account of the submission, taken from WKFormInfo a moment ago. It is
     // applied here because `submissionHandler` carries no decision, and it is applied
@@ -4293,6 +4653,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     decidePolicyFor navigationResponse: WKNavigationResponse
   ) async -> WKNavigationResponsePolicy {
     guard downloadContinuation != nil, navigationResponse.isForMainFrame else { return .allow }
+    downloadAttemptDiagnostics.navigationResponseSeen = true
     guard let responseURL = navigationResponse.response.url,
       let expectedOrigin = downloadExpectedOrigin,
       navigationOrigin(for: responseURL) == expectedOrigin
@@ -4346,7 +4707,23 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     if downloadContinuation == nil { resetForNavigation() }
   }
 
+  public func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+    if downloadContinuation != nil {
+      downloadAttemptDiagnostics.mainFrameNavigationCommitted = true
+    }
+  }
+
   public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    // Navigation is only a completion hint: it never grants agent authority.
+    if controlState == .humanControlled {
+      humanControlNavigationCompleted = true
+      humanControlInstruction?.stringValue = Self.localizedHandoff(
+        "Navigation finished. If your step is complete, select Done — Return Control.",
+        fallback: "Navigation finished. If your step is complete, select Done — Return Control.")
+      if let button = humanControlCompletionButton {
+        NSAccessibility.post(element: button, notification: .valueChanged)
+      }
+    }
     let completedType = pendingMainFrameNavigationType
     let currentItem = webView.backForwardList.currentItem
     let currentItemID = currentItem.map(ObjectIdentifier.init)
@@ -4419,6 +4796,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         return
       }
       let proposed = await self.proposedDownloadDestination(suggestedFilename: suggestedFilename)
+      guard download === self.activeDownload, self.downloadContinuation != nil else {
+        completionHandler(nil)
+        return
+      }
       guard let proposed else {
         completionHandler(nil)
         self.finishDownload(.failure(WebKitRuntimeError.downloadCancelled))
@@ -4491,33 +4872,219 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       download.cancel { _ in }
       return
     }
+    guard activeDownload == nil else {
+      if activeDownload !== download { download.cancel { _ in } }
+      return
+    }
     downloadStarted = true
+    downloadAttemptDiagnostics.downloadStarted = true
+    downloadAttemptDiagnostics.stage = "download_started"
     activeDownload = download
     download.delegate = self
     navigationFailure = nil
   }
 
+  /// A single request-bound export destination, never an agent-visible browser tab.
+  /// It accepts an empty bootstrap window, then only same-origin downloads. No
+  /// replacement URL load, ordinary HTML page, nested popup or interactive dialog.
+  private enum ExportDataKind { case preview, attachment }
+
+  /// Inspect only an allowlisted header. The credential payload stays private.
+  private static func exportDataKind(_ url: URL?) -> ExportDataKind? {
+    guard let url, url.scheme?.lowercased() == "data" else { return nil }
+    let prefix = url.absoluteString.prefix(256)
+    guard let comma = prefix.firstIndex(of: ",") else { return nil }
+    let fields = prefix[..<comma].lowercased().dropFirst(5).split(
+      separator: ";", omittingEmptySubsequences: false)
+    guard let mime = fields.first, fields.last == "base64",
+      fields.dropFirst().dropLast().allSatisfy({
+        $0 == "charset=utf-8" || $0 == "charset=us-ascii"
+      })
+    else { return nil }
+    switch mime {
+    case "text/plain": return .preview
+    case "attachment/file": return .attachment
+    default: return nil
+    }
+  }
+
+  @MainActor
+  private final class ManagedDownloadWindow: NSObject, WKNavigationDelegate, WKUIDelegate {
+    weak var owner: WebKitRuntime?
+    let requestID: UUID
+    let view: WKWebView
+    private var authorizedAttachmentURL: URL?
+
+    init(owner: WebKitRuntime, requestID: UUID, configuration: WKWebViewConfiguration) {
+      self.owner = owner
+      self.requestID = requestID
+      view = WKWebView(frame: .zero, configuration: configuration)
+      super.init()
+      view.navigationDelegate = self
+      view.uiDelegate = self
+    }
+
+    private var currentOwner: WebKitRuntime? {
+      guard let owner, owner.downloadRequestID == requestID,
+        owner.downloadWindow === self, owner.downloadContinuation != nil
+      else { return nil }
+      return owner
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async
+      -> WKNavigationActionPolicy
+    {
+      guard let owner = currentOwner else { return .cancel }
+      owner.downloadAttemptDiagnostics.navigationActionSeen = true
+      guard action.targetFrame?.isMainFrame == true else { return .cancel }
+      if action.request.url?.absoluteString == "about:blank" { return .allow }
+      if let url = action.request.url,
+        WebKitRuntime.exportDataKind(url) == .attachment,
+        (action.request.httpMethod ?? "GET").uppercased() == "GET",
+        let source = URL(
+          string: WebKitRuntime.agentSafeSecurityOrigin(action.sourceFrame.securityOrigin)),
+        owner.navigationOrigin(for: source) == owner.downloadExpectedOrigin
+      {
+        authorizedAttachmentURL = url
+        owner.downloadAttemptDiagnostics.dataAttachmentRequested = true
+        return .download
+      }
+      guard let url = action.request.url,
+        owner.navigationOrigin(for: url) == owner.downloadExpectedOrigin,
+        (action.request.httpMethod ?? "GET").uppercased() == "GET"
+      else {
+        owner.finishDownload(.failure(WebKitRuntimeError.networkBoundaryDenied))
+        return .cancel
+      }
+      if action.shouldPerformDownload || url.scheme?.lowercased() == "blob" {
+        return .download
+      }
+      return .allow
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async
+      -> WKNavigationResponsePolicy
+    {
+      guard let owner = currentOwner else { return .cancel }
+      if let authorizedAttachmentURL, response.response.url == authorizedAttachmentURL {
+        owner.downloadAttemptDiagnostics.navigationResponseSeen = true
+        return .download
+      }
+      return await owner.webView(webView, decidePolicyFor: response)
+    }
+
+    func webView(
+      _ webView: WKWebView, navigationAction: WKNavigationAction,
+      didBecome download: WKDownload
+    ) {
+      guard let owner = currentOwner else {
+        download.cancel { _ in }
+        return
+      }
+      owner.beginDownload(download)
+    }
+
+    func webView(
+      _ webView: WKWebView, navigationResponse: WKNavigationResponse,
+      didBecome download: WKDownload
+    ) {
+      guard let owner = currentOwner else {
+        download.cancel { _ in }
+        return
+      }
+      owner.beginDownload(download)
+    }
+
+    func webView(
+      _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
+      withError error: any Error
+    ) {
+      // WebKit may interrupt the initial popup load before delivering its
+      // download conversion callbacks. Neither cancellation proves success:
+      // the request still needs a completed file receipt or reaches its deadline.
+      let nativeError = error as NSError
+      let cancelled =
+        nativeError.domain == NSURLErrorDomain && nativeError.code == NSURLErrorCancelled
+      if !cancelled && !WebKitRuntime.isDownloadCancellation(error) {
+        currentOwner?.finishDownload(
+          .failure(
+            WebKitRuntimeError.downloadFailed(
+              "download_window_navigation_failed: "
+                + WebKitRuntime.sanitizedError(error))))
+      }
+    }
+
+    func webView(
+      _ webView: WKWebView, didFail navigation: WKNavigation!,
+      withError error: any Error
+    ) {
+      self.webView(webView, didFailProvisionalNavigation: navigation, withError: error)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+      currentOwner?.finishDownload(
+        .failure(WebKitRuntimeError.downloadFailed("download_window_process_terminated")))
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+      if currentOwner?.activeDownload == nil {
+        currentOwner?.finishDownload(.failure(WebKitRuntimeError.downloadCancelled))
+      }
+    }
+
+    func close() {
+      authorizedAttachmentURL = nil
+      view.navigationDelegate = nil
+      view.uiDelegate = nil
+      view.stopLoading()
+    }
+  }
+
   private func proposedDownloadDestination(suggestedFilename: String) async -> URL? {
+    downloadAttemptDiagnostics.stage = "destination_selection"
+    downloadAttemptDiagnostics.destinationSelectionStarted = true
     let filename = Self.safeSuggestedFilename(suggestedFilename)
     if let downloadDestinationProvider {
       return await downloadDestinationProvider(filename)
     }
-    let panel = NSSavePanel()
-    panel.title = "Save Browser Download"
-    panel.prompt = "Save"
-    panel.canCreateDirectories = true
-    panel.nameFieldStringValue = filename
-    return panel.runModal() == .OK ? panel.url : nil
+    guard let requestID = downloadRequestID else { return nil }
+    let window = browserWindow ?? makeBrowserWindow()
+    let wasOnScreen = browserWindowIsOnScreen
+    let initialControlState = controlState
+    if !wasOnScreen {
+      window.ignoresMouseEvents = false
+      bringHumanControlWindowToFront(window)
+    }
+    defer {
+      if !wasOnScreen, controlState == initialControlState {
+        window.orderOut(nil)
+        ensureLayoutViewport()
+      }
+    }
+    return await nativeDestinationPresenter.choose(filename: filename, parent: window) {
+      [weak self] in
+      self?.downloadRequestID == requestID && self?.controlState == initialControlState
+    }
   }
 
   private func finishDownload(_ result: Result<WebKitDownloadReceipt, any Error>) {
     guard let continuation = downloadContinuation else { return }
+    downloadAttemptDiagnostics.pageURLChanged = webView.url != downloadInitialDocumentURL
+    let diagnostic = downloadAttemptDiagnostics
+    downloadInitialDocumentURL = nil
+    let observer = downloadAttemptObserver
+    downloadAttemptObserver = nil
+    let ownedDownload = activeDownload
+    let ownedWindow = downloadWindow
+    downloadWindow = nil
     if case .failure = result, let downloadDestination {
       try? FileManager.default.removeItem(at: downloadDestination)
     }
     downloadTimeoutTask?.cancel()
     downloadTimeoutTask = nil
     downloadContinuation = nil
+    downloadRequestID = nil
+    nativeDestinationPresenter.cancel()
     downloadExpectedOrigin = nil
     downloadDestination = nil
     downloadMIMEType = nil
@@ -4528,6 +5095,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     downloadActionVerified = false
     completedDownloadReceipt = nil
     activeDownload = nil
+    ownedWindow?.close()
+    if case .failure = result {
+      ownedDownload?.cancel { _ in }
+    }
+    observer?(diagnostic)
     continuation.resume(with: result)
   }
 
@@ -4593,7 +5165,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private static func isDownloadCancellation(_ error: any Error) -> Bool {
     let error = error as NSError
-    return error.domain == WKError.errorDomain && error.code == 102
+    // WKDownload conversion can still emit the legacy domain declared by the
+    // installed SDK's WebKitErrors.h, not just WKError.errorDomain.
+    return [WKError.errorDomain, "WebKitErrorDomain"].contains(error.domain) && error.code == 102
   }
 
   private static func sanitizedError(_ error: any Error) -> String {
@@ -4874,6 +5448,8 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     expectedCandidateCount: Int,
     expectedBoundingBox: ObservedBoundingBox
   ) async throws -> RawActionResolution {
+    let diagnosticRequestID = downloadRequestID
+    if diagnosticRequestID != nil { downloadAttemptDiagnostics.stage = "native_target_validation" }
     let token = UUID().uuidString
     armedNativeGestureTokens[token] = ArmedNativeGestureContext(
       frameCapabilityID: nil, frameOrigin: nil)
@@ -4887,6 +5463,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       "expectedCandidateCount": expectedCandidateCount,
       "expectedBox": Self.boxDictionary(expectedBoundingBox),
       "token": token,
+      "armRecorder": false,
     ]
     var armed = try await actionScript(source: Self.armNativeClickSource, arguments: arguments)
     // A page still settling (a banner sliding in, a font, a re-render) moves the one
@@ -4896,28 +5473,50 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     // armed while it moves.
     var settleAttempts = 0
     while settleAttempts < Self.nativeClickSettleAttempts, armed.count == 1,
-      let moved = armed.candidate, !moved.geometryStable,
+      let moved = armed.candidate, !moved.geometryStable || moved.actionable,
       moved.physicalIdentity == physicalIdentity
     {
+      // Equal instantaneous samples can fall in the same compositor frame,
+      // just before a transition starts. Require a full stable interval even
+      // on that first agreement; never replay an already-dispatched click.
       settleAttempts += 1
       try await Task.sleep(for: .milliseconds(150))
       arguments["expectedBox"] = Self.boxDictionary(moved.boundingBox)
       armed = try await actionScript(source: Self.armNativeClickSource, arguments: arguments)
+      if armed.candidate?.geometryStable == true { break }
     }
     guard armed.count == 1, let candidate = armed.candidate else { return armed }
-    guard candidate.geometryStable, candidate.actionable else { return armed }
+    guard candidate.physicalIdentity == physicalIdentity,
+      candidate.geometryStable, candidate.actionable
+    else { return armed }
+    // Surveying stability must not leave a receipt slot armed during the wait.
+    // Recheck once more and arm only for the imminent native dispatch.
+    arguments["expectedBox"] = Self.boxDictionary(candidate.boundingBox)
+    arguments["armRecorder"] = true
+    armed = try await actionScript(source: Self.armNativeClickSource, arguments: arguments)
+    guard armed.count == 1, let dispatchCandidate = armed.candidate else { return armed }
+    guard dispatchCandidate.physicalIdentity == physicalIdentity,
+      dispatchCandidate.geometryStable, dispatchCandidate.actionable
+    else { return armed }
 
-    try dispatchNativeMouseClick(at: candidate.boundingBox)
+    try dispatchNativeMouseClick(at: dispatchCandidate.boundingBox)
+    if diagnosticRequestID != nil, downloadRequestID == diagnosticRequestID {
+      downloadAttemptDiagnostics.nativeDispatchAttempted = true
+      downloadAttemptDiagnostics.stage = "native_dispatch"
+    }
     let deadline = ContinuousClock.now + .seconds(1)
     while ContinuousClock.now < deadline {
       if let receipt = nativeGestureReceipt(
-        token: token, physicalIdentity: candidate.physicalIdentity, eventType: "click")
+        token: token, physicalIdentity: dispatchCandidate.physicalIdentity, eventType: "click")
       {
+        if diagnosticRequestID != nil, downloadRequestID == diagnosticRequestID {
+          downloadAttemptDiagnostics.nativeGestureVerified = receipt.trusted
+        }
         return RawActionResolution(
           count: armed.count,
           candidate: RawActionCandidate(
-            physicalIdentity: candidate.physicalIdentity,
-            boundingBox: candidate.boundingBox,
+            physicalIdentity: dispatchCandidate.physicalIdentity,
+            boundingBox: dispatchCandidate.boundingBox,
             geometryStable: candidate.geometryStable,
             actionable: candidate.actionable,
             dispatched: true,
@@ -5286,6 +5885,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   private func transition(to next: InteractionControlState, observationID: String?) {
+    if next != .humanControlled { pageFindController?.close() }
     let previous = controlState
     controlState = next
     handoffEvents.append(
@@ -5299,6 +5899,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   }
 
   private func resetForNavigation() {
+    pageFindController?.close()
     documentID = UUID().uuidString
     frameSemanticKey = SymmetricKey(size: .bits256)
     observationGeneration = 0
@@ -5510,6 +6111,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
 
   private func prepareForAllowedMainFrameNavigation(_ action: WKNavigationAction) {
     guard action.targetFrame?.isMainFrame == true else { return }
+    captchaWidgetRequestObserved =
+      action.request.url.map(CaptchaAccessibility.isWidgetRequest) ?? false
+    humanControlNavigationCompleted = false
     pendingMainFrameNavigationType = action.navigationType
   }
 
@@ -5679,7 +6283,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   /// restricted: the agent still cannot read, capture or fill it.
   private static let fullBrowserAuthenticationParents: [String: Set<String>] = [:]
 
-  private static func isRestrictedAuthenticationHost(_ rawHost: String?) -> Bool {
+  public static func isRestrictedAuthenticationHost(_ rawHost: String?) -> Bool {
     guard
       let host = rawHost?.lowercased().trimmingCharacters(
         in: CharacterSet(charactersIn: "."))
@@ -5854,7 +6458,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       clauses.append(
         .init(fact: .domPath, expectedValue: element.domPath, strength: .corroborating))
     }
-    if clauses.isEmpty {
+    // A nameless editor may have only corroborating name/path facts. Every
+    // recipe still needs a required clause; dispatch pins its observed node.
+    if !clauses.contains(where: { $0.strength == .required }) {
       clauses.append(
         .init(
           fact: .stableAttribute("tag"),
@@ -5923,7 +6529,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     else { return [] }
     var modes: [WebKitFrameActionMode] = [.hoverJavaScript, .pressKeyNativeAppKit]
     if element.tag == "select" { modes.append(.selectOptionJavaScript) }
-    if element.tag == "input" || element.tag == "textarea" || element.role == "textbox" {
+    if element.tag == "input" || element.tag == "textarea" || element.role == "textbox"
+      || element.contentEditable
+    {
       modes.append(.fillNativeAppKit)
     }
     return modes
@@ -6043,7 +6651,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         };
         const contentSelector = [
           'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
-          '[contenteditable="true"]', '[role="button"]', '[role="link"]', '[role="tab"]',
+          '[contenteditable="true" i], [contenteditable=""], [contenteditable="plaintext-only" i]', '[role="button"]', '[role="link"]', '[role="tab"]',
           '[role="checkbox"]', '[role="radio"]', '[role="switch"]', '[role="textbox"]',
           'img', 'picture', 'svg', 'canvas', 'video', 'audio[controls]',
           'iframe', 'frame', 'object', 'embed'
@@ -6205,1509 +6813,1563 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     });
     """
 
-  private static let observationSource = """
-    const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
-    const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
-    const walkedFrameDocuments = new Set([document]);
-    const deepQueryAll = (root, selector) => {
-      const matches = [];
-      const roots = [root];
-      for (let index = 0; index < roots.length; index += 1) {
-        const current = roots[index];
-        matches.push(...current.querySelectorAll(selector));
-        for (const host of current.querySelectorAll('*')) {
-          if (host.shadowRoot) roots.push(host.shadowRoot);
-          // A same-origin frame is part of the page a person sees. Skipping it made
-          // every control inside one invisible, which an agent reads as absent.
-          if (host.localName === 'iframe' || host.localName === 'frame') {
-            let inner = null;
-            try { inner = host.contentDocument; } catch { inner = null; }
-            if (inner) {
-              walkedFrameDocuments.add(inner);
-              roots.push(inner);
+  private static let observationSource =
+    BrowserTextPrivacy.source + BrowserScrollGeometry.source + BrowserInputCapabilities.source + """
+      const collapse = value => privacyRedact(value).replace(/\\s+/g, ' ').trim();
+      const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+      const scopeRoot = scopePhysicalIdentity
+        ? globalThis.__webkituiState?.nodesByID?.get(scopePhysicalIdentity)?.deref() : null;
+      if (scopePhysicalIdentity && (!scopeRoot?.isConnected || scopeRoot.ownerDocument !== document
+          || !(scopeRoot.localName === 'dialog' || ['dialog','alertdialog'].includes(scopeRoot.getAttribute('role'))))) {
+        throw new Error('observation_scope_unavailable');
+      }
+      const walkedFrameDocuments = new Set([document]);
+      const deepQueryAll = (root, selector) => {
+        const matches = [];
+        const roots = [root === document && scopeRoot ? scopeRoot : root];
+        for (let index = 0; index < roots.length; index += 1) {
+          const current = roots[index];
+          if (current === scopeRoot && current.matches(selector)) matches.push(current);
+          matches.push(...current.querySelectorAll(selector));
+          for (const host of current.querySelectorAll('*')) {
+            if (host.shadowRoot) roots.push(host.shadowRoot);
+            // A same-origin frame is part of the page a person sees. Skipping it made
+            // every control inside one invisible, which an agent reads as absent.
+            if (host.localName === 'iframe' || host.localName === 'frame') {
+              let inner = null;
+              try { inner = host.contentDocument; } catch { inner = null; }
+              if (inner) {
+                walkedFrameDocuments.add(inner);
+                roots.push(inner);
+              }
             }
           }
         }
-      }
-      return matches;
-    };
-    const labelledNode = (element, id) => {
-      const root = element?.getRootNode?.();
-      return (typeof root?.getElementById === 'function' ? root.getElementById(id) : null)
-        || document.getElementById(id);
-    };
-    let semanticTextTruncated = false;
-    const bounded = value => {
-      if (value === null || value === undefined) return null;
-      const text = collapse(value);
-      if (text.length <= maximumFieldCharacters) return text;
-      semanticTextTruncated = true;
-      return text.slice(0, maximumFieldCharacters);
-    };
-    const boundedFieldValue = value => {
-      if (value === null || value === undefined) return null;
-      const text = String(value).normalize('NFC').replace(/\\r\\n?/g, '\\n');
-      if (text.length <= maximumFieldCharacters) return text;
-      semanticTextTruncated = true;
-      return text.slice(0, maximumFieldCharacters);
-    };
-    let obscuredByAncestorOpacity = false;
-    const isRendered = element => {
-      const box = element.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
-        return false;
-      }
-      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
-        if (cursor.hidden || cursor.inert
-            || collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
-          return false;
-        }
-        const style = getComputedStyle(cursor);
-        if (style.display === 'none' || style.visibility === 'hidden'
-            || style.visibility === 'collapse') {
-          return false;
-        }
-        // A transparent ancestor is reported, not dropped. A single-page app whose
-        // entrance animation never ran leaves its whole tree at opacity 0 while the
-        // controls are laid out and interactive; dropping them makes the page look
-        // empty. Every write still passes an exact human confirmation, and the
-        // observation says the target is obscured.
-        if (Number(style.opacity) === 0 && cursor !== element) {
-          obscuredByAncestorOpacity = true;
-        } else if (Number(style.opacity) === 0) {
-          return false;
-        }
-      }
-      return true;
-    };
-    const sensitiveIdentifierTerm = /(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_]?key|recovery[-_]?code|backup[-_]?code|private[-_]?key|seed[-_]?phrase)/i;
-    const sensitiveLabelTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_ ]?key|recovery[-_ ]?codes?|backup[-_ ]?codes?|private[-_ ]?key|seed[-_ ]?phrase)(?:$|[^a-z0-9])/i;
-    const sensitiveAutocomplete = new Set([
-      'current-password', 'new-password', 'one-time-code', 'webauthn',
-      'cc-name', 'cc-given-name', 'cc-additional-name', 'cc-family-name',
-      'cc-number', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-csc', 'cc-type'
-    ]);
-    // A Material-style control renders in two halves: the real input, given no size
-    // or clipped away, and the painted box beside it marked aria-hidden. Neither half
-    // survives a visibility filter on its own, so the form observes as a group with no
-    // children and cannot be filled at all. Stand the pair up as one unit, addressed by
-    // the visible half. The walk stops at the first ancestor owning a second control,
-    // so a surface is never shared between two checkboxes.
-    const hiddenControlSurface = element => {
-      if (!(element instanceof HTMLInputElement)
-          || !['checkbox', 'radio'].includes(element.type)) return null;
-      const labels = element.labels ? Array.from(element.labels) : [];
-      const label = labels.find(isRendered);
-      if (label) return label;
-      const labelledBy = collapse(element.getAttribute('aria-labelledby'));
-      for (const id of labelledBy.split(/\\s+/).slice(0, 8).filter(Boolean)) {
-        const node = labelledNode(element, id);
-        if (node && isRendered(node)) return node;
-      }
-      // Climb to the outermost ancestor that still owns this one control and nothing
-      // else interactive: that is the labelled row, which carries both the visible text
-      // and the click handler. The tight wrapper around the input holds neither — it is
-      // the painted box, and its text is empty.
-      let widest = null;
-      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
-        if (cursor === document.body || cursor === document.documentElement) break;
-        if (deepQueryAll(cursor, soleControl).length !== 1) break;
-        if (isRendered(cursor)) widest = cursor;
-      }
-      return widest;
-    };
-    // A control can be rendered, sized and enabled and still be unable to receive its
-    // own click: Material paints the box in a sibling that covers it. Hit testing is
-    // the only way to tell, and without it every radio on the page costs a failed
-    // round trip reported as indeterminate.
-    // Hit testing belongs to the document the element lives in, at that document's own
-    // coordinates. Asking the top-level document about a point measured inside a frame
-    // answers about whatever sits at those numbers in the outer page.
-    const hitAtCentreOfLocal = (node, box) => {
-      const owner = node?.ownerDocument ?? document;
-      const view = owner.defaultView ?? window;
-      const x = Math.min(view.innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const y = Math.min(view.innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      let hit = owner.elementFromPoint(x, y);
-      while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
-        const nested = hit.shadowRoot.elementFromPoint(x, y);
-        if (!nested || nested === hit) break;
-        hit = nested;
-      }
-      return hit;
-    };
-    const hitReaches = (hit, ...targets) => {
-      for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
-        if (targets.includes(cursor)) return true;
-      }
-      return false;
-    };
-    const receivesOwnEvents = element => {
-      const box = element.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0)) return false;
-      return hitReaches(hitAtCentreOfLocal(element, box), element);
-    };
-    // An ordinal path from the document root. Structure is never identity — a recycled
-    // row keeps its position while meaning changes — so this only ever separates
-    // candidates that already satisfy every identity clause. Without it, twenty-two
-    // checkboxes that carry no name, no id and no distinguishing attribute have exactly
-    // one address between them.
-    const domPathOf = element => {
-      const steps = [];
-      for (let node = element; node && node.nodeType === 1; node = composedParent(node)) {
-        const parent = composedParent(node);
-        if (!parent) { steps.push(node.localName); break; }
-        let index = 0;
-        for (const sibling of parent.children) {
-          if (sibling === node) break;
-          if (sibling.localName === node.localName) index += 1;
-        }
-        steps.push(node.localName + '[' + index + ']');
-        if (steps.length >= 32) break;
-      }
-      return steps.reverse().join('/');
-    };
-    // Offset of an element's own frame within the top-level viewport. Geometry inside a
-    // frame is measured against that frame, so a click computed from it would land
-    // wherever that offset happens to be — usually somewhere else entirely.
-    const frameOffsetOf = element => {
-      let offsetX = 0;
-      let offsetY = 0;
-      let view = element?.ownerDocument?.defaultView ?? null;
-      let guard = 0;
-      while (view && view !== window && guard < 16) {
-        let host = null;
-        try { host = view.frameElement; } catch { host = null; }
-        if (!host) break;
-        const box = host.getBoundingClientRect();
-        offsetX += box.left;
-        offsetY += box.top;
-        view = host.ownerDocument?.defaultView ?? null;
-        guard += 1;
-      }
-      return { x: offsetX, y: offsetY };
-    };
-    // A rect in top-level viewport coordinates, whatever frame the element lives in.
-    const viewportRectOf = element => {
-      const box = element.getBoundingClientRect();
-      const offset = frameOffsetOf(element);
-      if (offset.x === 0 && offset.y === 0) return box;
-      return {
-        x: box.x + offset.x, y: box.y + offset.y,
-        left: box.left + offset.x, top: box.top + offset.y,
-        right: box.right + offset.x, bottom: box.bottom + offset.y,
-        width: box.width, height: box.height
+        return matches;
       };
-    };
-    const frameCapabilityIDOf = element => {
-      try {
-        const value = element?.ownerDocument?.defaultView?.__webkituiFrameCapabilityID;
-        return typeof value === 'string' && value ? value : null;
-      } catch (_) {
-        return null;
-      }
-    };
-    const soleControl =
-      'input, button, select, textarea, a[href], summary,'
-      + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
-    const controlSurfaceOf = element => {
-      const fallback = hiddenControlSurface(element);
-      if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
-      return isRendered(element) ? element : fallback;
-    };
-    // A control that borrows a surface for its geometry borrows its label with it.
-    // Play's checkboxes carry no aria-label and no aria-labelledby — the visible text
-    // is a sibling — so without this they are exposed and anonymous, their locator
-    // holds role and nothing else, and every act on them fails as not unique.
-    const borrowedLabel = element => {
-      const surface = controlSurfaceOf(element);
-      if (surface === element) return null;
-      if (surface) {
-        return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
-      }
-      // Nothing rendered to borrow from. A control that cannot be clicked must still be
-      // nameable, or the agent cannot report what it is unable to reach.
-      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
-        if (cursor === document.body || cursor === document.documentElement) break;
-        if (deepQueryAll(cursor, soleControl).length !== 1) break;
-        const text = collapse(cursor.textContent);
-        // Bounded inline: this helper is shared with the action script, which has no
-        // bounded(). Reaching this branch there threw a ReferenceError that no fixture
-        // exercised and the first real page found on the first click.
-        if (text) return text.length > 512 ? text.slice(0, 512) : text;
-      }
-      return null;
-    };
-    // Why a control cannot be acted on, decided once and reported before the agent
-    // spends a round trip finding out. locatorQuality answers "is this the only match";
-    // it was read as "can I click this", and nothing answered that question.
-    const actionabilityOf = (element, surface) => {
-      const box = surface.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0)) return 'no_layout_box';
-      const style = getComputedStyle(surface);
-      if (style.visibility === 'hidden' || style.display === 'none') return 'not_visible';
-      if (element.disabled
-          || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
-        return 'disabled';
-      }
-      const visible = viewportRectOf(surface);
-      if (visible.bottom <= 0 || visible.right <= 0
-          || visible.top >= innerHeight || visible.left >= innerWidth) {
-        return 'off_viewport';
-      }
-      return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
-        ? 'actionable' : 'covered';
-    };
-    // An element keeps its own box when an ancestor's overflow clips it away, so the
-    // geometry checks above still say it is laid out. A person sees nothing of it. The
-    // element stays in the tree (its actionability already says a click cannot reach
-    // it); this is what turns its visible flag off.
-    // Overflow clips only what an ancestor contains: an absolutely positioned box
-    // escapes every static ancestor up to its containing block, and a fixed box (a
-    // menu rendered through a portal) escapes them all short of a transformed one.
-    const clippedByAncestor = surface => {
-      let box = surface.getBoundingClientRect();
-      let position = getComputedStyle(surface).position;
-      for (let cursor = composedParent(surface); cursor; cursor = composedParent(cursor)) {
-        if (cursor.nodeType !== 1 || cursor.localName === 'html' || cursor.localName === 'body') {
-          break;
-        }
-        const style = getComputedStyle(cursor);
-        const containingBlock = style.transform !== 'none' || style.filter !== 'none'
-          || style.perspective !== 'none' || style.contain === 'paint'
-          || style.contain === 'strict' || style.contain === 'content';
-        if (position === 'fixed' && !containingBlock) continue;
-        if (position === 'absolute' && style.position === 'static' && !containingBlock) continue;
-        if (position === 'fixed' || position === 'absolute') position = style.position;
-        const clipsX = style.overflowX !== 'visible';
-        const clipsY = style.overflowY !== 'visible';
-        if (!clipsX && !clipsY) continue;
-        const clip = cursor.getBoundingClientRect();
-        const left = clipsX ? Math.max(box.left, clip.left) : box.left;
-        const right = clipsX ? Math.min(box.right, clip.right) : box.right;
-        const top = clipsY ? Math.max(box.top, clip.top) : box.top;
-        const bottom = clipsY ? Math.min(box.bottom, clip.bottom) : box.bottom;
-        if (right - left <= 0 || bottom - top <= 0) return true;
-        box = { left, right, top, bottom };
-      }
-      return false;
-    };
-    const classTokens = element => collapse(element?.getAttribute?.('class'));
-    const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
-    const hasSelectedToken = element =>
-      /(^|[\\s_-])(active|current|selected)($|[\\s_-])/i.test(classTokens(element));
-    const isPointerControl = element => {
-      if (!['a', 'div', 'li', 'span'].includes(element.localName) || !isRendered(element)) {
-        return false;
-      }
-      if (getComputedStyle(element).cursor !== 'pointer') return false;
-      const name = collapse(element.getAttribute('aria-label') || element.innerText);
-      if (!name || name.length > maximumFieldCharacters) return false;
-      return !Array.from(element.children).some(child =>
-        isRendered(child) && getComputedStyle(child).cursor === 'pointer'
-        && collapse(child.getAttribute('aria-label') || child.innerText) === name);
-    };
-    const hasImplicitTabSemantics = element => {
-      if (element.hasAttribute('aria-selected')) return true;
-      const parent = composedParent(element);
-      return isPointerControl(element)
-        && (collapse(parent?.getAttribute?.('role')).toLowerCase() === 'tablist'
-          || hasTabToken(element) || hasTabToken(parent));
-    };
-    const looksOpaque = value => {
-      const text = String(value ?? '');
-      if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(text)) return true;
-      if (text.length < 32 || /\\s/.test(text)
-          || !/^[A-Za-z0-9._~+/=-]+$/.test(text)) return false;
-      return new Set(text).size >= 12;
-    };
-    const roleOf = element => {
-      const explicit = collapse(element.getAttribute('role'));
-      if (explicit) return explicit;
-      if (hasImplicitTabSemantics(element)) return 'tab';
-      if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
-      if (element.localName === 'button' || element.hasAttribute('onclick')) return 'button';
-      if (/^h[1-6]$/.test(element.localName)) return 'heading';
-      if (element.localName === 'table') return 'table';
-      if (element.localName === 'tr') return 'row';
-      if (element.localName === 'th') return 'columnheader';
-      if (element.localName === 'td') return 'cell';
-      if (element.localName === 'select') return 'combobox';
-      if (element.localName === 'textarea') return 'textbox';
-      if (element.localName === 'summary') return 'button';
-      if (element.localName === 'input') {
-        const type = collapse(element.type).toLowerCase();
-        if (type === 'search') return 'searchbox';
-        if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
-        if (type === 'checkbox') return 'checkbox';
-        if (type === 'radio') return 'radio';
-        if (type === 'range') return 'slider';
-        return 'textbox';
-      }
-      if (isPointerControl(element)) return 'button';
-      return null;
-    };
-    const labelOf = element => {
-      if (element.labels && element.labels.length) {
-        return collapse(Array.from(element.labels).map(label => label.innerText).join(' ')) || null;
-      }
-      const labelledBy = collapse(element.getAttribute('aria-labelledby'));
-      if (labelledBy) {
-        return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
-      }
-      return borrowedLabel(element);
-    };
-    // innerText stops at a shadow host, so a custom element whose label is rendered in
-    // its own shadow root (Reddit's chat requests) observed with no name at all. Its
-    // shadow text, without style or script, stands in. Kept identical in the observation
-    // and the action helpers: the name recorded is the name re-resolved.
-    const shadowTextOf = (element, depth = 0) => {
-      const root = element.shadowRoot;
-      if (!root || depth > 2) return '';
-      const parts = [];
-      const walk = node => {
-        if (parts.join(' ').length > 200) return;
-        if (node.nodeType === Node.TEXT_NODE) { parts.push(node.data); return; }
-        if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
-          return;
-        }
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          if (['style', 'script', 'template'].includes(node.localName)) return;
-          if (node.shadowRoot) { parts.push(shadowTextOf(node, depth + 1)); return; }
-        }
-        node.childNodes.forEach(walk);
+      const labelledNode = (element, id) => {
+        const root = element?.getRootNode?.();
+        return (typeof root?.getElementById === 'function' ? root.getElementById(id) : null)
+          || document.getElementById(id);
       };
-      walk(root);
-      return collapse(parts.join(' ')).slice(0, 200);
-    };
-    // A submit input paints its value as its caption; innerText is empty. Only
-    // button-like inputs borrow that value, never editable or hidden field values.
-    const inputButtonName = element => element.localName === 'input'
-      && ['button', 'submit', 'reset'].includes(element.type)
-      ? collapse(element.value) : null;
-    const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
-      || inputButtonName(element)
-      || collapse(element.getAttribute('placeholder'))
-      || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
-      || collapse(element.innerText) || shadowTextOf(element) || null;
-    const directLabelledText = element => {
-      const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
-      if (!labelledBy) return null;
-      return collapse(labelledBy.split(/\\s+/)
-        .slice(0, 8)
-        .map(id => labelledNode(element, id)?.innerText)
-        .join(' ')) || null;
-    };
-    const safeContextValue = value => {
-      const text = collapse(value);
-      if (!text || looksOpaque(text) || sensitiveLabelTerm.test(text)) return null;
-      return bounded(text);
-    };
-    const sameRowLabelOf = element => {
-      const row = element.closest(
-        'tr, [role="row"], li, [data-row], [class~="row"], [class*="form-row"], [class*="capability"]');
-      if (!row) return null;
-      const labelled = Array.from(row.querySelectorAll(
-        'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
-      const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
-      for (const candidate of candidates) {
-        if (candidate === element || candidate.contains(element) || !isRendered(candidate)) continue;
-        const text = safeContextValue(
-          candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
-        if (text && text !== safeContextValue(nameOf(element))) return text;
-      }
-      return null;
-    };
-    const contextAnchorsOf = element => {
-      const anchors = [];
-      const fieldset = element.closest('fieldset');
-      const legend = fieldset?.querySelector(':scope > legend');
-      const legendText = safeContextValue(legend?.innerText);
-      if (legendText) anchors.push({ kind: 'fieldset_legend', text: legendText });
-
-      const region = element.closest(
-        'dialog, [role="dialog"], [role="alertdialog"], section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
-      const regionText = safeContextValue(
-        region?.getAttribute('aria-label') || directLabelledText(region));
-      if (regionText) anchors.push({ kind: 'labelled_region', text: regionText });
-
-      const structural = element.closest('section, article, nav, main, form, fieldset')
-        || document.body;
-      const headings = Array.from(
-        structural.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]'));
-      const heading = headings.filter(candidate =>
-        candidate !== element
-        && Boolean(candidate.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
-      ).pop();
-      const headingText = safeContextValue(heading?.innerText || heading?.getAttribute('aria-label'));
-      if (headingText) anchors.push({ kind: 'nearest_heading', text: headingText });
-
-      let sibling = element.previousElementSibling;
-      while (sibling && !isRendered(sibling)) sibling = sibling.previousElementSibling;
-      const siblingText = safeContextValue(sibling?.innerText || sibling?.textContent);
-      if (siblingText) anchors.push({ kind: 'previous_sibling', text: siblingText });
-      const rowLabel = sameRowLabelOf(element);
-      if (rowLabel) anchors.unshift({ kind: 'same_row_label', text: rowLabel });
-      return anchors.slice(0, 5);
-    };
-    const sanitizedHref = element => {
-      if (!element.hasAttribute('href')) return null;
-      try {
-        const url = new URL(element.getAttribute('href'), document.baseURI);
-        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
-        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
-        const query = keys.length
-          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
-        return bounded(`${url.origin}${url.pathname}${query}`);
-      } catch { return null; }
-    };
-    // Query values are redacted here exactly as they are for href: this string is
-    // exported with the observation, and a query is where a session token sits. An
-    // address with no readable origin is reported as its scheme rather than dropped,
-    // because staying silent would hide the case worth showing.
-    const sanitizedDestination = value => {
-      if (value === null || value === undefined || value === '') return null;
-      try {
-        const url = new URL(value, document.baseURI);
-        if (!['http:', 'https:'].includes(url.protocol)) return url.protocol;
-        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
-        const query = keys.length
-          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
-        return bounded(`${url.origin}${url.pathname}${query}`);
-      } catch { return 'about:invalid'; }
-    };
-    const stableAttributesOf = (element, sensitive) => {
-      if (sensitive) return {};
-      const attributes = {};
-      const href = sanitizedHref(element);
-      if (href && !looksOpaque(href)) attributes.href = href;
-      for (const name of ['id', 'name', 'title', 'data-testid']) {
-        const value = collapse(element.getAttribute(name));
-        if (!value || value.length > maximumFieldCharacters || looksOpaque(value)
-            || sensitiveIdentifierTerm.test(value)) continue;
-        attributes[name] = bounded(value);
-      }
-      return attributes;
-    };
-    const selector = [
-      'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
-      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-      'table', 'tr', 'th', 'td',
-      '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true"]', '[tabindex]', '[onclick]'
-    ].join(',');
-    const allowedRoles = new Set(Array.isArray(roleFilters) ? roleFilters : []);
-    const searchName = value => collapse(value).toLowerCase().replace(/[’‘ʼ]/g, "'");
-    const wantedName = searchName(nameFilter);
-    const semanticElements = deepQueryAll(document, selector);
-    const pointerElements = deepQueryAll(document, 'a:not([href]), div, li, span')
-      .filter(isPointerControl);
-    // Diagnostic: how many otherwise-matching controls are dropped only because an
-    // ancestor is aria-hidden or inert. A page that renders its controls and marks
-    // them hidden leaves the tree empty for a reason worth reporting.
-    let ariaHiddenDropCount = 0;
-    // A control with no layout box anywhere up its row cannot be clicked, so reporting
-    // it as actionable would be a lie. Reporting nothing at all is worse: the only exit
-    // from a form can be one of these, and an agent that cannot see it concludes the
-    // page is complete instead of handing over to a human.
-    let unrenderedControlCount = 0;
-    const unrenderedControlNames = [];
-    const unrenderedControlName = element =>
-      collapse(element.getAttribute('aria-label')) || labelOf(element);
-    // Laid out but collapsed to nothing is not the same as deliberately hidden. The
-    // only exit from a Play form is a control like this — the "none of these features"
-    // option that keeps Next disabled — so it is reported with the truth about why it
-    // cannot be clicked, rather than dropped as if it did not exist.
-    const hiddenOnlyByGeometry = element => {
-      const box = element.getBoundingClientRect();
-      if (box.width > 0 && box.height > 0) return false;
-      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
-        if (cursor.hidden || cursor.inert
-            || collapse(cursor.getAttribute?.('aria-hidden')).toLowerCase() === 'true') {
+      let semanticTextTruncated = false;
+      let aggregateTextOmitted = false;
+      const bounded = value => {
+        if (value === null || value === undefined) return null;
+        const text = collapse(value);
+        if (text.length <= maximumFieldCharacters) return text;
+        semanticTextTruncated = true;
+        return text.slice(0, maximumFieldCharacters);
+      };
+      const boundedFieldValue = value => {
+        if (value === null || value === undefined) return null;
+        const text = String(value).normalize('NFC').replace(/\\r\\n?/g, '\\n');
+        if (text.length <= maximumFieldCharacters) return text;
+        semanticTextTruncated = true;
+        return text.slice(0, maximumFieldCharacters);
+      };
+      let obscuredByAncestorOpacity = false;
+      const isRendered = element => {
+        const box = element.getBoundingClientRect();
+        if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) {
           return false;
         }
-        const style = getComputedStyle(cursor);
-        if (style.display === 'none' || style.visibility === 'hidden'
-            || style.visibility === 'collapse' || Number(style.opacity) === 0) {
-          return false;
-        }
-      }
-      return element.matches(soleControl);
-    };
-    const hiddenOnlyBySemantics = element => {
-      const box = element.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0)) return false;
-      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
-        if (cursor.inert
-            || collapse(cursor.getAttribute && cursor.getAttribute('aria-hidden')).toLowerCase()
-              === 'true') {
-          return true;
-        }
-      }
-      return false;
-    };
-    const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
-      .filter(element => {
-        // A wrapper with no independent state/action around one identically sized link
-        // exposes the same hit target twice. Keep the link and its destination.
-        if (element.getAttribute('role') === 'button'
-            && !element.matches('[onclick], [tabindex], [aria-expanded], [aria-pressed], [aria-controls], [aria-disabled]')) {
-          const links = deepQueryAll(element, 'a[href]');
-          if (links.length === 1 && collapse(nameOf(element)) === collapse(nameOf(links[0]))) {
-            const a = element.getBoundingClientRect(), b = links[0].getBoundingClientRect();
-            if (a.width > 0 && a.height > 0
-                && ['x', 'y', 'width', 'height'].every(key => Math.abs(a[key] - b[key]) < 0.5)) {
-              return false;
-            }
-          }
-        }
-        if (!controlSurfaceOf(element)) {
-          if (hiddenOnlyBySemantics(element)) {
-            ariaHiddenDropCount += 1;
+        for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+          if (cursor.hidden || cursor.inert
+              || collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
             return false;
           }
-          if (!hiddenOnlyByGeometry(element)) return false;
-          unrenderedControlCount += 1;
-          const name = unrenderedControlName(element);
-          if (name && unrenderedControlNames.length < 10
-              && !unrenderedControlNames.includes(name)) {
-            unrenderedControlNames.push(name);
+          const style = getComputedStyle(cursor);
+          if (style.display === 'none' || style.visibility === 'hidden'
+              || style.visibility === 'collapse') {
+            return false;
+          }
+          // A transparent ancestor is reported, not dropped. A single-page app whose
+          // entrance animation never ran leaves its whole tree at opacity 0 while the
+          // controls are laid out and interactive; dropping them makes the page look
+          // empty. Every write still passes an exact human confirmation, and the
+          // observation says the target is obscured.
+          if (Number(style.opacity) === 0 && cursor !== element) {
+            obscuredByAncestorOpacity = true;
+          } else if (Number(style.opacity) === 0) {
+            return false;
           }
         }
-        const role = collapse(roleOf(element)).toLowerCase();
-        if (allowedRoles.size > 0 && !allowedRoles.has(role)) return false;
-        const name = searchName(nameOf(element));
-        return !wantedName || name.includes(wantedName);
-      });
-    const elements = matchingElements
-      .slice(elementOffset, elementOffset + __MAXIMUM_ELEMENTS__)
-      .map(element => {
-        const surface = controlSurfaceOf(element) || element;
-        const actionability = actionabilityOf(element, surface);
-        // Reported where a person sees it, not where its own frame measures it.
-        const reportedBox = viewportRectOf(surface);
-        // A control nobody can see is reported so the agent knows it exists and what it
-        // is called. What is written inside it is a different matter: reading the value
-        // of a box the user cannot see is exactly the leak the visibility filter was
-        // there to prevent.
-        const withheldForInvisibility =
-          actionability === 'no_layout_box' || actionability === 'not_visible';
-        const box = surface.getBoundingClientRect();
-        const rawValue = typeof element.value === 'string' ? element.value : null;
-        const autocomplete = collapse(element.getAttribute('autocomplete')).toLowerCase();
-        const autocompleteTokens = autocomplete.split(/\\s+/).filter(Boolean);
-        const identifierMetadata = [
-          element.getAttribute('name'), element.id, element.getAttribute('type'), autocomplete
-        ].map(collapse).join(' ');
-        const labelMetadata = [element.getAttribute('aria-label'), labelOf(element)]
-          .map(collapse).join(' ');
-        const bundleIdentifierMetadata = /(?:^|[^a-z0-9])bundle(?:[ _-]*(?:id|identifier))?(?:$|[^a-z0-9])/i
-          .test(`${identifierMetadata} ${labelMetadata}`);
-        const publicReverseDNSIdentifier = bundleIdentifierMetadata
-          && /^[A-Za-z0-9][A-Za-z0-9-]*(?:\\.[A-Za-z0-9][A-Za-z0-9-]*){2,}$/.test(rawValue ?? '');
-        const sensitive = (element instanceof HTMLInputElement && element.type === 'password')
-          || autocompleteTokens.some(token => sensitiveAutocomplete.has(token))
-          || sensitiveIdentifierTerm.test(identifierMetadata)
-          || sensitiveLabelTerm.test(labelMetadata)
-          || (!(element instanceof HTMLSelectElement) && looksOpaque(rawValue)
-            && !publicReverseDNSIdentifier);
-        // A disabled or read-only field shows its value to anyone looking at the page, so
-        // it is reported like any other: an account page whose address fields were all
-        // disabled read as empty, and the agent had to take a screenshot to learn a
-        // postal address (FPS/TSP, 2026-09-23). Sensitivity and visibility still decide.
-        let observableValue = null;
-        if (!sensitive && element instanceof HTMLSelectElement) {
-          observableValue = collapse(
-            Array.from(element.selectedOptions).map(option => option.textContent).join(' ')) || null;
-        } else if (!sensitive && element instanceof HTMLTextAreaElement) {
-          observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
-        } else if (!sensitive && element instanceof HTMLInputElement
-                   && ['text', 'search', 'email', 'tel', 'url', 'number'].includes(element.type)) {
-          observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
-        } else if (!sensitive && element.isContentEditable) {
-          // WebKit's own editing leaves a trailing newline in a contenteditable's text.
-          // Reported verbatim it makes every exact-text postcondition fail on a write
-          // that landed perfectly.
-          const editableValue = (element.textContent ?? '').replace(/\\s+$/, '');
-          observableValue = editableValue.length <= maximumFieldCharacters ? editableValue : null;
-        }
-        // What is chosen in a `<select>` is that control's value, in the one form a
-        // `<select>` has one. So a sensitive select's selection is never read here, on
-        // the same rule that withholds its `value` and its `text` and that makes `fill`
-        // and `select_option` refuse it: a two-factor delivery method, a reason for
-        // closing an account and a clinic's appointment type are each a secret spelled
-        // out in a label.
-        const selectedLabel = element instanceof HTMLSelectElement && !sensitive
-          ? collapse(Array.from(element.selectedOptions).map(option => option.textContent).join(' '))
-          : null;
-        // `select_option` addresses an option by its exact visible label, so the labels
-        // are published or the agent has to guess them from the surrounding page. Each
-        // one goes through bounded(), the same rule every other published label goes
-        // through, because the writer collapses the label it is given by that rule too:
-        // publish them collapsed any other way and the two halves disagree in silence.
-        // Nothing is published for a sensitive control, which is the rule `fill` and
-        // `select_option` already apply, nor for one whose value is withheld because
-        // nobody can see it.
-        const optionElements =
-          element instanceof HTMLSelectElement && !sensitive && !withheldForInvisibility
-            ? Array.from(element.options) : null;
-        const options = optionElements?.slice(0, maximumOptions).map(option => {
-          const group = option.parentElement;
-          return {
-            label: bounded(option.textContent) ?? '',
-            selected: Boolean(option.selected),
-            // A disabled optgroup disables every option inside it, and the IDL getter
-            // reflects only the option's own attribute. Read both, or a whole group
-            // reads as choosable and every request for one is refused.
-            disabled: Boolean(
-              option.disabled || (group instanceof HTMLOptGroupElement && group.disabled))
-          };
-        }) ?? null;
-        const isEditableField = element instanceof HTMLInputElement
-          || element instanceof HTMLTextAreaElement || element.isContentEditable;
-        const characterCount = !sensitive && isEditableField
-          ? String(element.isContentEditable ? (element.textContent ?? '') : (rawValue ?? '')).length
-          : null;
-        const ariaInvalid = collapse(element.getAttribute('aria-invalid')).toLowerCase();
-        const invalidByARIA = ['true', 'grammar', 'spelling'].includes(ariaInvalid);
-        const invalidByConstraint = Boolean(element.willValidate && element.validity
-          && !element.validity.valid);
-        const validationReferenceIDs = [
-          ...collapse(element.getAttribute('aria-errormessage')).split(/\\s+/),
-          ...collapse(element.getAttribute('aria-describedby')).split(/\\s+/)
-        ].filter(Boolean);
-        const invalidByVisibleMessage = validationReferenceIDs.some(id => {
+        return true;
+      };
+      const sensitiveIdentifierTerm = /(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_]?key|recovery[-_]?code|backup[-_]?code|private[-_]?key|seed[-_]?phrase)/i;
+      const sensitiveLabelTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_ ]?key|recovery[-_ ]?codes?|backup[-_ ]?codes?|private[-_ ]?key|seed[-_ ]?phrase)(?:$|[^a-z0-9])/i;
+      const sensitiveAutocomplete = new Set([
+        'current-password', 'new-password', 'one-time-code', 'webauthn',
+        'cc-name', 'cc-given-name', 'cc-additional-name', 'cc-family-name',
+        'cc-number', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-csc', 'cc-type'
+      ]);
+      // A Material-style control renders in two halves: the real input, given no size
+      // or clipped away, and the painted box beside it marked aria-hidden. Neither half
+      // survives a visibility filter on its own, so the form observes as a group with no
+      // children and cannot be filled at all. Stand the pair up as one unit, addressed by
+      // the visible half. The walk stops at the first ancestor owning a second control,
+      // so a surface is never shared between two checkboxes.
+      const hiddenControlSurface = element => {
+        if (!(element instanceof HTMLInputElement)
+            || !['checkbox', 'radio'].includes(element.type)) return null;
+        const labels = element.labels ? Array.from(element.labels) : [];
+        const label = labels.find(isRendered);
+        if (label) return label;
+        const labelledBy = collapse(element.getAttribute('aria-labelledby'));
+        for (const id of labelledBy.split(/\\s+/).slice(0, 8).filter(Boolean)) {
           const node = labelledNode(element, id);
-          if (!node || !isRendered(node) || !collapse(node.textContent)) return false;
-          if (collapse(element.getAttribute('aria-errormessage')).split(/\\s+/).includes(id)) {
-            return true;
+          if (node && isRendered(node)) return node;
+        }
+        // Climb to the outermost ancestor that still owns this one control and nothing
+        // else interactive: that is the labelled row, which carries both the visible text
+        // and the click handler. The tight wrapper around the input holds neither — it is
+        // the painted box, and its text is empty.
+        let widest = null;
+        for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+          if (cursor === document.body || cursor === document.documentElement) break;
+          if (deepQueryAll(cursor, soleControl).length !== 1) break;
+          if (isRendered(cursor)) widest = cursor;
+        }
+        return widest;
+      };
+      // A control can be rendered, sized and enabled and still be unable to receive its
+      // own click: Material paints the box in a sibling that covers it. Hit testing is
+      // the only way to tell, and without it every radio on the page costs a failed
+      // round trip reported as indeterminate.
+      // Hit testing belongs to the document the element lives in, at that document's own
+      // coordinates. Asking the top-level document about a point measured inside a frame
+      // answers about whatever sits at those numbers in the outer page.
+      const hitAtCentreOfLocal = (node, box) => {
+        const owner = node?.ownerDocument ?? document;
+        const view = owner.defaultView ?? window;
+        const x = Math.min(view.innerWidth - 1, Math.max(0, box.left + box.width / 2));
+        const y = Math.min(view.innerHeight - 1, Math.max(0, box.top + box.height / 2));
+        let hit = owner.elementFromPoint(x, y);
+        while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+          const nested = hit.shadowRoot.elementFromPoint(x, y);
+          if (!nested || nested === hit) break;
+          hit = nested;
+        }
+        return hit;
+      };
+      const hitReaches = (hit, ...targets) => {
+        for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
+          if (targets.includes(cursor)) return true;
+        }
+        return false;
+      };
+      const receivesOwnEvents = element => {
+        const box = element.getBoundingClientRect();
+        if (!(box.width > 0 && box.height > 0)) return false;
+        return hitReaches(hitAtCentreOfLocal(element, box), element);
+      };
+      // An ordinal path from the document root. Structure is never identity — a recycled
+      // row keeps its position while meaning changes — so this only ever separates
+      // candidates that already satisfy every identity clause. Without it, twenty-two
+      // checkboxes that carry no name, no id and no distinguishing attribute have exactly
+      // one address between them.
+      const domPathOf = element => {
+        const steps = [];
+        for (let node = element; node && node.nodeType === 1; node = composedParent(node)) {
+          const parent = composedParent(node);
+          if (!parent) { steps.push(node.localName); break; }
+          let index = 0;
+          for (const sibling of parent.children) {
+            if (sibling === node) break;
+            if (sibling.localName === node.localName) index += 1;
           }
-          const metadata = `${node.id} ${node.className ?? ''} ${node.getAttribute('role') ?? ''}`;
-          return /error|invalid|alert/i.test(metadata) || node.hasAttribute('aria-live');
-        });
-        let validationState = 'not_applicable';
-        if (invalidByARIA || invalidByConstraint || invalidByVisibleMessage) {
-          validationState = 'invalid';
+          steps.push(node.localName + '[' + index + ']');
+          if (steps.length >= 32) break;
         }
-        else if (element.willValidate || ariaInvalid === 'false') validationState = 'valid';
-        const checked = (element instanceof HTMLInputElement
-          && ['checkbox', 'radio'].includes(element.type))
-          ? Boolean(element.checked)
-          : (element.hasAttribute('aria-checked')
-            ? collapse(element.getAttribute('aria-checked')).toLowerCase() === 'true' : null);
-        const selected = element instanceof HTMLOptionElement
-          ? Boolean(element.selected)
-          : (element.hasAttribute('aria-selected')
-            ? collapse(element.getAttribute('aria-selected')).toLowerCase() === 'true'
-            : (roleOf(element) === 'tab'
-              ? (element.hasAttribute('aria-current') || hasSelectedToken(element)) : null));
-        const stateAttributes = {};
-        for (const name of [
-          'aria-checked', 'aria-selected', 'aria-current', 'aria-disabled', 'aria-expanded',
-          'data-state', 'open'
-        ]) {
-          if (element.hasAttribute(name)) stateAttributes[name] = element.getAttribute(name) ?? '';
+        return steps.reverse().join('/');
+      };
+      // Offset of an element's own frame within the top-level viewport. Geometry inside a
+      // frame is measured against that frame, so a click computed from it would land
+      // wherever that offset happens to be — usually somewhere else entirely.
+      const frameOffsetOf = element => {
+        let offsetX = 0;
+        let offsetY = 0;
+        let view = element?.ownerDocument?.defaultView ?? null;
+        let guard = 0;
+        while (view && view !== window && guard < 16) {
+          let host = null;
+          try { host = view.frameElement; } catch { host = null; }
+          if (!host) break;
+          const box = host.getBoundingClientRect();
+          offsetX += box.left;
+          offsetY += box.top;
+          view = host.ownerDocument?.defaultView ?? null;
+          guard += 1;
         }
-        let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
-        if (!physicalIdentity) {
-          physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
-          globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
-          globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
-        }
-        const submitsForm = Boolean(
-          (element instanceof HTMLButtonElement
-            && (element.type || 'submit').toLowerCase() === 'submit' && element.form)
-          || (element instanceof HTMLInputElement
-            && ['submit', 'image'].includes(element.type) && element.form)
-        );
+        return { x: offsetX, y: offsetY };
+      };
+      // A rect in top-level viewport coordinates, whatever frame the element lives in.
+      const viewportRectOf = element => {
+        const box = element.getBoundingClientRect();
+        const offset = frameOffsetOf(element);
+        if (offset.x === 0 && offset.y === 0) return box;
         return {
-          physicalIdentity,
-          frameCapabilityID: frameCapabilityIDOf(element),
-          tag: element.localName,
-          role: roleOf(element),
-          accessibleName: bounded(nameOf(element)),
-          submissionDestination: sanitizedDestination((() => {
-            // formaction wins over the owning form's action, which is the precedence
-            // HTML gives the two. The formAction IDL getter falls back to the document
-            // URL rather than to the form, so the form's own action is read directly
-            // instead: a form posting off-site under a button with no formaction is
-            // exactly the case that must not be reported as this page's origin.
-            if (submitsForm) {
-              if (element.hasAttribute('formaction') && element.formAction) {
-                return element.formAction;
-              }
-              return element.form.action || null;
-            }
-            if (element.tagName === 'FORM' && typeof element.action === 'string') {
-              return element.action;
-            }
-            if (element.tagName === 'A' && element.hasAttribute('href')) {
-              return element.href;
-            }
-            return null;
-          })()),
-          label: bounded(labelOf(element)),
-          text: sensitive || withheldForInvisibility
-            ? null : bounded(selectedLabel || collapse(element.innerText) || null),
-          value: withheldForInvisibility ? null : boundedFieldValue(observableValue),
-          validationState,
-          characterCount: withheldForInvisibility ? null : characterCount,
-          sensitive,
-          submitsForm,
-          disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
-          checked,
-          selected,
-          // Both conditions, stated here rather than left to the definition above: this
-          // key was gated on invisibility alone, and published the chosen label of every
-          // sensitive select on every page until it was found.
-          selectedOption: sensitive || withheldForInvisibility
-            ? null : bounded(selectedLabel || null),
-          // Three keys a page of buttons never pays for: absent, not empty, wherever
-          // there is no list to publish.
-          options,
-          optionCount: optionElements ? optionElements.length : null,
-          optionsTruncated: options ? optionElements.length > options.length : null,
-          stateAttributes: sensitive ? {} : Object.fromEntries(
-            Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
-          contextAnchors: sensitive ? [] : contextAnchorsOf(element),
-          domPath: domPathOf(element),
-          stableAttributes: stableAttributesOf(element, sensitive),
-          visible: actionability !== 'no_layout_box' && actionability !== 'not_visible'
-            && !clippedByAncestor(surface),
-          actionability,
-          coveredBy: actionability === 'covered' ? (() => {
-            const hit = hitAtCentreOfLocal(surface, box);
-            if (!hit) return null;
-            const id = stableAttributesOf(hit, false).id;
-            return bounded(`${hit.localName}${id ? '#' + id : ''}${hit.getAttribute('role') ? ' role=' + hit.getAttribute('role') : ''}`);
-          })() : null,
-          boundingBox: {
-            x: reportedBox.x, y: reportedBox.y,
-            width: reportedBox.width, height: reportedBox.height
-          }
+          x: box.x + offset.x, y: box.y + offset.y,
+          left: box.left + offset.x, top: box.top + offset.y,
+          right: box.right + offset.x, bottom: box.bottom + offset.y,
+          width: box.width, height: box.height
         };
-      });
-    // Counted through the whole tree, frames nested inside readable frames included:
-    // an unreadable region one level down is exactly as invisible as one at the top.
-    let crossOriginFrameCount = 0;
-    for (const frame of deepQueryAll(document, 'iframe, frame')) {
-      try { if (!frame.contentDocument) crossOriginFrameCount += 1; }
-      catch { crossOriginFrameCount += 1; }
-    }
-    const visibleLoadingIndicators = deepQueryAll(
-      document, '[aria-busy="true"], [role="progressbar"], progress'
-    ).some(isRendered);
-    const loadingShellText = collapse(document.body?.innerText);
-    // Counted from the raw DOM, not the semantic matcher: a page whose matcher finds
-    // nothing may still be fully rendered, and must not be mistaken for a shell that
-    // has not painted its controls yet.
-    const rawControls = deepQueryAll(
-      document, 'button, a[href], input, select, textarea, [role="button"]');
-    const renderedInteractiveCount = rawControls.filter(isRendered).length;
-    // Separates "not in this tree" from "in the tree but not laid out": the first
-    // means the script is walking the wrong document, the second a layout problem.
-    const rawControlCount = rawControls.length;
-    const documentElementCount = document.querySelectorAll('*').length;
-    // One control described in full: enough to tell a layout problem from a filter
-    // problem without another round trip.
-    const probe = rawControls[0];
-    let firstControlProbe = 'none';
-    if (probe) {
-      const box = probe.getBoundingClientRect();
-      const style = getComputedStyle(probe);
-      firstControlProbe = [
-        probe.tagName.toLowerCase(),
-        'w=' + Math.round(box.width), 'h=' + Math.round(box.height),
-        'rects=' + probe.getClientRects().length,
-        'display=' + style.display, 'visibility=' + style.visibility,
-        'opacity=' + style.opacity,
-        'offsetParent=' + (probe.offsetParent ? 'yes' : 'no'),
-        'connected=' + probe.isConnected,
-        'docW=' + document.documentElement.clientWidth,
-        'docH=' + document.documentElement.clientHeight,
-        'innerW=' + window.innerWidth, 'innerH=' + window.innerHeight
-      ].join(' ');
-      // Which ancestor disqualifies it, and on which property.
-      let reason = 'accepted';
-      for (let cursor = probe; cursor; cursor = composedParent(cursor)) {
-        const tag = cursor.tagName ? cursor.tagName.toLowerCase() : String(cursor.nodeName);
-        if (cursor.hidden) { reason = 'hidden@' + tag; break; }
-        if (cursor.inert) { reason = 'inert@' + tag; break; }
-        if (cursor.getAttribute
-            && collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
-          reason = 'aria-hidden@' + tag; break;
-        }
-        const cs = getComputedStyle(cursor);
-        if (!cs) { reason = 'no-style@' + tag; break; }
-        if (cs.display === 'none') { reason = 'display-none@' + tag; break; }
-        if (cs.visibility === 'hidden' || cs.visibility === 'collapse') {
-          reason = 'visibility-' + cs.visibility + '@' + tag; break;
-        }
-        if (Number(cs.opacity) === 0) { reason = 'opacity0@' + tag; break; }
-      }
-      firstControlProbe += ' | ' + reason;
-    }
-    const bodyTextLength = (document.body?.innerText || '').length;
-    const pageContentProbe = globalThis.__webkituiPageContentProbe?.() ?? {
-      contentState: bodyTextLength > 0 || renderedInteractiveCount > 0
-        ? 'usable' : 'empty_or_unusable',
-      renderedContentCount: (bodyTextLength > 0 ? 1 : 0) + renderedInteractiveCount
-    };
-    // The entire visible text of the document is one short loading phrase. A shell that
-    // has already painted a menu button still says only this, and requiring zero
-    // controls handed such a page over as complete — the agent then read an empty form.
-    // The bound is deliberately tight: Play's rendered app list keeps the same phrase at
-    // the top of its text and must stay ready, so anything that says more than the
-    // phrase alone is a page, not a shell. Being wrong the other way costs a stall on
-    // every observation.
-    const bodyIsOnlyTheLoadingPhrase =
-      /^(loading|chargement)\\b/i.test(loadingShellText) && loadingShellText.length <= 32;
-    const transientLoading = bodyIsOnlyTheLoadingPhrase || (
-      matchingElements.length === 0 && (
-        visibleLoadingIndicators
-        // Anchored on the start, not the whole body: a loading shell usually renders
-        // its navigation labels too, so requiring the entire text to be the phrase
-        // never matched a real single-page app. Zero matching controls is what makes
-        // this safe — a hydrated page with controls is never treated as loading.
-        || (renderedInteractiveCount === 0
-          && /^(loading|chargement)\\b/i.test(loadingShellText))
-      )
-    );
-    return JSON.stringify({
-      url: location.href,
-      title: document.title,
-      readyState: document.readyState,
-      mutationCount: globalThis.__webkituiState?.mutationCount ?? 0,
-      walkedFrameCapabilityIDs: Array.from(walkedFrameDocuments).map(frameDocument => {
+      };
+      const frameCapabilityIDOf = element => {
         try {
-          const value = frameDocument.defaultView?.__webkituiFrameCapabilityID;
+          const value = element?.ownerDocument?.defaultView?.__webkituiFrameCapabilityID;
           return typeof value === 'string' && value ? value : null;
         } catch (_) {
           return null;
         }
-      }).filter(Boolean),
-      crossOriginFrameCount,
-      totalElementCount: matchingElements.length,
-      unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
-      renderedInteractiveCount,
-      renderedContentCount: pageContentProbe.renderedContentCount,
-      documentLanguage: bounded(
-        collapse(document.documentElement.getAttribute('lang'))
-          || collapse(document.body?.getAttribute('lang'))
-          || null),
-      ariaHiddenDropCount,
-      unrenderedControlCount,
-      unrenderedControlNames,
-      rawControlCount,
-      obscuredByAncestorOpacity,
-      documentElementCount,
-      bodyTextLength,
-      firstControlProbe,
-      transientLoading,
-      semanticTextTruncated,
-      elements
-    });
-    """
-
-  private static let actionHelpers = """
-    const collapse = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
-    const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
-    const deepQueryAll = (root, selector) => {
-      const matches = [];
-      const roots = [root];
-      for (let index = 0; index < roots.length; index += 1) {
-        const current = roots[index];
-        matches.push(...current.querySelectorAll(selector));
-        for (const host of current.querySelectorAll('*')) {
-          if (host.shadowRoot) roots.push(host.shadowRoot);
-          // A same-origin frame is part of the page a person sees. Skipping it made
-          // every control inside one invisible, which an agent reads as absent.
-          if (host.localName === 'iframe' || host.localName === 'frame') {
-            let inner = null;
-            try { inner = host.contentDocument; } catch { inner = null; }
-            if (inner) roots.push(inner);
-          }
-        }
-      }
-      return matches;
-    };
-    const labelledNode = (element, id) => {
-      const root = element?.getRootNode?.();
-      return (typeof root?.getElementById === 'function' ? root.getElementById(id) : null)
-        || document.getElementById(id);
-    };
-    const labelOf = element => {
-      if (element.labels && element.labels.length) {
-        return collapse(Array.from(element.labels).map(label => label.innerText).join(' ')) || null;
-      }
-      const labelledBy = collapse(element.getAttribute('aria-labelledby'));
-      if (labelledBy) {
-        return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
-      }
-      return borrowedLabel(element);
-    };
-    const classTokens = element => collapse(element?.getAttribute?.('class'));
-    const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
-    const isPointerControl = element => {
-      if (!['a', 'div', 'li', 'span'].includes(element.localName)) return false;
-      if (getComputedStyle(element).cursor !== 'pointer') return false;
-      const name = collapse(element.getAttribute('aria-label') || element.innerText);
-      if (!name) return false;
-      return !Array.from(element.children).some(child =>
-        isRendered(child) && getComputedStyle(child).cursor === 'pointer'
-        && collapse(child.getAttribute('aria-label') || child.innerText) === name);
-    };
-    const hasImplicitTabSemantics = element => {
-      if (element.hasAttribute('aria-selected')) return true;
-      const parent = composedParent(element);
-      return isPointerControl(element)
-        && (collapse(parent?.getAttribute?.('role')).toLowerCase() === 'tablist'
-          || hasTabToken(element) || hasTabToken(parent));
-    };
-    const roleOf = element => {
-      const explicit = collapse(element.getAttribute('role'));
-      if (explicit) return explicit;
-      if (hasImplicitTabSemantics(element)) return 'tab';
-      if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
-      if (element.localName === 'button' || element.hasAttribute('onclick')) return 'button';
-      if (/^h[1-6]$/.test(element.localName)) return 'heading';
-      if (element.localName === 'table') return 'table';
-      if (element.localName === 'tr') return 'row';
-      if (element.localName === 'th') return 'columnheader';
-      if (element.localName === 'td') return 'cell';
-      if (element.localName === 'select') return 'combobox';
-      if (element.localName === 'textarea') return 'textbox';
-      if (element.localName === 'summary') return 'button';
-      if (element.localName === 'input') {
-        const type = collapse(element.type).toLowerCase();
-        if (type === 'search') return 'searchbox';
-        if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
-        if (type === 'checkbox') return 'checkbox';
-        if (type === 'radio') return 'radio';
-        if (type === 'range') return 'slider';
-        return 'textbox';
-      }
-      if (isPointerControl(element)) return 'button';
-      return null;
-    };
-    // innerText stops at a shadow host, so a custom element whose label is rendered in
-    // its own shadow root (Reddit's chat requests) observed with no name at all. Its
-    // shadow text, without style or script, stands in. Kept identical in the observation
-    // and the action helpers: the name recorded is the name re-resolved.
-    const shadowTextOf = (element, depth = 0) => {
-      const root = element.shadowRoot;
-      if (!root || depth > 2) return '';
-      const parts = [];
-      const walk = node => {
-        if (parts.join(' ').length > 200) return;
-        if (node.nodeType === Node.TEXT_NODE) { parts.push(node.data); return; }
-        if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
-          return;
-        }
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          if (['style', 'script', 'template'].includes(node.localName)) return;
-          if (node.shadowRoot) { parts.push(shadowTextOf(node, depth + 1)); return; }
-        }
-        node.childNodes.forEach(walk);
       };
-      walk(root);
-      return collapse(parts.join(' ')).slice(0, 200);
-    };
-    // A submit input paints its value as its caption; innerText is empty. Only
-    // button-like inputs borrow that value, never editable or hidden field values.
-    const inputButtonName = element => element.localName === 'input'
-      && ['button', 'submit', 'reset'].includes(element.type)
-      ? collapse(element.value) : null;
-    const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
-      || inputButtonName(element)
-      || collapse(element.getAttribute('placeholder'))
-      || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
-      || collapse(element.innerText) || shadowTextOf(element) || null;
-    let obscuredByAncestorOpacity = false;
-    const isRendered = element => {
-      const box = element.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
-      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
-        const style = getComputedStyle(cursor);
-        if (cursor.hidden || cursor.inert || style.display === 'none'
-            || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
-      }
-      return true;
-    };
-    // Context anchors are re-derived here and compared with the text the observation
-    // recorded, so the neighbour must be chosen by the observation's rule, not the
-    // action rule above: aria-hidden is skipped, and only the element's own opacity
-    // hides it. The two rules differed and a Material tab whose previous sibling is an
-    // aria-hidden paginator was observed as unique, then refused as targetNotFound on
-    // every retry with no mutation (Play Console, 2026-09-23).
-    // The observation's safeContextValue, less the bounding the comparison applies
-    // itself: a sensitive or opaque label is skipped the same way on both sides, or the
-    // observation records the next label while the action re-derives this one.
-    const anchorSensitiveTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_ ]?key|recovery[-_ ]?codes?|backup[-_ ]?codes?|private[-_ ]?key|seed[-_ ]?phrase)(?:$|[^a-z0-9])/i;
-    const anchorLooksOpaque = value => {
-      const text = String(value ?? '');
-      if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(text)) return true;
-      if (text.length < 32 || /\\s/.test(text)
-          || !/^[A-Za-z0-9._~+/=-]+$/.test(text)) return false;
-      return new Set(text).size >= 12;
-    };
-    const anchorSafeText = value => {
-      const text = collapse(value);
-      if (!text || anchorLooksOpaque(text) || anchorSensitiveTerm.test(text)) return null;
-      return text;
-    };
-    const isAnchorRendered = element => {
-      const box = element.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
-      for (let cursor = element; cursor; cursor = composedParent(cursor)) {
-        if (cursor.hidden || cursor.inert
-            || collapse(cursor.getAttribute?.('aria-hidden')).toLowerCase() === 'true') {
+      const soleControl =
+        'input, button, select, textarea, a[href], summary,'
+        + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
+      const controlSurfaceOf = element => {
+        const fallback = hiddenControlSurface(element);
+        if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
+        return isRendered(element) ? element : fallback;
+      };
+      // A control that borrows a surface for its geometry borrows its label with it.
+      // Play's checkboxes carry no aria-label and no aria-labelledby — the visible text
+      // is a sibling — so without this they are exposed and anonymous, their locator
+      // holds role and nothing else, and every act on them fails as not unique.
+      const borrowedLabel = element => {
+        const surface = controlSurfaceOf(element);
+        if (surface === element) return null;
+        if (surface) {
+          return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
+        }
+        // Nothing rendered to borrow from. A control that cannot be clicked must still be
+        // nameable, or the agent cannot report what it is unable to reach.
+        for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+          if (cursor === document.body || cursor === document.documentElement) break;
+          if (deepQueryAll(cursor, soleControl).length !== 1) break;
+          const text = collapse(cursor.textContent);
+          // Bounded inline: this helper is shared with the action script, which has no
+          // bounded(). Reaching this branch there threw a ReferenceError that no fixture
+          // exercised and the first real page found on the first click.
+          if (text) return text.length > 512 ? text.slice(0, 512) : text;
+        }
+        return null;
+      };
+      // Why a control cannot be acted on, decided once and reported before the agent
+      // spends a round trip finding out. locatorQuality answers "is this the only match";
+      // it was read as "can I click this", and nothing answered that question.
+      const actionabilityOf = (element, surface) => {
+        const box = surface.getBoundingClientRect();
+        if (!(box.width > 0 && box.height > 0)) return 'no_layout_box';
+        const style = getComputedStyle(surface);
+        if (style.visibility === 'hidden' || style.display === 'none') return 'not_visible';
+        if (element.disabled
+            || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
+          return 'disabled';
+        }
+        const visible = viewportRectOf(surface);
+        if (visible.bottom <= 0 || visible.right <= 0
+            || visible.top >= innerHeight || visible.left >= innerWidth) {
+          return 'off_viewport';
+        }
+        return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
+          ? 'actionable' : 'covered';
+      };
+      // An element keeps its own box when an ancestor's overflow clips it away, so the
+      // geometry checks above still say it is laid out. A person sees nothing of it. The
+      // element stays in the tree (its actionability already says a click cannot reach
+      // it); this is what turns its visible flag off.
+      // Overflow clips only what an ancestor contains: an absolutely positioned box
+      // escapes every static ancestor up to its containing block, and a fixed box (a
+      // menu rendered through a portal) escapes them all short of a transformed one.
+      const clippedByAncestor = surface => {
+        let box = surface.getBoundingClientRect();
+        let position = getComputedStyle(surface).position;
+        for (let cursor = composedParent(surface); cursor; cursor = composedParent(cursor)) {
+          if (cursor.nodeType !== 1 || cursor.localName === 'html' || cursor.localName === 'body') {
+            break;
+          }
+          const style = getComputedStyle(cursor);
+          const containingBlock = style.transform !== 'none' || style.filter !== 'none'
+            || style.perspective !== 'none' || style.contain === 'paint'
+            || style.contain === 'strict' || style.contain === 'content';
+          if (position === 'fixed' && !containingBlock) continue;
+          if (position === 'absolute' && style.position === 'static' && !containingBlock) continue;
+          if (position === 'fixed' || position === 'absolute') position = style.position;
+          const clipsX = style.overflowX !== 'visible';
+          const clipsY = style.overflowY !== 'visible';
+          if (!clipsX && !clipsY) continue;
+          const clip = cursor.getBoundingClientRect();
+          const left = clipsX ? Math.max(box.left, clip.left) : box.left;
+          const right = clipsX ? Math.min(box.right, clip.right) : box.right;
+          const top = clipsY ? Math.max(box.top, clip.top) : box.top;
+          const bottom = clipsY ? Math.min(box.bottom, clip.bottom) : box.bottom;
+          if (right - left <= 0 || bottom - top <= 0) return true;
+          box = { left, right, top, bottom };
+        }
+        return false;
+      };
+      const classTokens = element => collapse(element?.getAttribute?.('class'));
+      const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
+      const hasSelectedToken = element =>
+        /(^|[\\s_-])(active|current|selected)($|[\\s_-])/i.test(classTokens(element));
+      const isPointerControl = element => {
+        if (!['a', 'div', 'li', 'span', 'p', 'label'].includes(element.localName) || !isRendered(element)) {
           return false;
         }
-        const style = getComputedStyle(cursor);
-        if (style.display === 'none' || style.visibility === 'hidden'
-            || style.visibility === 'collapse') return false;
-        if (Number(style.opacity) === 0 && cursor === element) return false;
-      }
-      return true;
-    };
-    // A Material-style control renders in two halves: the real input, given no size
-    // or clipped away, and the painted box beside it marked aria-hidden. Neither half
-    // survives a visibility filter on its own, so the form observes as a group with no
-    // children and cannot be filled at all. Stand the pair up as one unit, addressed by
-    // the visible half. The walk stops at the first ancestor owning a second control,
-    // so a surface is never shared between two checkboxes.
-    const hiddenControlSurface = element => {
-      if (!(element instanceof HTMLInputElement)
-          || !['checkbox', 'radio'].includes(element.type)) return null;
-      const labels = element.labels ? Array.from(element.labels) : [];
-      const label = labels.find(isRendered);
-      if (label) return label;
-      const labelledBy = collapse(element.getAttribute('aria-labelledby'));
-      for (const id of labelledBy.split(/\\s+/).slice(0, 8).filter(Boolean)) {
-        const node = labelledNode(element, id);
-        if (node && isRendered(node)) return node;
-      }
-      // Climb to the outermost ancestor that still owns this one control and nothing
-      // else interactive: that is the labelled row, which carries both the visible text
-      // and the click handler. The tight wrapper around the input holds neither — it is
-      // the painted box, and its text is empty.
-      let widest = null;
-      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
-        if (cursor === document.body || cursor === document.documentElement) break;
-        if (deepQueryAll(cursor, soleControl).length !== 1) break;
-        if (isRendered(cursor)) widest = cursor;
-      }
-      return widest;
-    };
-    // A control can be rendered, sized and enabled and still be unable to receive its
-    // own click: Material paints the box in a sibling that covers it. Hit testing is
-    // the only way to tell, and without it every radio on the page costs a failed
-    // round trip reported as indeterminate.
-    // Hit testing belongs to the document the element lives in, at that document's own
-    // coordinates. Asking the top-level document about a point measured inside a frame
-    // answers about whatever sits at those numbers in the outer page.
-    const hitAtCentreOfLocal = (node, box) => {
-      const owner = node?.ownerDocument ?? document;
-      const view = owner.defaultView ?? window;
-      const x = Math.min(view.innerWidth - 1, Math.max(0, box.left + box.width / 2));
-      const y = Math.min(view.innerHeight - 1, Math.max(0, box.top + box.height / 2));
-      let hit = owner.elementFromPoint(x, y);
-      while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
-        const nested = hit.shadowRoot.elementFromPoint(x, y);
-        if (!nested || nested === hit) break;
-        hit = nested;
-      }
-      return hit;
-    };
-    const hitReaches = (hit, ...targets) => {
-      for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
-        if (targets.includes(cursor)) return true;
-      }
-      return false;
-    };
-    const receivesOwnEvents = element => {
-      const box = element.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0)) return false;
-      return hitReaches(hitAtCentreOfLocal(element, box), element);
-    };
-    // An ordinal path from the document root. Structure is never identity — a recycled
-    // row keeps its position while meaning changes — so this only ever separates
-    // candidates that already satisfy every identity clause. Without it, twenty-two
-    // checkboxes that carry no name, no id and no distinguishing attribute have exactly
-    // one address between them.
-    const domPathOf = element => {
-      const steps = [];
-      for (let node = element; node && node.nodeType === 1; node = composedParent(node)) {
-        const parent = composedParent(node);
-        if (!parent) { steps.push(node.localName); break; }
-        let index = 0;
-        for (const sibling of parent.children) {
-          if (sibling === node) break;
-          if (sibling.localName === node.localName) index += 1;
-        }
-        steps.push(node.localName + '[' + index + ']');
-        if (steps.length >= 32) break;
-      }
-      return steps.reverse().join('/');
-    };
-    // Offset of an element's own frame within the top-level viewport. Geometry inside a
-    // frame is measured against that frame, so a click computed from it would land
-    // wherever that offset happens to be — usually somewhere else entirely.
-    const frameOffsetOf = element => {
-      let offsetX = 0;
-      let offsetY = 0;
-      let view = element?.ownerDocument?.defaultView ?? null;
-      let guard = 0;
-      while (view && view !== window && guard < 16) {
-        let host = null;
-        try { host = view.frameElement; } catch { host = null; }
-        if (!host) break;
-        const box = host.getBoundingClientRect();
-        offsetX += box.left;
-        offsetY += box.top;
-        view = host.ownerDocument?.defaultView ?? null;
-        guard += 1;
-      }
-      return { x: offsetX, y: offsetY };
-    };
-    // A rect in top-level viewport coordinates, whatever frame the element lives in.
-    const viewportRectOf = element => {
-      const box = element.getBoundingClientRect();
-      const offset = frameOffsetOf(element);
-      if (offset.x === 0 && offset.y === 0) return box;
-      return {
-        x: box.x + offset.x, y: box.y + offset.y,
-        left: box.left + offset.x, top: box.top + offset.y,
-        right: box.right + offset.x, bottom: box.bottom + offset.y,
-        width: box.width, height: box.height
+        if (getComputedStyle(element).cursor !== 'pointer') return false;
+        const name = collapse(element.getAttribute('aria-label') || element.innerText);
+        if (!name || name.length > maximumFieldCharacters) return false;
+        return !Array.from(element.children).some(child =>
+          // Only yield to a child that the pointer collector can actually return.
+          // A rich-text leaf inherits cursor:pointer but is not itself a candidate.
+          ['a', 'div', 'li', 'span', 'p', 'label'].includes(child.localName)
+          && isRendered(child) && getComputedStyle(child).cursor === 'pointer'
+          && collapse(child.getAttribute('aria-label') || child.innerText) === name);
       };
-    };
-    const soleControl =
-      'input, button, select, textarea, a[href], summary,'
-      + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
-    const controlSurfaceOf = element => {
-      const fallback = hiddenControlSurface(element);
-      if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
-      return isRendered(element) ? element : fallback;
-    };
-    // A control that borrows a surface for its geometry borrows its label with it.
-    // Play's checkboxes carry no aria-label and no aria-labelledby — the visible text
-    // is a sibling — so without this they are exposed and anonymous, their locator
-    // holds role and nothing else, and every act on them fails as not unique.
-    const borrowedLabel = element => {
-      const surface = controlSurfaceOf(element);
-      if (surface === element) return null;
-      if (surface) {
-        return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
-      }
-      // Nothing rendered to borrow from. A control that cannot be clicked must still be
-      // nameable, or the agent cannot report what it is unable to reach.
-      for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
-        if (cursor === document.body || cursor === document.documentElement) break;
-        if (deepQueryAll(cursor, soleControl).length !== 1) break;
-        const text = collapse(cursor.textContent);
-        // Bounded inline: this helper is shared with the action script, which has no
-        // bounded(). Reaching this branch there threw a ReferenceError that no fixture
-        // exercised and the first real page found on the first click.
-        if (text) return text.length > 512 ? text.slice(0, 512) : text;
-      }
-      return null;
-    };
-    // Why a control cannot be acted on, decided once and reported before the agent
-    // spends a round trip finding out. locatorQuality answers "is this the only match";
-    // it was read as "can I click this", and nothing answered that question.
-    const actionabilityOf = (element, surface) => {
-      const box = surface.getBoundingClientRect();
-      if (!(box.width > 0 && box.height > 0)) return 'no_layout_box';
-      const style = getComputedStyle(surface);
-      if (style.visibility === 'hidden' || style.display === 'none') return 'not_visible';
-      if (element.disabled
-          || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
-        return 'disabled';
-      }
-      const visible = viewportRectOf(surface);
-      if (visible.bottom <= 0 || visible.right <= 0
-          || visible.top >= innerHeight || visible.left >= innerWidth) {
-        return 'off_viewport';
-      }
-      return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
-        ? 'actionable' : 'covered';
-    };
-    const surfaceOf = element => controlSurfaceOf(element) || element;
-    const directLabelledText = element => {
-      const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
-      if (!labelledBy) return null;
-      return collapse(labelledBy.split(/\\s+/)
-        .slice(0, 8)
-        .map(id => labelledNode(element, id)?.innerText)
-        .join(' ')) || null;
-    };
-    const sameRowLabelOf = element => {
-      const row = element.closest(
-        'tr, [role="row"], li, [data-row], [class~="row"], [class*="form-row"], [class*="capability"]');
-      if (!row) return null;
-      const labelled = Array.from(row.querySelectorAll(
-        'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
-      const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
-      for (const candidate of candidates) {
-        if (candidate === element || candidate.contains(element) || !isAnchorRendered(candidate)) {
-          continue;
+      const hasImplicitTabSemantics = element => {
+        if (element.hasAttribute('aria-selected')) return true;
+        const parent = composedParent(element);
+        return isPointerControl(element)
+          && (collapse(parent?.getAttribute?.('role')).toLowerCase() === 'tablist'
+            || hasTabToken(element) || hasTabToken(parent));
+      };
+      const looksOpaque = value => {
+        const text = String(value ?? '');
+        if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(text)) return true;
+        if (text.length < 32 || /\\s/.test(text)
+            || !/^[A-Za-z0-9._~+/=-]+$/.test(text)) return false;
+        return new Set(text).size >= 12;
+      };
+      const roleOf = element => {
+        const explicit = collapse(element.getAttribute('role'));
+        if (explicit) return explicit;
+        if (element.localName === 'dialog') return 'dialog';
+        if (hasImplicitTabSemantics(element)) return 'tab';
+        if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
+        if (element.localName === 'button' || element.hasAttribute('onclick')) return 'button';
+        if (/^h[1-6]$/.test(element.localName)) return 'heading';
+        if (element.localName === 'table') return 'table';
+        if (element.localName === 'tr') return 'row';
+        if (element.localName === 'th') return 'columnheader';
+        if (element.localName === 'td') return 'cell';
+        if (element.localName === 'select') return 'combobox';
+        if (element.localName === 'textarea') return 'textbox';
+        if (element.localName === 'summary') return 'button';
+        if (element.localName === 'input') {
+          const type = collapse(element.type).toLowerCase();
+          if (type === 'search') return 'searchbox';
+          if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+          if (type === 'checkbox') return 'checkbox';
+          if (type === 'radio') return 'radio';
+          if (type === 'range') return 'slider';
+          return 'textbox';
         }
-        const text = anchorSafeText(
-          candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
-        if (text && text !== anchorSafeText(nameOf(element))) return text;
-      }
-      return null;
-    };
-    const contextAnchorOf = (element, kind) => {
-      if (kind === 'same_row_label') return sameRowLabelOf(element);
-      if (kind === 'fieldset_legend') {
-        return collapse(element.closest('fieldset')?.querySelector(':scope > legend')?.innerText)
-          || null;
-      }
-      if (kind === 'labelled_region') {
+        if (isPointerControl(element)) return 'button';
+        return null;
+      };
+      const labelOf = element => {
+        if (element.labels && element.labels.length) {
+          return collapse(Array.from(element.labels).map(label => label.innerText).join(' ')) || null;
+        }
+        const labelledBy = collapse(element.getAttribute('aria-labelledby'));
+        if (labelledBy) {
+          return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
+        }
+        return borrowedLabel(element);
+      };
+      // innerText stops at a shadow host, so a custom element whose label is rendered in
+      // its own shadow root (Reddit's chat requests) observed with no name at all. Its
+      // shadow text, without style or script, stands in. Kept identical in the observation
+      // and the action helpers: the name recorded is the name re-resolved.
+      const shadowTextOf = (element, depth = 0) => {
+        const root = element.shadowRoot;
+        if (!root || depth > 2) return '';
+        const parts = [];
+        const walk = node => {
+          if (parts.join(' ').length > 200) return;
+          if (node.nodeType === Node.TEXT_NODE) { parts.push(node.data); return; }
+          if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
+            return;
+          }
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (['style', 'script', 'template'].includes(node.localName)) return;
+            if (node.shadowRoot) { parts.push(shadowTextOf(node, depth + 1)); return; }
+          }
+          node.childNodes.forEach(walk);
+        };
+        walk(root);
+        return collapse(parts.join(' ')).slice(0, 200);
+      };
+      // A submit input paints its value as its caption; innerText is empty. Only
+      // button-like inputs borrow that value, never editable or hidden field values.
+      const inputButtonName = element => element.localName === 'input'
+        && ['button', 'submit', 'reset'].includes(element.type)
+        ? collapse(element.value) : null;
+      const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
+        || inputButtonName(element)
+        || collapse(element.getAttribute('placeholder'))
+        || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
+        || (element.isContentEditable ? null
+          : collapse(element.innerText) || shadowTextOf(element) || null);
+      const directLabelledText = element => {
+        const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
+        if (!labelledBy) return null;
+        return collapse(labelledBy.split(/\\s+/)
+          .slice(0, 8)
+          .map(id => labelledNode(element, id)?.innerText)
+          .join(' ')) || null;
+      };
+      const safeContextValue = value => {
+        const text = collapse(value);
+        if (!text || looksOpaque(text) || sensitiveLabelTerm.test(text)) return null;
+        if (scopeRoot && text.length > maximumFieldCharacters) {
+          aggregateTextOmitted = true;
+          return null;
+        }
+        return bounded(text);
+      };
+      const sameRowLabelOf = element => {
+        const row = element.closest(
+          'tr, [role="row"], li, [data-row], [class~="row"], [class*="form-row"], [class*="capability"]');
+        if (!row) return null;
+        const labelled = Array.from(row.querySelectorAll(
+          'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
+        const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
+        for (const candidate of candidates) {
+          if (candidate === element || candidate.contains(element) || !isRendered(candidate)) continue;
+          const text = safeContextValue(
+            candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
+          if (text && text !== safeContextValue(nameOf(element))) return text;
+        }
+        return null;
+      };
+      const contextAnchorsOf = element => {
+        const anchors = [];
+        const fieldset = element.closest('fieldset');
+        const legend = fieldset?.querySelector(':scope > legend');
+        const legendText = safeContextValue(legend?.innerText);
+        if (legendText) anchors.push({ kind: 'fieldset_legend', text: legendText });
+
         const region = element.closest(
           'dialog, [role="dialog"], [role="alertdialog"], section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
-        return collapse(region?.getAttribute('aria-label') || directLabelledText(region)) || null;
-      }
-      if (kind === 'nearest_heading') {
-        const structural = element.closest('section, article, nav, main, form, fieldset')
-          || document.body;
+        const regionText = safeContextValue(
+          region?.getAttribute('aria-label') || directLabelledText(region));
+        if (regionText) anchors.push({ kind: 'labelled_region', text: regionText });
+
+        let structural = element.closest('section, article, nav, main, form, fieldset')
+          || scopeRoot || document.body;
+        if (scopeRoot && !scopeRoot.contains(structural)) structural = scopeRoot;
         const headings = Array.from(
           structural.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]'));
         const heading = headings.filter(candidate =>
           candidate !== element
           && Boolean(candidate.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
         ).pop();
-        return collapse(heading?.innerText || heading?.getAttribute('aria-label')) || null;
-      }
-      if (kind === 'previous_sibling') {
+        const headingText = safeContextValue(heading?.innerText || heading?.getAttribute('aria-label'));
+        if (headingText) anchors.push({ kind: 'nearest_heading', text: headingText });
+
         let sibling = element.previousElementSibling;
-        while (sibling && !isAnchorRendered(sibling)) sibling = sibling.previousElementSibling;
-        return collapse(sibling?.innerText || sibling?.textContent) || null;
-      }
-      return null;
-    };
-    const sanitizedHref = element => {
-      if (!element.hasAttribute('href')) return null;
-      try {
-        const url = new URL(element.getAttribute('href'), document.baseURI);
-        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
-        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
-        const query = keys.length
-          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
-        return `${url.origin}${url.pathname}${query}`;
-      } catch { return null; }
-    };
-    // Kept aligned with the observation mapper. This copy runs at confirmation time,
-    // after the target has been resolved again, so a page cannot make the operator
-    // approve the destination from an older observation by mutating `formaction`.
-    const sanitizedSubmissionDestination = value => {
-      if (value === null || value === undefined || value === '') return null;
-      try {
-        const url = new URL(value, document.baseURI);
-        if (!['http:', 'https:'].includes(url.protocol)) return url.protocol;
-        const keys = Array.from(url.searchParams.keys()).slice(0, 16);
-        const query = keys.length
-          ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
-        const result = `${url.origin}${url.pathname}${query}`;
-        return result.length > 4096 ? result.slice(0, 4096) : result;
-      } catch { return 'about:invalid'; }
-    };
-    const submissionDestinationOf = element => {
-      const submitsForm = Boolean(
-        (element instanceof HTMLButtonElement
-          && (element.type || 'submit').toLowerCase() === 'submit' && element.form)
-        || (element instanceof HTMLInputElement
-          && ['submit', 'image'].includes(element.type) && element.form)
-      );
-      // The formAction getter falls back to the document URL. Only use it when the
-      // control actually carries the overriding attribute; otherwise the form wins.
-      if (submitsForm) {
-        if (element.hasAttribute('formaction') && element.formAction) {
-          return sanitizedSubmissionDestination(element.formAction);
+        while (sibling && !isRendered(sibling)) sibling = sibling.previousElementSibling;
+        const siblingText = safeContextValue(scopeRoot && !scopeRoot.contains(sibling)
+          ? null : (sibling?.innerText || sibling?.textContent));
+        if (siblingText) anchors.push({ kind: 'previous_sibling', text: siblingText });
+        const rowLabel = sameRowLabelOf(element);
+        if (rowLabel) anchors.unshift({ kind: 'same_row_label', text: rowLabel });
+        return anchors.slice(0, 5);
+      };
+      const sanitizedHref = element => {
+        if (!element.hasAttribute('href')) return null;
+        try {
+          const url = new URL(element.getAttribute('href'), document.baseURI);
+          if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+          const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+          const query = keys.length
+            ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+          return bounded(`${url.origin}${url.pathname}${query}`);
+        } catch { return null; }
+      };
+      // Query values are redacted here exactly as they are for href: this string is
+      // exported with the observation, and a query is where a session token sits. An
+      // address with no readable origin is reported as its scheme rather than dropped,
+      // because staying silent would hide the case worth showing.
+      const sanitizedDestination = value => {
+        if (value === null || value === undefined || value === '') return null;
+        try {
+          const url = new URL(value, document.baseURI);
+          if (!['http:', 'https:'].includes(url.protocol)) return url.protocol;
+          const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+          const query = keys.length
+            ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+          return bounded(`${url.origin}${url.pathname}${query}`);
+        } catch { return 'about:invalid'; }
+      };
+      const stableAttributesOf = (element, sensitive) => {
+        if (sensitive) return {};
+        const attributes = {};
+        const href = sanitizedHref(element);
+        if (href && !looksOpaque(href)) attributes.href = href;
+        for (const name of ['id', 'name', 'title', 'data-testid']) {
+          const value = collapse(element.getAttribute(name));
+          if (!value || value.length > maximumFieldCharacters || looksOpaque(value)
+              || sensitiveIdentifierTerm.test(value)) continue;
+          attributes[name] = bounded(value);
         }
-        return sanitizedSubmissionDestination(element.form.action || null);
-      }
-      if (element.tagName === 'FORM' && typeof element.action === 'string') {
-        return sanitizedSubmissionDestination(element.action);
-      }
-      if (element.tagName === 'A' && element.hasAttribute('href')) {
-        return sanitizedSubmissionDestination(element.href);
-      }
-      return null;
-    };
-    const boundedFactValue = (value, criterion) => {
-      if (value === null || value === undefined) return null;
-      const text = String(value);
-      const maximum = Number(criterion.maximumCharacters);
-      if (!Number.isSafeInteger(maximum) || maximum <= 0 || text.length <= maximum) return text;
-      return text.slice(0, maximum);
-    };
-    const factValue = (element, criterion) => {
-      switch (criterion.fact) {
-        case 'role': return roleOf(element);
-        case 'accessibleName': return boundedFactValue(nameOf(element), criterion);
-        case 'label': return boundedFactValue(labelOf(element), criterion);
-        case 'text': return boundedFactValue(collapse(element.innerText) || null, criterion);
-        case 'stableAttribute':
-          if (criterion.argument === 'tag') return element.localName;
-          if (criterion.argument === 'href') {
-            return boundedFactValue(sanitizedHref(element), criterion);
+        return attributes;
+      };
+      const selector = [
+        'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'table', 'tr', 'th', 'td',
+        '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true" i], [contenteditable=""], [contenteditable="plaintext-only" i]', '[tabindex]', '[onclick]'
+      ].join(',');
+      const allowedRoles = new Set(Array.isArray(roleFilters) ? roleFilters : []);
+      const searchName = value => collapse(value).toLowerCase().replace(/[’‘ʼ]/g, "'");
+      const wantedName = searchName(nameFilter);
+      // Report delegated href-less controls without inventing a link role.
+      if (scopeRoot && !isRendered(scopeRoot)) throw new Error('observation_scope_unavailable');
+      const semanticElements = [
+        ...deepQueryAll(document, selector + ',a:not([href]),dialog[open]'),
+        ...deepQueryAll(document, '*').filter(isScrollableContainer)
+      ];
+      const pointerElements = deepQueryAll(document, 'a:not([href]), div, li, span, p, label')
+        .filter(isPointerControl);
+      // Diagnostic: how many otherwise-matching controls are dropped only because an
+      // ancestor is aria-hidden or inert. A page that renders its controls and marks
+      // them hidden leaves the tree empty for a reason worth reporting.
+      let ariaHiddenDropCount = 0;
+      // A control with no layout box anywhere up its row cannot be clicked, so reporting
+      // it as actionable would be a lie. Reporting nothing at all is worse: the only exit
+      // from a form can be one of these, and an agent that cannot see it concludes the
+      // page is complete instead of handing over to a human.
+      let unrenderedControlCount = 0;
+      const unrenderedControlNames = [];
+      const unrenderedControlName = element =>
+        collapse(element.getAttribute('aria-label')) || labelOf(element);
+      // Laid out but collapsed to nothing is not the same as deliberately hidden. The
+      // only exit from a Play form is a control like this — the "none of these features"
+      // option that keeps Next disabled — so it is reported with the truth about why it
+      // cannot be clicked, rather than dropped as if it did not exist.
+      const hiddenOnlyByGeometry = element => {
+        const box = element.getBoundingClientRect();
+        if (box.width > 0 && box.height > 0) return false;
+        for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+          if (cursor.hidden || cursor.inert
+              || collapse(cursor.getAttribute?.('aria-hidden')).toLowerCase() === 'true') {
+            return false;
           }
-          return collapse(element.getAttribute(criterion.argument)) || null;
-        case 'contextAnchor':
-          return boundedFactValue(contextAnchorOf(element, criterion.argument), criterion);
-        case 'domPath': return domPathOf(element);
-        case 'enabled': return String(
-          !(element.disabled || element.getAttribute('aria-disabled') === 'true'));
-        case 'checked':
-          if ('checked' in element) return String(Boolean(element.checked));
-          if (element.hasAttribute('aria-checked')) {
-            return String(element.getAttribute('aria-checked') === 'true');
+          const style = getComputedStyle(cursor);
+          if (style.display === 'none' || style.visibility === 'hidden'
+              || style.visibility === 'collapse' || Number(style.opacity) === 0) {
+            return false;
           }
-          return null;
-        case 'selected':
-          if ('selected' in element) return String(Boolean(element.selected));
-          if (element.hasAttribute('aria-selected')) {
-            return String(element.getAttribute('aria-selected') === 'true');
+        }
+        return element.matches(soleControl);
+      };
+      const hiddenOnlyBySemantics = element => {
+        const box = element.getBoundingClientRect();
+        if (!(box.width > 0 && box.height > 0)) return false;
+        for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+          if (cursor.inert
+              || collapse(cursor.getAttribute && cursor.getAttribute('aria-hidden')).toLowerCase()
+                === 'true') {
+            return true;
           }
-          return null;
-        case 'selectedOption':
-          if (!(element instanceof HTMLSelectElement)) return null;
-          return boundedFactValue(collapse(
-            Array.from(element.selectedOptions).map(option => option.textContent).join(' ')
-          ), criterion);
-        case 'stateAttribute':
-          if (!element.hasAttribute(criterion.argument)) return null;
-          return boundedFactValue(element.getAttribute(criterion.argument) ?? '', criterion);
-        default: return null;
+        }
+        return false;
+      };
+      const matchingElements = Array.from(new Set([...semanticElements, ...pointerElements]))
+        .filter(element => {
+          // A wrapper with no independent state/action around one identically sized link
+          // exposes the same hit target twice. Keep the link and its destination.
+          if (element.getAttribute('role') === 'button'
+              && !element.matches('[onclick], [tabindex], [aria-expanded], [aria-pressed], [aria-controls], [aria-disabled]')) {
+            const links = deepQueryAll(element, 'a[href]');
+            if (links.length === 1 && collapse(nameOf(element)) === collapse(nameOf(links[0]))) {
+              const a = element.getBoundingClientRect(), b = links[0].getBoundingClientRect();
+              if (a.width > 0 && a.height > 0
+                  && ['x', 'y', 'width', 'height'].every(key => Math.abs(a[key] - b[key]) < 0.5)) {
+                return false;
+              }
+            }
+          }
+          if (!controlSurfaceOf(element)) {
+            if (hiddenOnlyBySemantics(element)) {
+              ariaHiddenDropCount += 1;
+              return false;
+            }
+            if (!hiddenOnlyByGeometry(element)) return false;
+            unrenderedControlCount += 1;
+            const name = unrenderedControlName(element);
+            if (name && unrenderedControlNames.length < 10
+                && !unrenderedControlNames.includes(name)) {
+              unrenderedControlNames.push(name);
+            }
+          }
+          const role = collapse(roleOf(element)).toLowerCase();
+          if (allowedRoles.size > 0 && !allowedRoles.has(role)) return false;
+          const name = searchName(nameOf(element));
+          return !wantedName || name.includes(wantedName);
+        });
+      const elements = matchingElements
+        .slice(elementOffset, elementOffset + __MAXIMUM_ELEMENTS__)
+        .map(element => {
+          const surface = controlSurfaceOf(element) || element;
+          const actionability = actionabilityOf(element, surface);
+          // Reported where a person sees it, not where its own frame measures it.
+          const reportedBox = viewportRectOf(surface);
+          // A control nobody can see is reported so the agent knows it exists and what it
+          // is called. What is written inside it is a different matter: reading the value
+          // of a box the user cannot see is exactly the leak the visibility filter was
+          // there to prevent.
+          const withheldForInvisibility =
+            actionability === 'no_layout_box' || actionability === 'not_visible';
+          const box = surface.getBoundingClientRect();
+          const rawValue = typeof element.value === 'string' ? element.value : null;
+          const autocomplete = collapse(element.getAttribute('autocomplete')).toLowerCase();
+          const autocompleteTokens = autocomplete.split(/\\s+/).filter(Boolean);
+          const publicTokenName = privacyPublicTokenName(element);
+          const publicNameMetadata = value => publicTokenName && privacyPublicNameTerm(value) ? '' : value;
+          const identifierMetadata = [
+            element.getAttribute('name'), element.id, element.getAttribute('type'), autocomplete
+          ].map(value => publicNameMetadata(collapse(value))).join(' ');
+          const labelMetadata = [element.getAttribute('aria-label'), labelOf(element)]
+            .map(value => publicNameMetadata(collapse(value))).join(' ');
+          const bundleIdentifierMetadata = /(?:^|[^a-z0-9])bundle(?:[ _-]*(?:id|identifier))?(?:$|[^a-z0-9])/i
+            .test(`${identifierMetadata} ${labelMetadata}`);
+          const publicReverseDNSIdentifier = bundleIdentifierMetadata
+            && /^[A-Za-z0-9][A-Za-z0-9-]*(?:\\.[A-Za-z0-9][A-Za-z0-9-]*){2,}$/.test(rawValue ?? '');
+          // Same-origin frame nodes belong to their own Window's DOM constructors.
+          // Testing them against the outer Window loses both value readback and fill.
+        const sensitive = privacyIsSensitive(element)
+          || (element instanceof element.ownerDocument.defaultView.HTMLInputElement && element.type === 'password')
+            || autocompleteTokens.some(token => sensitiveAutocomplete.has(token))
+            || sensitiveIdentifierTerm.test(identifierMetadata)
+            || sensitiveLabelTerm.test(labelMetadata)
+            || (!(element instanceof HTMLSelectElement) && looksOpaque(rawValue)
+              && !publicReverseDNSIdentifier);
+          // A disabled or read-only field shows its value to anyone looking at the page, so
+          // it is reported like any other: an account page whose address fields were all
+          // disabled read as empty, and the agent had to take a screenshot to learn a
+          // postal address (FPS/TSP, 2026-09-23). Sensitivity and visibility still decide.
+          let observableValue = null;
+          if (!sensitive && element instanceof HTMLSelectElement) {
+            observableValue = collapse(
+              Array.from(element.selectedOptions).map(option => option.textContent).join(' ')) || null;
+          } else if (!sensitive && element instanceof element.ownerDocument.defaultView.HTMLTextAreaElement) {
+            observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
+          } else if (!sensitive && element instanceof element.ownerDocument.defaultView.HTMLInputElement
+                     && ['text', 'search', 'email', 'tel', 'url', 'number'].includes(element.type)) {
+            observableValue = rawValue !== null && rawValue.length <= maximumFieldCharacters ? rawValue : null;
+          } else if (!sensitive && element.isContentEditable) {
+            // WebKit's own editing leaves a trailing newline in a contenteditable's text.
+            // Reported verbatim it makes every exact-text postcondition fail on a write
+            // that landed perfectly.
+            const editableValue = (element.textContent ?? '').replace(/\\s+$/, '');
+            observableValue = editableValue.length <= maximumFieldCharacters ? editableValue : null;
+          }
+          // What is chosen in a `<select>` is that control's value, in the one form a
+          // `<select>` has one. So a sensitive select's selection is never read here, on
+          // the same rule that withholds its `value` and its `text` and that makes `fill`
+          // and `select_option` refuse it: a two-factor delivery method, a reason for
+          // closing an account and a clinic's appointment type are each a secret spelled
+          // out in a label.
+          const selectedLabel = element instanceof HTMLSelectElement && !sensitive
+            ? collapse(Array.from(element.selectedOptions).map(option => option.textContent).join(' '))
+            : null;
+          // `select_option` addresses an option by its exact visible label, so the labels
+          // are published or the agent has to guess them from the surrounding page. Each
+          // one goes through bounded(), the same rule every other published label goes
+          // through, because the writer collapses the label it is given by that rule too:
+          // publish them collapsed any other way and the two halves disagree in silence.
+          // Nothing is published for a sensitive control, which is the rule `fill` and
+          // `select_option` already apply, nor for one whose value is withheld because
+          // nobody can see it.
+          const optionElements =
+            element instanceof HTMLSelectElement && !sensitive && !withheldForInvisibility
+              ? Array.from(element.options) : null;
+          const options = optionElements?.slice(0, maximumOptions).map(option => {
+            const group = option.parentElement;
+            return {
+              label: bounded(option.textContent) ?? '',
+              selected: Boolean(option.selected),
+              // A disabled optgroup disables every option inside it, and the IDL getter
+              // reflects only the option's own attribute. Read both, or a whole group
+              // reads as choosable and every request for one is refused.
+              disabled: Boolean(
+                option.disabled || (group instanceof HTMLOptGroupElement && group.disabled))
+            };
+          }) ?? null;
+          const isEditableField = element instanceof element.ownerDocument.defaultView.HTMLInputElement
+            || element instanceof element.ownerDocument.defaultView.HTMLTextAreaElement || element.isContentEditable;
+          const characterCount = !sensitive && isEditableField
+            ? String(element.isContentEditable ? (element.textContent ?? '') : (rawValue ?? '')).length
+            : null;
+          const ariaInvalid = collapse(element.getAttribute('aria-invalid')).toLowerCase();
+          const invalidByARIA = ['true', 'grammar', 'spelling'].includes(ariaInvalid);
+          const invalidByConstraint = Boolean(element.willValidate && element.validity
+            && !element.validity.valid);
+          const validationReferenceIDs = [
+            ...collapse(element.getAttribute('aria-errormessage')).split(/\\s+/),
+            ...collapse(element.getAttribute('aria-describedby')).split(/\\s+/)
+          ].filter(Boolean);
+          const invalidByVisibleMessage = validationReferenceIDs.some(id => {
+            const node = labelledNode(element, id);
+            if (!node || !isRendered(node) || !collapse(node.textContent)) return false;
+            if (collapse(element.getAttribute('aria-errormessage')).split(/\\s+/).includes(id)) {
+              return true;
+            }
+            const metadata = `${node.id} ${node.className ?? ''} ${node.getAttribute('role') ?? ''}`;
+            return /error|invalid|alert/i.test(metadata) || node.hasAttribute('aria-live');
+          });
+          let validationState = 'not_applicable';
+          if (invalidByARIA || invalidByConstraint || invalidByVisibleMessage) {
+            validationState = 'invalid';
+          }
+          else if (element.willValidate || ariaInvalid === 'false') validationState = 'valid';
+          const checked = (element instanceof HTMLInputElement
+            && ['checkbox', 'radio'].includes(element.type))
+            ? Boolean(element.checked)
+            : (element.hasAttribute('aria-checked')
+              ? collapse(element.getAttribute('aria-checked')).toLowerCase() === 'true' : null);
+          const selected = element instanceof HTMLOptionElement
+            ? Boolean(element.selected)
+            : (element.hasAttribute('aria-selected')
+              ? collapse(element.getAttribute('aria-selected')).toLowerCase() === 'true'
+              : (roleOf(element) === 'tab'
+                ? (element.hasAttribute('aria-current') || hasSelectedToken(element)) : null));
+          const stateAttributes = {};
+          for (const name of [
+            'aria-checked', 'aria-selected', 'aria-current', 'aria-disabled', 'aria-expanded',
+            'data-state', 'open'
+          ]) {
+            if (element.hasAttribute(name)) stateAttributes[name] = element.getAttribute(name) ?? '';
+          }
+          let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
+          if (!physicalIdentity) {
+            physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
+            globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
+            globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
+          }
+          const submitsForm = Boolean(
+            (element instanceof HTMLButtonElement
+              && (element.type || 'submit').toLowerCase() === 'submit' && element.form)
+            || (element instanceof HTMLInputElement
+              && ['submit', 'image'].includes(element.type) && element.form)
+          );
+          const scopedAggregate = scopeRoot && (element === scopeRoot
+            || isScrollableContainer(element)
+            || ['dialog','alertdialog','group','region','table','row'].includes(roleOf(element)));
+          const scopedText = value => {
+            if (scopedAggregate && collapse(value).length > maximumFieldCharacters) {
+              aggregateTextOmitted = true;
+              return null;
+            }
+            return bounded(value);
+          };
+          const explicitName = collapse(element.getAttribute('aria-label')) || labelOf(element)
+            || inputButtonName(element) || collapse(element.getAttribute('placeholder'))
+            || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'));
+          return {
+            physicalIdentity,
+            frameCapabilityID: frameCapabilityIDOf(element),
+            tag: element.localName,
+            role: roleOf(element),
+            accessibleName: explicitName ? bounded(explicitName) : scopedText(nameOf(element)),
+            submissionDestination: sanitizedDestination((() => {
+              // formaction wins over the owning form's action, which is the precedence
+              // HTML gives the two. The formAction IDL getter falls back to the document
+              // URL rather than to the form, so the form's own action is read directly
+              // instead: a form posting off-site under a button with no formaction is
+              // exactly the case that must not be reported as this page's origin.
+              if (submitsForm) {
+                if (element.hasAttribute('formaction') && element.formAction) {
+                  return element.formAction;
+                }
+                return element.form.action || null;
+              }
+              if (element.tagName === 'FORM' && typeof element.action === 'string') {
+                return element.action;
+              }
+              if (element.tagName === 'A' && element.hasAttribute('href')) {
+                return element.href;
+              }
+              return null;
+            })()),
+            label: bounded(labelOf(element)),
+            text: sensitive || withheldForInvisibility
+              ? null : scopedText(selectedLabel || collapse(element.innerText) || null),
+            value: withheldForInvisibility ? null : boundedFieldValue(observableValue),
+            validationState,
+            characterCount: withheldForInvisibility ? null : characterCount,
+            sensitive,
+            submitsForm,
+            contentEditable: Boolean(element.isContentEditable),
+            scrollable: isScrollableContainer(element) ? true : null,
+            fillCapability: ['input','textarea'].includes(element.localName)
+              || element.isContentEditable || ['textbox','combobox'].includes(roleOf(element))
+              ? (sensitive ? 'sensitive' : measuredFillCapability(element)) : null,
+            disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+            checked,
+            selected,
+            // Both conditions, stated here rather than left to the definition above: this
+            // key was gated on invisibility alone, and published the chosen label of every
+            // sensitive select on every page until it was found.
+            selectedOption: sensitive || withheldForInvisibility
+              ? null : bounded(selectedLabel || null),
+            // Three keys a page of buttons never pays for: absent, not empty, wherever
+            // there is no list to publish.
+            options,
+            optionCount: optionElements ? optionElements.length : null,
+            optionsTruncated: options ? optionElements.length > options.length : null,
+            stateAttributes: sensitive ? {} : Object.fromEntries(
+              Object.entries(stateAttributes).map(([key, value]) => [key, bounded(value) ?? ''])),
+            contextAnchors: sensitive ? [] : contextAnchorsOf(element),
+            domPath: domPathOf(element),
+            stableAttributes: stableAttributesOf(element, sensitive),
+            visible: actionability !== 'no_layout_box' && actionability !== 'not_visible'
+              && !clippedByAncestor(surface),
+            actionability,
+            coveredBy: actionability === 'covered' ? (() => {
+              const hit = hitAtCentreOfLocal(surface, box);
+              if (!hit) return null;
+              const id = stableAttributesOf(hit, false).id;
+              return bounded(`${hit.localName}${id ? '#' + id : ''}${hit.getAttribute('role') ? ' role=' + hit.getAttribute('role') : ''}`);
+            })() : null,
+            boundingBox: {
+              x: reportedBox.x, y: reportedBox.y,
+              width: reportedBox.width, height: reportedBox.height
+            }
+          };
+        });
+      // Counted through the whole tree, frames nested inside readable frames included:
+      // an unreadable region one level down is exactly as invisible as one at the top.
+      let crossOriginFrameCount = 0;
+      for (const frame of deepQueryAll(document, 'iframe, frame')) {
+        try { if (!frame.contentDocument) crossOriginFrameCount += 1; }
+        catch { crossOriginFrameCount += 1; }
       }
-    };
-    const matchesCriterion = (element, criterion) => {
-      const actual = factValue(element, criterion);
-      if (actual === null) return criterion.strength !== 'required';
-      if (criterion.comparison === 'whitespaceCollapsed') {
-        return collapse(actual) === collapse(criterion.expected);
+      const visibleLoadingIndicators = deepQueryAll(
+        document, '[aria-busy="true"], [role="progressbar"], progress'
+      ).some(isRendered);
+      const loadingShellText = collapse(document.body?.innerText);
+      // Counted from the raw DOM, not the semantic matcher: a page whose matcher finds
+      // nothing may still be fully rendered, and must not be mistaken for a shell that
+      // has not painted its controls yet.
+      const rawControls = deepQueryAll(
+        document, 'button, a[href], input, select, textarea, [role="button"]');
+      const renderedInteractiveCount = rawControls.filter(isRendered).length;
+      // Separates "not in this tree" from "in the tree but not laid out": the first
+      // means the script is walking the wrong document, the second a layout problem.
+      const rawControlCount = rawControls.length;
+      const documentElementCount = document.querySelectorAll('*').length;
+      // One control described in full: enough to tell a layout problem from a filter
+      // problem without another round trip.
+      const probe = rawControls[0];
+      let firstControlProbe = 'none';
+      if (probe) {
+        const box = probe.getBoundingClientRect();
+        const style = getComputedStyle(probe);
+        firstControlProbe = [
+          probe.tagName.toLowerCase(),
+          'w=' + Math.round(box.width), 'h=' + Math.round(box.height),
+          'rects=' + probe.getClientRects().length,
+          'display=' + style.display, 'visibility=' + style.visibility,
+          'opacity=' + style.opacity,
+          'offsetParent=' + (probe.offsetParent ? 'yes' : 'no'),
+          'connected=' + probe.isConnected,
+          'docW=' + document.documentElement.clientWidth,
+          'docH=' + document.documentElement.clientHeight,
+          'innerW=' + window.innerWidth, 'innerH=' + window.innerHeight
+        ].join(' ');
+        // Which ancestor disqualifies it, and on which property.
+        let reason = 'accepted';
+        for (let cursor = probe; cursor; cursor = composedParent(cursor)) {
+          const tag = cursor.tagName ? cursor.tagName.toLowerCase() : String(cursor.nodeName);
+          if (cursor.hidden) { reason = 'hidden@' + tag; break; }
+          if (cursor.inert) { reason = 'inert@' + tag; break; }
+          if (cursor.getAttribute
+              && collapse(cursor.getAttribute('aria-hidden')).toLowerCase() === 'true') {
+            reason = 'aria-hidden@' + tag; break;
+          }
+          const cs = getComputedStyle(cursor);
+          if (!cs) { reason = 'no-style@' + tag; break; }
+          if (cs.display === 'none') { reason = 'display-none@' + tag; break; }
+          if (cs.visibility === 'hidden' || cs.visibility === 'collapse') {
+            reason = 'visibility-' + cs.visibility + '@' + tag; break;
+          }
+          if (Number(cs.opacity) === 0) { reason = 'opacity0@' + tag; break; }
+        }
+        firstControlProbe += ' | ' + reason;
       }
-      return actual === criterion.expected;
-    };
-    const selector = [
-      'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
-      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-      'table', 'tr', 'th', 'td',
-      '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true"]', '[tabindex]'
-    ].join(',');
-    const candidates = Array.from(new Set([
-      ...deepQueryAll(document, selector),
-      ...deepQueryAll(document, 'a:not([href]), div, li, span').filter(isPointerControl)
-    ]));
-    const reportedFactNames = {
-      role: 'role', accessibleName: 'accessible_name', label: 'label',
-      contextAnchor: 'context_anchor', stableAttribute: 'stable_attribute',
-      framePath: 'frame_path', text: 'value', domPath: 'dom_path', enabled: 'enabled',
-      checked: 'checked', selected: 'selected', selectedOption: 'selected_option',
-      stateAttribute: 'state_attribute'
-    };
-    const reportedFactName = criterion => {
-      const base = reportedFactNames[criterion.fact] || criterion.fact;
-      return criterion.argument ? base + ':' + criterion.argument : base;
-    };
-    // Required clauses decide what the target is. Corroborating ones were filtering just
-    // as hard whenever they had a value, which made "corroborating" a lie and let a
-    // single structural fact pick an element on its own — the exact thing a DOM path
-    // must never be allowed to do.
-    const requiredCriteria = criteria.filter(criterion => criterion.strength === 'required');
-    const locatorMatches = candidates.filter(element =>
-      requiredCriteria.every(criterion => matchesCriterion(element, criterion))
-    );
-    // The observation handed out this element's identity and browser_act was given it
-    // back. Re-deriving the target from a name the element may not have throws that
-    // away: twenty-two anonymous checkboxes are one address each, and every one of them
-    // resolved to twenty-two candidates. The identity is the disambiguation.
-    // It is not a licence to skip the locator. A virtual list recycles its rows, so the
-    // pinned node still has to satisfy every required clause, or it is not the element
-    // that was observed and this falls back to addressing by meaning.
-    // When the pin does not save an ambiguous address, the reason decides what the
-    // client should do, and guessing it from the outside costs a round trip each time.
-    let pinnedState = 'not_requested';
-    const pinnedNode = (() => {
-      if (typeof physicalIdentity !== 'string' || !physicalIdentity) return null;
-      const reference = globalThis.__webkituiState?.nodesByID?.get(physicalIdentity);
-      if (!reference) { pinnedState = 'absent_from_registry'; return null; }
-      const node = typeof reference.deref === 'function' ? reference.deref() : null;
-      if (!node) { pinnedState = 'collected'; return null; }
-      if (!node.isConnected) { pinnedState = 'detached'; return null; }
-      const failed = criteria
-        .filter(criterion => criterion.strength === 'required')
-        .filter(criterion => !matchesCriterion(node, criterion))
-        .map(reportedFactName);
-      if (failed.length > 0) {
-        pinnedState = 'clause_mismatch:' + failed.join(',');
+      const bodyTextLength = (document.body?.innerText || '').length;
+      const pageContentProbe = globalThis.__webkituiPageContentProbe?.() ?? {
+        contentState: bodyTextLength > 0 || renderedInteractiveCount > 0
+          ? 'usable' : 'empty_or_unusable',
+        renderedContentCount: (bodyTextLength > 0 ? 1 : 0) + renderedInteractiveCount
+      };
+      // The entire visible text of the document is one short loading phrase. A shell that
+      // has already painted a menu button still says only this, and requiring zero
+      // controls handed such a page over as complete — the agent then read an empty form.
+      // The bound is deliberately tight: Play's rendered app list keeps the same phrase at
+      // the top of its text and must stay ready, so anything that says more than the
+      // phrase alone is a page, not a shell. Being wrong the other way costs a stall on
+      // every observation.
+      const bodyIsOnlyTheLoadingPhrase =
+        /^(loading|chargement)\\b/i.test(loadingShellText) && loadingShellText.length <= 32;
+      const transientLoading = bodyIsOnlyTheLoadingPhrase || (
+        matchingElements.length === 0 && (
+          visibleLoadingIndicators
+          // Anchored on the start, not the whole body: a loading shell usually renders
+          // its navigation labels too, so requiring the entire text to be the phrase
+          // never matched a real single-page app. Zero matching controls is what makes
+          // this safe — a hydrated page with controls is never treated as loading.
+          || (renderedInteractiveCount === 0
+            && /^(loading|chargement)\\b/i.test(loadingShellText))
+        )
+      );
+      return privacyJSONStringify({
+        url: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        mutationCount: globalThis.__webkituiState?.mutationCount ?? 0,
+        walkedFrameCapabilityIDs: Array.from(walkedFrameDocuments).map(frameDocument => {
+          try {
+            const value = frameDocument.defaultView?.__webkituiFrameCapabilityID;
+            return typeof value === 'string' && value ? value : null;
+          } catch (_) {
+            return null;
+          }
+        }).filter(Boolean),
+        crossOriginFrameCount,
+        totalElementCount: matchingElements.length,
+        unfilteredCandidateCount: Array.from(new Set([...semanticElements, ...pointerElements])).length,
+        renderedInteractiveCount,
+        renderedContentCount: pageContentProbe.renderedContentCount,
+        documentLanguage: bounded(
+          collapse(document.documentElement.getAttribute('lang'))
+            || collapse(document.body?.getAttribute('lang'))
+            || null),
+        ariaHiddenDropCount,
+        unrenderedControlCount,
+        unrenderedControlNames,
+        rawControlCount,
+        obscuredByAncestorOpacity,
+        documentElementCount,
+        bodyTextLength,
+        firstControlProbe,
+        transientLoading,
+        semanticTextTruncated,
+        aggregateTextOmitted,
+        elements
+      });
+      """
+
+  private static let actionHelpers =
+    BrowserTextPrivacy.source + BrowserScrollGeometry.source + BrowserInputCapabilities.source + """
+      const collapse = value => privacyRedact(value).replace(/\\s+/g, ' ').trim();
+      const composedParent = element => element?.parentElement || element?.getRootNode?.()?.host || null;
+      const deepQueryAll = (root, selector) => {
+        const matches = [];
+        const roots = [root];
+        for (let index = 0; index < roots.length; index += 1) {
+          const current = roots[index];
+          matches.push(...current.querySelectorAll(selector));
+          for (const host of current.querySelectorAll('*')) {
+            if (host.shadowRoot) roots.push(host.shadowRoot);
+            // A same-origin frame is part of the page a person sees. Skipping it made
+            // every control inside one invisible, which an agent reads as absent.
+            if (host.localName === 'iframe' || host.localName === 'frame') {
+              let inner = null;
+              try { inner = host.contentDocument; } catch { inner = null; }
+              if (inner) roots.push(inner);
+            }
+          }
+        }
+        return matches;
+      };
+      const labelledNode = (element, id) => {
+        const root = element?.getRootNode?.();
+        return (typeof root?.getElementById === 'function' ? root.getElementById(id) : null)
+          || document.getElementById(id);
+      };
+      const labelOf = element => {
+        if (element.labels && element.labels.length) {
+          return collapse(Array.from(element.labels).map(label => label.innerText).join(' ')) || null;
+        }
+        const labelledBy = collapse(element.getAttribute('aria-labelledby'));
+        if (labelledBy) {
+          return collapse(labelledBy.split(/\\s+/).map(id => labelledNode(element, id)?.innerText).join(' ')) || null;
+        }
+        return borrowedLabel(element);
+      };
+      const classTokens = element => collapse(element?.getAttribute?.('class'));
+      const hasTabToken = element => /(^|[\\s_-])tabs?($|[\\s_-])/i.test(classTokens(element));
+      const isPointerControl = element => {
+        if (!['a', 'div', 'li', 'span', 'p', 'label'].includes(element.localName)) return false;
+        if (getComputedStyle(element).cursor !== 'pointer') return false;
+        const name = collapse(element.getAttribute('aria-label') || element.innerText);
+        if (!name) return false;
+        return !Array.from(element.children).some(child =>
+          ['a', 'div', 'li', 'span', 'p', 'label'].includes(child.localName)
+          && isRendered(child) && getComputedStyle(child).cursor === 'pointer'
+          && collapse(child.getAttribute('aria-label') || child.innerText) === name);
+      };
+      const hasImplicitTabSemantics = element => {
+        if (element.hasAttribute('aria-selected')) return true;
+        const parent = composedParent(element);
+        return isPointerControl(element)
+          && (collapse(parent?.getAttribute?.('role')).toLowerCase() === 'tablist'
+            || hasTabToken(element) || hasTabToken(parent));
+      };
+      const roleOf = element => {
+        const explicit = collapse(element.getAttribute('role'));
+        if (explicit) return explicit;
+        if (element.localName === 'dialog') return 'dialog';
+        if (hasImplicitTabSemantics(element)) return 'tab';
+        if (element.localName === 'a' && element.hasAttribute('href')) return 'link';
+        if (element.localName === 'button' || element.hasAttribute('onclick')) return 'button';
+        if (/^h[1-6]$/.test(element.localName)) return 'heading';
+        if (element.localName === 'table') return 'table';
+        if (element.localName === 'tr') return 'row';
+        if (element.localName === 'th') return 'columnheader';
+        if (element.localName === 'td') return 'cell';
+        if (element.localName === 'select') return 'combobox';
+        if (element.localName === 'textarea') return 'textbox';
+        if (element.localName === 'summary') return 'button';
+        if (element.localName === 'input') {
+          const type = collapse(element.type).toLowerCase();
+          if (type === 'search') return 'searchbox';
+          if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+          if (type === 'checkbox') return 'checkbox';
+          if (type === 'radio') return 'radio';
+          if (type === 'range') return 'slider';
+          return 'textbox';
+        }
+        if (isPointerControl(element)) return 'button';
         return null;
-      }
-      pinnedState = 'used';
-      return node;
-    })();
-    // Identity clauses say what the target is; when several elements are the same
-    // thing, the corroborating clauses say which one. Refusing at that point left
-    // twenty-two identical checkboxes permanently unreachable, while the observation
-    // had already recorded exactly what separates them. This can only ever narrow a set
-    // that already satisfies every required clause, so it cannot promote a wrong
-    // element — and if it does not land on exactly one, the ambiguity stands.
-    const narrowed = (() => {
-      if (locatorMatches.length <= 1) return locatorMatches;
-      // Position only means something while the set it indexes is the same set. If a row
-      // has been added or removed since the observation, the eighth checkbox is no
-      // longer the eighth thing the user saw, and picking by structure would silently
-      // tick the wrong box — worse than refusing. Same population, or no narrowing.
-      if (locatorMatches.length !== expectedCandidateCount) return locatorMatches;
-      const corroborating = criteria.filter(criterion => criterion.strength !== 'required');
-      if (corroborating.length === 0) return locatorMatches;
-      const singled = clauses => {
-        const exact = locatorMatches.filter(element =>
-          clauses.every(criterion => matchesCriterion(element, criterion)));
-        return exact.length === 1 ? exact : null;
       };
-      // All of them first: agreement across every corroborating fact is the strongest
-      // evidence available. But one volatile fact — a neighbouring label that moved, a
-      // caption that changed — must not veto the rest, so fall back to position alone,
-      // which is the one corroborator guaranteed to single out a member of a set that
-      // has not itself changed.
-      const byEverything = singled(corroborating);
-      if (byEverything) return byEverything;
-      const positional = corroborating.filter(criterion => criterion.fact === 'domPath');
-      return (positional.length > 0 ? singled(positional) : null) ?? locatorMatches;
-    })();
-    const matches = pinnedNode ? [pinnedNode] : narrowed;
-    // Zero matches is an absence, not an ambiguity. A client told "not unique" goes
-    // looking for a second candidate that does not exist; what it needs is which
-    // required fact stopped matching, because that is usually one re-observation away.
-    const eliminatedBy = matches.length > 0 ? [] : criteria
-      .filter(criterion => criterion.strength === 'required')
-      .filter(criterion => !candidates.some(element => matchesCriterion(element, criterion)))
-      .map(reportedFactName);
-    const describe = element => {
-      // The native dispatch computes a screen point from this, so it has to be in
-      // top-level coordinates or the click lands at the frame's offset instead.
-      const box = viewportRectOf(surfaceOf(element));
-      let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
-      if (!physicalIdentity) {
-        physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
-        globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
-        globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
-      }
-      return {
-        physicalIdentity,
-        submissionDestination: submissionDestinationOf(element),
-        boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height },
-        geometryStable: false,
-        actionable: false,
-        dispatched: false,
-        trustedUserGesture: false
+      // innerText stops at a shadow host, so a custom element whose label is rendered in
+      // its own shadow root (Reddit's chat requests) observed with no name at all. Its
+      // shadow text, without style or script, stands in. Kept identical in the observation
+      // and the action helpers: the name recorded is the name re-resolved.
+      const shadowTextOf = (element, depth = 0) => {
+        const root = element.shadowRoot;
+        if (!root || depth > 2) return '';
+        const parts = [];
+        const walk = node => {
+          if (parts.join(' ').length > 200) return;
+          if (node.nodeType === Node.TEXT_NODE) { parts.push(node.data); return; }
+          if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
+            return;
+          }
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (['style', 'script', 'template'].includes(node.localName)) return;
+            if (node.shadowRoot) { parts.push(shadowTextOf(node, depth + 1)); return; }
+          }
+          node.childNodes.forEach(walk);
+        };
+        walk(root);
+        return collapse(parts.join(' ')).slice(0, 200);
       };
-    };
-    """
+      // A submit input paints its value as its caption; innerText is empty. Only
+      // button-like inputs borrow that value, never editable or hidden field values.
+      const inputButtonName = element => element.localName === 'input'
+        && ['button', 'submit', 'reset'].includes(element.type)
+        ? collapse(element.value) : null;
+      const nameOf = element => collapse(element.getAttribute('aria-label')) || labelOf(element)
+        || inputButtonName(element)
+        || collapse(element.getAttribute('placeholder'))
+        || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
+        || (element.isContentEditable ? null
+          : collapse(element.innerText) || shadowTextOf(element) || null);
+      let obscuredByAncestorOpacity = false;
+      const isRendered = element => {
+        const box = element.getBoundingClientRect();
+        if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
+        for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+          const style = getComputedStyle(cursor);
+          if (cursor.hidden || cursor.inert || style.display === 'none'
+              || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+        }
+        return true;
+      };
+      // Context anchors are re-derived here and compared with the text the observation
+      // recorded, so the neighbour must be chosen by the observation's rule, not the
+      // action rule above: aria-hidden is skipped, and only the element's own opacity
+      // hides it. The two rules differed and a Material tab whose previous sibling is an
+      // aria-hidden paginator was observed as unique, then refused as targetNotFound on
+      // every retry with no mutation (Play Console, 2026-09-23).
+      // The observation's safeContextValue, less the bounding the comparison applies
+      // itself: a sensitive or opaque label is skipped the same way on both sides, or the
+      // observation records the next label while the action re-derives this one.
+      const anchorSensitiveTerm = /(?:^|[^a-z0-9])(token|state|csrf|nonce|session|assertion|secret|password|passcode|otp|one[-_ ]?time|api[-_ ]?key|recovery[-_ ]?codes?|backup[-_ ]?codes?|private[-_ ]?key|seed[-_ ]?phrase)(?:$|[^a-z0-9])/i;
+      const anchorLooksOpaque = value => {
+        const text = String(value ?? '');
+        if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(text)) return true;
+        if (text.length < 32 || /\\s/.test(text)
+            || !/^[A-Za-z0-9._~+/=-]+$/.test(text)) return false;
+        return new Set(text).size >= 12;
+      };
+      const anchorSafeText = value => {
+        const text = collapse(value);
+        if (!text || anchorLooksOpaque(text) || anchorSensitiveTerm.test(text)) return null;
+        return text;
+      };
+      const isAnchorRendered = element => {
+        const box = element.getBoundingClientRect();
+        if (!(box.width > 0 && box.height > 0) || element.getClientRects().length === 0) return false;
+        for (let cursor = element; cursor; cursor = composedParent(cursor)) {
+          if (cursor.hidden || cursor.inert
+              || collapse(cursor.getAttribute?.('aria-hidden')).toLowerCase() === 'true') {
+            return false;
+          }
+          const style = getComputedStyle(cursor);
+          if (style.display === 'none' || style.visibility === 'hidden'
+              || style.visibility === 'collapse') return false;
+          if (Number(style.opacity) === 0 && cursor === element) return false;
+        }
+        return true;
+      };
+      // A Material-style control renders in two halves: the real input, given no size
+      // or clipped away, and the painted box beside it marked aria-hidden. Neither half
+      // survives a visibility filter on its own, so the form observes as a group with no
+      // children and cannot be filled at all. Stand the pair up as one unit, addressed by
+      // the visible half. The walk stops at the first ancestor owning a second control,
+      // so a surface is never shared between two checkboxes.
+      const hiddenControlSurface = element => {
+        if (!(element instanceof HTMLInputElement)
+            || !['checkbox', 'radio'].includes(element.type)) return null;
+        const labels = element.labels ? Array.from(element.labels) : [];
+        const label = labels.find(isRendered);
+        if (label) return label;
+        const labelledBy = collapse(element.getAttribute('aria-labelledby'));
+        for (const id of labelledBy.split(/\\s+/).slice(0, 8).filter(Boolean)) {
+          const node = labelledNode(element, id);
+          if (node && isRendered(node)) return node;
+        }
+        // Climb to the outermost ancestor that still owns this one control and nothing
+        // else interactive: that is the labelled row, which carries both the visible text
+        // and the click handler. The tight wrapper around the input holds neither — it is
+        // the painted box, and its text is empty.
+        let widest = null;
+        for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+          if (cursor === document.body || cursor === document.documentElement) break;
+          if (deepQueryAll(cursor, soleControl).length !== 1) break;
+          if (isRendered(cursor)) widest = cursor;
+        }
+        return widest;
+      };
+      // A control can be rendered, sized and enabled and still be unable to receive its
+      // own click: Material paints the box in a sibling that covers it. Hit testing is
+      // the only way to tell, and without it every radio on the page costs a failed
+      // round trip reported as indeterminate.
+      // Hit testing belongs to the document the element lives in, at that document's own
+      // coordinates. Asking the top-level document about a point measured inside a frame
+      // answers about whatever sits at those numbers in the outer page.
+      const hitAtCentreOfLocal = (node, box) => {
+        const owner = node?.ownerDocument ?? document;
+        const view = owner.defaultView ?? window;
+        const x = Math.min(view.innerWidth - 1, Math.max(0, box.left + box.width / 2));
+        const y = Math.min(view.innerHeight - 1, Math.max(0, box.top + box.height / 2));
+        let hit = owner.elementFromPoint(x, y);
+        while (hit?.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+          const nested = hit.shadowRoot.elementFromPoint(x, y);
+          if (!nested || nested === hit) break;
+          hit = nested;
+        }
+        return hit;
+      };
+      const hitReaches = (hit, ...targets) => {
+        for (let cursor = hit; cursor; cursor = composedParent(cursor)) {
+          if (targets.includes(cursor)) return true;
+        }
+        return false;
+      };
+      const receivesOwnEvents = element => {
+        const box = element.getBoundingClientRect();
+        if (!(box.width > 0 && box.height > 0)) return false;
+        return hitReaches(hitAtCentreOfLocal(element, box), element);
+      };
+      // An ordinal path from the document root. Structure is never identity — a recycled
+      // row keeps its position while meaning changes — so this only ever separates
+      // candidates that already satisfy every identity clause. Without it, twenty-two
+      // checkboxes that carry no name, no id and no distinguishing attribute have exactly
+      // one address between them.
+      const domPathOf = element => {
+        const steps = [];
+        for (let node = element; node && node.nodeType === 1; node = composedParent(node)) {
+          const parent = composedParent(node);
+          if (!parent) { steps.push(node.localName); break; }
+          let index = 0;
+          for (const sibling of parent.children) {
+            if (sibling === node) break;
+            if (sibling.localName === node.localName) index += 1;
+          }
+          steps.push(node.localName + '[' + index + ']');
+          if (steps.length >= 32) break;
+        }
+        return steps.reverse().join('/');
+      };
+      // Offset of an element's own frame within the top-level viewport. Geometry inside a
+      // frame is measured against that frame, so a click computed from it would land
+      // wherever that offset happens to be — usually somewhere else entirely.
+      const frameOffsetOf = element => {
+        let offsetX = 0;
+        let offsetY = 0;
+        let view = element?.ownerDocument?.defaultView ?? null;
+        let guard = 0;
+        while (view && view !== window && guard < 16) {
+          let host = null;
+          try { host = view.frameElement; } catch { host = null; }
+          if (!host) break;
+          const box = host.getBoundingClientRect();
+          offsetX += box.left;
+          offsetY += box.top;
+          view = host.ownerDocument?.defaultView ?? null;
+          guard += 1;
+        }
+        return { x: offsetX, y: offsetY };
+      };
+      // A rect in top-level viewport coordinates, whatever frame the element lives in.
+      const viewportRectOf = element => {
+        const box = element.getBoundingClientRect();
+        const offset = frameOffsetOf(element);
+        if (offset.x === 0 && offset.y === 0) return box;
+        return {
+          x: box.x + offset.x, y: box.y + offset.y,
+          left: box.left + offset.x, top: box.top + offset.y,
+          right: box.right + offset.x, bottom: box.bottom + offset.y,
+          width: box.width, height: box.height
+        };
+      };
+      const soleControl =
+        'input, button, select, textarea, a[href], summary,'
+        + ' [role="button"], [role="link"], [role="checkbox"], [role="radio"]';
+      const controlSurfaceOf = element => {
+        const fallback = hiddenControlSurface(element);
+        if (fallback && (!isRendered(element) || !receivesOwnEvents(element))) return fallback;
+        return isRendered(element) ? element : fallback;
+      };
+      // A control that borrows a surface for its geometry borrows its label with it.
+      // Play's checkboxes carry no aria-label and no aria-labelledby — the visible text
+      // is a sibling — so without this they are exposed and anonymous, their locator
+      // holds role and nothing else, and every act on them fails as not unique.
+      const borrowedLabel = element => {
+        const surface = controlSurfaceOf(element);
+        if (surface === element) return null;
+        if (surface) {
+          return collapse(surface.getAttribute?.('aria-label') || surface.innerText) || null;
+        }
+        // Nothing rendered to borrow from. A control that cannot be clicked must still be
+        // nameable, or the agent cannot report what it is unable to reach.
+        for (let cursor = composedParent(element); cursor; cursor = composedParent(cursor)) {
+          if (cursor === document.body || cursor === document.documentElement) break;
+          if (deepQueryAll(cursor, soleControl).length !== 1) break;
+          const text = collapse(cursor.textContent);
+          // Bounded inline: this helper is shared with the action script, which has no
+          // bounded(). Reaching this branch there threw a ReferenceError that no fixture
+          // exercised and the first real page found on the first click.
+          if (text) return text.length > 512 ? text.slice(0, 512) : text;
+        }
+        return null;
+      };
+      // Why a control cannot be acted on, decided once and reported before the agent
+      // spends a round trip finding out. locatorQuality answers "is this the only match";
+      // it was read as "can I click this", and nothing answered that question.
+      const actionabilityOf = (element, surface) => {
+        const box = surface.getBoundingClientRect();
+        if (!(box.width > 0 && box.height > 0)) return 'no_layout_box';
+        const style = getComputedStyle(surface);
+        if (style.visibility === 'hidden' || style.display === 'none') return 'not_visible';
+        if (element.disabled
+            || collapse(element.getAttribute?.('aria-disabled')).toLowerCase() === 'true') {
+          return 'disabled';
+        }
+        const visible = viewportRectOf(surface);
+        if (visible.bottom <= 0 || visible.right <= 0
+            || visible.top >= innerHeight || visible.left >= innerWidth) {
+          return 'off_viewport';
+        }
+        return hitReaches(hitAtCentreOfLocal(surface, box), element, surface)
+          ? 'actionable' : 'covered';
+      };
+      const surfaceOf = element => controlSurfaceOf(element) || element;
+      const directLabelledText = element => {
+        const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
+        if (!labelledBy) return null;
+        return collapse(labelledBy.split(/\\s+/)
+          .slice(0, 8)
+          .map(id => labelledNode(element, id)?.innerText)
+          .join(' ')) || null;
+      };
+      const sameRowLabelOf = element => {
+        const row = element.closest(
+          'tr, [role="row"], li, [data-row], [class~="row"], [class*="form-row"], [class*="capability"]');
+        if (!row) return null;
+        const labelled = Array.from(row.querySelectorAll(
+          'label, legend, h1, h2, h3, h4, h5, h6, [role="heading"], th, [role="rowheader"]'));
+        const candidates = labelled.length > 0 ? labelled : Array.from(row.children);
+        for (const candidate of candidates) {
+          if (candidate === element || candidate.contains(element) || !isAnchorRendered(candidate)) {
+            continue;
+          }
+          const text = anchorSafeText(
+            candidate.getAttribute?.('aria-label') || candidate.innerText || candidate.textContent);
+          if (text && text !== anchorSafeText(nameOf(element))) return text;
+        }
+        return null;
+      };
+      const contextAnchorOf = (element, kind) => {
+        if (kind === 'same_row_label') return sameRowLabelOf(element);
+        if (kind === 'fieldset_legend') {
+          return collapse(element.closest('fieldset')?.querySelector(':scope > legend')?.innerText)
+            || null;
+        }
+        if (kind === 'labelled_region') {
+          const region = element.closest(
+            'dialog, [role="dialog"], [role="alertdialog"], section, article, nav, main, form, [role="region"], [aria-label], [aria-labelledby]');
+          return collapse(region?.getAttribute('aria-label') || directLabelledText(region)) || null;
+        }
+        if (kind === 'nearest_heading') {
+          const structural = element.closest('section, article, nav, main, form, fieldset')
+            || document.body;
+          const headings = Array.from(
+            structural.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]'));
+          const heading = headings.filter(candidate =>
+            candidate !== element
+            && Boolean(candidate.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+          ).pop();
+          return collapse(heading?.innerText || heading?.getAttribute('aria-label')) || null;
+        }
+        if (kind === 'previous_sibling') {
+          let sibling = element.previousElementSibling;
+          while (sibling && !isAnchorRendered(sibling)) sibling = sibling.previousElementSibling;
+          return collapse(sibling?.innerText || sibling?.textContent) || null;
+        }
+        return null;
+      };
+      const sanitizedHref = element => {
+        if (!element.hasAttribute('href')) return null;
+        try {
+          const url = new URL(element.getAttribute('href'), document.baseURI);
+          if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+          const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+          const query = keys.length
+            ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+          return `${url.origin}${url.pathname}${query}`;
+        } catch { return null; }
+      };
+      // Kept aligned with the observation mapper. This copy runs at confirmation time,
+      // after the target has been resolved again, so a page cannot make the operator
+      // approve the destination from an older observation by mutating `formaction`.
+      const sanitizedSubmissionDestination = value => {
+        if (value === null || value === undefined || value === '') return null;
+        try {
+          const url = new URL(value, document.baseURI);
+          if (!['http:', 'https:'].includes(url.protocol)) return url.protocol;
+          const keys = Array.from(url.searchParams.keys()).slice(0, 16);
+          const query = keys.length
+            ? `?${keys.map(key => `${encodeURIComponent(key)}=<redacted>`).join('&')}` : '';
+          const result = `${url.origin}${url.pathname}${query}`;
+          return result.length > 4096 ? result.slice(0, 4096) : result;
+        } catch { return 'about:invalid'; }
+      };
+      const submissionDestinationOf = element => {
+        const submitsForm = Boolean(
+          (element instanceof HTMLButtonElement
+            && (element.type || 'submit').toLowerCase() === 'submit' && element.form)
+          || (element instanceof HTMLInputElement
+            && ['submit', 'image'].includes(element.type) && element.form)
+        );
+        // The formAction getter falls back to the document URL. Only use it when the
+        // control actually carries the overriding attribute; otherwise the form wins.
+        if (submitsForm) {
+          if (element.hasAttribute('formaction') && element.formAction) {
+            return sanitizedSubmissionDestination(element.formAction);
+          }
+          return sanitizedSubmissionDestination(element.form.action || null);
+        }
+        if (element.tagName === 'FORM' && typeof element.action === 'string') {
+          return sanitizedSubmissionDestination(element.action);
+        }
+        if (element.tagName === 'A' && element.hasAttribute('href')) {
+          return sanitizedSubmissionDestination(element.href);
+        }
+        return null;
+      };
+      const boundedFactValue = (value, criterion) => {
+        if (value === null || value === undefined) return null;
+        const text = String(value);
+        const maximum = Number(criterion.maximumCharacters);
+        if (!Number.isSafeInteger(maximum) || maximum <= 0 || text.length <= maximum) return text;
+        return text.slice(0, maximum);
+      };
+      const factValue = (element, criterion) => {
+        switch (criterion.fact) {
+          case 'role': return roleOf(element);
+          case 'accessibleName': return boundedFactValue(nameOf(element), criterion);
+          case 'label': return boundedFactValue(labelOf(element), criterion);
+          case 'text': return boundedFactValue(collapse(element.innerText) || null, criterion);
+          case 'stableAttribute':
+            if (criterion.argument === 'tag') return element.localName;
+            if (criterion.argument === 'href') {
+              return boundedFactValue(sanitizedHref(element), criterion);
+            }
+            return collapse(element.getAttribute(criterion.argument)) || null;
+          case 'contextAnchor':
+            return boundedFactValue(contextAnchorOf(element, criterion.argument), criterion);
+          case 'domPath': return domPathOf(element);
+          case 'enabled': return String(
+            !(element.disabled || element.getAttribute('aria-disabled') === 'true'));
+          case 'checked':
+            if ('checked' in element) return String(Boolean(element.checked));
+            if (element.hasAttribute('aria-checked')) {
+              return String(element.getAttribute('aria-checked') === 'true');
+            }
+            return null;
+          case 'selected':
+            if ('selected' in element) return String(Boolean(element.selected));
+            if (element.hasAttribute('aria-selected')) {
+              return String(element.getAttribute('aria-selected') === 'true');
+            }
+            return null;
+          case 'selectedOption':
+            if (!(element instanceof HTMLSelectElement)) return null;
+            return boundedFactValue(collapse(
+              Array.from(element.selectedOptions).map(option => option.textContent).join(' ')
+            ), criterion);
+          case 'stateAttribute':
+            if (!element.hasAttribute(criterion.argument)) return null;
+            return boundedFactValue(element.getAttribute(criterion.argument) ?? '', criterion);
+          default: return null;
+        }
+      };
+      const matchesCriterion = (element, criterion) => {
+        const actual = factValue(element, criterion);
+        if (actual === null) return criterion.strength !== 'required';
+        if (criterion.comparison === 'whitespaceCollapsed') {
+          return collapse(actual) === collapse(criterion.expected);
+        }
+        return actual === criterion.expected;
+      };
+      const selector = [
+        'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'table', 'tr', 'th', 'td',
+        '[role]', '[aria-selected]', '[aria-controls]', '[contenteditable="true" i], [contenteditable=""], [contenteditable="plaintext-only" i]', '[tabindex]'
+      ].join(',');
+      const candidates = Array.from(new Set([
+        ...deepQueryAll(document, selector + ',a:not([href]),dialog[open]'),
+        ...deepQueryAll(document, '*').filter(isScrollableContainer),
+        ...deepQueryAll(document, 'a:not([href]), div, li, span, p, label').filter(isPointerControl)
+      ]));
+      const reportedFactNames = {
+        role: 'role', accessibleName: 'accessible_name', label: 'label',
+        contextAnchor: 'context_anchor', stableAttribute: 'stable_attribute',
+        framePath: 'frame_path', text: 'value', domPath: 'dom_path', enabled: 'enabled',
+        checked: 'checked', selected: 'selected', selectedOption: 'selected_option',
+        stateAttribute: 'state_attribute'
+      };
+      const reportedFactName = criterion => {
+        const base = reportedFactNames[criterion.fact] || criterion.fact;
+        return criterion.argument ? base + ':' + criterion.argument : base;
+      };
+      // Required clauses decide what the target is. Corroborating ones were filtering just
+      // as hard whenever they had a value, which made "corroborating" a lie and let a
+      // single structural fact pick an element on its own — the exact thing a DOM path
+      // must never be allowed to do.
+      const requiredCriteria = criteria.filter(criterion => criterion.strength === 'required');
+      const locatorMatches = candidates.filter(element =>
+        requiredCriteria.every(criterion => matchesCriterion(element, criterion))
+      );
+      // The observation handed out this element's identity and browser_act was given it
+      // back. Re-deriving the target from a name the element may not have throws that
+      // away: twenty-two anonymous checkboxes are one address each, and every one of them
+      // resolved to twenty-two candidates. The identity is the disambiguation.
+      // It is not a licence to skip the locator. A virtual list recycles its rows, so the
+      // pinned node still has to satisfy every required clause, or it is not the element
+      // that was observed and this falls back to addressing by meaning.
+      // When the pin does not save an ambiguous address, the reason decides what the
+      // client should do, and guessing it from the outside costs a round trip each time.
+      let pinnedState = 'not_requested';
+      const pinnedNode = (() => {
+        if (typeof physicalIdentity !== 'string' || !physicalIdentity) return null;
+        const reference = globalThis.__webkituiState?.nodesByID?.get(physicalIdentity);
+        if (!reference) { pinnedState = 'absent_from_registry'; return null; }
+        const node = typeof reference.deref === 'function' ? reference.deref() : null;
+        if (!node) { pinnedState = 'collected'; return null; }
+        if (!node.isConnected) { pinnedState = 'detached'; return null; }
+        const failed = criteria
+          .filter(criterion => criterion.strength === 'required')
+          .filter(criterion => !matchesCriterion(node, criterion))
+          .map(reportedFactName);
+        if (failed.length > 0) {
+          pinnedState = 'clause_mismatch:' + failed.join(',');
+          return null;
+        }
+        pinnedState = 'used';
+        return node;
+      })();
+      // Identity clauses say what the target is; when several elements are the same
+      // thing, the corroborating clauses say which one. Refusing at that point left
+      // twenty-two identical checkboxes permanently unreachable, while the observation
+      // had already recorded exactly what separates them. This can only ever narrow a set
+      // that already satisfies every required clause, so it cannot promote a wrong
+      // element — and if it does not land on exactly one, the ambiguity stands.
+      const narrowed = (() => {
+        if (locatorMatches.length <= 1) return locatorMatches;
+        // Position only means something while the set it indexes is the same set. If a row
+        // has been added or removed since the observation, the eighth checkbox is no
+        // longer the eighth thing the user saw, and picking by structure would silently
+        // tick the wrong box — worse than refusing. Same population, or no narrowing.
+        if (locatorMatches.length !== expectedCandidateCount) return locatorMatches;
+        const corroborating = criteria.filter(criterion => criterion.strength !== 'required');
+        if (corroborating.length === 0) return locatorMatches;
+        const singled = clauses => {
+          const exact = locatorMatches.filter(element =>
+            clauses.every(criterion => matchesCriterion(element, criterion)));
+          return exact.length === 1 ? exact : null;
+        };
+        // All of them first: agreement across every corroborating fact is the strongest
+        // evidence available. But one volatile fact — a neighbouring label that moved, a
+        // caption that changed — must not veto the rest, so fall back to position alone,
+        // which is the one corroborator guaranteed to single out a member of a set that
+        // has not itself changed.
+        const byEverything = singled(corroborating);
+        if (byEverything) return byEverything;
+        const positional = corroborating.filter(criterion => criterion.fact === 'domPath');
+        return (positional.length > 0 ? singled(positional) : null) ?? locatorMatches;
+      })();
+      const matches = pinnedNode ? [pinnedNode] : narrowed;
+      // Zero matches is an absence, not an ambiguity. A client told "not unique" goes
+      // looking for a second candidate that does not exist; what it needs is which
+      // required fact stopped matching, because that is usually one re-observation away.
+      const eliminatedBy = matches.length > 0 ? [] : criteria
+        .filter(criterion => criterion.strength === 'required')
+        .filter(criterion => !candidates.some(element => matchesCriterion(element, criterion)))
+        .map(reportedFactName);
+      const describe = element => {
+        // The native dispatch computes a screen point from this, so it has to be in
+        // top-level coordinates or the click lands at the frame's offset instead.
+        const box = viewportRectOf(surfaceOf(element));
+        let physicalIdentity = globalThis.__webkituiState.nodeIDs.get(element);
+        if (!physicalIdentity) {
+          physicalIdentity = `n${globalThis.__webkituiState.nextNodeID++}`;
+          globalThis.__webkituiState.nodeIDs.set(element, physicalIdentity);
+          globalThis.__webkituiState.nodesByID.set(physicalIdentity, new WeakRef(element));
+        }
+        return {
+          physicalIdentity,
+          submissionDestination: submissionDestinationOf(element),
+          boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height },
+          geometryStable: false,
+          actionable: false,
+          dispatched: false,
+          trustedUserGesture: false
+        };
+      };
+      """
 
   private static let resolveSource =
     actionHelpers + """
@@ -7831,6 +8493,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       });
       """
 
+  private static let containerScrollSource =
+    actionHelpers + """
+      const element = matches.length === 1 && pinnedState === 'used' ? matches[0] : null;
+      // Never substitute a semantic lookalike or fall back to the background page.
+      if (!element || !isScrollableContainer(element) || !isRendered(element)) {
+        throw new Error('scroll_target_changed');
+      }
+      const beforeX = element.scrollLeft, beforeY = element.scrollTop;
+      element.scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' });
+      const x = element.scrollLeft, y = element.scrollTop;
+      return JSON.stringify({
+        x, y, beforeX, beforeY, actualDeltaX: x - beforeX, actualDeltaY: y - beforeY,
+        viewportWidth: element.clientWidth, viewportHeight: element.clientHeight,
+        documentWidth: element.scrollWidth, documentHeight: element.scrollHeight,
+        reachedTop: y <= 0,
+        reachedBottom: y >= Math.max(0, element.scrollHeight - element.clientHeight) - 1,
+        observationInvalidated: true
+      });
+      """
+
   private static let pageScrollSource =
     scrollerSource + """
       if (scrollerIsDocument) {
@@ -7840,101 +8522,102 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       }
       """ + scrollStateSource
 
-  private static let textSnapshotSource = """
-    const collapseLines = value => String(value ?? '')
-      .split(/\\n/).map(line => line.replace(/[\\t ]+/g, ' ').trimEnd()).join('\\n').trim();
-    const limit = Math.max(1, Number(maximumCharacters));
-    let remaining = limit;
-    let truncated = false;
-    const take = value => {
-      const text = collapseLines(value);
-      if (text.length <= remaining) { remaining -= text.length; return text; }
-      truncated = true;
-      const result = text.slice(0, remaining);
-      remaining = 0;
-      return result;
-    };
-    const candidates = Array.from(document.querySelectorAll(
-      '[role="log"], [role="terminal"], pre, code, [aria-live], [data-testid*="log" i], [class*="log" i]'
-    ));
-    for (const element of document.querySelectorAll('div, section, article')) {
-      if (element.scrollHeight > element.clientHeight + 8 && collapseLines(element.innerText)) {
-        candidates.push(element);
-      }
-    }
-    // A hidden live region or closed dialog is not on the page. Its textContent used to
-    // be reported as a region: a stale "Your session has ended — Sign in" on a portal
-    // where the person was signed in (Éclair session, 2026-09-26).
-    const hiddenSelector = '[hidden], [inert], [aria-hidden="true"], dialog:not([open])';
-    const seen = new Set();
-    const regions = [];
-    for (const element of candidates) {
-      if (remaining <= 0 || seen.has(element)) continue;
-      seen.add(element);
-      if (element.closest(hiddenSelector) || element.getClientRects().length === 0) continue;
-      const text = take(element.innerText);
-      if (!text) continue;
-      regions.push({
-        kind: element.getAttribute('role') || element.localName,
-        label: element.getAttribute('aria-label') || element.getAttribute('data-testid') || null,
-        text,
-        scrollTop: element.scrollTop,
-        scrollHeight: element.scrollHeight,
-        clientHeight: element.clientHeight
-      });
-    }
-    // WebKit's innerText stops at a shadow host: a chat panel built from web components
-    // (Reddit's) read as absent (2026-09-23). When the page has open shadow roots, read
-    // the flat tree instead — into shadow roots, through slots, skipping what is not
-    // rendered, breaking lines at blocks. Pages without shadow roots keep innerText.
-    // Closed shadow roots stay unreadable by design.
-    const hasOpenShadowRoot = Array.from(document.querySelectorAll('*'))
-      .some(element => element.shadowRoot);
-    const flatText = root => {
-      const parts = [];
-      const walk = node => {
-        if (node.nodeType === Node.TEXT_NODE) {
-          parts.push(node.data.replace(/\\s+/g, ' '));
-          return;
-        }
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          const tag = node.localName;
-          if (['script', 'style', 'template', 'noscript', 'head'].includes(tag)) return;
-          if (tag === 'br') { parts.push('\\n'); return; }
-          const style = getComputedStyle(node);
-          if (style.display === 'none' || style.visibility === 'hidden'
-              || style.visibility === 'collapse') return;
-          const block = !style.display.startsWith('inline') && style.display !== 'contents';
-          if (block) parts.push('\\n');
-          if (node.shadowRoot) {
-            walk(node.shadowRoot);
-          } else if (tag === 'slot') {
-            const assigned = node.assignedNodes({ flatten: true });
-            (assigned.length ? assigned : Array.from(node.childNodes)).forEach(walk);
-          } else {
-            node.childNodes.forEach(walk);
-          }
-          if (block) parts.push('\\n');
-          return;
-        }
-        if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) node.childNodes.forEach(walk);
+  private static let textSnapshotSource =
+    BrowserTextPrivacy.source + """
+      const collapseLines = value => privacyRedact(value)
+        .split(/\\n/).map(line => line.replace(/[\\t ]+/g, ' ').trimEnd()).join('\\n').trim();
+      const limit = Math.max(1, Number(maximumCharacters));
+      let remaining = limit;
+      let truncated = false;
+      const take = value => {
+        const text = collapseLines(value);
+        if (text.length <= remaining) { remaining -= text.length; return text; }
+        truncated = true;
+        const result = text.slice(0, remaining);
+        remaining = 0;
+        return result;
       };
-      walk(root);
-      return parts.join('').split('\\n').map(line => line.trim()).filter(Boolean).join('\\n');
-    };
-    const bodySource = hasOpenShadowRoot && document.body
-      ? flatText(document.body) : (document.body?.innerText || '');
-    const bodyText = remaining > 0 ? take(bodySource) : '';
-    const pageContentProbe = globalThis.__webkituiPageContentProbe?.() ?? {
-      contentState: bodyText ? 'usable' : 'empty_or_unusable',
-      renderedContentCount: bodyText ? 1 : 0
-    };
-    return JSON.stringify({
-      bodyText, regions, truncated,
-      contentState: pageContentProbe.contentState,
-      renderedContentCount: pageContentProbe.renderedContentCount
-    });
-    """
+      const candidates = Array.from(document.querySelectorAll(
+        '[role="log"], [role="terminal"], pre, code, [aria-live], [data-testid*="log" i], [class*="log" i]'
+      ));
+      for (const element of document.querySelectorAll('div, section, article')) {
+        if (element.scrollHeight > element.clientHeight + 8 && collapseLines(element.innerText)) {
+          candidates.push(element);
+        }
+      }
+      // A hidden live region or closed dialog is not on the page. Its textContent used to
+      // be reported as a region: a stale "Your session has ended — Sign in" on a portal
+      // where the person was signed in (Éclair session, 2026-09-26).
+      const hiddenSelector = '[hidden], [inert], [aria-hidden="true"], dialog:not([open])';
+      const seen = new Set();
+      const regions = [];
+      for (const element of candidates) {
+        if (remaining <= 0 || seen.has(element)) continue;
+        seen.add(element);
+        if (element.closest(hiddenSelector) || element.getClientRects().length === 0) continue;
+        const text = take(element.innerText);
+        if (!text) continue;
+        regions.push({
+          kind: element.getAttribute('role') || element.localName,
+          label: element.getAttribute('aria-label') || element.getAttribute('data-testid') || null,
+          text,
+          scrollTop: element.scrollTop,
+          scrollHeight: element.scrollHeight,
+          clientHeight: element.clientHeight
+        });
+      }
+      // WebKit's innerText stops at a shadow host: a chat panel built from web components
+      // (Reddit's) read as absent (2026-09-23). When the page has open shadow roots, read
+      // the flat tree instead — into shadow roots, through slots, skipping what is not
+      // rendered, breaking lines at blocks. Pages without shadow roots keep innerText.
+      // Closed shadow roots stay unreadable by design.
+      const hasOpenShadowRoot = Array.from(document.querySelectorAll('*'))
+        .some(element => element.shadowRoot);
+      const flatText = root => {
+        const parts = [];
+        const walk = node => {
+          if (node.nodeType === Node.TEXT_NODE) {
+            parts.push(node.data.replace(/\\s+/g, ' '));
+            return;
+          }
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            const tag = node.localName;
+            if (['script', 'style', 'template', 'noscript', 'head'].includes(tag)) return;
+            if (tag === 'br') { parts.push('\\n'); return; }
+            const style = getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden'
+                || style.visibility === 'collapse') return;
+            const block = !style.display.startsWith('inline') && style.display !== 'contents';
+            if (block) parts.push('\\n');
+            if (node.shadowRoot) {
+              walk(node.shadowRoot);
+            } else if (tag === 'slot') {
+              const assigned = node.assignedNodes({ flatten: true });
+              (assigned.length ? assigned : Array.from(node.childNodes)).forEach(walk);
+            } else {
+              node.childNodes.forEach(walk);
+            }
+            if (block) parts.push('\\n');
+            return;
+          }
+          if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) node.childNodes.forEach(walk);
+        };
+        walk(root);
+        return parts.join('').split('\\n').map(line => line.trim()).filter(Boolean).join('\\n');
+      };
+      const bodySource = hasOpenShadowRoot && document.body
+        ? flatText(document.body) : (document.body?.innerText || '');
+      const bodyText = remaining > 0 ? take(bodySource) : '';
+      const pageContentProbe = globalThis.__webkituiPageContentProbe?.() ?? {
+        contentState: bodyText ? 'usable' : 'empty_or_unusable',
+        renderedContentCount: bodyText ? 1 : 0
+      };
+      return privacyJSONStringify({
+        bodyText, regions, truncated,
+        contentState: pageContentProbe.contentState,
+        renderedContentCount: pageContentProbe.renderedContentCount
+      });
+      """
 
   private static let performSource =
     actionHelpers + """
@@ -7965,10 +8648,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       const receivesEvents = Boolean(hit && (
         composedContains(element, hit) || composedContains(surface, hit)
       ));
-      const editable = operation !== 'fill' || (
-        (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
-          || element.isContentEditable) && !element.readOnly
-      );
+      const editable = operation !== 'fill' || measuredFillCapability(element) === 'editable';
       // A control that cannot be typed into is not the same failure as one behind an
       // overlay or a disabled one, and target_not_actionable was all three.
       if (!editable) candidate.unsupportedOperationRole = roleOf(element) || element.localName;
@@ -8025,8 +8705,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             element.textContent = value;
           }
         } else {
-          const prototype = element instanceof HTMLTextAreaElement
-            ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const view = element.ownerDocument.defaultView;
+          const prototype = element instanceof view.HTMLTextAreaElement
+            ? view.HTMLTextAreaElement.prototype : view.HTMLInputElement.prototype;
           const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
           if (setter) setter.call(element, value); else element.value = value;
         }
@@ -8150,6 +8831,26 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     """
   private static let nativeGestureMessageHandlerName = "webkituiNativeGesture"
 
+  // Install before page handlers, without consuming or changing the event. Only the
+  // isolated world can arm this single bounded slot; the host still checks its token,
+  // physical identity, frame, origin and the actual browser-provided isTrusted bit.
+  private static let nativeClickRecorderSource = """
+    (() => {
+      let armed = null;
+      globalThis.__webkituiArmNativeClick = (element, surface, report) => {
+        armed = { element, surface, report };
+      };
+      window.addEventListener('click', event => {
+        const current = armed;
+        if (!current || !current.element.isConnected || !current.surface.isConnected) return;
+        const path = event.composedPath();
+        if (!path.includes(current.element) && !path.includes(current.surface)) return;
+        armed = null;
+        current.report(event);
+      }, { capture: true });
+    })();
+    """
+
   private static let armNativeClickSource =
     actionHelpers + """
       const element = matches.length === 1 ? matches[0] : null;
@@ -8169,12 +8870,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       // Hit testing in the element's own document: box is in top-level coordinates so
       // the dispatch lands correctly, but a frame answers only about its own points.
       const hit = hitAtCentreOfLocal(surface, surface.getBoundingClientRect());
-      const receivesEvents = Boolean(hit && (
-        hit === element || element.contains(hit) || hit === surface || surface.contains(hit)
-      ));
+      const receivesEvents = hitReaches(hit, element, surface);
       candidate.actionable = visible && enabled && receivesEvents
         && candidate.geometryStable && element.isConnected && surface.isConnected;
-      if (candidate.actionable) {
+      if (candidate.actionable && armRecorder) {
         const physicalIdentity = candidate.physicalIdentity;
         const report = event => {
           globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
@@ -8182,10 +8881,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             frameCapabilityID: globalThis.__webkituiFrameCapabilityID ?? null
           });
         };
-        element.addEventListener('click', report, { capture: true, once: true });
-        if (surface !== element) {
-          surface.addEventListener('click', report, { capture: true, once: true });
-        }
+        // Same-origin frame targets are resolved from the top-level isolated
+        // world. Observe in the target's window, but retain that armed world's
+        // reporting context and the host's existing frame-authority checks.
+        element.ownerDocument.defaultView.__webkituiArmNativeClick(element, surface, report);
       }
       return JSON.stringify({ count: matches.length, candidate, eliminatedBy, pinnedState });
       """
@@ -8238,11 +8937,17 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
       candidate.geometryStable = ['x', 'y', 'width', 'height'].every(key =>
         Math.abs(box[key] - expectedBox[key]) <= tolerance
       );
-      const editable = element instanceof HTMLInputElement
-        || element instanceof HTMLTextAreaElement || element.isContentEditable;
+      const editable = measuredFillCapability(element) === 'editable';
       const enabled = !element.matches(':disabled') && !element.readOnly
         && element.getAttribute('aria-disabled') !== 'true';
-      candidate.actionable = editable && enabled && candidate.geometryStable
+      const style = getComputedStyle(surface);
+      const visible = box.width > 0 && box.height > 0 && style.visibility !== 'hidden'
+        && style.display !== 'none' && Number(style.opacity) !== 0;
+      const hit = hitAtCentreOfLocal(surface, surface.getBoundingClientRect());
+      const receivesEvents = Boolean(hit && (
+        hit === element || element.contains(hit) || hit === surface || surface.contains(hit)
+      ));
+      candidate.actionable = editable && enabled && visible && receivesEvents && candidate.geometryStable
         && element.isConnected && typeof element.focus === 'function';
       if (candidate.actionable) {
         element.focus({ preventScroll: true });
@@ -8268,7 +8973,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             frameCapabilityID: globalThis.__webkituiFrameCapabilityID ?? null
           });
         }, { capture: true, once: true });
-        document.addEventListener('keydown', event => {
+        element.ownerDocument.addEventListener('keydown', event => {
           if (event.key !== 'Tab') return;
           globalThis.webkit.messageHandlers.webkituiNativeGesture.postMessage({
             token, physicalIdentity, eventType: 'commit_keydown', trusted: event.isTrusted,
@@ -8300,7 +9005,12 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     const element = globalThis.__webkituiState?.nodesByID?.get(physicalIdentity)?.deref();
     if (!element || !element.isConnected) return false;
     let active = document.activeElement;
-    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    while (active) {
+      const nested = active.shadowRoot?.activeElement
+        || (['iframe', 'frame'].includes(active.localName) ? active.contentDocument?.activeElement : null);
+      if (!nested) break;
+      active = nested;
+    }
     // A block inside a document editor cannot hold focus itself; the editing host
     // does. That host counts as here, and only the block's own contents get selected.
     const focusedHere = active === element
@@ -8537,6 +9247,7 @@ private struct RawObservation: Decodable {
   let bodyTextLength: Int
   let firstControlProbe: String
   let semanticTextTruncated: Bool
+  let aggregateTextOmitted: Bool?
   let elements: [RawElement]
 }
 
@@ -8576,6 +9287,9 @@ private struct RawElement: Decodable {
   let characterCount: Int?
   let sensitive: Bool
   let submitsForm: Bool
+  let contentEditable: Bool
+  let scrollable: Bool?
+  let fillCapability: String?
   let disabled: Bool
   let checked: Bool?
   let selected: Bool?

@@ -142,6 +142,10 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
     menu.addItem(.separator())
     menu.addItem(
       NSMenuItem(
+        title: text("Revoke Remembered Site Permissions"),
+        action: #selector(revokeRememberedSitePermissions), keyEquivalent: ""))
+    menu.addItem(
+      NSMenuItem(
         title: text("Quit WebKitUI MCP"),
         action: #selector(application.terminate(_:)),
         keyEquivalent: "q"))
@@ -149,6 +153,22 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
       item.target = self
     }
     statusItem.menu = menu
+  }
+
+  @objc private func revokeRememberedSitePermissions() {
+    let alert = NSAlert()
+    do {
+      try WebKitMCPServer.revokeRememberedSiteApprovals()
+      alert.messageText = text("Site permissions revoked")
+      alert.informativeText = text(
+        "Session and permanent permissions were cleared. Future actions will ask again.")
+    } catch {
+      alert.alertStyle = .warning
+      alert.messageText = text("Could not clear remembered site permissions")
+      alert.informativeText = text(
+        "Do not continue automation until permissions have been cleared.")
+    }
+    alert.runModal()
   }
 
   private func configureWindow() {

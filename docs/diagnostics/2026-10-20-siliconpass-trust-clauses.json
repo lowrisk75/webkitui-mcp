@@ -1,0 +1,10 @@
+{
+  "corrected_cli_syntax": "-R=<requirement string>",
+  "installed_application": {
+    "apple_anchor": true,
+    "team": true,
+    "identifier": true,
+    "debug_absent": true
+  },
+  "previous_failure_was_requirement_file_parsing": true
+}

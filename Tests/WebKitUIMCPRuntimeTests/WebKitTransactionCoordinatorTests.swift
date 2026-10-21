@@ -18,6 +18,20 @@ struct WebKitTransactionCoordinatorTests {
         == DispatchOutcome.notDispatched.rawValue)
   }
 
+  /// A person took the window during a handoff; the agent's click was refused at the
+  /// guard, before any gesture existed. The key must stay replayable, or the next call
+  /// reports "already used, indeterminate" for a click that never happened.
+  @Test("A human-control refusal happens before dispatch, so the key is not spent")
+  func humanControlRefusalIsNotDispatched() {
+    #expect(
+      WebKitTransactionCoordinator.dispatchOutcome(for: .humanControlActive).rawValue
+        == DispatchOutcome.notDispatched.rawValue)
+    #expect(
+      WebKitTransactionCoordinator.dispatchOutcome(
+        for: .authenticationOriginRequiresHuman("example.test")
+      ).rawValue == DispatchOutcome.notDispatched.rawValue)
+  }
+
   @Test("A dispatched click is successful only after its postcondition")
   func verifiedClick() async throws {
     let runtime = WebKitRuntime()

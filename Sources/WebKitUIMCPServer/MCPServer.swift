@@ -4,6 +4,7 @@ import Darwin
 import Dispatch
 import Foundation
 import ImageIO
+import WebKitUIMCPConfirmPolicy
 import WebKitUIMCPCore
 import WebKitUIMCPRuntime
 
@@ -21,6 +22,11 @@ private enum MCPServerError: Error {
 }
 
 @MainActor
+private final class DownloadAttemptEvidence {
+  var value: WebKitDownloadAttemptDiagnostics?
+}
+
+@MainActor
 public final class WebKitMCPServer {
   public static let protocolVersion = "2026-07-28"
   public static let legacyProtocolVersion = "2025-11-25"
@@ -29,6 +35,7 @@ public final class WebKitMCPServer {
   private let presentHumanWindows: Bool
   private let credentialBroker: any CredentialBrokerFilling
   private let confirmationPresenter: any BrowserConfirmationPresenting
+  private let siteApprovals: SiteApprovalStore
   private let safariCompatibilityPresenter: any SafariCompatibilityPresenting
   private let preserveBrowserOnClose: Bool
   private let transactionLedgerFactory: WebKitTransactionLedgerFactory
@@ -49,6 +56,7 @@ public final class WebKitMCPServer {
   /// One policy per session: two clients holding two sessions must not starve each
   /// other, and the count an attacker built up dies with the session it was built in.
   private var confirmationRates: [WebKitSessionHandle: ConfirmationRatePolicy] = [:]
+  private var pendingConfirmationSession: WebKitSessionHandle?
   private struct CompletedDownload {
     let arguments: [String: JSONValue]
     let receipt: WebKitDownloadReceipt
@@ -231,6 +239,7 @@ public final class WebKitMCPServer {
   }
 
   private struct PendingActuation {
+    var authorizationSource = "exact_confirmation"
     let arguments: [String: JSONValue]
     let session: WebKitSessionHandle
     let observation: WebKitPageObservation
@@ -250,6 +259,7 @@ public final class WebKitMCPServer {
   }
 
   private struct PendingNavigation {
+    var authorizationSource = "exact_confirmation"
     let arguments: [String: JSONValue]
     let session: WebKitSessionHandle
     let url: URL
@@ -273,6 +283,7 @@ public final class WebKitMCPServer {
     self.presentHumanWindows = true
     self.credentialBroker = SyntheticCredentialBrokerXPCClient()
     self.confirmationPresenter = NativeBrowserConfirmationPresenter()
+    self.siteApprovals = .shared
     self.safariCompatibilityPresenter = NativeSafariCompatibilityPresenter()
     self.preserveBrowserOnClose = preserveBrowserOnClose
     self.transactionLedgerFactory = transactionLedgerFactory
@@ -294,6 +305,7 @@ public final class WebKitMCPServer {
     self.presentHumanWindows = true
     self.credentialBroker = SyntheticCredentialBrokerXPCClient()
     self.confirmationPresenter = NativeBrowserConfirmationPresenter()
+    self.siteApprovals = .shared
     self.safariCompatibilityPresenter = NativeSafariCompatibilityPresenter()
     self.preserveBrowserOnClose = true
     self.transactionLedgerFactory = transactionLedgerFactory
@@ -312,12 +324,14 @@ public final class WebKitMCPServer {
     preserveBrowserOnClose: Bool = false,
     transactionLedgerFactory: WebKitTransactionLedgerFactory = .inMemory,
     activityLog: WebKitActivityLog? = nil,
-    goalDelegationMonitor: GoalDelegationMonitor = GoalDelegationMonitor()
+    goalDelegationMonitor: GoalDelegationMonitor = GoalDelegationMonitor(),
+    siteApprovals: SiteApprovalStore = SiteApprovalStore()
   ) {
     self.registry = registry
     self.presentHumanWindows = presentHumanWindows
     self.credentialBroker = credentialBroker
     self.confirmationPresenter = confirmationPresenter
+    self.siteApprovals = siteApprovals
     self.safariCompatibilityPresenter = safariCompatibilityPresenter
     self.preserveBrowserOnClose = preserveBrowserOnClose
     self.transactionLedgerFactory = transactionLedgerFactory
@@ -329,6 +343,7 @@ public final class WebKitMCPServer {
   /// browser in durable-broker mode. A reconnect must observe the live page
   /// again before it can request a fill or action.
   public func prepareForClientReconnect() async {
+    siteApprovals.revoke(client: clientAuthorityID)
     observations.removeAll(keepingCapacity: false)
     coordinators.removeAll(keepingCapacity: false)
     sessionBackends.removeAll(keepingCapacity: false)
@@ -486,8 +501,8 @@ public final class WebKitMCPServer {
     case nil:
       cause = "unknown_to_this_app_process"
       explanation =
-        "this WebKitUI app process never held it, which means the app restarted since it "
-        + "was opened"
+        "this WebKitUI app process has no record of it; a broker restart or an invalid/foreign "
+        + "handle are possible, but a restart or crash is not established by this error"
     }
     return try structuredToolError(
       structured: .object([
@@ -497,6 +512,7 @@ public final class WebKitMCPServer {
             + "with browser_session operation=open; earlier observation IDs are void. The "
             + "persistent profile keeps sign-ins."),
         "cause": .string(cause),
+        "broker_generation": .string(registry.processGeneration),
         "removed_at": removal.map { .string(ISO8601DateFormatter().string(from: $0.removedAt)) }
           ?? .null,
         "owner_disconnect_grace_seconds": .int(Int64(grace)),
@@ -701,12 +717,28 @@ public final class WebKitMCPServer {
         guard compact || compactFields.isEmpty else {
           throw MCPServerError.invalidParams("fields requires compact=true")
         }
+        let scope: WebKitObservationScope?
+        if arguments["scope_observation_id"] != nil || arguments["scope_element_id"] != nil {
+          let previousID = try requireString(
+            arguments["scope_observation_id"], named: "scope_observation_id")
+          let rootID = try requireString(arguments["scope_element_id"], named: "scope_element_id")
+          guard let previous = observations[handle], previous.observationID == previousID,
+            previous.elements.contains(where: {
+              $0.elementID == rootID
+                && ($0.tag.segments.first?.text == "dialog"
+                  || ["dialog", "alertdialog"].contains($0.role?.segments.first?.text ?? ""))
+            })
+          else { throw MCPServerError.invalidParams("scope requires a fresh observed dialog") }
+          scope = try runtime.dialogObservationScope(observationID: previousID, elementID: rootID)
+        } else {
+          scope = nil
+        }
         let observation = try await runtime.observe(
           maximumElements: maximum,
           elementOffset: elementOffset,
           maximumFieldCharacters: maximumFieldCharacters,
           roles: roles,
-          nameContains: nameContains)
+          nameContains: nameContains, scope: scope)
         observations[handle] = observation
         if compact {
           let selectedFields =
@@ -767,6 +799,14 @@ public final class WebKitMCPServer {
         observed["observation_is_partial"] = .bool(observation.isPartial)
         observed["unreadable_frame_count"] = .int(Int64(observation.unreadableFrameCount))
         observed["observation_is_complete"] = .bool(observation.isComplete)
+        observed["observation_is_structurally_complete"] = .bool(
+          observation.isStructurallyComplete)
+        observed["observation_completeness_scope"] = .string(
+          observation.verificationScopeID == nil
+            ? "discovered_collector_results_only"
+            : "observed_dialog_collector_results_only")
+        observed["semantic_text_complete"] = .bool(
+          observation.isComplete && observation.aggregateTextOmitted != true)
         observed["file_picker_visible"] = .bool(runtime.isFilePickerVisible())
         observed.removeValue(forKey: "renderedContentCount")
         annotatePageContent(
@@ -795,7 +835,21 @@ public final class WebKitMCPServer {
           arguments["delta_x"], defaultValue: 0, range: -2_000...2_000, name: "delta_x")
         let deltaY = try boundedDouble(
           arguments["delta_y"], defaultValue: 0, range: -2_000...2_000, name: "delta_y")
-        let result = try await runtime.scrollBy(deltaX: deltaX, deltaY: deltaY)
+        let result: WebKitScrollResult
+        if arguments["observation_id"] != nil || arguments["element_id"] != nil {
+          let observationID = try requireString(
+            arguments["observation_id"], named: "observation_id")
+          let elementID = try requireString(arguments["element_id"], named: "element_id")
+          guard let observation = observations[handle], observation.observationID == observationID,
+            observation.elements.contains(where: {
+              $0.elementID == elementID && $0.scrollable == true
+            })
+          else { throw MCPServerError.invalidParams("fresh observed scroll container required") }
+          result = try await runtime.scrollContainer(
+            observationID: observationID, elementID: elementID, deltaX: deltaX, deltaY: deltaY)
+        } else {
+          result = try await runtime.scrollBy(deltaX: deltaX, deltaY: deltaY)
+        }
         observations.removeValue(forKey: handle)
         return try toolResult(structured: .encoded(result), modern: modern)
       case "element_scroll_into_view":
@@ -947,6 +1001,21 @@ public final class WebKitMCPServer {
       default:
         return try toolError("Unknown tool: \(name)", modern: modern)
       }
+    } catch let error where WebKitRuntime.isPrivacyInventoryLimit(error) {
+      return try structuredToolError(
+        structured: .object([
+          "code": .string("privacy_scan_limit_exceeded"),
+          "privacy_budget": try WebKitRuntime.privacyInventoryLimitDiagnostic(error).map(
+            JSONValue.encoded) ?? .null,
+          "message": .string(
+            "The bounded privacy filter could not complete; no unfiltered text is returned."),
+          "automatic_retry_allowed": .bool(false),
+          "recovery_tool": .string("browser_session"),
+          "recovery_operation": .string("handoff"),
+          "remediation": .string(
+            "Use the local human window. Do not replay a mutation or infer that a previous action was not dispatched."
+          ),
+        ]), modern: modern)
     } catch let error as MCPServerError {
       throw error
     } catch WebKitSessionRegistryError.hostControllerBusy(let holder) {
@@ -1581,6 +1650,10 @@ public final class WebKitMCPServer {
       }
       statusObject["holder"] = holderValue(try registry.sessionOwner(for: handle))
       statusObject["ownership_basis"] = .string("client_connection_identity")
+      statusObject["ownership_is_not_task_identity"] = .bool(true)
+      statusObject["broker_generation"] = .string(registry.processGeneration)
+      statusObject["human_control_session_label"] = .string(
+        try registry.runtime(for: handle).humanControlSessionLabel)
       statusObject["file_upload_receipt"] =
         try registry.runtime(for: handle)
         .latestFileUploadReceipt().map(JSONValue.encoded) ?? .null
@@ -1609,7 +1682,8 @@ public final class WebKitMCPServer {
               ? "last_navigation_settlement_before_handoff" : "latest_navigation_settlement"),
         ])
       } else {
-        statusObject["safari_compatibility_available"] = .bool(false)
+        statusObject["safari_compatibility_available"] = .bool(
+          statusRuntime.agentSafeCurrentOrigin() != nil)
         statusObject["authentication_restriction"] = .null
       }
       if let blocker = crossOriginHandoffDiagnostic(runtime: statusRuntime) {
@@ -1627,11 +1701,27 @@ public final class WebKitMCPServer {
       }
       statusObject["authenticated_origins"] = .array(
         await statusRuntime.authenticatedOrigins().map(JSONValue.string))
+      statusObject["captcha_widget_request_observed"] = .bool(
+        statusRuntime.captchaWidgetRequestObserved)
+      statusObject["captcha_assistance"] = .string(
+        "If a CAPTCHA is present, use human handoff. The WebKitUI window has a CAPTCHA / accessibility button and a Focus website button. The user chooses official audio/accessibility controls on the site. Widget URL metadata is only a hint; absence does not prove no challenge. Never read, transcribe or solve a challenge automatically."
+      )
       statusObject["file_picker_visible"] = .bool(
         try registry.runtime(for: handle).isFilePickerVisible())
       statusObject["native_confirmation_state"] = .string(confirmationPresenter.state.rawValue)
+      if confirmationPresenter.state == .pending {
+        statusObject["native_confirmation_instructions"] = .string(
+          "Waiting for a local confirmation in WebKitUI. Tell the user now; poll status for the presentation receipt. Use confirmation_focus with its exact requestID if hidden, or confirmation_cancel to stop waiting. Focus does not approve or extend the deadline."
+        )
+      }
+      statusObject["last_confirmation_presentation"] =
+        try confirmationPresenter.presentationReceipt.map(JSONValue.encoded) ?? .null
       statusObject["native_confirmation_cancel_available"] = .bool(
         confirmationPresenter.state == .pending)
+      statusObject["native_confirmation_focus_available"] = .bool(
+        pendingConfirmationSession == handle && confirmationPresenter.state == .pending
+          && confirmationPresenter.presentationReceipt?.decision == nil
+          && confirmationPresenter.presentationReceipt != nil)
       statusObject["safari_compatibility_handoff_active"] = .bool(
         safariCompatibilityHandoffs.contains(handle))
       if let delegation = await activeGoalDelegation(for: handle) {
@@ -1641,6 +1731,27 @@ public final class WebKitMCPServer {
       }
       return try toolResult(
         structured: .object(statusObject), modern: modern)
+    case "diagnose":
+      guard arguments.keys.allSatisfy({ $0 == "operation" || $0 == "session_id" }) else {
+        throw MCPServerError.invalidParams("diagnose accepts only operation and session_id")
+      }
+      let runtime = try registry.runtime(for: sessionHandle(arguments))
+      let diagnostics = try await runtime.loadDiagnostics()
+      return try toolResult(
+        structured: .object([
+          "diagnostics": try .encoded(diagnostics),
+          "native_loading": .bool(runtime.webView.isLoading),
+          "estimated_progress": .double(max(0, min(1, runtime.webView.estimatedProgress))),
+          "window_presented": .bool(runtime.humanControlSurfaceIsPresented),
+          "origin": runtime.agentSafeCurrentOrigin().map(JSONValue.string) ?? .null,
+          "diagnostic_scope": .string("main_frame_window_error_events_and_sampled_resource_timing"),
+          "limits": .string(
+            "Counts only; no raw console, request URLs, paths, queries, headers, bodies or field values. Captured events are not a complete network log; absent errors do not prove all resources succeeded. Parser-blocking script count is a structural hint, not proof a particular script is stalled."
+          ),
+          "recovery": .string(
+            "If the page remains unusable, use handoff_start to show the native window or compatibility_start for a locally confirmed manual Safari fallback. handoff toggles authority: on a completed human step it resumes the agent; it is not a show-window command."
+          ),
+        ]), modern: modern)
     case "set_viewport":
       return try await setViewportSessionOperation(arguments: arguments, modern: modern)
     case "back", "forward", "reload":
@@ -1648,6 +1759,32 @@ public final class WebKitMCPServer {
         operation: try requireHistoryOperation(operation),
         arguments: arguments,
         modern: modern)
+    case "confirmation_focus":
+      let handle = try sessionHandle(arguments)
+      _ = try registry.status(handle)
+      guard
+        arguments.keys.allSatisfy({
+          ["operation", "session_id", "confirmation_request_id"].contains($0)
+        }),
+        let requestID = UUID(
+          uuidString: try requireString(
+            arguments["confirmation_request_id"], named: "confirmation_request_id"))
+      else {
+        throw MCPServerError.invalidParams(
+          "confirmation_focus requires only operation, session_id and the exact confirmation_request_id from status"
+        )
+      }
+      let requested =
+        pendingConfirmationSession == handle
+        && confirmationPresenter.rePresent(requestID: requestID)
+      return try toolResult(
+        structured: .object([
+          "focus_requested": .bool(requested), "approval_granted": .bool(false),
+          "action_dispatched": .bool(false), "timeout_extended": .bool(false),
+          "safe_next_step": .string(
+            "Poll status for measured presentation; only a human decision can approve. A stale, expired, cancelled or rate-limited request is not revived."
+          ),
+        ]), modern: modern)
     case "confirmation_cancel":
       let handle = try sessionHandle(arguments)
       _ = try registry.status(handle)
@@ -1680,6 +1817,7 @@ public final class WebKitMCPServer {
       await revokeGoalDelegation(for: handle)
       safariCompatibilityHandoffs.remove(handle)
       confirmationRates.removeValue(forKey: handle)
+      siteApprovals.revoke(client: clientAuthorityID, session: handle.rawValue)
       if !preserveBrowserOnClose {
         try registry.close(handle)
       } else {
@@ -1689,6 +1827,9 @@ public final class WebKitMCPServer {
         structured: .object([
           "closed": .bool(true),
           "browser_preserved": .bool(preserveBrowserOnClose),
+          "close_effect": .string(
+            preserveBrowserOnClose
+              ? "ownership_released_browser_state_preserved" : "session_destroyed"),
         ]),
         modern: modern)
     case "client_handoff":
@@ -1716,7 +1857,7 @@ public final class WebKitMCPServer {
       return try await goalDelegationRevoke(arguments: arguments, modern: modern)
     default:
       throw MCPServerError.invalidParams(
-        "operation must be open, profiles, status, set_viewport, back, forward, reload, close, client_handoff, handoff, handoff_start, handoff_status, handoff_resume, handoff_focus, compatibility_start, goal_delegation_start, goal_delegation_status, goal_delegation_revoke, or confirmation_cancel"
+        "operation must be open, profiles, status, diagnose, set_viewport, back, forward, reload, close, client_handoff, handoff, handoff_start, handoff_status, handoff_resume, handoff_focus, compatibility_start, goal_delegation_start, goal_delegation_status, goal_delegation_revoke, or confirmation_cancel"
       )
     }
   }
@@ -1770,17 +1911,18 @@ public final class WebKitMCPServer {
     // This exact URL stays local. Only the same redacted projection used by observations
     // reaches the operator, and the runtime compares the exact URL again after approval.
     let destination = try runtime.historyDestination(for: operation)
-    let outcome = try await rateLimitedConfirmation(
+    let historyApproval = try await siteScopedConfirmation(
       session: handle,
+      context: siteApprovalContext(runtime: runtime, url: destination), interaction: false,
       title: "Approve Web Navigation",
       message: historyConfirmationMessage(
         operation: operation,
         currentURL: runtime.agentSafeCurrentURL() ?? "no current page",
         destination: destination),
       approveLabel: "Navigate")
-    guard outcome == .approved else {
+    guard historyApproval.outcome == .approved else {
       return try confirmationOutcomeResult(
-        outcome, action: "history_\(operation.rawValue)", modern: modern)
+        historyApproval.outcome, action: "history_\(operation.rawValue)", modern: modern)
     }
     guard let scheme = destination.scheme, let host = destination.host else {
       throw MCPServerError.invalidParams("history destination has no security origin")
@@ -1811,6 +1953,7 @@ public final class WebKitMCPServer {
       var structured = try requireObject(
         navigationResultPayload(result), named: "history navigation result")
       structured["historyOperation"] = .string(operation.rawValue)
+      structured["authorization_source"] = .string(historyApproval.source)
       structured["observationInvalidated"] = .bool(true)
       return try toolResult(structured: .object(structured), modern: modern)
     } catch WebKitRuntimeError.crossOriginRedirectRequiresHuman(let fromOrigin, let toOrigin) {
@@ -1986,7 +2129,9 @@ public final class WebKitMCPServer {
     session: WebKitSessionHandle,
     title: String,
     message: String,
-    approveLabel: String
+    approveLabel: String,
+    remembering: Bool = false,
+    allowPersistent: Bool = false
   ) async throws -> NativeConfirmationOutcome {
     var policy = confirmationRates[session] ?? ConfirmationRatePolicy()
     let verdict = policy.record(atMonotonicNanoseconds: DispatchTime.now().uptimeNanoseconds)
@@ -2013,8 +2158,67 @@ public final class WebKitMCPServer {
           + "confirmations have been asked for in the last 60 seconds, then retry the same "
           + "bounded operation. Retrying immediately will be refused again.")
     }
+    let shownTitle =
+      String(title.prefix(90)) + " [" + String(session.rawValue.uuidString.prefix(8)) + "]"
+    guard pendingConfirmationSession == nil else { return .failed }
+    pendingConfirmationSession = session
+    defer { pendingConfirmationSession = nil }
+    if remembering {
+      return await confirmationPresenter.confirmRemembering(
+        title: shownTitle, message: shown, approveLabel: approveLabel,
+        allowPersistent: allowPersistent)
+    }
     return await confirmationPresenter.confirm(
-      title: title, message: shown, approveLabel: approveLabel)
+      title: String(title.prefix(90)) + " [" + String(session.rawValue.uuidString.prefix(8)) + "]",
+      message: shown, approveLabel: approveLabel)
+  }
+
+  /// Only the local application menu can revoke all grants; no MCP self-grant API.
+  public static func revokeRememberedSiteApprovals() throws {
+    try SiteApprovalStore.shared.revokeAll()
+  }
+
+  private func siteApprovalContext(runtime: WebKitRuntime, url: URL?) -> SiteApprovalContext? {
+    guard let url, runtime.authenticationRestrictionStatus() == nil,
+      !WebKitRuntime.isRestrictedAuthenticationHost(url.host)
+    else { return nil }
+    let store = runtime.webView.configuration.websiteDataStore
+    return SiteApprovalContext(
+      url: url, profile: store.identifier?.uuidString ?? "default", persistent: store.isPersistent)
+  }
+
+  private func siteScopedConfirmation(
+    session: WebKitSessionHandle, context: SiteApprovalContext?, interaction: Bool, title: String,
+    message: String, approveLabel: String
+  ) async throws -> (outcome: NativeConfirmationOutcome, source: String) {
+    guard let context else {
+      return (
+        try await rateLimitedConfirmation(
+          session: session, title: title, message: message, approveLabel: approveLabel),
+        "exact_confirmation"
+      )
+    }
+    if let source = siteApprovals.authorize(
+      context, client: clientAuthorityID, session: session.rawValue, interaction: interaction)
+    {
+      return (.approved, source)
+    }
+    let warning =
+      message + "\n\nRemembered permission scope:\nOrigin: " + jsonQuoted(context.origin)
+      + "\nBrowser profile: " + jsonQuoted(context.profile)
+      + "\n\nNavigation + clicks/typing can send, modify or delete data. The site may not disclose these effects."
+      + "\nSession permissions apply only to this client and session. Permanent permissions apply to ALL agents using this browser profile."
+      + "\nDownloads, uploads, native form submissions, authentication and control transfers still require separate approval."
+      + "\nRevoke permissions from the WebKitUI MCP application menu. Cancel or Approve Once does not remember anything."
+    let outcome = try await rateLimitedConfirmation(
+      session: session, title: title, message: warning, approveLabel: approveLabel,
+      remembering: true, allowPersistent: context.persistent)
+    guard let choice = outcome.rememberedChoice else { return (outcome, "exact_confirmation") }
+    do {
+      try siteApprovals.grant(
+        choice, context: context, client: clientAuthorityID, session: session.rawValue)
+    } catch { return (.failed, "exact_confirmation") }
+    return (.approved, "exact_confirmation")
   }
 
   public nonisolated static func displayClientName(_ raw: String) -> String {
@@ -2034,7 +2238,8 @@ public final class WebKitMCPServer {
     _ outcome: NativeConfirmationOutcome, action: String, modern: Bool
   ) throws -> JSONValue {
     switch outcome {
-    case .approved:
+    case .approved, .approvedSessionNavigation, .approvedPersistentNavigation,
+      .approvedSessionInteractions, .approvedPersistentInteractions:
       throw MCPServerError.invalidParams("internal confirmation state mismatch")
     case .declined:
       return try structuredToolError(
@@ -2045,13 +2250,13 @@ public final class WebKitMCPServer {
           "confirmation_presented": .bool(true),
           "remediation": .string("Ask for a different action, or none."),
         ]), modern: modern)
-    case .timedOut, .cancelled, .failed, .hidden:
+    case .timedOut, .queueTimedOut, .cancelled, .failed, .hidden:
       // Three different situations used to share one message that blamed the helper's
       // signature, which sent a caller checking a signature that was fine while the
       // real cause was a panel nobody could see (Éclair session, 2026-09-23).
       let message: String
       let remediation: String
-      let presented: Bool
+      let presented: JSONValue
       switch outcome {
       case .hidden:
         message =
@@ -2060,27 +2265,39 @@ public final class WebKitMCPServer {
         remediation =
           "Ask the user to close full-screen overlays or switch to the Space with "
           + "the WebKitUI MCP panel, then retry. Nothing was dispatched."
-        presented = true
+        presented =
+          confirmationPresenter.presentationReceipt.map { .bool($0.windowVisible) } ?? .null
+      case .queueTimedOut:
+        message =
+          "The confirmation queue expired before a helper was launched. Nothing was presented."
+        remediation = "Wait for the current confirmation to finish. Nothing was dispatched."
+        presented = .bool(false)
       case .timedOut:
-        message = "The confirmation was not answered in time, so no decision was taken."
+        message = "The confirmation timed out; this does not establish that the user saw its panel."
         remediation =
           "Ask the user whether they saw the WebKitUI MCP panel; retry once they "
           + "are at the Mac. Nothing was dispatched."
-        presented = true
+        presented =
+          confirmationPresenter.presentationReceipt.map { .bool($0.windowVisible) } ?? .null
       default:
-        message = "The confirmation helper did not present a prompt, so no decision was taken."
+        message =
+          "The confirmation ended without a verified decision. Presentation metadata, if "
+          + "available, does not establish that a person saw its panel. Nothing was dispatched."
         remediation =
           "Verify the packaged confirmation helper beside the running executable: "
           + "it must be present, executable, and signed by the same team as the server. "
           + "Nothing was dispatched."
-        presented = false
+        presented = .null
       }
       return try structuredToolError(
         structured: .object([
           "status": .string("confirmation_unavailable"),
           "code": .string("confirmation_unavailable"),
           "message": .string(message),
-          "confirmation_presented": .bool(presented),
+          "confirmation_presented": presented,
+          "confirmation_presentation": try confirmationPresenter.presentationReceipt.map(
+            JSONValue.encoded) ?? .null,
+          "presentation_is_not_human_visibility_proof": .bool(true),
           "confirmation_outcome": .string(outcome.rawValue),
           "remediation": .string(remediation),
         ]), modern: modern)
@@ -2325,21 +2542,21 @@ public final class WebKitMCPServer {
     }
     let handle = try sessionHandle(arguments)
     let runtime = try registry.runtime(for: handle)
-    guard let restriction = runtime.authenticationRestrictionStatus() else {
+    let restriction = runtime.authenticationRestrictionStatus()
+    guard let privateURL = try? runtime.privateFullBrowserHandoffURL(allowUnrestrictedOrigin: true),
+      let origin = runtime.agentSafeCurrentOrigin()
+    else {
       return try structuredToolError(
         structured: .object([
-          "status": .string("compatibility_not_required"),
-          "selected_backend": .string(sessionBackends[handle] ?? "native_webkit"),
-          "opened": .bool(false),
-        ]),
-        modern: modern)
+          "status": .string("compatibility_url_unavailable"), "opened": .bool(false),
+        ]), modern: modern)
     }
     guard
       try await rateLimitedConfirmation(
         session: handle,
-        title: "Open Authentication in Safari",
+        title: "Open Page in Safari",
         message:
-          "Open \(restriction.origin) in Safari as a manual authentication fallback?\n\n"
+          "Open \(origin) in Safari as a manual browser fallback?\n\n"
           + "The native WebKit handoff remains available and is not replaced. "
           + "Cookies, credentials, MFA codes, paths, and query parameters are not exposed "
           + "through MCP or copied from WebKitUI.",
@@ -2349,19 +2566,25 @@ public final class WebKitMCPServer {
       return try toolResult(
         structured: .object([
           "status": .string("compatibility_handoff_declined"),
-          "origin": .string(restriction.origin),
+          "origin": .string(origin),
           "opened": .bool(false),
           "credentials_exposed_to_mcp": .bool(false),
         ]),
         modern: modern)
     }
 
-    let privateURL = try runtime.privateFullBrowserHandoffURL()
+    guard (try? runtime.privateFullBrowserHandoffURL(allowUnrestrictedOrigin: true)) == privateURL
+    else {
+      return try structuredToolError(
+        structured: .object([
+          "status": .string("compatibility_destination_changed"), "opened": .bool(false),
+        ]), modern: modern)
+    }
     guard await safariCompatibilityPresenter.openPrivateAuthenticationURL(privateURL) else {
       return try structuredToolError(
         structured: .object([
           "status": .string("safari_compatibility_unavailable"),
-          "origin": .string(restriction.origin),
+          "origin": .string(origin),
           "opened": .bool(false),
           "credentials_exposed_to_mcp": .bool(false),
         ]),
@@ -2371,7 +2594,7 @@ public final class WebKitMCPServer {
     return try toolResult(
       structured: .object([
         "status": .string("safari_compatibility_handoff_started"),
-        "origin": .string(restriction.origin),
+        "origin": .string(origin),
         "selected_backend": .string(sessionBackends[handle] ?? "native_webkit"),
         "handoff_backend": .string("safari"),
         "opened": .bool(true),
@@ -2382,7 +2605,8 @@ public final class WebKitMCPServer {
         "cookie_transfer_supported": .bool(false),
         "credential_transfer_supported": .bool(false),
         "credentials_exposed_to_mcp": .bool(false),
-        "fallback_from": .string(restriction.classification.rawValue),
+        "fallback_from": .string(
+          restriction?.classification.rawValue ?? "manual_native_rendering_fallback"),
         "native_handoff_remains_active": .bool(
           [.humanControlled, .humanStepCompleted].contains(runtime.interactionControlState())),
         "instructions": .string(
@@ -2489,15 +2713,18 @@ public final class WebKitMCPServer {
     )
     if !modern || approvalMode == "native" {
       let currentURL = runtime.agentSafeCurrentURL() ?? "no current page"
-      let outcome = try await rateLimitedConfirmation(
+      let approval = try await siteScopedConfirmation(
         session: handle,
+        context: siteApprovalContext(runtime: runtime, url: url), interaction: false,
         title: "Approve Web Navigation",
         message: navigationConfirmationMessage(currentURL: currentURL, url: url),
         approveLabel: "Navigate")
-      guard outcome == .approved else {
-        return try confirmationOutcomeResult(outcome, action: "navigation", modern: modern)
+      guard approval.outcome == .approved else {
+        return try confirmationOutcomeResult(approval.outcome, action: "navigation", modern: modern)
       }
-      return try await executeNavigation(pending, runtime: runtime, modern: modern)
+      var authorized = pending
+      authorized.authorizationSource = approval.source
+      return try await executeNavigation(authorized, runtime: runtime, modern: modern)
     }
     pendingNavigations = pendingNavigations.filter {
       $0.value.expiresAt > Date() && $0.value.session != handle
@@ -2568,7 +2795,12 @@ public final class WebKitMCPServer {
     do {
       status = try await credentialBroker.fill(binding: binding, runtime: runtime).status
     } catch {
-      status = .failed
+      return try credentialBrokerFailureResult(error, modern: modern)
+    }
+    if status == .failed || status == .stale {
+      return try credentialBrokerFailureResult(
+        CredentialBrokerClientError.transport(
+          stage: .delivery, code: status == .stale ? .stale : .providerFailed), modern: modern)
     }
     if status == .credentialNotFound {
       let origin =
@@ -2670,7 +2902,12 @@ public final class WebKitMCPServer {
         runtime: runtime
       ).status
     } catch {
-      status = .failed
+      return try credentialBrokerFailureResult(error, modern: modern)
+    }
+    if status == .failed || status == .stale {
+      return try credentialBrokerFailureResult(
+        CredentialBrokerClientError.transport(
+          stage: .delivery, code: status == .stale ? .stale : .providerFailed), modern: modern)
     }
     return try toolResult(
       structured: .object([
@@ -2681,6 +2918,42 @@ public final class WebKitMCPServer {
       ]),
       modern: modern
     )
+  }
+
+  private func credentialBrokerFailureResult(_ error: Error, modern: Bool) throws -> JSONValue {
+    let code: CredentialBrokerFailureCode
+    let stage: CredentialBrokerCallStage?
+    switch error {
+    case CredentialBrokerClientError.transport(let value, let failure):
+      stage = value
+      code = failure
+    case CredentialBrokerClientError.unavailable:
+      stage = nil
+      code = .unavailable
+    case CredentialBrokerClientError.invalidReply:
+      stage = nil
+      code = .invalidReply
+    default:
+      stage = nil
+      code = .unexpectedFailure
+    }
+    return try structuredToolError(
+      structured: .object([
+        "status": .string("failed"),
+        "code": .string("credential_broker_" + code.rawValue),
+        "credential_broker_stage": stage.map { .string($0.rawValue) } ?? .string("unknown"),
+        "automatic_retry": .bool(false),
+        "retryable": .bool(false),
+        "secret_released_to_mcp": .bool(false),
+        "sink_delivery_state": .string(stage == .request ? "not_started" : "unknown"),
+        "requires_human_handoff": .bool(true),
+        "recovery": .string(
+          "Do not automatically retry. Check SiliconPass and its native broker are available "
+            + "on this unlocked Mac. Start browser_session operation=handoff_start for this session "
+            + "and direct the user to the visible WebKitUI window; use handoff_focus if hidden. "
+            + "Let the user inspect or complete the fields without exposing sensitive values. A transport failure does not prove no fill occurred. "
+            + "No credential value is returned through MCP."),
+      ]), modern: modern)
   }
 
   private func safeNavigationURL(_ rawValue: String) throws -> URL {
@@ -2803,19 +3076,9 @@ public final class WebKitMCPServer {
         // A confirmed tokenless resume also ends any earlier token-based handoff.
         // Retire it before observing: a failed observation must not revive that handoff.
         registry.revokeHandoffResumeCapabilities(for: handle)
-        let observation = try await runtime.resumeAfterHumanControl(
-          maximumElements: observationOptions.maximumElements)
-        registry.releaseHandoffOwnership(for: handle, owner: clientAuthorityID)
-        observations[handle] = observation
-        return try toolResult(
-          structured: .object([
-            "control_state": .string(runtime.interactionControlState().rawValue),
-            "observation_compact": .bool(observationOptions.compact),
-            "observation": try handoffObservationPayload(
-              observation, compact: observationOptions.compact, runtime: runtime),
-          ]),
-          modern: false
-        )
+        return try await completedHandoffResult(
+          handle: handle, runtime: runtime, options: observationOptions, modern: false)
+
       default:
         throw MCPServerError.invalidParams("handoff transition is already in progress")
       }
@@ -2834,17 +3097,9 @@ public final class WebKitMCPServer {
       try runtime.requestAgentResume()
       // The round-trip protocol must retire the token at the same control boundary.
       registry.revokeHandoffResumeCapabilities(for: handle)
-      let observation = try await runtime.resumeAfterHumanControl(
-        maximumElements: observationOptions.maximumElements)
-      registry.releaseHandoffOwnership(for: handle, owner: clientAuthorityID)
-      observations[handle] = observation
-      return try toolResult(
-        structured: .object([
-          "control_state": .string(runtime.interactionControlState().rawValue),
-          "observation_compact": .bool(observationOptions.compact),
-          "observation": try handoffObservationPayload(
-            observation, compact: observationOptions.compact, runtime: runtime),
-        ]), modern: modern)
+      return try await completedHandoffResult(
+        handle: handle, runtime: runtime, options: observationOptions, modern: modern)
+
     }
     guard params["inputResponses"] == nil else {
       throw MCPServerError.invalidParams("inputResponses requires requestState")
@@ -2966,8 +3221,11 @@ public final class WebKitMCPServer {
         "expires_at": .string(ISO8601DateFormatter().string(from: capability.expiresAt)),
         "blocking": .bool(false),
         "instructions": .string(
-          "Complete the sensitive step in the live WebKit window. If it is not visible, call handoff_focus for this session. Then select Done — Return Control there. Poll handoff_status until human_step_completed=true, then call handoff_resume with this single-session token."
+          "Safari and WebKitUI use separate sign-in sessions; a new login may be required. Complete the sensitive step in the live WebKitUI window. For CAPTCHA, the user must solve the challenge using official accessibility options, including audio; never transcribe or solve it automatically. If the window is not visible, call handoff_focus for this session. Then select \(WebKitRuntime.humanControlReturnButtonLabel) there. Poll handoff_status until human_step_completed=true, then call handoff_resume with this single-session token. Returning control does not prove the site saved anything."
         ),
+        "human_window_session_label": .string(runtime.humanControlSessionLabel),
+        "return_control_button_label": .string(WebKitRuntime.humanControlReturnButtonLabel),
+        "return_control_proves_remote_save": .bool(false),
       ]), modern: modern)
   }
 
@@ -2992,6 +3250,18 @@ public final class WebKitMCPServer {
       structured: .object([
         "control_state": .string(runtime.interactionControlState().rawValue),
         "resume_token_state": .string(tokenState),
+        "human_navigation_completed": .bool(runtime.humanControlNavigationCompleted),
+        "captcha_widget_request_observed": .bool(runtime.captchaWidgetRequestObserved),
+        "captcha_assistance": .string(
+          "Use CAPTCHA / accessibility in the WebKitUI window, then Focus website to reach the site's official controls. The human resolves the challenge; no automated transcription or solution. Audio may not be offered."
+        ),
+        "completion_hint_grants_control": .bool(false),
+        "instructions": .string(
+          "In the WebKitUI window, select \(WebKitRuntime.humanControlReturnButtonLabel) when finished. Saying the step is done or navigating does not return control. Use handoff_focus if the window is hidden. Then request handoff_resume; local approval is still required and a fresh observation follows."
+        ),
+        "human_window_session_label": .string(runtime.humanControlSessionLabel),
+        "return_control_button_label": .string(WebKitRuntime.humanControlReturnButtonLabel),
+        "return_control_proves_remote_save": .bool(false),
         "blocking": .bool(false),
         "human_step_completed": .bool(
           runtime.interactionControlState() == .humanStepCompleted),
@@ -3066,19 +3336,49 @@ public final class WebKitMCPServer {
       throw MCPServerError.invalidParams("resume_token is unknown, expired, or session-mismatched")
     }
     try runtime.requestAgentResume()
-    let observation = try await runtime.resumeAfterHumanControl(
-      maximumElements: observationOptions.maximumElements)
-    registry.releaseHandoffOwnership(for: handle)
-    observations[handle] = observation
-    return try toolResult(
-      structured: .object([
-        "control_state": .string(runtime.interactionControlState().rawValue),
-        "resume_token_state": .string("consumed"),
-        "resumed": .bool(true),
-        "observation_compact": .bool(observationOptions.compact),
-        "observation": try handoffObservationPayload(
-          observation, compact: observationOptions.compact, runtime: runtime),
-      ]), modern: modern)
+    return try await completedHandoffResult(
+      handle: handle, runtime: runtime, options: observationOptions, modern: modern,
+      tokenConsumed: true)
+  }
+
+  private func completedHandoffResult(
+    handle: WebKitSessionHandle, runtime: WebKitRuntime,
+    options: (compact: Bool, maximumElements: Int), modern: Bool,
+    tokenConsumed: Bool = false
+  ) async throws -> JSONValue {
+    // Never leave a pre-handoff target cache usable after a failed fresh read.
+    observations.removeValue(forKey: handle)
+    var result: [String: JSONValue] = [
+      "resumed": .bool(true), "observation_compact": .bool(options.compact),
+    ]
+    if tokenConsumed { result["resume_token_state"] = .string("consumed") }
+    do {
+      let observation = try await runtime.resumeAfterHumanControl(
+        maximumElements: options.maximumElements)
+      observations[handle] = observation
+      result["observation_available"] = .bool(true)
+      result["observation"] = try handoffObservationPayload(
+        observation, compact: options.compact, runtime: runtime)
+    } catch let error where WebKitRuntime.isPrivacyInventoryLimit(error) {
+      guard runtime.interactionControlState() == .agentControlled else { throw error }
+      result["status"] = .string("resumed_observation_unavailable")
+      result["code"] = .string("privacy_scan_limit_exceeded")
+      result["observation_available"] = .bool(false)
+      result["observation"] = .null
+      result["privacy_budget"] =
+        try WebKitRuntime.privacyInventoryLimitDiagnostic(error)
+        .map(JSONValue.encoded) ?? .null
+      result["automatic_retry_allowed"] = .bool(false)
+      result["action_replayed"] = .bool(false)
+      result["remote_save_verified"] = .bool(false)
+      result["recovery_tool"] = .string("browser_navigate")
+      result["remediation"] = .string(
+        "Control was returned, but privacy filtering withheld the observation. Navigate to an exact destination with the normal confirmation, or start a new human handoff. Old observation IDs are invalid. Do not replay a write or infer a site save. Closing/reopening preserves the page and does not reset its authority or privacy state."
+      )
+    }
+    registry.releaseHandoffOwnership(for: handle, owner: clientAuthorityID)
+    result["control_state"] = .string(runtime.interactionControlState().rawValue)
+    return try toolResult(structured: .object(result), modern: modern)
   }
 
   private func handoffObservationOptions(
@@ -3285,11 +3585,20 @@ public final class WebKitMCPServer {
         guard !target.sensitive else {
           throw MCPServerError.invalidParams("sensitive fields require local human handoff")
         }
+        if let capability = target.fillCapability, capability != "editable" {
+          throw MCPServerError.invalidParams(
+            "fill requires an editable exact control; observed fillCapability=\(capability). Nothing was dispatched. For a picker, observe and select its exact option instead of guessing text input."
+          )
+        }
         let tag = target.tag.segments.map(\.text).joined().lowercased()
         let role = target.role?.segments.map(\.text).joined().lowercased() ?? ""
-        guard tag == "input" || tag == "textarea" || role == "textbox" else {
+        guard
+          tag == "input" || tag == "textarea" || role == "textbox"
+            || target.contentEditable == true
+        else {
           throw MCPServerError.invalidParams(
-            "fill currently supports input, textarea, and semantic textbox controls only")
+            "fill supports input, textarea, semantic textbox, and observed contenteditable controls only; inspect the exact target or observe its editable child"
+          )
         }
         guard arguments["postcondition"] == nil else {
           throw MCPServerError.invalidParams("fill uses an exact target-value postcondition")
@@ -3372,6 +3681,35 @@ public final class WebKitMCPServer {
       let idempotencyKey = try requireString(
         arguments["idempotency_key"], named: "idempotency_key")
 
+      // A completed/uncertain transaction is evidence to reconcile, not a fresh
+      // request for approval. The ledger still enforces at-most-once dispatch;
+      // this read prevents an already-used key from needlessly prompting again.
+      if let coordinator = coordinators[handle] {
+        do {
+          let receipt = try await coordinator.receipt(idempotencyKey: idempotencyKey)
+          // A key whose gesture was refused before it reached the page — a person held
+          // the window at that moment, say — is still unspent: the ledger put it back to
+          // prepared and nothing was dispatched. Refusing it as "already used" told the
+          // agent its click was in doubt when it had never happened.
+          let neverDispatched =
+            receipt.phase == .prepared && receipt.dispatchedAtNanoseconds == nil
+          if !neverDispatched {
+            return try structuredToolError(
+              structured: .object([
+                "code": .string("idempotency_key_already_used"),
+                "previous_transaction_phase": .string(receipt.phase.rawValue),
+                "previous_action_dispatched": .bool(receipt.dispatchedAtNanoseconds != nil),
+                "action_replayed": .bool(false), "automatic_retry_allowed": .bool(false),
+                "safe_next_step": .string(
+                  "Read the existing browser_transaction receipt or reconcile it; do not replay this action or invent a new key to bypass the refusal."
+                ),
+              ]), modern: modern)
+          }
+        } catch TransactionError.unknownTransaction {
+          // A new key has no receipt; normal confirmation remains mandatory.
+        }
+      }
+
       if modern, approvalMode == "mcp", let requestState = params["requestState"]?.stringValue {
         guard let pending = pendingActuations.removeValue(forKey: requestState) else {
           throw MCPServerError.invalidParams("requestState is unknown or already used")
@@ -3439,14 +3777,33 @@ public final class WebKitMCPServer {
       )
     }
     if !modern || approvalMode == "native" {
-      let outcome = try await rateLimitedConfirmation(
+      let rememberable: Bool
+      if let pending {
+        let target = pending.observation.elements.first { $0.elementID == pending.elementID }
+        if case .submit = pending.operation {
+          rememberable = false
+        } else {
+          rememberable = target?.frameOrigin == nil
+        }
+      } else {
+        rememberable = false
+      }
+      let currentSite = siteApprovalContext(runtime: runtime, url: runtime.webView.url)
+      let observedSite = pending.flatMap { action in
+        siteApprovalContext(
+          runtime: runtime, url: URL(string: action.observation.url.segments.map(\.text).joined()))
+      }
+      let approval = try await siteScopedConfirmation(
         session: handle,
+        context: rememberable && currentSite?.key == observedSite?.key ? currentSite : nil,
+        interaction: true,
         title: "Approve Browser Action",
         message: confirmationMessage,
         approveLabel: "Approve Once")
-      guard outcome == .approved else {
+      guard approval.outcome == .approved else {
         return try confirmationOutcomeResult(
-          outcome, action: dialogAnswer == nil ? "action" : "dialog answer", modern: modern)
+          approval.outcome, action: dialogAnswer == nil ? "action" : "dialog answer", modern: modern
+        )
       }
       if let dialogAnswer {
         return try executeDialogAnswer(dialogAnswer, runtime: runtime, modern: modern)
@@ -3454,7 +3811,9 @@ public final class WebKitMCPServer {
       guard let pending else {
         throw MCPServerError.invalidParams("internal actuation state mismatch")
       }
-      return try await executeActuation(pending, modern: modern)
+      var authorized = pending
+      authorized.authorizationSource = approval.source
+      return try await executeActuation(authorized, modern: modern)
     }
     guard let pending else {
       throw MCPServerError.invalidParams("internal actuation state mismatch")
@@ -3624,6 +3983,8 @@ public final class WebKitMCPServer {
       }
       var structured = try requireObject(
         navigationResultPayload(result), named: "navigation result")
+      structured["authorization_source"] = .string(
+        pending.goalDelegationID == nil ? pending.authorizationSource : "goal_delegation")
       if let delegationID = pending.goalDelegationID {
         structured["authorization"] = .object([
           "mode": .string("goal_delegation"),
@@ -4142,6 +4503,9 @@ public final class WebKitMCPServer {
       throw MCPServerError.invalidParams(
         "browser_upload requires a file input, or a label or button that opens one")
     }
+    if runtime.isFilePickerVisible() {
+      return try uploadPanelAlreadyOpenResult(modern: modern)
+    }
 
     let label = String(
       ((target.accessibleName ?? target.label ?? target.text)?.segments.map(\.text).joined() ?? "")
@@ -4158,6 +4522,11 @@ public final class WebKitMCPServer {
       approveLabel: candidates.isEmpty ? "Choose Files" : "Attach Files")
     guard uploadOutcome == .approved else {
       return try confirmationOutcomeResult(uploadOutcome, action: "upload", modern: modern)
+    }
+    // Confirmation suspends this actor: the page may have opened a panel meanwhile.
+    // Arming a new selection cannot attach it to that already pending delegate.
+    if runtime.isFilePickerVisible() {
+      return try uploadPanelAlreadyOpenResult(modern: modern)
     }
 
     if !candidates.isEmpty {
@@ -4182,21 +4551,44 @@ public final class WebKitMCPServer {
         expiresAt: Date().addingTimeInterval(60)
       ), modern: modern)
     if !candidates.isEmpty, runtime.hasArmedUploadSelection() {
+      let panelPending = runtime.isFilePickerVisible()
+      let uncertainDispatch =
+        result.objectValue?["structuredContent"]?.objectValue?["dispatch_error"] != nil
       return try structuredToolError(
         structured: .object([
-          "status": .string("upload_panel_not_opened"),
+          "status": .string(
+            panelPending
+              ? "upload_panel_pending"
+              : uncertainDispatch ? "upload_selection_indeterminate" : "upload_panel_not_opened"),
           "message": .string(
-            "The click was dispatched but opened no file panel, so no file was attached."),
+            "No file panel consumed the approved selection during this call. This does not prove whether the click reached the page or a panel opened."
+          ),
           "file_selected": .bool(false),
+          "file_picker_visible": .bool(panelPending),
           "remediation": .string(
-            "Observe again and target the control that opens the file chooser, or request "
-              + "browser_session operation=handoff: the panel then starts in the proposed "
-              + "file's folder."),
+            "Reconcile the current page and provider state before another upload; never replay automatically. If a file panel is pending, use browser_session operation=handoff to complete or cancel it, then return control and observe again. Call browser_upload directly on the freshly observed chooser control, without opening its panel first."
+          ),
           "action": result,
         ]),
         modern: modern)
     }
     return Self.annotatingConfirmedDigests(result, confirmed: candidates.map(\.sha256))
+  }
+
+  private func uploadPanelAlreadyOpenResult(modern: Bool) throws -> JSONValue {
+    try structuredToolError(
+      structured: .object([
+        "status": .string("upload_panel_already_open"),
+        "file_picker_visible": .bool(true),
+        "dispatched": .bool(false),
+        "file_selected": .bool(false),
+        "message": .string(
+          "A file-panel delegate is already pending. This call clicked nothing and selected no files."
+        ),
+        "remediation": .string(
+          "Use browser_session operation=handoff to complete or cancel the existing chooser, then return control and reconcile the page and provider state. After observing again, call browser_upload directly on the chooser control without opening its panel first."
+        ),
+      ]), modern: modern)
   }
 
   /// The digests shown at confirmation are read before the panel consumes the files,
@@ -4295,28 +4687,78 @@ public final class WebKitMCPServer {
       observedTarget = (observationID, elementID)
       triggerDescription = "Freshly observed control:\n" + jsonQuoted(String(label.prefix(120)))
     }
-    guard
-      try await rateLimitedConfirmation(
-        session: handle,
-        title: "Approve Browser Download",
-        message:
-          "Download from the current authenticated WebKit session.\n\n"
-          + triggerDescription
-          + "\n\nA native save panel will choose the destination. Existing files are never overwritten.",
-        approveLabel: "Choose Destination"
-      ) == .approved
-    else {
-      return try toolError("The user did not approve this download", modern: modern)
+    let confirmation = try await rateLimitedConfirmation(
+      session: handle,
+      title: "Approve Browser Download",
+      message:
+        "Download from the current authenticated WebKit session.\n\n"
+        + triggerDescription
+        + "\n\nA native save panel will choose the destination. Existing files are never overwritten.",
+      approveLabel: "Choose Destination"
+    )
+    guard confirmation == .approved else {
+      return try confirmationOutcomeResult(confirmation, action: "download", modern: modern)
     }
     let receipt: WebKitDownloadReceipt
     if let directURL {
       receipt = try await runtime.download(
         url: directURL, expectedProvisioningProfileUUID: expectedUUID)
     } else if let observedTarget {
-      receipt = try await runtime.download(
-        observationID: observedTarget.0,
-        elementID: observedTarget.1,
-        expectedProvisioningProfileUUID: expectedUUID)
+      let attemptEvidence = DownloadAttemptEvidence()
+      do {
+        receipt = try await runtime.download(
+          observationID: observedTarget.0,
+          elementID: observedTarget.1,
+          expectedProvisioningProfileUUID: expectedUUID,
+          onAttemptFinished: { attemptEvidence.value = $0 })
+      } catch let error as WebKitRuntimeError {
+        let code: String
+        switch error {
+        case .targetNotActionable: code = "target_not_actionable"
+        case .targetGeometryChanged: code = "target_geometry_changed"
+        case .nativeGestureReceiptUnavailable: code = "native_gesture_receipt_unavailable"
+        case .downloadReceiptTimedOut: code = "download_receipt_timed_out"
+        case .downloadFailed(let reason): code = reason
+        default: throw error
+        }
+        let status: String
+        if case .downloadFailed = error {
+          status = "download_failed"
+        } else {
+          status = code == "download_receipt_timed_out" ? "download_timeout" : code
+        }
+        // Bound to this request before its continuation resumes, never read from
+        // a mutable "latest attempt" after another client may have started work.
+        guard let evidence = attemptEvidence.value else { throw error }
+        return try structuredToolError(
+          structured: .object([
+            "code": .string(code),
+            "status": .string(status),
+            "reason": .string(code),
+            "stage": .string(evidence.stage),
+            "native_dispatch_attempted": .bool(evidence.nativeDispatchAttempted),
+            "native_gesture_verified": .bool(evidence.nativeGestureVerified),
+            "navigation_action_seen": .bool(evidence.navigationActionSeen),
+            "navigation_response_seen": .bool(evidence.navigationResponseSeen),
+            "new_window_requested": .bool(evidence.newWindowRequested),
+            "new_window_source_main_frame": .bool(evidence.newWindowSourceMainFrame),
+            "new_window_target_absent": .bool(evidence.newWindowTargetAbsent),
+            "download_window_created": .bool(evidence.downloadWindowCreated),
+            "suppressed_data_preview": .bool(evidence.suppressedDataPreview),
+            "data_attachment_requested": .bool(evidence.dataAttachmentRequested),
+            "destination_selection_started": .bool(evidence.destinationSelectionStarted),
+            "page_url_changed": .bool(evidence.pageURLChanged),
+            "main_frame_navigation_committed": .bool(evidence.mainFrameNavigationCommitted),
+            "download_started": .bool(evidence.downloadStarted),
+            "download_verified": .bool(false),
+            "download_completed": .bool(false),
+            "artifact_exists": .bool(false),
+            "automatic_retry_allowed": .bool(false),
+            "message": .string(
+              "Download was not verified. Do not replay the click; obtain a fresh observation and inspect the reported stage."
+            ),
+          ]), modern: modern)
+      }
     } else {
       throw MCPServerError.invalidParams("download trigger is unavailable")
     }
@@ -4515,13 +4957,32 @@ public final class WebKitMCPServer {
   private func validatePostconditionBaseline(
     _ postcondition: ActPostcondition?, observation: WebKitPageObservation
   ) throws {
-    if let postcondition, !observation.isComplete {
+    if observation.aggregateTextOmitted == true, let postcondition {
       switch postcondition {
-      case .targetAbsent, .semanticTextAppears, .semanticTextContains, .dialogAppears, .panelOpen:
+      case .semanticTextAppears, .semanticTextContains:
         throw MCPServerError.invalidParams(
-          "postcondition_baseline_incomplete: this observation is filtered, paginated, truncated, or has unreadable content. Observe without role/name filters and with enough elements/field characters before asking whether semantic content appeared or a target disappeared."
+          "postcondition_baseline_incomplete: oversized aggregate text was explicitly omitted in this dialog scope. Use a heading or target-local structural condition, not a semantic-text claim."
         )
       default: break
+      }
+    }
+    if let postcondition {
+      // A structural claim (a target vanishes, a dialog or panel appears) needs every
+      // element discovered; it does not need every field's text whole. A text claim
+      // needs both, because the words may sit in the part that was cut.
+      let baselineSufficient: Bool
+      switch postcondition {
+      case .targetAbsent, .dialogAppears, .panelOpen:
+        baselineSufficient = observation.isStructurallyComplete
+      case .semanticTextAppears, .semanticTextContains:
+        baselineSufficient = observation.isComplete
+      default:
+        baselineSufficient = true
+      }
+      if !baselineSufficient {
+        throw MCPServerError.invalidParams(
+          "postcondition_baseline_incomplete: this observation is filtered, paginated, truncated, or has unreadable content. Observe without role/name filters and with enough elements/field characters before asking whether semantic content appeared or a target disappeared. If unreadable frames remain, do not retry the same global condition: use an applicable first-party postcondition such as heading_equals, heading_contains, title_equals, title_contains, a url condition, or an observed target-local state."
+        )
       }
     }
   }
@@ -4600,6 +5061,7 @@ public final class WebKitMCPServer {
         structured: .object([
           "action": try .encoded(action),
           "confirmation_mode": .string(pending.approvalMode),
+          "authorization_source": .string(pending.authorizationSource),
           "dispatch_mode": .string(action.dispatchMode.rawValue),
           "confirmation_and_dispatch_are_distinct": .bool(true),
           // WebKit forwards no mouse-moved event to an embedder, so a hover is a
@@ -4667,15 +5129,13 @@ public final class WebKitMCPServer {
         ))
       let semanticValueKey = ObservationFieldKey(
         frameID: targetFrameID, elementID: target.locatorRecipe.semanticIdentity, field: "@value")
-      // An untouched embedded input may have no observable value entry yet. Its
-      // presence, not a pre-existing value, is the honest precondition for insertion.
-      preconditions =
-        target.frameOrigin == nil
-        ? [.entryPresent(semanticValueKey)]
-        : [
-          .entryPresent(
-            .init(frameID: targetFrameID, elementID: pending.elementID, field: "@tag"))
-        ]
+      // An untouched editable control can have no observable value entry yet. Require
+      // the exact observed element to remain present; dispatch still re-resolves and
+      // pins that node, while the semantic value below remains an exact postcondition.
+      preconditions = [
+        .entryPresent(
+          .init(frameID: targetFrameID, elementID: pending.elementID, field: "@tag"))
+      ]
       postconditions = [
         .entryTextDigest(
           semanticValueKey,
@@ -4739,12 +5199,18 @@ public final class WebKitMCPServer {
         structured["navigation_blocker"] = .object(blocker)
         structured["safe_next_step"] = blocker["safe_next_step"]
       }
+      structured = try addingFileUploadFacts(
+        to: structured, runtime: runtime, since: dispatchFloorNanoseconds)
       return try toolResult(structured: .object(structured), modern: modern)
     }
     var structured: [String: JSONValue] = [
       "action": try .encoded(result.action),
+      "verification_scope_id": pending.observation.verificationScopeID.map(JSONValue.string)
+        ?? .null,
+      "verification_proves_remote_save": .bool(false),
       "verification": try .encoded(result.verification),
       "confirmation_mode": .string(pending.approvalMode),
+      "authorization_source": .string(pending.authorizationSource),
       "dispatch_mode": .string(result.action.dispatchMode.rawValue),
       "confirmation_and_dispatch_are_distinct": .bool(true),
       "trusted_gesture_state": .string(
@@ -4771,13 +5237,8 @@ public final class WebKitMCPServer {
       structured["navigation_blocker"] = .object(blocker)
       structured["safe_next_step"] = blocker["safe_next_step"]
     }
-    if let uploadReceipt = runtime.latestFileUploadReceipt(),
-      uploadReceipt.monotonicNanoseconds >= dispatchFloorNanoseconds
-    {
-      structured["file_upload_receipt"] = try .encoded(uploadReceipt)
-      structured["file_selected"] = .bool(true)
-      structured["upload_accepted_by_site"] = .string("requires_postcondition")
-    }
+    structured = try addingFileUploadFacts(
+      to: structured, runtime: runtime, since: dispatchFloorNanoseconds)
     // Scoped to this dispatch by the same floor the upload receipt uses: a suppressed
     // window stands until the document is replaced, so without the floor a later
     // unrelated action would report a refusal that happened before it ran.
@@ -4810,6 +5271,22 @@ public final class WebKitMCPServer {
       ])
     }
     return try toolResult(structured: .object(structured), modern: modern)
+  }
+
+  /// Selection evidence is independent of a native gesture receipt. A page can open
+  /// its chooser while preventing the gesture listener from receiving the click.
+  /// Keep the dispatch uncertainty and report only this attempt's upload facts.
+  private func addingFileUploadFacts(
+    to result: [String: JSONValue], runtime: WebKitRuntime, since floor: UInt64
+  ) throws -> [String: JSONValue] {
+    var result = result
+    if runtime.isFilePickerVisible() { result["file_picker_visible"] = .bool(true) }
+    if let receipt = runtime.latestFileUploadReceipt(), receipt.monotonicNanoseconds >= floor {
+      result["file_upload_receipt"] = try .encoded(receipt)
+      result["file_selected"] = .bool(true)
+      result["upload_accepted_by_site"] = .string("requires_postcondition")
+    }
+    return result
   }
 
   private func discoverResult() -> JSONValue {
@@ -4894,6 +5371,12 @@ public final class WebKitMCPServer {
     // redirect by diffing two strings it was never told to compare. Several real
     // console paths land somewhere else entirely.
     payload["redirected"] = .bool(result.redirected)
+    payload["readiness_scope"] = .string("document_completion_and_mutation_quiescence")
+    payload["business_readiness"] = .string("not_verified")
+    payload["remote_persistence_verified"] = .bool(false)
+    payload["business_readiness_next_step"] = .string(
+      "Read again until an observed business marker is present within a bounded deadline. ready does not prove business data loaded; absence on the first read is unknown, not deletion."
+    )
     annotatePageContent(&payload, state: result.contentState)
     return .object(payload)
   }
@@ -4914,7 +5397,10 @@ public final class WebKitMCPServer {
         "actionable": .bool(element.actionable),
       ]
       // Which of click or submit is legal depends on it, so it is never optional either.
-      if element.submitsForm { row["submits_form"] = .bool(true) }
+      row["submits_form"] = .bool(element.submitsForm)
+      if let editable = element.contentEditable { row["contentEditable"] = .bool(editable) }
+      if element.scrollable == true { row["scrollable"] = .bool(true) }
+      if let capability = element.fillCapability { row["fillCapability"] = .string(capability) }
       if let coveredBy = element.coveredBy { row["covered_by"] = plain(coveredBy) }
       if !element.actionable {
         row["not_actionable_because"] = .string(element.actionability.rawValue)
@@ -4952,6 +5438,7 @@ public final class WebKitMCPServer {
         ])
       }
       if fields.contains("state") {
+        row["stateAttributes"] = .object(element.stateAttributes.mapValues { plain($0) })
         row["state"] = .object([
           "disabled": .bool(element.disabled),
           "checked": element.checked.map(JSONValue.bool) ?? .null,
@@ -4986,6 +5473,15 @@ public final class WebKitMCPServer {
       // exceed the bounded native registry remain explicit so absence is never page truth.
       "unreadable_frame_count": .int(Int64(observation.unreadableFrameCount)),
       "observation_is_complete": .bool(observation.isComplete),
+      "observation_is_structurally_complete": .bool(observation.isStructurallyComplete),
+      "observation_completeness_scope": .string(
+        observation.verificationScopeID == nil
+          ? "discovered_collector_results_only"
+          : "observed_dialog_collector_results_only"),
+      "verification_scope_id": observation.verificationScopeID.map(JSONValue.string) ?? .null,
+      "aggregate_text_omitted": .bool(observation.aggregateTextOmitted == true),
+      "semantic_text_complete": .bool(
+        observation.isComplete && observation.aggregateTextOmitted != true),
       "elementOffset": .int(Int64(observation.elementOffset)),
       "nextElementOffset": observation.nextElementOffset.map { .int(Int64($0)) } ?? .null,
       "semanticTextTruncated": .bool(observation.semanticTextTruncated),
@@ -5049,10 +5545,13 @@ public final class WebKitMCPServer {
       "label": plain(element.label),
       "sensitive": .bool(element.sensitive),
       "submitsForm": .bool(element.submitsForm),
+      "contentEditable": .bool(element.contentEditable == true),
+      "scrollable": .bool(element.scrollable == true),
       "actionable": .bool(element.actionable),
       "actionability": .string(element.actionability.rawValue),
       "stableAttributes": .object(
         element.stableAttributes.mapValues { plain($0) }),
+      "stateAttributes": .object(element.stateAttributes.mapValues { plain($0) }),
       "contextAnchors": .array(
         element.contextAnchors.map { anchor in
           .object([
@@ -5078,6 +5577,7 @@ public final class WebKitMCPServer {
         .string(ProvenanceClass.thirdPartyEmbed.rawValue)
       ])
     }
+    if let capability = element.fillCapability { payload["fillCapability"] = .string(capability) }
     return .object(payload)
   }
 
@@ -5380,113 +5880,104 @@ public final class WebKitMCPServer {
     "browser_rotate_siliconpass_password",
   ]
 
-  private static let actPostconditionSchema: JSONValue = .object([
-    "type": .string("object"),
-    "description": .string(
-      "Required for click and submit; forbidden for fill, whose exact value is verified automatically. target_absent with value=true verifies that the original semantic identity is absent from a complete observation; it does not prove server persistence. enabled_equals=false requires a target that remains present and disabled."
-    ),
-    "oneOf": .array([
-      .object([
-        "type": .string("object"),
-        "properties": .object([
-          "type": .object(["const": .string("target_absent")]),
-          "value": .object(["const": .string("true")]),
-        ]),
-        "required": .array([.string("type"), .string("value")]),
-        "additionalProperties": .bool(false),
+  private static let actPostconditionSchema: JSONValue = {
+    let attributes: JSONValue = .object([
+      "type": .string("string"),
+      "enum": .array([
+        .string("aria-checked"), .string("aria-selected"), .string("aria-current"),
+        .string("aria-disabled"), .string("aria-expanded"), .string("data-state"), .string("open"),
       ]),
+    ])
+    func branch(_ types: [String], value: JSONValue, attribute: Bool = false) -> JSONValue {
+      var properties: [String: JSONValue] = [
+        "type": .object(["type": .string("string"), "enum": .array(types.map { .string($0) })]),
+        "value": value,
+      ]
+      var required = [JSONValue.string("type"), .string("value")]
+      if attribute {
+        properties["attribute"] = attributes
+        required.append(.string("attribute"))
+      }
+      return .object([
+        "type": .string("object"), "properties": .object(properties),
+        "required": .array(required), "additionalProperties": .bool(false),
+      ])
+    }
+    func text(_ maximum: Int, minimum: Int = 0) -> JSONValue {
       .object([
-        "type": .string("object"),
-        "properties": .object([
-          "type": .object(["const": .string("url_equals")]),
-          "value": .object(["type": .string("string"), "format": .string("uri")]),
+        "type": .string("string"), "minLength": .int(Int64(minimum)),
+        "maxLength": .int(Int64(maximum)),
+      ])
+    }
+    let types = [
+      "target_absent", "url_equals", "url_prefix", "url_changes_from", "url_contains",
+      "semantic_text_appears", "semantic_text_contains", "checked_equals", "selected_equals",
+      "enabled_equals", "value_equals", "validation_state", "character_count_equals",
+      "title_equals", "title_contains", "heading_equals", "heading_contains", "dialog_appears",
+      "panel_open", "option_selected", "attribute_equals",
+    ]
+    return .object([
+      "type": .string("object"),
+      "description": .string(
+        "Required for click, submit, press_key, blur and commit_input; forbidden for fill and select_option, whose target value or selected label is verified automatically. Shape: {type: string, value: string}; only attribute_equals adds attribute. State booleans and character counts are strings. target_absent requires value=\"true\" and a complete observation in its explicit scope (global by default). panel_open/dialog_appears require the exact accessible NAME as a string, never true. semantic_text_appears is exact; semantic_text_contains is substring. A condition already true is not a transition. For a wizard whose Next button persists, verify a new observed heading rather than target absence. Oversized aggregate text omitted in a dialog scope cannot support semantic-text predicates. Verification does not prove backend persistence."
+      ),
+      // Explicit properties let clients display the object even when they cannot
+      // render oneOf. Branches retain precise per-type validation constraints.
+      "properties": .object([
+        "type": .object(["type": .string("string"), "enum": .array(types.map { .string($0) })]),
+        "value": .object([
+          "type": .string("string"),
+          "description": .string(
+            "Expected text/absolute URL; true/false for state predicates; valid/invalid/not_applicable for validation_state; decimal 0..4096 for character_count_equals."
+          ),
         ]),
-        "required": .array([.string("type"), .string("value")]),
-        "additionalProperties": .bool(false),
+        "attribute": attributes,
       ]),
-      .object([
-        "type": .string("object"),
-        "properties": .object([
-          "type": .object(["const": .string("semantic_text_appears")]),
-          "value": .object([
-            "type": .string("string"), "minLength": .int(1), "maxLength": .int(512),
-          ]),
-        ]),
-        "required": .array([.string("type"), .string("value")]),
-        "additionalProperties": .bool(false),
-      ]),
-      .object([
-        "type": .string("object"),
-        "properties": .object([
-          "type": .object(["const": .string("semantic_text_contains")]),
-          "value": .object([
-            "type": .string("string"), "minLength": .int(1), "maxLength": .int(512),
-          ]),
-        ]),
-        "required": .array([.string("type"), .string("value")]),
-        "additionalProperties": .bool(false),
-      ]),
-      .object([
-        "type": .string("object"),
-        "properties": .object([
-          "type": .object([
-            "enum": .array([
-              .string("checked_equals"), .string("selected_equals"),
-              .string("enabled_equals"),
-            ])
-          ]),
-          "value": .object([
+      "required": .array([.string("type"), .string("value")]),
+      "additionalProperties": .bool(false),
+      "oneOf": .array([
+        branch(
+          ["target_absent"], value: .object(["type": .string("string"), "const": .string("true")])),
+        branch(
+          ["url_equals", "url_changes_from"],
+          value: .object([
+            "type": .string("string"), "format": .string("uri"),
+          ])),
+        branch(
+          ["url_prefix"],
+          value: .object([
+            "type": .string("string"), "format": .string("uri"), "maxLength": .int(2048),
+            "description": .string("Absolute URL prefix; runtime also limits UTF-8 to 2048 bytes."),
+          ])),
+        branch(["semantic_text_appears"], value: text(512)),
+        branch(
+          [
+            "semantic_text_contains", "url_contains", "title_equals", "title_contains",
+            "heading_equals", "heading_contains", "dialog_appears", "panel_open", "option_selected",
+          ], value: text(512, minimum: 1)),
+        branch(
+          ["checked_equals", "selected_equals", "enabled_equals"],
+          value: .object([
             "type": .string("string"),
-            "enum": .array([.string("true"), .string("false")]),
-          ]),
-        ]),
-        "required": .array([.string("type"), .string("value")]),
-        "additionalProperties": .bool(false),
-      ]),
-      .object([
-        "type": .string("object"),
-        "properties": .object([
-          "type": .object([
-            "enum": .array([
-              .string("value_equals"), .string("url_changes_from"),
-              .string("url_contains"),
-              .string("title_equals"), .string("title_contains"),
-              .string("heading_equals"), .string("heading_contains"),
-              .string("dialog_appears"),
-              .string("option_selected"),
-            ])
-          ]),
-          "value": .object([
-            "type": .string("string"), "minLength": .int(1), "maxLength": .int(1_024),
-          ]),
-        ]),
-        "required": .array([.string("type"), .string("value")]),
-        "additionalProperties": .bool(false),
-      ]),
-      .object([
-        "type": .string("object"),
-        "properties": .object([
-          "type": .object(["const": .string("attribute_equals")]),
-          "attribute": .object([
+            "pattern": .string("^([Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee])$"),
+          ])),
+        branch(["value_equals"], value: text(4096)),
+        branch(
+          ["validation_state"],
+          value: .object([
             "type": .string("string"),
-            "enum": .array([
-              .string("aria-checked"), .string("aria-selected"),
-              .string("aria-current"), .string("aria-disabled"),
-              .string("aria-expanded"),
-              .string("data-state"), .string("open"),
-            ]),
-          ]),
-          "value": .object([
-            "type": .string("string"), "maxLength": .int(1_024),
-          ]),
-        ]),
-        "required": .array([
-          .string("type"), .string("attribute"), .string("value"),
-        ]),
-        "additionalProperties": .bool(false),
+            "enum": .array([.string("valid"), .string("invalid"), .string("not_applicable")]),
+          ])),
+        branch(
+          ["character_count_equals"],
+          value: .object([
+            "type": .string("string"),
+            "description": .string("An integer from 0 through 4096, encoded as a string."),
+          ])),
+        branch(["attribute_equals"], value: .object(["type": .string("string")]), attribute: true),
       ]),
-    ]),
-  ])
+    ])
+  }()
 
   /// Extended, not replaced: Enter, Tab and Escape still mean exactly what they meant. A
   /// printable character cannot be enumerated, so the named keys are one branch of the
@@ -5553,7 +6044,7 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_upload",
       description:
-        "Attach local files to one freshly observed file control. Provide file_paths for a bounded agent selection the native confirmation states in full — filename, byte count and SHA-256 for every file — or omit it to have a person choose in the native open panel. Files must be readable regular local files, never symlinks, at most 10 files of 50 MiB each. Requires exact native confirmation and a postcondition that proves the site accepted the selection. Local paths and file contents are never returned; the receipt carries names, sizes and digests only.",
+        "Attach local files by calling this tool directly on one freshly observed file input, label or button that opens its chooser; do not open the file panel with browser_act first. An already pending file panel is refused without a click or selection: use human handoff to complete or cancel it, return control and reconcile before retrying. Provide file_paths for a bounded agent selection the native confirmation states in full — filename, byte count and SHA-256 for every file — or omit it to have a person choose in the native open panel. Files must be readable regular local files, never symlinks, at most 10 files of 50 MiB each. Requires exact native confirmation and a postcondition that proves the site accepted the selection. A selection receipt is reported independently of gesture/verification uncertainty and does not prove backend acceptance. Local paths and file contents are never returned; the receipt carries names, sizes and digests only.",
       properties: sessionSchemaProperties.merging([
         "observation_id": .object([
           "type": .string("string"),
@@ -5561,7 +6052,8 @@ public final class WebKitMCPServer {
         ]),
         "element_id": .object([
           "type": .string("string"),
-          "description": .string("Freshly observed file input to open."),
+          "description": .string(
+            "Freshly observed file input, label or button that opens the chooser."),
         ]),
         "idempotency_key": .object([
           "type": .string("string"),
@@ -5597,10 +6089,18 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_act",
       description:
-        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, select_option, hover, one bounded key press with optional modifiers, blur, or input commit, or answer the one JavaScript dialog a page is suspended on (dialog_accept, dialog_dismiss, dialog_accept_value). A pending dialog blocks every other operation until it is answered, and is never answered automatically. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and exact human confirmation. approval_mode=native uses server-owned confirmation and AppKit dispatch for click/submit/fill/key operations, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. In a registered cross-origin frame, hover/select_option use only untrusted frame-local JavaScript; non-sensitive press_key/fill use native confirmation and require an exact trusted receipt from that child frame. Native pointer click/submit cannot translate frame-local geometry and refuse before confirmation, directing the user to live human handoff. select_option and hover are always JavaScript-dispatched and always report trusted_gesture_state=untrusted_javascript: a select popup is an NSMenu running its own event loop that a synthetic NSEvent never reaches, and WebKit forwards no mouse-moved event to an embedder at all. select_option names an option by its exact visible label, never an index, and a label matching no option or more than one is refused before dispatch; the labels browser_observe publishes in a select\'s options are collapsed by the same rule this operation collapses the one it is given, so a label copied from an observation is a label this accepts. hover raises mouseover, mouseenter and mousemove; it cannot move WebKit\'s own pointer state, so a menu that opens purely through a CSS :hover rule will not open, and hover carries no postcondition of its own — call browser_observe to read what it revealed. UI state does not prove backend commit.",
+        "Prepare one transactionally verified click, native form-submit click, non-sensitive input fill, select_option, hover, one bounded key press with optional modifiers, blur, or input commit, or answer the one JavaScript dialog a page is suspended on (dialog_accept, dialog_dismiss, dialog_accept_value). A pending dialog blocks every other operation until it is answered, and is never answered automatically. Authentication origins are fail-closed. Every operation requires a fresh observation, idempotency key, and authorization. Native mode can reuse a site/profile permission explicitly selected in the local Always Allow menu; session and permanent permissions are revocable locally. Permanent permissions are profile-wide across agents, not bound to a self-reported agent name. approval_mode=native uses exact local confirmation or the selected remembered site permission and AppKit dispatch for click/submit/fill/key operations, with an independently measured WebKit event trust receipt; approval_mode=mcp retains multi-round confirmation and JavaScript dispatch. In a registered cross-origin frame, hover/select_option use only untrusted frame-local JavaScript; non-sensitive press_key/fill use native confirmation and require an exact trusted receipt from that child frame. Native pointer click/submit cannot translate frame-local geometry and refuse before confirmation, directing the user to live human handoff. select_option and hover are always JavaScript-dispatched and always report trusted_gesture_state=untrusted_javascript: a select popup is an NSMenu running its own event loop that a synthetic NSEvent never reaches, and WebKit forwards no mouse-moved event to an embedder at all. select_option names an option by its exact visible label, never an index, and a label matching no option or more than one is refused before dispatch; the labels browser_observe publishes in a select\'s options are collapsed by the same rule this operation collapses the one it is given, so a label copied from an observation is a label this accepts. hover raises mouseover, mouseenter and mousemove; it cannot move WebKit\'s own pointer state, so a menu that opens purely through a CSS :hover rule will not open, and hover carries no postcondition of its own — call browser_observe to read what it revealed. UI state does not prove backend commit.",
       properties: sessionSchemaProperties.merging([
-        "observation_id": .object(["type": .string("string")]),
-        "element_id": .object(["type": .string("string")]),
+        "observation_id": .object([
+          "type": .string("string"),
+          "description": .string(
+            "Required for non-dialog actions: fresh browser_observe observation_id."),
+        ]),
+        "element_id": .object([
+          "type": .string("string"),
+          "description": .string(
+            "Required for non-dialog actions: the target in that fresh observation."),
+        ]),
         "operation": .object([
           "type": .string("string"),
           "enum": .array([
@@ -5620,7 +6120,7 @@ public final class WebKitMCPServer {
         "value": .object([
           "type": .string("string"), "maxLength": .int(4_096),
           "description": .string(
-            "Required for fill (empty string clears the control), for select_option (the exact visible label of the option to choose, never an index) and for dialog_accept_value (the exact string handed to the page\'s prompt)."
+            "Required for fill (empty string clears the control; at most 4096 characters; input forbids newlines), for select_option (the exact visible label of the option to choose, never an index) and for dialog_accept_value (the exact string handed to the page\'s prompt). Fill accepts non-sensitive input, textarea, semantic textbox or an exact target observed with contentEditable=true; a generic wrapper is not redirected to a child. Live editability is rechecked at dispatch. Fill forbids a supplied postcondition and verifies the target value and non-invalid DOM validation state automatically; verification does not prove save or backend persistence."
           ),
         ]),
         "key": pressKeySchema,
@@ -5638,76 +6138,6 @@ public final class WebKitMCPServer {
       ]) { _, new in new },
       required: [
         "session_id", "operation", "idempotency_key",
-      ],
-      schemaExtras: [
-        "allOf": .array([
-          // Answering a dialog names no element: while a panel is open the page's script
-          // does not run, so there is nothing on the page left to address. Every other
-          // operation still requires the fresh observation and element it always did.
-          .object([
-            "if": .object([
-              "properties": .object([
-                "operation": .object([
-                  "enum": .array([
-                    .string("dialog_accept"), .string("dialog_dismiss"),
-                    .string("dialog_accept_value"),
-                  ])
-                ])
-              ]),
-              "required": .array([.string("operation")]),
-            ]),
-            "then": .object(["required": .array([.string("dialog_id")])]),
-            "else": .object([
-              "required": .array([.string("observation_id"), .string("element_id")])
-            ]),
-          ]),
-          .object([
-            "if": .object([
-              "properties": .object([
-                "operation": .object(["const": .string("dialog_accept_value")])
-              ]),
-              "required": .array([.string("operation")]),
-            ]),
-            "then": .object(["required": .array([.string("value")])]),
-          ]),
-          .object([
-            "if": .object([
-              "properties": .object([
-                "operation": .object([
-                  "enum": .array([
-                    .string("click"), .string("submit"), .string("press_key"),
-                    .string("blur"), .string("commit_input"),
-                  ])
-                ])
-              ]),
-              "required": .array([.string("operation")]),
-            ]),
-            "then": .object(["required": .array([.string("postcondition")])]),
-          ]),
-          .object([
-            "if": .object([
-              "properties": .object([
-                "operation": .object([
-                  "enum": .array([.string("fill"), .string("select_option")])
-                ])
-              ]),
-              "required": .array([.string("operation")]),
-            ]),
-            "then": .object([
-              "required": .array([.string("value")]),
-              "not": .object(["required": .array([.string("postcondition")])]),
-            ]),
-          ]),
-          .object([
-            "if": .object([
-              "properties": .object([
-                "operation": .object(["const": .string("press_key")])
-              ]),
-              "required": .array([.string("operation")]),
-            ]),
-            "then": .object(["required": .array([.string("key")])]),
-          ]),
-        ])
       ],
       readOnly: false,
       destructive: true
@@ -5781,6 +6211,18 @@ public final class WebKitMCPServer {
       description:
         "Return rendered full-page semantics with provenance, sanitized context/stable attributes, locator quality, and fresh observation-scoped element IDs. Registered cross-origin frames contribute bounded semantics with THIRD_PARTY_EMBED provenance and a sanitized frame origin; their bounding boxes are frame-viewport-local. frameActionModes (compact frame_action_modes) lists eligible frame-local modes separately from actionable=false, which means no native pointer geometry, not that every attempt is impossible. Only hover/select_option as untrusted JavaScript and non-sensitive native-confirmed press_key/fill with an exact trusted child-frame receipt can be attempted; native pointer actions refuse with a named human-handoff route. Frames that cannot be read remain explicit. compact=true factors document provenance once, returns concise rows, and on modern MCP avoids duplicating the structured payload in content text. Both shapes report content_state; empty_or_unusable includes an explicit safe next step and means absence is not page truth. Both also report camera, microphone, and geolocation requests that the native host denied, including the sanitized requesting origin; no MCP operation grants those permissions. Hidden, zero-size, aria-hidden, inert, transparent, and sensitive field values are omitted before serialization. URL query values are redacted. A select publishes the option labels it will accept, each marked selected or disabled, in document order, bounded to 64 per control with optionsTruncated saying when the list was cut and optionCount giving the true total; a sensitive select publishes no options key, no optionCount and no selectedOption at all, because what is chosen in a select is that control's value, and neither does anything that is not a select publish options. Restricted authentication origins require local human handoff and return no page semantics. Never reuse an element ID after another observation.",
       properties: sessionSchemaProperties.merging([
+        "scope_observation_id": .object([
+          "type": .string("string"),
+          "description": .string(
+            "Use with scope_element_id to restrict observation and subsequent verification to that exact freshly observed dialog; not arbitrary selectors. Root replacement/loss is unknown, never successful absence."
+          ),
+        ]),
+        "scope_element_id": .object([
+          "type": .string("string"),
+          "description": .string(
+            "An observed main-document dialog/alertdialog root. Oversized aggregate duplicates may be omitted explicitly; heading/target structural predicates remain available, semantic-text predicates refuse omitted text. Omit both scope fields for a global observation."
+          ),
+        ]),
         "maximum_elements": integerSchema(minimum: 1, maximum: 2_000, defaultValue: 150),
         "element_offset": integerSchema(minimum: 0, maximum: 100_000, defaultValue: 0),
         "maximum_field_characters": integerSchema(
@@ -5813,7 +6255,9 @@ public final class WebKitMCPServer {
               .string("state"), .string("locator_quality"),
             ]),
           ]),
-          "description": .string("Optional compact-row field selection; requires compact=true."),
+          "description": .string(
+            "Optional compact-row field selection; requires compact=true. state includes stateAttributes (e.g. aria-expanded) as sanitized strings with document provenance. Full observations use ProvenancedText.segments instead. Text controls and pickers report fillCapability: editable/readonly/disabled/unsupported/sensitive; absent elsewhere. editable is DOM capability, not framework acceptance or remote persistence."
+          ),
         ]),
       ]) { _, new in new },
       required: ["session_id"],
@@ -5844,8 +6288,10 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_scroll",
       description:
-        "Scroll the top-level page by bounded CSS-pixel deltas and return viewport/document bounds. Scrolling invalidates the prior observation, so call browser_observe again.",
+        "Scroll by bounded CSS-pixel deltas. To move a dialog/list instead of the background, supply both observation_id and element_id for a freshly observed scrollable=true container. That exact physical container must still exist; no background fallback. Targeted results include beforeX/beforeY and actualDeltaX/actualDeltaY (zero means no movement, not success beyond a boundary). Without a target, scroll the document or inferred page pane. Scrolling invalidates the prior observation; observe again before acting. No clicks, form edits or remote-save proof.",
       properties: sessionSchemaProperties.merging([
+        "observation_id": .object(["type": .string("string")]),
+        "element_id": .object(["type": .string("string")]),
         "delta_x": numberSchema(minimum: -2_000, maximum: 2_000, defaultValue: 0),
         "delta_y": numberSchema(minimum: -2_000, maximum: 2_000, defaultValue: 0),
       ]) { _, new in new },
@@ -5866,12 +6312,16 @@ public final class WebKitMCPServer {
     tool(
       name: "browser_session",
       description:
-        "List persistent profiles, open, inspect, resize, recover, close, or transfer one bounded session behind the single WebKitUI MCP authority. For each independent task, call open and retain its exact session_id; sessions on the same profile share sign-ins. Never adopt a different task's page from status. A full broker refuses reopening an active page already owned by this client. set_viewport changes only the CSS-pixel layout and invalidates a prior observation; width is 320–3840 and height is 240–2160. It does not emulate a mobile device: the public macOS SDK exposes no WKWebView ContentMode API, and set_emulated_media is deliberately unsupported. back, forward, and reload take their exact destination from WKBackForwardList, require native confirmation, and invalidate the observation; an absent entry is an explicit refusal, and reload is refused after a form submission to prevent replay. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens an exact private restricted-authentication URL in Safari only after native confirmation; it is an optional manual fallback and never replaces native handoff. Cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. handoff_focus re-presents only an already-active human-control window and changes no authority. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation under the same bounds. Profile listing never exposes cookies or credentials.",
+        "diagnose returns bounded main-frame loading/error counters and sampled resource timing without raw console or request data; it is read-only and makes no completeness claim. List persistent profiles, open, inspect, resize, recover, close, or transfer one bounded session behind the single WebKitUI MCP authority. For each independent task, call open and retain its exact session_id; sessions on the same profile share sign-ins. Never adopt a different task's page from status. A full broker refuses reopening an active page already owned by this client. set_viewport changes only the CSS-pixel layout and invalidates a prior observation; width is 320–3840 and height is 240–2160. It does not emulate a mobile device: the public macOS SDK exposes no WKWebView ContentMode API, and set_emulated_media is deliberately unsupported. back, forward, and reload take their exact destination from WKBackForwardList, require native confirmation, and invalidate the observation; an absent entry is an explicit refusal, and reload is refused after a form submission to prevent replay. status works without a session ID and exposes only privacy-safe holder metadata. client_handoff transfers authority only after local human confirmation and a final no-active-call check. goal_delegation_start asks once for a typed, temporary same-origin navigation grant; the free-text goal is never authority, and origin/path/query/expiry/count plus hard stops are enforced locally. goal_delegation_status is read-only and goal_delegation_revoke stops automation immediately. Native WebKit is the trusted-write backend. compatibility_start opens the current exact private HTTP(S) URL in Safari only after native confirmation, including when the native page cannot render; it is an optional manual fallback and never replaces native handoff. Cookies, credentials, MFA, paths, and queries remain outside MCP and are never copied between backends. handoff_focus re-presents only an already-active human-control window and changes no authority. Isolated read-only policy remains unavailable. status reports pending_native_confirmation without blocking; confirmation_cancel can cancel that exact local prompt. handoff runs both ways and issues no token: under agent control it hands the live window to a person, and called again once status reports control_state=human_step_completed it takes control back after one local confirmation and returns a fresh observation, compact and bounded by default so it stays readable. handoff_start returns immediately with a session-bound opaque resume token; handoff_status polls without taking control; handoff_resume consumes the token only after local confirmation and returns a fresh observation under the same bounds. If an authorized resume hits the privacy inventory limit, it returns resumed=true, control_state=agent_controlled and observation_available=false; old targets remain invalid, and exact-destination navigation still needs its normal confirmation. When close returns browser_preserved=true it releases ownership without resetting the live page or human authority; open with reused=true is not a reset. Profile listing never exposes cookies or credentials.",
       properties: sessionSchemaProperties.merging([
         "operation": .object([
           "type": .string("string"),
+          "description": .string(
+            "Argument rules are operation-specific. handoff_start: only operation/session_id. handoff_status: operation/session_id/resume_token. handoff_resume: those plus compact/maximum_elements. timeout_ms and quiet_window_ms are for back/forward/reload only, never handoff. confirmation_focus: only operation/session_id/confirmation_request_id; re-present this exact live pending prompt without approval, dispatch, new prompt or deadline extension. Poll status for measured presentation, not human perception."
+          ),
           "enum": .array([
-            .string("open"), .string("profiles"), .string("status"), .string("close"),
+            .string("open"), .string("profiles"), .string("status"), .string("diagnose"),
+            .string("close"),
             .string("set_viewport"), .string("back"), .string("forward"), .string("reload"),
             .string("client_handoff"),
             .string("handoff"), .string("handoff_start"), .string("handoff_status"),
@@ -5880,12 +6330,19 @@ public final class WebKitMCPServer {
             .string("goal_delegation_start"), .string("goal_delegation_status"),
             .string("goal_delegation_revoke"),
             .string("confirmation_cancel"),
+            .string("confirmation_focus"),
           ]),
         ]),
         "profile_id": .object([
           "type": .string("string"),
           "description": .string(
             "For open only: default or an exact UUID returned by operation=profiles."
+          ),
+        ]),
+        "confirmation_request_id": .object([
+          "type": .string("string"), "format": .string("uuid"),
+          "description": .string(
+            "confirmation_focus only: exact requestID from this session's pending last_confirmation_presentation. Focus only, never approval or timeout extension; at most three requests, one per second."
           ),
         ]),
         "execution_policy": .object([
@@ -6005,7 +6462,7 @@ public final class WebKitMCPServer {
     return .object([
       "name": .string(name),
       "description": .string(description),
-      "inputSchema": .object(inputSchema),
+      "inputSchema": discoverySchema(.object(inputSchema)),
       "annotations": .object([
         "readOnlyHint": .bool(readOnly),
         "destructiveHint": .bool(destructive),
@@ -6013,6 +6470,20 @@ public final class WebKitMCPServer {
         "openWorldHint": .bool(name == "browser_navigate"),
       ]),
     ])
+  }
+
+  /// The public discovery shape is deliberately composition-free: some clients
+  /// intersect root properties with oneOf and erase the entire argument type.
+  /// Explicit types/enums/descriptions stay available. Conditional requirements
+  /// remain authoritatively checked by the runtime before confirmation/dispatch.
+  private static func discoverySchema(_ value: JSONValue) -> JSONValue {
+    switch value {
+    case .object(let fields):
+      let composition = Set(["oneOf", "anyOf", "allOf", "if", "then", "else"])
+      return .object(fields.filter { !composition.contains($0.key) }.mapValues(discoverySchema))
+    case .array(let values): return .array(values.map(discoverySchema))
+    default: return value
+    }
   }
 
   private static func integerSchema(

@@ -1,0 +1,197 @@
+{
+  "format": "manual_sanitized_protocol_event_extract_v1",
+  "date": "2026-10-20",
+  "installed_native_app": {
+    "version": "0.6.40",
+    "build": "640"
+  },
+  "not_raw_transport_or_receipt_dump": true,
+  "exclusions": [
+    "session and resume tokens",
+    "session handles",
+    "account identifiers",
+    "URL paths and queries",
+    "page text and screenshots",
+    "cookies and browser storage",
+    "credentials and environment",
+    "foreign process arguments",
+    "idempotency keys and transaction receipts"
+  ],
+  "events": [
+    {
+      "sequence": 1,
+      "tool": "browser_navigate",
+      "target_origin": "https://www.reddit.com",
+      "result": {
+        "readiness": "ready",
+        "content_state": "usable",
+        "business_readiness": "not_verified"
+      }
+    },
+    {
+      "sequence": 2,
+      "tool": "browser_observe",
+      "result": {
+        "code": "privacy_scan_limit_exceeded",
+        "automatic_retry_allowed": false,
+        "recovery_tool": "browser_session",
+        "recovery_operation": "handoff"
+      },
+      "effect": "No unfiltered content returned"
+    },
+    {
+      "sequence": 3,
+      "tool": "browser_session",
+      "operation": "handoff_start",
+      "result": {
+        "blocking": false,
+        "control_state": "human_controlled",
+        "resume_token_state": "active"
+      },
+      "note": "Opaque token intentionally excluded"
+    },
+    {
+      "sequence": 4,
+      "tool": "browser_session",
+      "operation": "status",
+      "result": {
+        "control_state": "human_step_completed",
+        "human_step_completed": true
+      },
+      "note": "Observed after human clicked return control"
+    },
+    {
+      "sequence": 5,
+      "tool": "browser_session",
+      "operation": "handoff",
+      "arguments": {
+        "compact": true,
+        "maximum_elements": 5
+      },
+      "result": {
+        "code": "privacy_scan_limit_exceeded",
+        "automatic_retry_allowed": false,
+        "recovery_operation": "handoff"
+      },
+      "effect": "No usable agent resume or observation"
+    },
+    {
+      "sequence": 6,
+      "tool": "browser_session",
+      "operation": "status",
+      "result": {
+        "control_state": "human_step_completed",
+        "human_step_completed": true,
+        "control_available": true
+      }
+    },
+    {
+      "sequence": 7,
+      "tool": "browser_navigate",
+      "result": {
+        "code": "human_control_active",
+        "control_state": "human_step_completed",
+        "dispatched": false,
+        "caller_action": "request_agent_resume",
+        "recovery_operation": "handoff"
+      },
+      "effect": "Agent cannot navigate away from the page that blocks resume"
+    },
+    {
+      "sequence": 8,
+      "source": "human_feedback",
+      "observation": "Human handoff window has no address bar; suggested manual URL entry was not possible",
+      "verification": "User report; native toolbar was not visually inspected successfully"
+    },
+    {
+      "sequence": 9,
+      "tool": "browser_session",
+      "operation": "handoff",
+      "precondition": "Human had navigated to another Reddit page using site controls",
+      "result": {
+        "code": "privacy_scan_limit_exceeded",
+        "automatic_retry_allowed": false
+      },
+      "effect": "Different page did not resolve the observed block"
+    },
+    {
+      "sequence": 10,
+      "tool": "browser_session",
+      "operation": "close",
+      "result": {
+        "closed": true,
+        "browser_preserved": true
+      }
+    },
+    {
+      "sequence": 11,
+      "tool": "browser_session",
+      "operation": "open",
+      "result": {
+        "reused": true,
+        "control_available": true
+      },
+      "note": "Owned mission session returned; no unrelated session adopted"
+    },
+    {
+      "sequence": 12,
+      "tool": "browser_navigate",
+      "result": {
+        "code": "human_control_active",
+        "control_state": "human_controlled",
+        "dispatched": false
+      },
+      "effect": "Releasing and reacquiring ownership did not reset human authority"
+    },
+    {
+      "sequence": 13,
+      "tool": "CUA.getApp",
+      "target": "Safari",
+      "result": {
+        "domain": "Computer Use",
+        "code": -10005,
+        "stable_failure": "failedToCreateImageDestination"
+      },
+      "attribution": "Fallback failure only; WebKitUI causality not established"
+    },
+    {
+      "sequence": 14,
+      "tool": "CUA.createBrowserTab",
+      "target": "iab",
+      "result": {
+        "stable_failure": "Browser is not available: iab"
+      },
+      "attribution": "Unavailable fallback; not a WebKitUI regression"
+    },
+    {
+      "sequence": 15,
+      "tool": "browser_session",
+      "operation": "status",
+      "result": {
+        "control_state": "human_controlled",
+        "human_step_completed": false,
+        "control_available": false,
+        "handoff_active": true,
+        "wait_only": true,
+        "current_origin": "https://www.reddit.com",
+        "capacity": {
+          "maximum": 3,
+          "active": 3,
+          "free": 0
+        }
+      }
+    }
+  ],
+  "external_write": {
+    "edit_dispatched": false,
+    "submit_dispatched": false,
+    "publication_verified": false
+  },
+  "safety": {
+    "privacy_filter_bypassed": false,
+    "foreign_sessions_modified": false,
+    "shared_browser_restarted": false,
+    "write_replayed": false
+  }
+}
+

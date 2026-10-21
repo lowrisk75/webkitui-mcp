@@ -20,6 +20,18 @@ private let fixtureNavigationTimeout: Duration = .seconds(15)
 private let fixtureSettlementPolls = 750
 
 @MainActor
+private final class SuspendedDownloadDestination {
+  var continuation: CheckedContinuation<URL?, Never>?
+  func choose() async -> URL? {
+    await withCheckedContinuation { continuation = $0 }
+  }
+  func finish(_ url: URL?) {
+    continuation?.resume(returning: url)
+    continuation = nil
+  }
+}
+
+@MainActor
 private func descendant<T: NSView>(
   of type: T.Type,
   accessibilityIdentifier: String,
@@ -1581,6 +1593,111 @@ struct WebKitRuntimeTests {
       observationID: filtered.observationID, elementID: control.elementID, operation: .click)
     let after = try await runtime.observe()
     #expect(after.elements.contains { $0.accessibleName?.segments.first?.text == "Configured" })
+  }
+
+  /// App Store Connect's privacy questionnaire ends with "Configure device ID" links
+  /// that are not anchors with an href, not buttons and carry no role: a text element
+  /// styled cursor:pointer with a click listener. They read in bodyText and were
+  /// missing from every observation, so the form could not be finished.
+  @Test(
+    "A pointer control on a text tag is observed and clickable",
+    arguments: ["p", "label"])
+  func textTagPointerControl(tag: String) async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      """
+      <h2>Device ID</h2>
+      <span>?</span>
+      <\(tag) id="configure" style="cursor:pointer;color:blue">Configure device ID</\(tag)>
+      <script>document.getElementById('configure').addEventListener('click', () => {
+        document.querySelector('h2').textContent='Configured';
+      });</script>
+      """, baseURL: URL(string: "https://fixture.invalid/privacy-types"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let controls = observation.elements.filter {
+      $0.accessibleName?.segments.first?.text == "Configure device ID"
+    }
+    #expect(controls.count == 1)
+    let control = try #require(controls.first)
+    #expect(control.role?.segments.first?.text == "button")
+    #expect(control.actionable)
+    let result = try await runtime.perform(
+      observationID: observation.observationID, elementID: control.elementID,
+      operation: .click, stabilityInterval: .milliseconds(10))
+    #expect(result.dispatched)
+    let after = try await runtime.observe()
+    #expect(after.elements.contains { $0.accessibleName?.segments.first?.text == "Configured" })
+  }
+
+  @Test(
+    "A pointer card with a rich-text leaf remains observable and addressable",
+    arguments: [false, true], ["strong", "em", "small"])
+  func richPointerCardControl(native: Bool, leaf: String) async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      """
+      <h2>Other user content</h2>
+      <section style="background:#eee;padding:20px">
+        <a id="configure" style="cursor:pointer;color:blue"><\(leaf)>Configure other user content</\(leaf)></a>
+      </section>
+      <script>document.getElementById('configure').addEventListener('click', () => {
+        document.querySelector('h2').textContent='Configured';
+      });</script>
+      """, baseURL: URL(string: "https://fixture.invalid/privacy-card"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let controls = observation.elements.filter {
+      $0.accessibleName?.segments.first?.text == "Configure other user content"
+    }
+    #expect(controls.count == 1)
+    let control = try #require(controls.first)
+    #expect(control.actionable)
+    let result = try await runtime.perform(
+      observationID: observation.observationID, elementID: control.elementID,
+      operation: .click, dispatchMode: native ? .nativeAppKit : .javascript,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.dispatched)
+    #expect(result.trustedUserGesture == native)
+    let after = try await runtime.observe()
+    #expect(after.elements.contains { $0.accessibleName?.segments.first?.text == "Configured" })
+  }
+
+  @Test("Two handoff windows identify their own sessions and do not share Done state")
+  func handoffWindowsIdentifySession() async throws {
+    let registry = try WebKitSessionRegistry(maximumSessions: 2)
+    let first = try registry.open()
+    let second = try registry.open()
+    defer {
+      try? registry.close(first)
+      try? registry.close(second)
+    }
+    let a = try registry.runtime(for: first)
+    let b = try registry.runtime(for: second)
+    _ = try await a.loadHTML(
+      "<title>First local task</title><button>First</button>",
+      baseURL: URL(string: "https://fixture.invalid/first"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    _ = try await b.loadHTML(
+      "<title>Second local task</title><button>Second</button>",
+      baseURL: URL(string: "https://fixture.invalid/second"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    a.humanControlRequester = "same-client"
+    b.humanControlRequester = "same-client"
+    try a.requestHumanHandoff()
+    try b.requestHumanHandoff()
+    try a.beginHumanControl()
+    try b.beginHumanControl()
+    #expect(a.humanControlSessionLabel != b.humanControlSessionLabel)
+    #expect(a.webView.window?.title.contains(a.humanControlSessionLabel) == true)
+    #expect(b.webView.window?.title.contains(b.humanControlSessionLabel) == true)
+    #expect(a.humanControlSessionLabel == String(first.rawValue.uuidString.prefix(8)))
+    try a.markHumanStepCompleted()
+    #expect(a.interactionControlState() == .humanStepCompleted)
+    #expect(b.interactionControlState() == .humanControlled)
+    _ = try a.focusHumanControlWindow()
+    #expect(a.interactionControlState() == .humanStepCompleted)
+    #expect(b.interactionControlState() == .humanControlled)
   }
 
   @Test("Every control says whether it can be acted on, and why not")
@@ -4393,6 +4510,93 @@ struct WebKitRuntimeTests {
     #expect(capture.renderedInteractiveCount == 1)
   }
 
+  @Test("Load diagnosis counts failures without returning sensitive messages or values")
+  func loadDiagnosticsAreStructuralAndBounded() async throws {
+    let runtime = makeWindowHandoffRuntime()
+    _ = try await runtime.loadHTML(
+      "<input type=password value=DIAGNOSTIC-PRIVATE-CANARY><p>DIAGNOSTIC-PRIVATE-CANARY</p>",
+      baseURL: URL(string: "https://fixture.invalid/private?token=DIAGNOSTIC-PRIVATE-CANARY"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    _ = try await runtime.webView.evaluateJavaScript(
+      "for(let i=0;i<300;i++)window.dispatchEvent(new ErrorEvent('error',{message:'DIAGNOSTIC-PRIVATE-CANARY'}));window.dispatchEvent(new Event('unhandledrejection'));let image=document.createElement('img');document.body.appendChild(image);image.dispatchEvent(new Event('error'));null"
+    )
+    let diagnostics = try await runtime.loadDiagnostics()
+    #expect(diagnostics.documentReadyState == "complete")
+    #expect(diagnostics.hasBody)
+    #expect(diagnostics.scriptErrors == 255)
+    #expect(diagnostics.unhandledRejections == 1)
+    #expect(diagnostics.resourceErrors["img"] == 1)
+    #expect(diagnostics.sampledResources <= 256)
+    #expect(
+      !String(decoding: try JSONEncoder().encode(diagnostics), as: UTF8.self).contains(
+        "DIAGNOSTIC-PRIVATE-CANARY"))
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    await #expect(throws: WebKitRuntimeError.humanControlActive) {
+      _ = try await runtime.loadDiagnostics()
+    }
+  }
+
+  @Test("CAPTCHA help is local, keyboard accessible and preserves human authority")
+  func captchaHumanAccessibility() async throws {
+    let runtime = makeWindowHandoffRuntime()
+    _ = try await runtime.loadHTML(
+      "<h1>Human challenge fixture</h1><button>Audio option provided by site</button>",
+      baseURL: URL(string: "https://fixture.invalid/challenge"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: true)
+    let window = try #require(runtime.webView.window)
+    defer { window.orderOut(nil) }
+    let root = try #require(window.contentView)
+    let help = try #require(
+      descendant(
+        of: NSButton.self,
+        accessibilityIdentifier: "webkitui.handoff.captcha.help", in: root))
+    let focus = try #require(
+      descendant(
+        of: NSButton.self,
+        accessibilityIdentifier: "webkitui.handoff.captcha.focus", in: root))
+    let text = try #require(
+      descendant(
+        of: NSTextField.self,
+        accessibilityIdentifier: "webkitui.handoff.captcha.instructions", in: root))
+    #expect(text.isHiddenOrHasHiddenAncestor)
+    try pressWithoutNestedEventLoop(help)
+    root.layoutSubtreeIfNeeded()
+    #expect(!text.isHiddenOrHasHiddenAncestor)
+    #expect(text.stringValue.contains("audio"))
+    #expect(text.stringValue.contains("does not read, transcribe or solve"))
+    for width in [800.0, 1280.0] {
+      window.setContentSize(NSSize(width: width, height: 800))
+      root.layoutSubtreeIfNeeded()
+      let textRect = text.convert(text.bounds, to: root)
+      #expect(root.bounds.contains(textRect))
+      #expect(runtime.webView.bounds.height > 200)
+      #expect(focus.convert(focus.bounds, to: root).maxY <= root.bounds.maxY)
+      for button in [help, focus] {
+        #expect(root.bounds.contains(button.convert(button.bounds, to: root)))
+      }
+      if let prefix = ProcessInfo.processInfo.environment["WEBKITUI_HANDOFF_EVIDENCE_PREFIX"],
+        let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds)
+      {
+        root.cacheDisplay(in: root.bounds, to: bitmap)
+        let png = try #require(bitmap.representation(using: .png, properties: [:]))
+        try png.write(to: URL(fileURLWithPath: "\(prefix)-\(Int(width)).png"))
+      }
+    }
+    try pressWithoutNestedEventLoop(focus)
+    #expect(window.firstResponder === runtime.webView)
+    #expect(runtime.interactionControlState() == .humanControlled)
+    #expect(runtime.humanStepCompletionMonotonicNanoseconds() == nil)
+    try pressWithoutNestedEventLoop(help)
+    #expect(text.isHiddenOrHasHiddenAncestor)
+    try runtime.markHumanStepCompleted()
+    try runtime.requestAgentResume()
+    _ = try await runtime.resumeAfterHumanControl()
+    #expect(runtime.interactionControlState() == .freshlyReobserved)
+  }
+
   @Test("Human handoff presents the live rendered WebView")
   func humanHandoffPresentsLiveRenderedWebView() async throws {
     let runtime = makeWindowHandoffRuntime()
@@ -4417,7 +4621,9 @@ struct WebKitRuntimeTests {
 
     let window = try #require(runtime.webView.window)
     #expect(window === stableWindow)
-    #expect(window.title == "WebkitUIMCP — Human control — fixture.invalid")
+    #expect(
+      window.title
+        == "WebkitUIMCP — Human control [\(runtime.humanControlSessionLabel)] — fixture.invalid")
 
     window.orderOut(nil)
     #expect(!runtime.humanControlSurfaceIsPresented)
@@ -4711,6 +4917,108 @@ struct WebKitRuntimeTests {
     #expect(after.elements[0].stateAttributes["data-state"]?.segments.first?.text == "trusted")
   }
 
+  @Test(
+    "Same-origin frame text fields fill and expose exact values in either dispatch mode",
+    arguments: [false, true],
+    [
+      "<input name='public-name'>", "<input type='text' name='public-name'>",
+      "<input type='email' name='public-name'>", "<textarea name='public-name'></textarea>",
+    ])
+  func sameOriginFrameFill(native: Bool, control: String) async throws {
+    let runtime = WebKitRuntime()
+    let child = "<label>Public field \(control)</label>"
+      .replacingOccurrences(of: "<", with: "&lt;")
+      .replacingOccurrences(of: ">", with: "&gt;")
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Frame editing</title>
+      <input aria-label="Outer decoy" value="untouched">
+      <iframe width="600" height="200" srcdoc="\(child)"></iframe>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/framed-fill"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(100))
+    let before = try await runtime.observe()
+    let target = try #require(
+      before.elements.first { $0.accessibleName?.segments.first?.text == "Public field" })
+    #expect(target.actionable)
+    #expect(!target.sensitive)
+    #expect(target.value?.segments.map(\.text).joined() == "")
+    let value = try ProvenancedText(
+      text: "reader@example.invalid", source: ProvenanceSource(classification: .userIntent))
+    let result = try await runtime.perform(
+      observationID: before.observationID, elementID: target.elementID,
+      operation: .fill(value), dispatchMode: native ? .nativeAppKit : .javascript,
+      stabilityInterval: .milliseconds(10))
+    #expect(result.dispatched)
+    #expect(result.trustedUserGesture == native)
+    let after = try await runtime.observe()
+    let filled = try #require(
+      after.elements.first { $0.accessibleName?.segments.first?.text == "Public field" })
+    #expect(filled.value?.segments.map(\.text).joined() == "reader@example.invalid")
+    let decoy = try #require(
+      after.elements.first { $0.accessibleName?.segments.first?.text == "Outer decoy" })
+    #expect(decoy.value?.segments.map(\.text).joined() == "untouched")
+    let empty = try ProvenancedText(
+      text: "", source: ProvenanceSource(classification: .userIntent))
+    let cleared = try await runtime.perform(
+      observationID: after.observationID, elementID: filled.elementID,
+      operation: .fill(empty), dispatchMode: native ? .nativeAppKit : .javascript,
+      stabilityInterval: .milliseconds(10))
+    #expect(cleared.dispatched)
+    #expect(cleared.trustedUserGesture == native)
+    let final = try await runtime.observe()
+    #expect(
+      final.elements.first { $0.accessibleName?.segments.first?.text == "Public field" }?
+        .value?.segments.map(\.text).joined() == "")
+  }
+
+  @Test(
+    "Framed protected and non-editable controls still refuse fill",
+    arguments: [false, true],
+    [
+      "<input readonly value='keep'>", "<input disabled value='keep'>",
+      "<input type='password' value='keep'>",
+      "<select aria-label='Guarded field'><option value='keep'>Keep</option></select>",
+    ])
+  func sameOriginFrameFillRefusesProtectedControls(native: Bool, control: String) async throws {
+    let runtime = WebKitRuntime()
+    let child = "<label>Guarded field \(control)</label>"
+      .replacingOccurrences(of: "<", with: "&lt;")
+      .replacingOccurrences(of: ">", with: "&gt;")
+    _ = try await runtime.loadHTML(
+      "<iframe width='600' height='200' srcdoc=\"\(child)\"></iframe>",
+      baseURL: URL(string: "https://fixture.invalid/framed-guards"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(100))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first { $0.accessibleName?.segments.first?.text == "Guarded field" })
+    if control.contains("password") {
+      #expect(target.sensitive)
+      #expect(target.value == nil)
+    }
+    let replacement = try ProvenancedText(
+      text: "replacement", source: ProvenanceSource(classification: .userIntent))
+    do {
+      _ = try await runtime.perform(
+        observationID: observation.observationID, elementID: target.elementID,
+        operation: .fill(replacement), dispatchMode: native ? .nativeAppKit : .javascript,
+        stabilityInterval: .milliseconds(10))
+      Issue.record("a protected or non-editable framed control accepted fill")
+    } catch let error as WebKitRuntimeError {
+      switch error {
+      case .targetNotActionable, .operationUnsupportedForControl, .sensitiveInputRequiresHuman:
+        break
+      default: Issue.record("unexpected refusal: \(error)")
+      }
+    }
+    let unchanged =
+      try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('iframe').contentDocument.querySelector('input,select').value === 'keep'"
+      )
+      as? Bool
+    #expect(unchanged == true)
+  }
+
   @Test("AppKit fill survives a controlled-input rerender with an exact trusted receipt")
   func nativeControlledFillActuation() async throws {
     let runtime = WebKitRuntime()
@@ -4799,15 +5107,105 @@ struct WebKitRuntimeTests {
     #expect(observation.elements[0].value?.segments.first?.text == "Lumen")
   }
 
-  @Test("AppKit fill replaces a non-empty rich-text editor exactly, paragraphs included")
-  func nativeRichTextFillReplacesExistingDraft() async throws {
+  @Test("Only exact public token names avoid credential heuristics; secrets remain withheld")
+  func publicTokenNameClassification() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <label for='token-name'>Token name</label><input id='token-name' value='Clasp read only'>
+      <input aria-label='API token name' name='api_token_name' value='Public deployment'>
+      <input aria-label='Token name' name='secret' value='synthetic-secret-canary-640'>
+      <input aria-label='Token name' type='password' value='synthetic-password-canary-640'>
+      <input aria-label='Token name' autocomplete='one-time-code' value='640123'>
+      <input aria-label='Token name' value='AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'>
+      <input aria-label='Token name secret' value='synthetic-label-canary-640'>
+      <input aria-label='Token' value='synthetic-token-canary-640'>
+      <input aria-label='Value' name='value' value='ordinary public value'>
+      <input aria-label='Token name' name='session' value='synthetic-session-canary-640'>
+      """, baseURL: URL(string: "https://fixture.invalid/public-name"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let inputs = observation.elements.filter { $0.tag.segments.first?.text == "input" }
+    #expect(inputs.count == 10)
+    #expect(inputs[0].sensitive == false)
+    #expect(inputs[0].value?.segments.first?.text == "Clasp read only")
+    #expect(inputs[1].sensitive == false)
+    for input in inputs[2...7] {
+      #expect(input.sensitive)
+      #expect(input.value == nil)
+    }
+    #expect(inputs[9].sensitive)
+    let encoded = String(decoding: try JSONEncoder().encode(observation), as: UTF8.self)
+    for canary in [
+      "synthetic-secret-canary-640", "synthetic-password-canary-640",
+      "synthetic-label-canary-640", "synthetic-token-canary-640",
+      "synthetic-session-canary-640",
+    ] {
+      #expect(!encoded.contains(canary))
+    }
+    let value = try ProvenancedText(
+      text: "Public fixture label", source: ProvenanceSource(classification: .userIntent))
+    _ = try await runtime.perform(
+      observationID: observation.observationID, elementID: inputs[0].elementID,
+      operation: .fill(value), stabilityInterval: .milliseconds(10))
+    let after = try await runtime.observe()
+    #expect(after.elements.first?.value?.segments.first?.text == "Public fixture label")
+  }
+
+  @Test(
+    "Fill capability distinguishes pickers without promising framework acceptance",
+    arguments: [false, true])
+  func observedFillCapabilities(native: Bool) async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <input role='combobox' aria-label='Editable picker' value='first'>
+      <input role='combobox' aria-label='Readonly picker' readonly value='first'>
+      <input role='combobox' aria-label='ARIA readonly picker' aria-readonly='true'>
+      <button role='combobox'>Button picker</button>
+      <input aria-label='Disabled text' disabled>
+      <input type='checkbox' aria-label='Check'>
+      <input type='password' aria-label='Secret'>
+      <div contenteditable='true' aria-label='Editor'>draft</div>
+      """, baseURL: URL(string: "https://fixture.invalid/pickers"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let data = try JSONEncoder().encode(before)
+    let encoded = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let rows = try #require(encoded["elements"] as? [[String: Any]])
+    #expect(
+      rows.compactMap { $0["fillCapability"] as? String } == [
+        "editable", "readonly", "readonly", "unsupported", "disabled", "unsupported",
+        "sensitive", "editable",
+      ])
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('input').setAttribute('aria-readonly','true')")
+    let value = try ProvenancedText(
+      text: "second", source: ProvenanceSource(classification: .userIntent))
+    await #expect(throws: (any Error).self) {
+      _ = try await runtime.perform(
+        observationID: before.observationID, elementID: before.elements[0].elementID,
+        operation: .fill(value), dispatchMode: native ? .nativeAppKit : .javascript,
+        stabilityInterval: .milliseconds(10))
+    }
+    let liveValue = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('input').value")
+    #expect(liveValue as? String == "first")
+  }
+
+  @Test(
+    "AppKit fill replaces semantic and roleless editors exactly, paragraphs included",
+    arguments: [
+      "role=\"textbox\" aria-label=\"Body\"", "",
+    ])
+  func nativeRichTextFillReplacesExistingDraft(semanticAttributes: String) async throws {
     let runtime = WebKitRuntime()
     // Like Lexical: once focused, the editor restores its own caret at the end on the
     // next task, discarding the selection the page was given. innerText separates
     // block paragraphs with a blank line.
     _ = try await runtime.loadHTML(
       """
-      <div id="editor" contenteditable="true" role="textbox" aria-label="Body"
+      <div id="editor" contenteditable="true" \(semanticAttributes)
         aria-multiline="true"><p>Old draft</p></div>
       <script>
       const editor = document.getElementById('editor');
@@ -4824,7 +5222,7 @@ struct WebKitRuntimeTests {
       timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
     let before = try await runtime.observe()
     let editor = try #require(
-      before.elements.first { $0.accessibleName?.segments.first?.text == "Body" })
+      before.elements.first { $0.contentEditable == true })
     let value = try ProvenancedText(
       text: "First paragraph.\nSecond paragraph.",
       source: ProvenanceSource(classification: .userIntent))
@@ -4849,7 +5247,7 @@ struct WebKitRuntimeTests {
     _ = try await runtime.loadHTML(
       """
       <div id="top" style="height: 0; transition: height 120ms linear"></div>
-      <button id="pick" onclick="this.textContent = 'Picked'">Select API here...</button>
+      <button id="pick" onclick="window.pickCount = (window.pickCount || 0) + 1; this.textContent = 'Picked'">Select API here...</button>
       """,
       baseURL: URL(string: "https://fixture.invalid/apis"),
       timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
@@ -4870,6 +5268,35 @@ struct WebKitRuntimeTests {
     #expect(
       try await runtime.webView.evaluateJavaScript(
         "document.getElementById('pick').textContent") as? String == "Picked")
+    #expect(try await runtime.webView.evaluateJavaScript("window.pickCount") as? Int == 1)
+  }
+
+  @Test("A page-script click during settling cannot become the native click receipt")
+  func scriptedClickDuringNativeSettlingCannotSupplyReceipt() async throws {
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+    _ = try await runtime.loadHTML(
+      """
+      <button id="pick" onclick="if (event.isTrusted) window.nativeCount = (window.nativeCount || 0) + 1; else window.scriptCount = (window.scriptCount || 0) + 1">Select fixture</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/settling"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Select fixture"
+      })
+    _ = try await runtime.webView.evaluateJavaScript(
+      "setTimeout(() => document.getElementById('pick').click(), 25)")
+    let result = try await runtime.perform(
+      observationID: observation.observationID, elementID: target.elementID,
+      operation: .click, dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    #expect(result.trustedUserGesture)
+    #expect(try await runtime.webView.evaluateJavaScript("window.nativeCount") as? Int == 1)
+    #expect(try await runtime.webView.evaluateJavaScript("window.scriptCount") as? Int == 1)
   }
 
   @Test("A custom radio observed as actionable can be clicked natively")
@@ -5244,6 +5671,744 @@ struct WebKitRuntimeTests {
     #expect(
       try String(contentsOf: directory.appendingPathComponent(receipt.filename), encoding: .utf8)
         == body)
+  }
+
+  @Test(
+    "Native custom-control hit testing follows the composed tree without accepting overlays",
+    arguments: [false, true])
+  func nativeShadowControlHitTesting(covered: Bool) async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Ready</h1>
+      <osds-button role="button" aria-label="Export fixture" tabindex="0">Export fixture</osds-button>
+      <script>
+        customElements.define('osds-button', class extends HTMLElement {
+          connectedCallback() {
+            this.style.display='inline-block';
+            this.attachShadow({mode:'open'}).innerHTML =
+              '<button aria-hidden="true" style="width:220px;height:44px"><slot></slot></button>';
+            this.addEventListener('click', () => document.querySelector('h1').textContent='Export clicked');
+          }
+        });
+      </script>
+      \(covered ? "<div style='position:fixed;inset:0;z-index:999;background:white'>Cover</div>" : "")
+      """,
+      baseURL: URL(string: "https://fixture.invalid/shadow-control"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(80))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Export fixture"
+      })
+    #expect(target.actionable == !covered)
+    if covered {
+      await #expect(throws: (any Error).self) {
+        _ = try await runtime.perform(
+          observationID: observation.observationID, elementID: target.elementID,
+          operation: .click, dispatchMode: .nativeAppKit)
+      }
+      #expect(
+        try await runtime.webView.evaluateJavaScript("document.querySelector('h1').textContent")
+          as? String == "Ready")
+    } else {
+      let result = try await runtime.perform(
+        observationID: observation.observationID, elementID: target.elementID,
+        operation: .click, dispatchMode: .nativeAppKit)
+      #expect(result.dispatched && result.trustedUserGesture)
+      #expect(
+        try await runtime.webView.evaluateJavaScript("document.querySelector('h1').textContent")
+          as? String == "Export clicked")
+    }
+  }
+
+  @Test("An earlier page capture handler cannot hide a real native download gesture")
+  func blobDownloadWithStoppedCapturePropagation() async throws {
+    let body = "synthetic-export-only"
+    let server = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <h1>Local export</h1><button id="dl">Download fixture</button>
+          <script>
+            window.addEventListener('click', event => {
+              if (!event.target.closest('#dl')) return;
+              event.stopImmediatePropagation();
+              const link = document.createElement('a');
+              link.href = URL.createObjectURL(new Blob(['\(body)'], {type:'application/json'}));
+              link.download = 'fixture.json'; document.body.appendChild(link); link.click(); link.remove();
+            }, true);
+          </script>
+          """)
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { directory.appendingPathComponent($0) })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/")!,
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let target = try #require(
+      before.elements.first { $0.accessibleName?.segments.first?.text == "Download fixture" })
+    let receipt = try await runtime.download(
+      observationID: before.observationID, elementID: target.elementID,
+      timeout: .seconds(5))
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: body))
+    #expect(try await runtime.readText().bodyText.contains("Local export"))
+  }
+
+  @Test("Credential configuration values never escape through row names or rendered text")
+  func configurationValueRedaction() async throws {
+    let canary = "synthetic-config-canary-638-not-a-real-key"
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Configuration</h1>
+      <table><thead><tr><th>Name</th><th>Type</th><th>Value</th><th>Action</th></tr></thead>
+      <tbody><tr aria-label="CLOUDKIT_API_TOKEN Variable \(canary)">
+        <td>CLOUDKIT_API_TOKEN</td><td>Variable</td>
+        <td><span aria-label="\(canary)" title="\(canary)">\(canary)</span></td>
+        <td><button type="button" onclick="document.querySelector('dialog').showModal()">Edit setting</button></td>
+      </tr><tr><td>PUBLIC_MODE</td><td>Variable</td><td>development</td><td>Unrelated</td></tr></tbody></table>
+      <dialog role="dialog" aria-label="Settings dialog"><p>Settings opened</p></dialog>
+      """, baseURL: URL(string: "https://privacy.fixture.invalid"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let wire = String(decoding: try JSONEncoder().encode(observation), as: UTF8.self)
+    #expect(!wire.contains(canary), "Synthetic configuration value escaped observation")
+    let text = try await runtime.readText()
+    let textWire = String(decoding: try JSONEncoder().encode(text), as: UTF8.self)
+    #expect(!textWire.contains(canary), "Synthetic configuration value escaped rendered text")
+    #expect(text.bodyText.contains("CLOUDKIT_API_TOKEN"))
+    #expect(text.bodyText.contains("Variable"))
+    #expect(text.bodyText.contains("development"))
+    let edit = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Edit setting"
+      })
+    let result = try await runtime.perform(
+      observationID: observation.observationID,
+      elementID: edit.elementID, operation: .click, dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    let after = try await runtime.observe()
+    #expect(
+      after.elements.contains { $0.accessibleName?.segments.first?.text == "Settings dialog" })
+  }
+
+  @Test(
+    "Configuration redaction covers reordered columns, forms, definitions and shadow roots",
+    arguments: ["reordered", "form", "definition", "shadow"])
+  func configurationLayoutRedaction(layout: String) async throws {
+    let canary = "synthetic-secret-canary-638-not-a-real-key"
+    let table =
+      "<table><thead><tr><th>Value</th><th>Type</th><th>Name</th></tr></thead>"
+      + "<tr aria-label='CLOUDKIT_API_TOKEN \(canary)'><td>\(canary)</td><td>Variable</td>"
+      + "<td>CLOUDKIT_API_TOKEN</td></tr></table>"
+    var html = table
+    if layout == "form" {
+      html =
+        "<form role='form' aria-label='CLOUDKIT_API_TOKEN \(canary)'>"
+        + "<input name='Key' value='CLOUDKIT_API_TOKEN'><input name='Value' aria-label='Value' value='\(canary)'>"
+        + "<output>\(canary)</output></form><p>CLOUDKIT_API_TOKEN Variable</p>"
+    } else if layout == "definition" {
+      html =
+        "<dl><dt>CLOUDKIT_API_TOKEN</dt><dd aria-label='\(canary)'>\(canary)</dd></dl><p>Variable</p>"
+    } else if layout == "shadow" {
+      let literal = String(decoding: try JSONEncoder().encode(table), as: UTF8.self)
+      html =
+        "<div id='host'></div><script>document.querySelector('#host').attachShadow({mode:'open'}).innerHTML=\(literal)</script>"
+    }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+    _ = try await runtime.loadHTML(
+      html, baseURL: URL(string: "https://privacy.fixture.invalid"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observed = try await runtime.observe()
+    if layout == "form" {
+      #expect(
+        observed.elements.contains {
+          $0.accessibleName?.segments.first?.text == "Value" && $0.sensitive
+        })
+    }
+    let wire = String(decoding: try JSONEncoder().encode(observed), as: UTF8.self)
+    #expect(!wire.contains(canary), "Synthetic value escaped observation")
+    let text = try await runtime.readText()
+    #expect(!String(decoding: try JSONEncoder().encode(text), as: UTF8.self).contains(canary))
+    #expect(text.bodyText.contains("CLOUDKIT_API_TOKEN"))
+    #expect(text.bodyText.contains("Variable"))
+  }
+
+  @Test("A visible delegated href-less configuration entry can be addressed without guessing")
+  func delegatedConfigurationEntry() async throws {
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+    _ = try await runtime.loadHTML(
+      """
+      <h1>Privacy settings</h1><a id="audio">Configurer les données audio</a>
+      <dialog role="dialog" aria-label="Données audio"><p>Finalités audio</p></dialog>
+      <script>document.body.dataset.clicks='0'; document.addEventListener('click', event => {
+        if (event.target.closest('#audio')) {
+          document.body.dataset.clicks=String(Number(document.body.dataset.clicks)+1);
+          document.querySelector('dialog').showModal();
+        }
+      });</script>
+      """, baseURL: URL(string: "https://discovery.fixture.invalid"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    #expect(try await runtime.readText().bodyText.contains("Configurer les données audio"))
+    let observation = try await runtime.observe()
+    let matches = observation.elements.filter {
+      $0.accessibleName?.segments.first?.text == "Configurer les données audio"
+    }
+    #expect(matches.count == 1)
+    let target = try #require(matches.first)
+    let fresh = try await runtime.observe()
+    await #expect(throws: WebKitRuntimeError.staleObservation) {
+      _ = try await runtime.perform(
+        observationID: observation.observationID,
+        elementID: target.elementID, operation: .click, dispatchMode: .nativeAppKit)
+    }
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.body.dataset.clicks") as? String == "0"
+    )
+    let freshTarget = try #require(
+      fresh.elements.first {
+        $0.accessibleName?.segments.first?.text == "Configurer les données audio"
+      })
+    let result = try await runtime.perform(
+      observationID: fresh.observationID,
+      elementID: freshTarget.elementID, operation: .click, dispatchMode: .nativeAppKit,
+      stabilityInterval: .milliseconds(1))
+    #expect(result.dispatched)
+    let after = try await runtime.observe()
+    #expect(after.elements.contains { $0.accessibleName?.segments.first?.text == "Données audio" })
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.body.dataset.clicks") as? String == "1"
+    )
+  }
+
+  @Test(
+    "Privacy budget exhaustion returns authority without exposing semantics",
+    arguments: ["values", "characters", "roots"])
+  func privacyFailedResumeReturnsAuthority(category: String) async throws {
+    let runtime = makeWindowHandoffRuntime()
+    _ = try await runtime.loadHTML(
+      "<button onclick='document.body.dataset.writes=1'>Save</button><input type='password'>",
+      baseURL: URL(string: "https://privacy.fixture.invalid"), timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40))
+    let old = try await runtime.observe()
+    let button = try #require(
+      old.elements.first { $0.accessibleName?.segments.first?.text == "Save" })
+    switch category {
+    case "values":
+      _ = try await runtime.webView.evaluateJavaScript(
+        "for(let i=0;i<257;i++){const f=document.createElement('input');f.type='password';f.value='private-'+i;document.body.appendChild(f)};null"
+      )
+    case "characters":
+      _ = try await runtime.webView.evaluateJavaScript(
+        "document.querySelector('input').value='private-canary-'.repeat(6000)")
+    default:
+      _ = try await runtime.webView.evaluateJavaScript(
+        "for(let i=0;i<64;i++){const h=document.createElement('div');document.body.appendChild(h);h.attachShadow({mode:'open'}).innerHTML='<p>Local root</p>'};null"
+      )
+    }
+    try runtime.requestHumanHandoff()
+    try runtime.beginHumanControl(presentWindow: false)
+    try runtime.markHumanStepCompleted()
+    try runtime.requestAgentResume()
+    do {
+      _ = try await runtime.resumeAfterHumanControl(maximumElements: 5)
+      Issue.record("Over-budget observation unexpectedly succeeded")
+    } catch {
+      let diagnostic = try #require(WebKitRuntime.privacyInventoryLimitDiagnostic(error))
+      #expect(diagnostic.category == category)
+      #expect(diagnostic.observedCountAtLeast == diagnostic.limit.map { $0 + 1 })
+      #expect(
+        !String(decoding: try JSONEncoder().encode(diagnostic), as: UTF8.self).contains(
+          "private-canary"))
+    }
+    #expect(runtime.interactionControlState() == .agentControlled)
+    await #expect(throws: (any Error).self) { _ = try await runtime.readText() }
+    await #expect(throws: (any Error).self) {
+      _ = try await runtime.perform(
+        observationID: old.observationID,
+        elementID: button.elementID, operation: .click)
+    }
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.body.dataset.writes || '0'") as? String
+        == "0")
+  }
+
+  @Test("An over-budget privacy inventory fails closed instead of returning unfiltered text")
+  func privacyInventoryLimitIsClosed() async throws {
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+    _ = try await runtime.loadHTML(
+      "<h1>Local fixture</h1><input name='password' type='password'>",
+      baseURL: URL(string: "https://privacy.fixture.invalid"), timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40))
+    _ = try await runtime.webView.evaluateJavaScript(
+      "document.querySelector('input').value='x'.repeat(65537)")
+    await #expect(throws: (any Error).self) { _ = try await runtime.observe() }
+    await #expect(throws: (any Error).self) { _ = try await runtime.readText() }
+  }
+
+  @Test("A download timeout retains its trusted dispatch evidence and existing page")
+  func downloadTimeoutRetainsTrustedDispatchEvidence() async throws {
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false)
+    _ = try await runtime.loadHTML(
+      "<h1>Export form</h1><button onclick=\"this.textContent='Requested'\">Export fixture</button>",
+      baseURL: URL(string: "https://fixture.invalid/export"),
+      timeout: .seconds(3), quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Export fixture"
+      })
+    var diagnostic: WebKitDownloadAttemptDiagnostics?
+    await #expect(throws: WebKitRuntimeError.downloadReceiptTimedOut(started: false)) {
+      _ = try await runtime.download(
+        observationID: observation.observationID, elementID: target.elementID,
+        timeout: .seconds(2), onAttemptFinished: { diagnostic = $0 })
+    }
+    let evidence = try #require(diagnostic)
+    #expect(evidence.nativeDispatchAttempted)
+    #expect(evidence.nativeGestureVerified)
+    #expect(!evidence.downloadStarted)
+    #expect(!evidence.navigationActionSeen)
+    #expect(!evidence.navigationResponseSeen)
+    #expect(!evidence.destinationSelectionStarted)
+    #expect(try await runtime.readText().bodyText.contains("Export form"))
+  }
+
+  @Test("A deferred Blob export preserves its existing page", arguments: [false, true])
+  func deferredBlobDownloadPreservesPage(newWindow: Bool) async throws {
+    let server = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <h1>Export form</h1><button id="dl">Export fixture</button>
+          <script>document.querySelector('#dl').onclick = () => setTimeout(() => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob(['synthetic-only'], {type:'application/octet-stream'}));
+            a.download = 'fixture.conf';
+            if (\(newWindow)) a.target = '_blank';
+            document.body.appendChild(a); a.click(); a.remove();
+          }, 100);</script>
+          """)
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { directory.appendingPathComponent($0) })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/")!,
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Export fixture"
+      })
+    let receipt = try await runtime.download(
+      observationID: observation.observationID, elementID: target.elementID,
+      timeout: .seconds(5))
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: "synthetic-only"))
+    #expect(try await runtime.readText().bodyText.contains("Export form"))
+  }
+
+  @Test(
+    "An export through a retained popup preserves the original form",
+    arguments: ["blank-blob", "script-attachment", "link-attachment"])
+  func blankPopupExportPreservesPage(mode: String) async throws {
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /file") {
+        guard request.contains("export_fixture=synthetic") else {
+          return "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+        let body = "synthetic-popup-only"
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+          + "Content-Disposition: attachment; filename=fixture.conf\r\n"
+          + "Content-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+      }
+      return
+        FormFixtureServer.response(
+          body: """
+            <h1>Export form</h1><input aria-label="Keep value" value="preserved">
+            <button id="dl">Export fixture</button>
+            <script>document.querySelector('#dl').onclick = () => {
+              if ('\(mode)' === 'script-attachment') { window.open('/file', '_blank'); return; }
+              if ('\(mode)' === 'link-attachment') {
+                const a = document.createElement('a'); a.href='/file'; a.target='_blank';
+                document.body.appendChild(a); a.click(); a.remove(); return;
+              }
+              const child = window.open('', '_blank');
+              setTimeout(() => { if (child) child.location.href = URL.createObjectURL(
+                new Blob(['synthetic-popup-only'], {type:'application/json'})); }, 100);
+            };</script>
+            """, extraHeaders: "Set-Cookie: export_fixture=synthetic; HttpOnly\r\n")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { directory.appendingPathComponent($0) })
+    let url = URL(string: "http://127.0.0.1:\(server.port)/")!
+    _ = try await runtime.navigate(
+      to: url, timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Export fixture"
+      })
+    var diagnostic: WebKitDownloadAttemptDiagnostics?
+    let receipt = try await runtime.download(
+      observationID: observation.observationID, elementID: target.elementID,
+      timeout: .seconds(5), onAttemptFinished: { diagnostic = $0 })
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: "synthetic-popup-only"))
+    #expect(runtime.webView.url == url)
+    #expect(try await runtime.readText().bodyText.contains("Export form"))
+    let after = try await runtime.observe()
+    #expect(after.elements.contains { $0.value?.segments.first?.text == "preserved" })
+    #expect(diagnostic?.newWindowRequested == true)
+    #expect(diagnostic?.downloadWindowCreated == true)
+    #expect(diagnostic?.newWindowSourceMainFrame == true)
+    #expect(diagnostic?.newWindowTargetAbsent == true)
+    #expect(diagnostic?.pageURLChanged == false)
+  }
+
+  @Test("A same-origin embedded export opens a retained download window")
+  func sameOriginFramePopupExportPreservesPage() async throws {
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /frame") {
+        return FormFixtureServer.response(
+          body: """
+            <h2>Embedded export form</h2><button id="dl">Embedded export</button>
+            <script>document.querySelector('#dl').onclick = () => {
+              const child = window.open('', '_blank');
+              setTimeout(() => { if (child) child.location.href = URL.createObjectURL(
+                new Blob(['synthetic-frame-only'], {type:'application/json'})); }, 100);
+            };</script>
+            """)
+      }
+      return FormFixtureServer.response(
+        body: """
+          <h1>Preserved portal</h1><input aria-label="Keep value" value="preserved">
+          <iframe src="/frame" style="width:700px;height:300px;border:0"></iframe>
+          """)
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { directory.appendingPathComponent($0) })
+    let url = URL(string: "http://127.0.0.1:\(server.port)/")!
+    _ = try await runtime.navigate(
+      to: url, timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Embedded export"
+      })
+    var diagnostic: WebKitDownloadAttemptDiagnostics?
+    let receipt = try await runtime.download(
+      observationID: observation.observationID, elementID: target.elementID,
+      timeout: .seconds(5), onAttemptFinished: { diagnostic = $0 })
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: "synthetic-frame-only"))
+    #expect(runtime.webView.url == url)
+    #expect(try await runtime.readText().bodyText.contains("Preserved portal"))
+    #expect(diagnostic?.newWindowRequested == true)
+    #expect(diagnostic?.newWindowSourceMainFrame == false)
+    #expect(diagnostic?.downloadWindowCreated == true)
+    #expect(diagnostic?.pageURLChanged == false)
+  }
+
+  @Test(
+    "The OVH FileSaver plus data-preview pattern saves one file and preserves its portal",
+    arguments: ["blank", "top"])
+  func rcloneFallbackPreservesPage(previewTarget: String) async throws {
+    let body = "synthetic-ovh-only"
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /frame") {
+        return FormFixtureServer.response(
+          body: """
+            <button id="dl">Export fixture</button>
+            <script>document.querySelector('#dl').onclick = () => {
+              const data = new Blob(['\(body)'], {type:'text/plain;charset=utf-8'});
+              const popup = window.open('', '_blank');
+              if (popup) popup.document.body.innerText = 'downloading...';
+              const saver = new FileReader();
+              saver.onloadend = () => {
+                const url = String(saver.result).replace(/^data:[^;]*;/, 'data:attachment/file;');
+                if (popup) popup.location.href = url;
+              };
+              saver.readAsDataURL(data);
+              const preview = new FileReader();
+              preview.onload = () => window.open(String(preview.result), '_\(previewTarget)');
+              preview.readAsDataURL(data);
+            };</script>
+            """)
+      }
+      return FormFixtureServer.response(
+        body: """
+          <h1>Preserved portal</h1><input aria-label="Keep value" value="preserved">
+          <iframe src="/frame" style="width:700px;height:300px;border:0"></iframe>
+          """)
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var destinationCalls = 0
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: {
+        destinationCalls += 1
+        try? await Task.sleep(for: .milliseconds(200))
+        return directory.appendingPathComponent($0)
+      })
+    let url = URL(string: "http://127.0.0.1:\(server.port)/")!
+    _ = try await runtime.navigate(
+      to: url, timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Export fixture"
+      })
+    var diagnostic: WebKitDownloadAttemptDiagnostics?
+    let receipt = try await runtime.download(
+      observationID: observation.observationID, elementID: target.elementID,
+      timeout: fixtureNavigationTimeout, onAttemptFinished: { diagnostic = $0 })
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: body))
+    #expect(receipt.byteCount == UInt64(body.utf8.count))
+    #expect(destinationCalls == 1)
+    #expect(runtime.webView.url == url)
+    #expect(try await runtime.readText().bodyText.contains("Preserved portal"))
+    #expect(diagnostic?.newWindowSourceMainFrame == false)
+    #expect(diagnostic?.downloadWindowCreated == true)
+    #expect(diagnostic?.pageURLChanged == false)
+    #expect(diagnostic?.suppressedDataPreview == true)
+    #expect(diagnostic?.dataAttachmentRequested == true)
+  }
+
+  @Test("A foreign embedded opener cannot use an approved main-frame export")
+  func foreignFramePopupExportIsRefused() async throws {
+    let child = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <script>onmessage = () => { window.open('', '_blank'); };</script>
+          <p>Foreign embedded frame</p>
+          """)
+    }
+    let childURL = "http://localhost:\(child.port)/"
+    let server = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <h1>Preserved portal</h1><button id="dl">Export fixture</button>
+          <iframe src="\(childURL)"></iframe>
+          <script>document.querySelector('#dl').onclick = () => {
+            document.querySelector('iframe').contentWindow.postMessage('export', '*');
+          };</script>
+          """)
+    }
+    var destinationCalls = 0
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { _ in
+        destinationCalls += 1
+        return nil
+      })
+    let url = URL(string: "http://127.0.0.1:\(server.port)/")!
+    _ = try await runtime.navigate(
+      to: url, timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Export fixture"
+      })
+    var diagnostic: WebKitDownloadAttemptDiagnostics?
+    await #expect(throws: WebKitRuntimeError.downloadFailed("download_window_origin_mismatch")) {
+      _ = try await runtime.download(
+        observationID: observation.observationID, elementID: target.elementID,
+        timeout: .seconds(5), onAttemptFinished: { diagnostic = $0 })
+    }
+    #expect(diagnostic?.newWindowRequested == true)
+    #expect(diagnostic?.newWindowSourceMainFrame == false)
+    #expect(diagnostic?.downloadWindowCreated == false)
+    #expect(destinationCalls == 0)
+    #expect(runtime.webView.url == url)
+    #expect(try await runtime.readText().bodyText.contains("Preserved portal"))
+  }
+
+  @Test(
+    "A managed export popup fails closed and is cleaned up without replacing its parent",
+    arguments: [
+      "timeout", "foreign", "html", "close", "cancel-save", "data-html", "data-percent",
+      "data-param",
+    ])
+  func managedDownloadPopupFailures(mode: String) async throws {
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /file") {
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+          + "Content-Disposition: attachment; filename=fixture.conf\r\n"
+          + "Content-Length: 7\r\nConnection: close\r\n\r\nfixture"
+      }
+      if request.hasPrefix("GET /html") {
+        return FormFixtureServer.response(body: "<h1>Not an attachment</h1>")
+      }
+      return FormFixtureServer.response(
+        body: """
+          <h1>Preserved export form</h1><button id="dl">Export fixture</button>
+          <script>document.querySelector('#dl').onclick = () => {
+            const child = window.open('', '_blank');
+            if (!child) return;
+            setTimeout(() => {
+              if ('\(mode)' === 'foreign') child.location.href = 'http://localhost:' + location.port + '/file';
+              if ('\(mode)' === 'html') child.location.href = '/html';
+              if ('\(mode)' === 'data-html') child.location.href = 'data:text/html;base64,PGgxPmZpeHR1cmU8L2gxPg==';
+              if ('\(mode)' === 'data-percent') child.location.href = 'data:attachment/file,synthetic';
+              if ('\(mode)' === 'data-param') child.location.href = 'data:attachment/file;foo=bar;base64,Zml4dHVyZQ==';
+            if ('\(mode)' === 'cancel-save') child.location.href = '/file';
+              if ('\(mode)' === 'close') child.close();
+            }, 100);
+          };</script>
+          """)
+    }
+    var destinationCalls = 0
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { _ in
+        destinationCalls += 1
+        return nil
+      })
+    let url = URL(string: "http://127.0.0.1:\(server.port)/")!
+    _ = try await runtime.navigate(
+      to: url, timeout: fixtureNavigationTimeout,
+      quietWindow: .milliseconds(40))
+    // A second attempt uses a fresh observation and explicit test invocation,
+    // proving the first window no longer occupies the request slot (not replay).
+    for _ in 0..<2 {
+      let observation = try await runtime.observe()
+      let target = try #require(
+        observation.elements.first {
+          $0.accessibleName?.segments.first?.text == "Export fixture"
+        })
+      var diagnostic: WebKitDownloadAttemptDiagnostics?
+      do {
+        _ = try await runtime.download(
+          observationID: observation.observationID,
+          elementID: target.elementID, timeout: .seconds(2),
+          onAttemptFinished: { diagnostic = $0 })
+        Issue.record("Non-attachment popup unexpectedly succeeded")
+      } catch let error as WebKitRuntimeError {
+        switch mode {
+        case "timeout": #expect(error == .downloadReceiptTimedOut(started: false))
+        case "foreign", "data-html", "data-percent", "data-param":
+          #expect(error == .networkBoundaryDenied)
+        case "html": #expect(error == .unsupportedDownload(httpStatus: 200))
+        default: #expect(error == .downloadCancelled)
+        }
+      }
+      #expect(diagnostic?.newWindowRequested == true)
+      #expect(diagnostic?.downloadWindowCreated == true)
+      #expect(diagnostic?.pageURLChanged == false)
+      #expect(diagnostic?.downloadStarted == (mode == "cancel-save"))
+      #expect(runtime.webView.url == url)
+      #expect(try await runtime.readText().bodyText.contains("Preserved export form"))
+    }
+    #expect(destinationCalls == (mode == "cancel-save" ? 2 : 0))
+  }
+
+  @Test("An explicitly requested Blob export without download attribute preserves its page")
+  func blobNavigationWithoutDownloadAttributePreservesPage() async throws {
+    let server = try FormFixtureServer { _ in
+      FormFixtureServer.response(
+        body: """
+          <h1>Export form</h1><button id="dl">Export fixture</button>
+          <script>document.querySelector('#dl').onclick = () => {
+            location.href = URL.createObjectURL(new Blob(['synthetic-only'], {type:'application/json'}));
+          };</script>
+          """)
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { directory.appendingPathComponent($0) })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/")!,
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Export fixture"
+      })
+    let receipt = try await runtime.download(
+      observationID: observation.observationID, elementID: target.elementID,
+      timeout: .seconds(5))
+    #expect(receipt.sha256 == ObservationPredicate.textDigest(of: "synthetic-only"))
+    #expect(try await runtime.readText().bodyText.contains("Export form"))
+  }
+
+  @Test("A save destination returned after download timeout cannot create a late file")
+  func lateDownloadDestinationIsRejected() async throws {
+    let server = try FormFixtureServer { request in
+      if request.hasPrefix("GET /file") {
+        return
+          "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=fixture.json\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfixture"
+      }
+      return FormFixtureServer.response(body: "<h1>Local page</h1>")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let destination = directory.appendingPathComponent("late.json")
+    let panel = SuspendedDownloadDestination()
+    defer { panel.finish(nil) }
+    let runtime = WebKitRuntime(
+      websiteDataStore: .nonPersistent(), egressProxy: nil,
+      managesApplicationActivationPolicy: false,
+      downloadDestinationProvider: { _ in await panel.choose() })
+    _ = try await runtime.navigate(
+      to: URL(string: "http://127.0.0.1:\(server.port)/")!,
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let task = Task {
+      try await runtime.download(
+        url: URL(string: "http://127.0.0.1:\(server.port)/file")!, timeout: .seconds(2))
+    }
+    let deadline = ContinuousClock.now + .seconds(3)
+    while panel.continuation == nil, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(panel.continuation != nil)
+    do {
+      _ = try await task.value
+      Issue.record("Expected timeout")
+    } catch { #expect(error as? WebKitRuntimeError == .downloadReceiptTimedOut(started: true)) }
+    panel.finish(destination)
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(!FileManager.default.fileExists(atPath: destination.path))
+    #expect(try await runtime.readText().bodyText.contains("Local page"))
   }
 
   @Test("A consent frame loading from another origin does not end a pending download")
@@ -5794,6 +6959,150 @@ struct WebKitRuntimeTests {
     #expect(result.y > 0)
     #expect(result.viewportHeight == 120)
     #expect(result.documentHeight > result.viewportHeight)
+  }
+
+  @Test("A long dialog exposes its actual scroll container, not just its background")
+  func observedScrollContainer() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div style='height:1800px'>Background</div>
+      <div role='dialog' aria-label='Collection' style='position:fixed;top:10px;left:10px'>
+        <div id='choices' aria-label='Choices' style='height:120px;width:240px;overflow:auto'>
+          <div style='height:900px'>Long content</div><button>Last choice</button>
+        </div>
+      </div>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/container"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let container = try #require(
+      observation.elements.first {
+        $0.accessibleName?.segments.first?.text == "Choices"
+      })
+    #expect(container.scrollable == true)
+    #expect(container.role == nil)
+    let result = try await runtime.scrollContainer(
+      observationID: observation.observationID, elementID: container.elementID,
+      deltaX: 0, deltaY: 2_000)
+    #expect(result.beforeY == 0)
+    #expect(result.y > 0)
+    #expect(result.actualDeltaY == result.y)
+    #expect(result.targetElementID == container.elementID)
+    #expect(result.reachedBottom)
+    #expect(try await runtime.webView.evaluateJavaScript("scrollY") as? Double == 0)
+    await #expect(throws: WebKitRuntimeError.staleObservation) {
+      try await runtime.scrollContainer(
+        observationID: observation.observationID, elementID: container.elementID,
+        deltaX: 0, deltaY: -100)
+    }
+    let fresh = try await runtime.observe()
+    let current = try #require(fresh.elements.first { $0.scrollable == true })
+    let boundary = try await runtime.scrollContainer(
+      observationID: fresh.observationID, elementID: current.elementID,
+      deltaX: 0, deltaY: 100)
+    #expect(boundary.actualDeltaY == 0)
+    #expect(boundary.reachedBottom)
+  }
+
+  @Test("Targeted scroll refuses a replaced physical container without background fallback")
+  func replacedScrollContainer() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<div id='choices' aria-label='Choices' style='height:100px;overflow:auto'>"
+        + "<div style='height:900px'>Content</div></div><div style='height:1800px'>Background</div>",
+      baseURL: URL(string: "https://fixture.invalid/replaced-container"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let container = try #require(observation.elements.first { $0.scrollable == true })
+    _ = try await runtime.webView.evaluateJavaScript(
+      "const old = document.getElementById('choices'); old.replaceWith(old.cloneNode(true)); null")
+    await #expect(throws: WebKitRuntimeError.staleObservation) {
+      try await runtime.scrollContainer(
+        observationID: observation.observationID, elementID: container.elementID,
+        deltaX: 0, deltaY: 100)
+    }
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.getElementById('choices').scrollTop")
+        as? Double == 0)
+    #expect(try await runtime.webView.evaluateJavaScript("scrollY") as? Double == 0)
+  }
+
+  @Test("A dialog verification scope refuses physical replacement and non-dialog roots")
+  func dialogScopeIsPhysicallyBound() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<div role='dialog' id='wizard' aria-label='Wizard'><h2>Step</h2><button>Next</button></div><button>Outside</button>",
+      baseURL: URL(string: "https://fixture.invalid/bound-scope"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let full = try await runtime.observe()
+    let outside = try #require(
+      full.elements.first { $0.accessibleName?.segments.first?.text == "Outside" })
+    let invalid = try runtime.dialogObservationScope(
+      observationID: full.observationID, elementID: outside.elementID)
+    await #expect(throws: WebKitRuntimeError.staleObservation) {
+      try await runtime.observe(scope: invalid)
+    }
+    let root = try #require(
+      full.elements.first { $0.accessibleName?.segments.first?.text == "Wizard" })
+    let scope = try runtime.dialogObservationScope(
+      observationID: full.observationID, elementID: root.elementID)
+    let scoped = try await runtime.observe(scope: scope)
+    #expect(!scoped.elements.contains { $0.accessibleName?.segments.first?.text == "Outside" })
+    _ = try await runtime.webView.evaluateJavaScript(
+      "const old=document.getElementById('wizard'); old.replaceWith(old.cloneNode(true)); null")
+    await #expect(throws: WebKitRuntimeError.staleObservation) {
+      try await runtime.observe(scope: scope)
+    }
+  }
+
+  @Test("Targeted scroll measures both axes including open Shadow DOM", arguments: [false, true])
+  func targetedScrollAxes(shadow: Bool) async throws {
+    let runtime = WebKitRuntime()
+    let region =
+      "<div aria-label='Two axes' style='width:100px;height:100px;overflow:auto'><div style='width:900px;height:900px'>Content</div></div>"
+    let markup =
+      shadow
+      ? "<section id='host'></section><script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML=\(String(decoding: try JSONEncoder().encode(region), as: UTF8.self));</script>"
+      : region
+    _ = try await runtime.loadHTML(
+      markup,
+      baseURL: URL(string: "https://fixture.invalid/scroll-axes"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let observation = try await runtime.observe()
+    let target = try #require(observation.elements.first { $0.scrollable == true })
+    await #expect(throws: WebKitRuntimeError.malformedInstrumentationResult) {
+      try await runtime.scrollContainer(
+        observationID: observation.observationID,
+        elementID: target.elementID, deltaX: 2_001, deltaY: 0)
+    }
+    let result = try await runtime.scrollContainer(
+      observationID: observation.observationID,
+      elementID: target.elementID, deltaX: 100, deltaY: 200)
+    #expect(result.actualDeltaX == 100)
+    #expect(result.actualDeltaY == 200)
+  }
+
+  @Test("Explicit scope names still truncate and capture bounds remain pinned")
+  func scopeRetainsCaptureBounds() async throws {
+    let runtime = WebKitRuntime()
+    let longName = String(repeating: "Explicit public name ", count: 4)
+    _ = try await runtime.loadHTML(
+      "<dialog open aria-label='\(longName)'><button>Next</button></dialog>",
+      baseURL: URL(string: "https://fixture.invalid/scope-bounds"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let full = try await runtime.observe()
+    let root = try #require(full.elements.first { $0.tag.segments.first?.text == "dialog" })
+    let scope = try runtime.dialogObservationScope(
+      observationID: full.observationID, elementID: root.elementID)
+    let limited = try await runtime.observe(
+      maximumElements: 300,
+      maximumFieldCharacters: 32, scope: scope)
+    #expect(!limited.isComplete)
+    #expect(limited.semanticTextTruncated)
+    let retained = try #require(try runtime.observationScope(observationID: limited.observationID))
+    #expect(retained.maximumElements == 300)
+    #expect(retained.maximumFieldCharacters == 32)
   }
 
   @Test("Observation filters apply before serialization")

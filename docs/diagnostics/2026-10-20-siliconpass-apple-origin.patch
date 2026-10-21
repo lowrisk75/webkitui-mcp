@@ -1,0 +1,110 @@
+--- a/Sources/SiliconPassCredentialBrokerVault/VaultCredentialFillProvider.swift
++++ b/Sources/SiliconPassCredentialBrokerVault/VaultCredentialFillProvider.swift
+@@ -196,7 +196,7 @@
+     }
+ 
+     var candidates: [VaultCredentialCandidate] = []
+-    for item in snapshot.items where Self.item(item, exactlyCovers: origin) {
++    for item in snapshot.items where Self.item(item, coversBrokerOrigin: origin) {
+       guard let authentication = item.basicAuthentication,
+         let userName = authentication.userName?.value,
+         !userName.isEmpty,
+@@ -229,7 +229,7 @@
+       Self.eraseBasicAuthentication(in: &item)
+       item.pendingPasswordRotation?.password.value = ""
+     }
+-    guard Self.item(item, exactlyCovers: binding.origin),
++    guard Self.item(item, coversBrokerOrigin: binding.origin),
+       let authentication = item.basicAuthentication,
+       let usernameBytes = authentication.userName?.copyValueBytes(),
+       let passwordBytes = authentication.password?.copyValueBytes()
+@@ -287,13 +287,10 @@
+     try await sink.fill(binding: binding, username: username, password: password)
+   }
+ 
+-  private static func item(_ item: VaultItem, exactlyCovers origin: CredentialOrigin) -> Bool {
++  private static func item(_ item: VaultItem, coversBrokerOrigin origin: CredentialOrigin) -> Bool {
+     !item.isArchived && item.scope?.urls.contains { url in
+-      guard url.scheme?.lowercased() == origin.scheme,
+-        url.host?.lowercased() == origin.asciiHost
+-      else { return false }
+-      let effectivePort = url.port ?? (url.scheme?.lowercased() == "https" ? 443 : 80)
+-      return effectivePort == Int(origin.effectivePort)
++      AppleCredentialOriginMatching.matches(savedURL: url, scheme: origin.scheme,
++        host: origin.asciiHost, port: origin.effectivePort)
+     } == true
+   }
+ 
+@@ -322,7 +319,7 @@
+       Self.eraseBasicAuthentication(in: &item)
+       item.pendingPasswordRotation?.password.value = ""
+     }
+-    guard Self.item(item, exactlyCovers: binding.origin),
++    guard Self.item(item, coversBrokerOrigin: binding.origin),
+       let authentication = item.basicAuthentication,
+       let currentPassword = authentication.password?.copyValueBytes()
+     else {
+--- a/Sources/SiliconPassCredentialBrokerVault/AppleCredentialOriginMatching.swift
++++ b/Sources/SiliconPassCredentialBrokerVault/AppleCredentialOriginMatching.swift
+@@ -0,0 +1,24 @@
++import Foundation
++
++/// Apple Account sign-in aliases for the native broker. The sink's exact origin/binding never changes.
++enum AppleCredentialOriginMatching {
++  private static let signInSites: Set<String> = [
++    "idmsa.apple.com", "appleid.apple.com", "account.apple.com",
++    "developer.apple.com", "appstoreconnect.apple.com",
++  ]
++  private static let savedAccountSites = signInSites.union(["apple.com", "www.apple.com"])
++
++  static func matches(savedURL: URL, scheme: String, host: String, port: UInt16) -> Bool {
++    guard let savedScheme = savedURL.scheme?.lowercased(),
++      let savedHost = savedURL.host?.lowercased()
++    else { return false }
++    let savedPort = savedURL.port ?? (savedScheme == "https" ? 443 : 80)
++    if savedScheme == scheme && savedHost == host && savedPort == Int(port) { return true }
++    // Explicit Apple Account relationships only. Never infer a relationship from
++    // an email address, title, substring or an arbitrary apple.com subdomain.
++    return scheme == "https" && savedScheme == "https"
++      && port == 443 && savedPort == 443
++      && savedURL.user == nil && savedURL.password == nil
++      && signInSites.contains(host) && savedAccountSites.contains(savedHost)
++  }
++}
+--- a/Tests/SiliconPassCredentialBrokerVaultTests/AppleCredentialOriginMatchingTests.swift
++++ b/Tests/SiliconPassCredentialBrokerVaultTests/AppleCredentialOriginMatchingTests.swift
+@@ -0,0 +1,34 @@
++import Foundation
++import Testing
++@testable import SiliconPassCredentialBrokerVault
++
++struct AppleCredentialOriginMatchingTests {
++  @Test("Developer and Apple Account login hosts share native candidates")
++  func developerAppleAccountCandidates() throws {
++    for target in ["idmsa.apple.com", "appleid.apple.com", "account.apple.com", "developer.apple.com", "appstoreconnect.apple.com"] {
++      for stored in ["apple.com", "www.apple.com", "appleid.apple.com", "account.apple.com", "developer.apple.com", "appstoreconnect.apple.com"] {
++        #expect(AppleCredentialOriginMatching.matches(
++          savedURL: try #require(URL(string: "https://\(stored)/account")),
++          scheme: "https", host: target, port: 443))
++      }
++    }
++  }
++
++  @Test("Apple aliases reject phishing, email domains, downgrade and port changes")
++  func appleAliasBoundaries() throws {
++    for stored in ["https://developer.apple.com.attacker.invalid", "https://fakeapple.com", "https://kevinn.ie", "https://unlisted.apple.com", "http://developer.apple.com", "https://developer.apple.com:444", "https://user@developer.apple.com"] {
++      #expect(!AppleCredentialOriginMatching.matches(savedURL: try #require(URL(string: stored)),
++        scheme: "https", host: "idmsa.apple.com", port: 443))
++    }
++    for target in ["idmsa.apple.com.attacker.invalid", "fakeapple.com", "unlisted.apple.com", "kevinn.ie"] {
++      #expect(!AppleCredentialOriginMatching.matches(savedURL: try #require(URL(string: "https://developer.apple.com")),
++        scheme: "https", host: target, port: 443))
++    }
++    #expect(!AppleCredentialOriginMatching.matches(savedURL: try #require(URL(string: "https://developer.apple.com")),
++      scheme: "https", host: "idmsa.apple.com", port: 444))
++    #expect(AppleCredentialOriginMatching.matches(savedURL: try #require(URL(string: "https://other.example.com:444")),
++      scheme: "https", host: "other.example.com", port: 444))
++    #expect(!AppleCredentialOriginMatching.matches(savedURL: try #require(URL(string: "https://other.example.com")),
++      scheme: "https", host: "login.other.example.com", port: 443))
++  }
++}

@@ -16,7 +16,8 @@ workspace_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 release_version=$(plutil -extract CFBundleShortVersionString raw \
   "$workspace_dir/Support/AquaApp/Info.plist")
 scratch_dir=$(mktemp -d /private/tmp/webkitui-exact-sign.XXXXXX)
-trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
+printf 'RESOURCE_CREATED=signing-stage:%s\n' "$scratch_dir"
+trap 'rm -rf "$scratch_dir"; printf "RESOURCE_REMOVED=signing-stage:%s\n" "$scratch_dir"' EXIT HUP INT TERM
 
 actual_sha=$(shasum -a 256 "$input_archive" | awk '{print $1}')
 if [ "$actual_sha" != "$expected_sha" ]; then
@@ -29,10 +30,14 @@ ditto -x -k "$input_archive" "$scratch_dir/input"
 app="$scratch_dir/input/WebKitUI MCP.app"
 helper="$app/Contents/MacOS/webkitui-mcp-confirm"
 relay="$app/Contents/MacOS/webkitui-mcp-relay"
+siliconpass_connector="$app/Contents/Resources/CredentialBroker/siliconpass-vault-mcp"
+siliconpass_bundle="$app/Contents/Resources/CredentialBroker/SiliconPass_SiliconPassCredentialBroker.bundle"
+siliconpass_policy="$app/Contents/Resources/SiliconPassVaultMCP.plist"
 
 test -d "$app"
 test -x "$helper"
 test -x "$relay"
+test -x "$siliconpass_connector"
 mkdir -p "$output_dir"
 output_archive="$output_dir/WebKitUI-MCP-$release_version-signed-local.zip"
 attestation="$output_dir/SigningAttestation.plist"
@@ -49,6 +54,9 @@ codesign --force --sign "$signing_identity" \
 codesign --force --sign "$signing_identity" \
   --identifier com.lorislab.webkitui-mcp.relay \
   --options runtime --timestamp "$relay"
+codesign --force --sign "$signing_identity" \
+  --identifier "$(plutil -extract ConnectorIdentifier raw "$siliconpass_policy")" \
+  --options runtime --timestamp "$siliconpass_connector"
 codesign --force --sign "$signing_identity" \
   --options runtime --timestamp "$app"
 
@@ -77,6 +85,8 @@ plutil -insert SignedConfirmationHelperSHA256 -string \
   "$(shasum -a 256 "$helper" | awk '{print $1}')" "$attestation"
 plutil -insert SignedEmbeddedRelaySHA256 -string \
   "$(shasum -a 256 "$relay" | awk '{print $1}')" "$attestation"
+plutil -insert SignedSiliconPassMCPConnectorSHA256 -string \
+  "$(shasum -a 256 "$siliconpass_connector" | awk '{print $1}')" "$attestation"
 chmod 0644 "$attestation"
 printf '%s  %s\n' "$archive_sha" "$output_archive"
 printf '%s\n' \

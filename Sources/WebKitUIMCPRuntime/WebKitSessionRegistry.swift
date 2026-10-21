@@ -263,6 +263,8 @@ public final class WebKitSessionRegistry {
   private var activeClientCalls: [UUID: Int] = [:]
   private var hostControllerLease: HostControllerLease?
   private let unownedLeaseGrace: Duration
+  /// Correlates observations with this registry lifetime, not with a client name.
+  public let processGeneration = UUID().uuidString
   public var unownedLeaseGraceSeconds: Int { Int(unownedLeaseGrace.components.seconds) }
 
   public func removal(of handle: WebKitSessionHandle) -> WebKitSessionRemoval? {
@@ -402,6 +404,7 @@ public final class WebKitSessionRegistry {
     let handle = WebKitSessionHandle(rawValue: UUID())
     do {
       sessions[handle] = try runtimeFactory(profileIdentifier)
+      sessions[handle]?.humanControlSessionLabel = String(handle.rawValue.uuidString.prefix(8))
       hostControllerLease = lease
       // A session opened but not yet owned must not be swept by a yield armed for the
       // previous client.

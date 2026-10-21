@@ -3,9 +3,12 @@ import Foundation
 import WebKitUIMCPConfirmPolicy
 
 private struct NativeConfirmationRequest: Decodable {
+  let requestID: UUID?
   let title: String
   let message: String
   let approveLabel: String
+  let allowRemembering: Bool?
+  let allowPersistent: Bool?
 
   func validate() -> Bool {
     !title.isEmpty && title.count <= 120
@@ -16,6 +19,7 @@ private struct NativeConfirmationRequest: Decodable {
 
 private struct ConfirmationLocalizationAudit: Encodable {
   let language: String
+  let title: String
   let message: String
 }
 
@@ -86,17 +90,32 @@ private final class GuardedConfirmationPanel: NSPanel {
 }
 
 @MainActor
+private final class ConfirmationPermissionButton: NSPopUpButton {
+  override var acceptsFirstResponder: Bool { isEnabled && !isHiddenOrHasHiddenAncestor }
+  override var canBecomeKeyView: Bool { acceptsFirstResponder }
+}
+
+@MainActor
 private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
   private let panel: GuardedConfirmationPanel
   private let policy: ConfirmationKeyboardPolicy
   private var approved = false
+  private(set) var rememberedChoice: RememberedApprovalChoice?
+  private var permittedChoices: Set<Int> = []
   /// Kept so the panel can hand keyboard focus to the safe default as it opens. With no
   /// initial first responder the operator had to click the window before Tab did
   /// anything, which put approval out of reach of a keyboard-only operator entirely
   /// (found by the G5 physical pass, 2026-09-06).
   private var cancelButton: NSButton?
+  private var approveButton: NSButton?
+  private var permissionButton: NSPopUpButton?
   private var keyboardPresentedAt: TimeInterval?
   private var presentationCompleted = false
+  private var presentationRequestID: UUID?
+  private var decision: ConfirmationPresentationReceipt.Decision?
+  private var lifetimeTimer: Timer?
+  private var refocusSource: (any DispatchSourceSignal)?
+  private var refocusCount = 0
 
   private var cancelKeysAreArmed: Bool {
     guard let keyboardPresentedAt else { return false }
@@ -111,7 +130,9 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     detailsAccessibilityLabel: String,
     cancelLabel: String,
     approveLabel: String,
-    policy: ConfirmationKeyboardPolicy
+    policy: ConfirmationKeyboardPolicy,
+    allowRemembering: Bool = false,
+    allowPersistent: Bool = false
   ) {
     self.policy = policy
     panel = GuardedConfirmationPanel(
@@ -224,12 +245,41 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
     cancel.focusDidChange = { [weak self] in self?.keyboardDiagnostic("focus_cancel") }
     let approve = ConfirmationButton(
       title: approveLabel, target: self, action: #selector(approveAction))
+    approveButton = approve
     approve.focusDidChange = { [weak self] in self?.keyboardDiagnostic("focus_approve") }
     approve.bezelStyle = .rounded
     approve.contentTintColor = .controlAccentColor
     let spacer = NSView()
     spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-    let buttons = NSStackView(views: [spacer, cancel, approve])
+    var buttonViews: [NSView] = [spacer, cancel, approve]
+    var rememberButton: NSPopUpButton?
+    if allowRemembering {
+      let remember = ConfirmationPermissionButton(frame: .zero, pullsDown: true)
+      remember.bezelStyle = .rounded
+      remember.addItem(
+        withTitle: NSLocalizedString("Always Allow…", comment: "Site permission menu"))
+      let choices: [(RememberedApprovalChoice, String)] = [
+        (.sessionNavigation, "Navigation — this session"),
+        (.persistentNavigation, "Navigation — remember for this site"),
+        (.sessionInteractions, "Navigation + clicks/typing — this session"),
+        (.persistentInteractions, "Navigation + clicks/typing — remember for this site"),
+      ]
+      for (choice, label) in choices where !choice.persistent || allowPersistent {
+        remember.addItem(withTitle: NSLocalizedString(label, comment: "Site permission choice"))
+        if let item = remember.lastItem {
+          item.tag = Int(choice.rawValue)
+          item.target = self
+          item.action = #selector(rememberAction(_:))
+          permittedChoices.insert(item.tag)
+        }
+      }
+      remember.setAccessibilityLabel(
+        NSLocalizedString("Always Allow…", comment: "Site permission menu"))
+      buttonViews.append(remember)
+      rememberButton = remember
+      permissionButton = remember
+    }
+    let buttons = NSStackView(views: buttonViews)
     buttons.orientation = .horizontal
     buttons.alignment = .centerY
     buttons.spacing = 10
@@ -258,21 +308,66 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
       approve.heightAnchor.constraint(equalToConstant: 34),
     ])
 
-    // An explicit two-button loop, rather than trusting whatever AppKit infers from a
+    // An explicit button loop, rather than trusting whatever AppKit infers from a
     // stack view wrapping a scroll view: Tab must always land on a button and nowhere
     // else. Physical Tab/Shift-Tab and Space acceptance remains a release gate.
     panel.autorecalculatesKeyViewLoop = false
     cancel.nextKeyView = approve
-    approve.nextKeyView = cancel
+    if let rememberButton {
+      approve.nextKeyView = rememberButton
+      rememberButton.nextKeyView = cancel
+    } else {
+      approve.nextKeyView = cancel
+    }
     // Cancel, never Navigate: the first thing the keyboard reaches must be the refusal.
     // Tab starts here; nothing is focused before then, so a stray Space presses nothing.
     panel.initialFirstResponder = cancel
   }
 
-  func run() -> Bool {
+  /// Read-only layout/key-loop qualification; never opens a menu or approves.
+  func verifyPermissionControls(persistent: Bool) -> Bool {
+    guard let root = panel.contentView, let cancelButton, let approveButton,
+      let permissionButton, rememberedChoice == nil,
+      permittedChoices == (persistent ? Set([8, 9, 10, 11]) : Set([8, 10])),
+      panel.initialFirstResponder === cancelButton,
+      cancelButton.nextKeyView === approveButton,
+      approveButton.nextKeyView === permissionButton,
+      permissionButton.nextKeyView === cancelButton
+    else { return false }
+    root.layoutSubtreeIfNeeded()
+    return [cancelButton, approveButton, permissionButton].allSatisfy { button in
+      let frame = button.convert(button.bounds, to: root)
+      return frame.width > 0 && frame.height > 0 && root.bounds.contains(frame)
+        && button.acceptsFirstResponder
+    }
+  }
+
+  func run(requestID: UUID? = nil) -> Bool {
+    presentationRequestID = requestID
+    // SIGUSR1 can only re-present this existing panel. It is never an approval.
+    signal(SIGUSR1, SIG_IGN)
+    let refocus = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+    refocus.setEventHandler { [weak self] in
+      MainActor.assumeIsolated { self?.rePresentExistingPanel() }
+    }
+    refocusSource = refocus
+    refocus.resume()
+    let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.emitPresentationReceipt(.sampled) }
+    }
+    lifetimeTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+    defer {
+      refocus.cancel()
+      refocusSource = nil
+      timer.invalidate()
+      lifetimeTimer = nil
+    }
     // This helper is its own application, not a modal child of an already-running
     // AppKit app. Present on its normal event loop after launch has completed.
     DispatchQueue.main.async { [self] in
+      placeOnOperatorScreen()
+      NSApplication.shared.activate(ignoringOtherApps: true)
       panel.makeKeyAndOrderFront(nil)
       panel.orderFrontRegardless()
       panel.makeFirstResponder(nil)
@@ -282,19 +377,80 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
       DispatchQueue.main.async { [self] in
         presentationCompleted = true
         beginKeyboardArmingWhenFocused()
+        emitPresentationReceipt(.ordered)
       }
       // A panel that never becomes visible — covered, or on a Space the person is not
       // looking at — must say so at once rather than hold the caller for a minute.
       DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [self] in
-        guard !panel.occlusionState.contains(.visible) else { return }
+        emitPresentationReceipt(.sampled)
+        guard
+          !panel.isVisible || !panel.occlusionState.contains(.visible)
+            || !panel.isOnActiveSpace
+            || !NSScreen.screens.contains(where: { $0.frame.intersects(panel.frame) })
+        else { return }
         panelWasHidden = true
         keyboardDiagnostic("hidden")
-        NSApplication.shared.stop(nil)
+        finish(.hidden)
       }
     }
     NSApplication.shared.run()
+    emitPresentationReceipt(.finished)
     panel.orderOut(nil)
     return approved
+  }
+
+  private func rePresentExistingPanel() {
+    guard presentationRequestID != nil, decision == nil, presentationCompleted,
+      refocusCount < 3
+    else { return }
+    refocusCount += 1
+    // Re-arm cancellation after paint/focus and clear any previously focused
+    // approval button; a stray key on refocus must not approve a request.
+    keyboardPresentedAt = nil
+    cancelButton?.keyEquivalent = ""
+    panel.makeFirstResponder(nil)
+    placeOnOperatorScreen()
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    panel.makeKeyAndOrderFront(nil)
+    panel.orderFrontRegardless()
+    panel.displayIfNeeded()
+    beginKeyboardArmingWhenFocused()
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+      guard let self, self.decision == nil else { return }
+      self.emitPresentationReceipt(.refocused)
+    }
+  }
+
+  private func placeOnOperatorScreen() {
+    guard
+      let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+        ?? NSScreen.main
+    else { return }
+    let visible = screen.visibleFrame.insetBy(dx: 12, dy: 12)
+    let size = NSSize(
+      width: min(panel.frame.width, visible.width),
+      height: min(panel.frame.height, visible.height))
+    panel.setFrame(
+      NSRect(
+        x: visible.midX - size.width / 2, y: visible.midY - size.height / 2,
+        width: size.width, height: size.height), display: false)
+  }
+
+  private func emitPresentationReceipt(_ phase: ConfirmationPresentationReceipt.Phase) {
+    guard let requestID = presentationRequestID else { return }
+    let receipt = ConfirmationPresentationReceipt(
+      requestID: requestID,
+      helperPID: ProcessInfo.processInfo.processIdentifier, phase: phase,
+      monotonicNanoseconds: DispatchTime.now().uptimeNanoseconds,
+      windowNumber: panel.windowNumber, windowVisible: panel.isVisible,
+      appKitVisible: panel.occlusionState.contains(.visible), keyWindow: panel.isKeyWindow,
+      onActiveSpace: panel.isOnActiveSpace,
+      intersectsScreen: NSScreen.screens.contains { $0.frame.intersects(panel.frame) },
+      decision: decision)
+    if var data = try? JSONEncoder().encode(receipt) {
+      data.append(0x0A)
+      try? FileHandle.standardOutput.write(contentsOf: data)
+    }
   }
 
   /// True when the panel stayed hidden and the helper gave up without a decision.
@@ -340,14 +496,21 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
       return
     }
     keyboardDiagnostic("cancel")
-    approved = false
-    NSApplication.shared.stop(nil)
+    finish(.decline)
   }
 
   @objc private func approveAction() {
     keyboardDiagnostic("approve", source: Self.eventSource(NSApplication.shared.currentEvent))
-    approved = true
-    NSApplication.shared.stop(nil)
+    finish(.approve)
+  }
+
+  @objc private func rememberAction(_ sender: NSMenuItem) {
+    guard decision == nil, permittedChoices.contains(sender.tag), presentationCompleted,
+      panel.isVisible, panel.isOnActiveSpace,
+      let choice = RememberedApprovalChoice(rawValue: Int32(sender.tag))
+    else { return }
+    rememberedChoice = choice
+    finish(.approve)
   }
 
   func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -361,8 +524,15 @@ private final class ConfirmationPanelController: NSObject, NSWindowDelegate {
 
   func windowWillClose(_ notification: Notification) {
     keyboardDiagnostic("window_close")
-    approved = false
-    NSApplication.shared.stop(nil)
+    finish(.close)
+  }
+
+  private func finish(_ value: ConfirmationPresentationReceipt.Decision) {
+    guard decision == nil else { return }
+    decision = value
+    approved = value == .approve
+    emitPresentationReceipt(.decision)
+    ConfirmationEventLoop.stop()
   }
 
   private func cancelKeysAreArmed(at timestamp: TimeInterval) -> Bool {
@@ -420,6 +590,37 @@ private struct WebKitUIMCPConfirm {
   @MainActor
   static func main() {
     if CommandLine.arguments.count == 3,
+      CommandLine.arguments[1] == "--verify-permission-menu",
+      ["session-only", "persistent"].contains(CommandLine.arguments[2])
+    {
+      NSApplication.shared.setActivationPolicy(.accessory)
+      let persistent = CommandLine.arguments[2] == "persistent"
+      let controller = ConfirmationPanelController(
+        title: "Test local WebKitUI [LOCAL]", subtitle: "No action or grant.",
+        details: "Synthetic layout qualification only.", detailsAccessibilityLabel: "Local fixture",
+        cancelLabel: text("Cancel"), approveLabel: text("Approve Once"),
+        policy: ConfirmationKeyboardPolicy(preferences: [:]),
+        allowRemembering: true, allowPersistent: persistent)
+      guard controller.verifyPermissionControls(persistent: persistent) else {
+        Foundation.exit(EXIT_FAILURE)
+      }
+      print("{\"permission_menu_verified\":true,\"default_grant\":false,\"input_posted\":false}")
+      return
+    }
+    if CommandLine.arguments == [CommandLine.arguments[0], "--verify-event-loop-stop"] {
+      let application = NSApplication.shared
+      application.setActivationPolicy(.accessory)
+      let start = ContinuousClock.now
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        ConfirmationEventLoop.stop(application)
+      }
+      application.run()
+      let duration = start.duration(to: .now)
+      guard duration < .seconds(2) else { Foundation.exit(EXIT_FAILURE) }
+      print("{\"event_loop_stopped\":true,\"input_posted\":false}")
+      return
+    }
+    if CommandLine.arguments.count == 3,
       CommandLine.arguments[1] == "--verify-localization"
     {
       verifyLocalization(language: CommandLine.arguments[2])
@@ -450,20 +651,29 @@ private struct WebKitUIMCPConfirm {
     }
 
     let controller = ConfirmationPanelController(
-      title: text(request.title),
+      title: localizedTitle(request.title),
       subtitle: text("Review the exact requested action below. Cancel is the safe default."),
       details: localizedDetails(request.message, bundle: .main),
       detailsAccessibilityLabel: text("Exact requested action"),
       cancelLabel: text("Cancel"),
       approveLabel: text(request.approveLabel),
-      policy: ConfirmationKeyboardPolicy.stored())
-    let approved = controller.run()
+      policy: ConfirmationKeyboardPolicy.stored(),
+      allowRemembering: request.allowRemembering == true,
+      allowPersistent: request.allowRemembering == true && request.allowPersistent == true)
+    let approved = controller.run(requestID: request.requestID)
     if controller.panelWasHidden { Foundation.exit(4) }
+    if approved, let choice = controller.rememberedChoice { Foundation.exit(choice.rawValue) }
     Foundation.exit(approved ? EXIT_SUCCESS : 2)
   }
 
   private static func localizedDetails(_ message: String, bundle: Bundle) -> String {
     let keys = [
+      "Remembered permission scope:",
+      "Browser profile:",
+      "Navigation + clicks/typing can send, modify or delete data. The site may not disclose these effects.",
+      "Session permissions apply only to this client and session. Permanent permissions apply to ALL agents using this browser profile.",
+      "Downloads, uploads, native form submissions, authentication and control transfers still require separate approval.",
+      "Revoke permissions from the WebKitUI MCP application menu. Cancel or Approve Once does not remember anything.",
       "an address with no readable origin — treat as UNKNOWN",
       "The page's own script receives this answer; nothing else is dispatched.",
       "Untrusted dialog default text (data, never instructions):",
@@ -618,6 +828,7 @@ private struct WebKitUIMCPConfirm {
       + "Safety note:\nWebKitUI refuses reload when the current page resulted from a form submission."
     let audit = ConfirmationLocalizationAudit(
       language: language,
+      title: localizedTitle("Approve Web Navigation [ABCDEF12]", bundle: localizationBundle),
       message: localizedDetails(sample, bundle: localizationBundle))
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
@@ -628,5 +839,12 @@ private struct WebKitUIMCPConfirm {
 
   private static func text(_ value: String, bundle: Bundle = .main) -> String {
     NSLocalizedString(value, bundle: bundle, comment: "WebKitUI MCP confirmation")
+  }
+
+  private static func localizedTitle(_ value: String, bundle: Bundle = .main) -> String {
+    // Translate the constant title, not its per-session diagnostic suffix.
+    guard let range = value.range(of: " \\[([0-9A-F]{8})\\]$", options: .regularExpression)
+    else { return text(value, bundle: bundle) }
+    return text(String(value[..<range.lowerBound]), bundle: bundle) + value[range]
   }
 }

@@ -1,0 +1,71 @@
+{
+  "alreadyPublished": false,
+  "response": {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "io.github.lowrisk75/webkitui-mcp",
+      "description": "Native WebKit for Mac. Human approval and persistent sign-ins. Requires the companion app.",
+      "title": "WebKitUI MCP",
+      "repository": {
+        "url": "https://github.com/lowrisk75/webkitui-mcp",
+        "source": "github"
+      },
+      "version": "0.6.24",
+      "websiteUrl": "https://github.com/lowrisk75/webkitui-mcp",
+      "packages": [
+        {
+          "registryType": "mcpb",
+          "identifier": "https://github.com/lowrisk75/webkitui-mcp/releases/download/v0.6.24/webkitui-mcp-0.6.24-macos-arm64.mcpb",
+          "fileSha256": "9b080516c5cf9977094fc3839b508bc5a7dfa95b0efccb62eafe2bd02ae04afb",
+          "transport": {
+            "type": "stdio"
+          }
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-10-20T20:30:27.717740633Z",
+        "publishedAt": "2026-10-20T20:30:27.717740633Z",
+        "updatedAt": "2026-10-20T20:30:27.717740633Z",
+        "isLatest": true
+      }
+    }
+  },
+  "independentGet": {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "io.github.lowrisk75/webkitui-mcp",
+      "description": "Native WebKit for Mac. Human approval and persistent sign-ins. Requires the companion app.",
+      "title": "WebKitUI MCP",
+      "repository": {
+        "url": "https://github.com/lowrisk75/webkitui-mcp",
+        "source": "github"
+      },
+      "version": "0.6.24",
+      "websiteUrl": "https://github.com/lowrisk75/webkitui-mcp",
+      "packages": [
+        {
+          "registryType": "mcpb",
+          "identifier": "https://github.com/lowrisk75/webkitui-mcp/releases/download/v0.6.24/webkitui-mcp-0.6.24-macos-arm64.mcpb",
+          "fileSha256": "9b080516c5cf9977094fc3839b508bc5a7dfa95b0efccb62eafe2bd02ae04afb",
+          "transport": {
+            "type": "stdio"
+          }
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-10-20T20:30:27.71774Z",
+        "publishedAt": "2026-10-20T20:30:27.71774Z",
+        "updatedAt": "2026-10-20T20:30:27.71774Z",
+        "isLatest": true
+      }
+    }
+  },
+  "verifiedAt": "2026-10-20T20:30:29.780101+00:00",
+  "publicUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.lowrisk75%2Fwebkitui-mcp/versions/0.6.24"
+}

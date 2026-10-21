@@ -48,9 +48,10 @@ plutil() { shasum -a 256 "$installed_app/Contents/Resources/SOURCE-MANIFEST.sha2
     (resources/'SOURCE-MANIFEST.sha256').write_text('stale source\n')
     result=run(prelude+manifest,[root,app]); assert result.returncode!=0 and 'source manifest differs' in result.stderr,result
     pre= (base/'verify-pre-notarization.sh').read_text()
-    branch=pre[pre.index('  if wait "$probe_pid"'):pre.index('\nfi\n\nprintf', pre.index('  if wait "$probe_pid"'))]
-    # The branch now sits inside the probe's own `if`; give it that frame and its inputs.
-    result=run('scratch_dir=$1\nprintf "synthetic crash detail\\n" > "$scratch_dir/confirmation-probe.err"\n(exit 64) &\nprobe_pid=$!\nprobe_started=$(perl -MTime::HiRes=time -e "print time")\nprobe_presented=0\nif true; then\n'+branch+'\nfi\n',[work])
+    start=pre.index('probe_presented=0')
+    branch=pre[start:pre.index('\ntest "$(wc -c < "$scratch_dir/confirmation-probe.out")"', start)]
+    # Exercise the full production block and let the synthetic child exit first.
+    result=run('scratch_dir=$1\nprintf "synthetic crash detail\\n" > "$scratch_dir/confirmation-probe.err"\n(exit 64) &\nprobe_pid=$!\nprobe_started=$(perl -MTime::HiRes=time -e "print time")\nsleep 0.05\n'+branch,[work])
     assert result.returncode==1 and 'exited with 64' in result.stderr and 'synthetic crash detail' in result.stderr,result
 print('PASS: 3 signed-byte variants accepted; 3 stale embedded executables rejected; current manifest accepted; stale manifest rejected; crash status and stderr retained. No native helper or UI launched.')
 

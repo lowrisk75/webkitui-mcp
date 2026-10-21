@@ -1,0 +1,13 @@
+{
+  "verified_root_identity": [
+    16777244,
+    42717249,
+    1792496039
+  ],
+  "removed_mission_root": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7",
+  "source_archive": "/Users/kevin/GitHub/webkitui-mcp/dist/local-0.6.41-745E07FF/source-snapshot-0.6.41.tar.gz",
+  "source_archive_sha256": "783055ade17d1fa7eacd130b1d1f8a590e70f0168ce40122c09ed1bf3aecc8f5",
+  "installed_service_retained_pid": 7217,
+  "rollback_retained": "/Users/kevin/GitHub/webkitui-mcp/dist/local-0.6.41-745E07FF/rollback/WebKitUI MCP.app",
+  "other_mission_resources_touched": false
+}

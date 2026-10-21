@@ -5,24 +5,48 @@ workspace_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 output_dir=${1:-"$workspace_dir/dist"}
 release_plist="$workspace_dir/Support/AquaApp/Info.plist"
 release_version=$(plutil -extract CFBundleShortVersionString raw "$release_plist")
+siliconpass_policy="$workspace_dir/Support/Packaging/SiliconPassVaultMCP.plist"
+siliconpass_manager=${SILICONPASS_CREDENTIAL_BROKER_MANAGER_APP:-/Applications/SiliconPassCredentialBrokerManager.app}
+siliconpass_source="$siliconpass_manager/Contents/Resources/CredentialBroker"
+siliconpass_connector="$siliconpass_source/siliconpass-vault-mcp"
+siliconpass_bundle="$siliconpass_source/SiliconPass_SiliconPassCredentialBroker.bundle"
 scratch_dir=$(mktemp -d /private/tmp/webkitui-package.XXXXXX)
-trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
+printf 'RESOURCE_CREATED=packaging-stage:%s\n' "$scratch_dir"
+trap 'rm -rf "$scratch_dir"; printf "RESOURCE_REMOVED=packaging-stage:%s\n" "$scratch_dir"' EXIT HUP INT TERM
 # Optional explicit Swift cache for space-constrained local packaging. Changed
 # inputs are still rebuilt and provenance checked; default builds stay isolated.
-build_dir=${2:-"$scratch_dir/build"}
+build_dir=${2:-}
 
 cd "$workspace_dir"
+test "$(plutil -extract CFBundleIdentifier raw "$siliconpass_manager/Contents/Info.plist")" = \
+  "$(plutil -extract ManagerBundleIdentifier raw "$siliconpass_policy")"
+test "$(plutil -extract CFBundleShortVersionString raw "$siliconpass_manager/Contents/Info.plist")" = \
+  "$(plutil -extract ManagerVersion raw "$siliconpass_policy")"
+test "$(plutil -extract CFBundleVersion raw "$siliconpass_manager/Contents/Info.plist")" = \
+  "$(plutil -extract ManagerBuild raw "$siliconpass_policy")"
+scripts/verify-siliconpass-vault-mcp.sh \
+  "$siliconpass_connector" "$siliconpass_bundle" "$siliconpass_policy" input
 mkdir -p "$scratch_dir/provenance-before" "$scratch_dir/provenance-after"
 scripts/generate-release-provenance.sh "$scratch_dir/provenance-before" >/dev/null
-swift build -c release --arch arm64 --scratch-path "$build_dir"
-release_dir=$(swift build -c release --arch arm64 --scratch-path "$build_dir" --show-bin-path)
+if test -n "$build_dir"; then
+  case "$build_dir" in
+    /Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/*) ;;
+    *) printf '%s\n' 'Isolated builds must use BuildScratch/Auto/webkitui-mcp/<name>.' >&2; exit 64 ;;
+  esac
+  swift build -c release --arch arm64 --scratch-path "$build_dir"
+  release_dir=$(swift build -c release --arch arm64 --scratch-path "$build_dir" --show-bin-path)
+else
+  swift build -c release --arch arm64
+  release_dir=$(swift build -c release --arch arm64 --show-bin-path)
+fi
 scripts/generate-release-provenance.sh "$scratch_dir/provenance-after" >/dev/null
 cmp "$scratch_dir/provenance-before/SOURCE-MANIFEST.sha256" \
   "$scratch_dir/provenance-after/SOURCE-MANIFEST.sha256"
 app_dir="$scratch_dir/WebKitUI MCP.app"
 relay_dir="$scratch_dir/webkitui-mcp-relay-$release_version"
 
-mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources" "$relay_dir" "$output_dir"
+mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources/CredentialBroker" \
+  "$relay_dir" "$output_dir"
 install -m 0755 "$release_dir/webkitui-mcp-aqua-broker" \
   "$app_dir/Contents/MacOS/webkitui-mcp-aqua-broker"
 install -m 0755 "$release_dir/webkitui-mcp-confirm" \
@@ -31,6 +55,11 @@ install -m 0755 "$release_dir/webkitui-mcp-relay" \
   "$app_dir/Contents/MacOS/webkitui-mcp-relay"
 cp -R "$release_dir/WebKitUIMCP_WebKitUIMCPLicensing.bundle" \
   "$app_dir/Contents/Resources/"
+install -m 0755 "$siliconpass_connector" \
+  "$app_dir/Contents/Resources/CredentialBroker/siliconpass-vault-mcp"
+cp -R "$siliconpass_bundle" "$app_dir/Contents/Resources/CredentialBroker/"
+install -m 0644 "$siliconpass_policy" \
+  "$app_dir/Contents/Resources/SiliconPassVaultMCP.plist"
 install -m 0644 Support/AquaApp/Info.plist "$app_dir/Contents/Info.plist"
 install -m 0644 Support/AquaApp/AppIcon.icns \
   "$app_dir/Contents/Resources/AppIcon.icns"
@@ -56,6 +85,18 @@ plutil -insert UnsignedConfirmationHelperSHA256 -string "$helper_sha" \
   "$app_dir/Contents/Resources/ReleaseProvenance.plist"
 plutil -insert UnsignedEmbeddedRelaySHA256 -string "$relay_sha" \
   "$app_dir/Contents/Resources/ReleaseProvenance.plist"
+plutil -insert SiliconPassMCPInputSHA256 -string \
+  "$(plutil -extract ConnectorInputSHA256 raw "$siliconpass_policy")" \
+  "$app_dir/Contents/Resources/ReleaseProvenance.plist"
+plutil -insert SiliconPassConnectorVersion -string \
+  "$(plutil -extract ConnectorVersion raw "$siliconpass_policy")" \
+  "$app_dir/Contents/Resources/ReleaseProvenance.plist"
+plutil -insert SiliconPassManagerVersion -string \
+  "$(plutil -extract ManagerVersion raw "$siliconpass_policy")" \
+  "$app_dir/Contents/Resources/ReleaseProvenance.plist"
+plutil -insert SiliconPassManagerBuild -string \
+  "$(plutil -extract ManagerBuild raw "$siliconpass_policy")" \
+  "$app_dir/Contents/Resources/ReleaseProvenance.plist"
 scripts/generate-release-sbom.sh \
   "$app_dir/Contents/Resources/ReleaseProvenance.plist" \
   "$app_dir/Contents/Resources/sbom.cdx.json"
@@ -73,9 +114,14 @@ install -m 0644 \
 plutil -lint \
   "$app_dir/Contents/Info.plist" \
   "$app_dir/Contents/Resources/PrivacyInfo.xcprivacy" \
-  "$app_dir/Contents/Resources/ReleaseProvenance.plist"
+  "$app_dir/Contents/Resources/ReleaseProvenance.plist" \
+  "$app_dir/Contents/Resources/SiliconPassVaultMCP.plist"
 file "$app_dir/Contents/MacOS/webkitui-mcp-aqua-broker" | grep -q 'arm64'
 file "$relay_dir/webkitui-mcp-relay" | grep -q 'arm64'
+scripts/verify-siliconpass-vault-mcp.sh \
+  "$app_dir/Contents/Resources/CredentialBroker/siliconpass-vault-mcp" \
+  "$app_dir/Contents/Resources/CredentialBroker/SiliconPass_SiliconPassCredentialBroker.bundle" \
+  "$app_dir/Contents/Resources/SiliconPassVaultMCP.plist" input
 plutil -extract CFBundleShortVersionString raw "$app_dir/Contents/Info.plist" \
   | grep -Fqx "$release_version"
 plutil -extract CFBundleIconFile raw "$app_dir/Contents/Info.plist" | grep -qx 'AppIcon'

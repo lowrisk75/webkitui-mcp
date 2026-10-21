@@ -12,6 +12,10 @@ struct CredentialBrokerPhysicalValidation {
 
     do {
       let mode = try parseArguments()
+      if mode == .nativeAction {
+        try await verifyNativeAction()
+        exit(EXIT_SUCCESS)
+      }
       let registry = try WebKitSessionRegistry()
       let session = try registry.open()
       let runtime = try registry.runtime(for: session)
@@ -179,6 +183,57 @@ struct CredentialBrokerPhysicalValidation {
     else { throw ValidationError.postRotationVerificationFailed }
   }
 
+  /// Opt-in physical qualification only: fresh isolated profile, local HTML,
+  /// production presenter/signature checks, and no credential broker invocation.
+  private static func verifyNativeAction() async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open(profileIdentifier: UUID())
+    defer { try? registry.close(handle) }
+    let runtime = try registry.runtime(for: handle)
+    defer {
+      runtime.webView.configuration.websiteDataStore.removeData(
+        ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast,
+        completionHandler: {})
+    }
+    _ = try await runtime.loadHTML(
+      """
+      <!doctype html><title>Test local WebKitUI [LOCAL]</title>
+      <button aria-label="Test local WebKitUI [LOCAL]"
+        onclick="this.dataset.state=event.isTrusted?'trusted':'rejected'">Test local seulement</button>
+      """,
+      baseURL: URL(string: "https://fixture.invalid/native-action"),
+      timeout: .seconds(5), quietWindow: .milliseconds(80))
+    let server = WebKitMCPServer(durableRegistry: registry)
+    let observation = try await callTool(
+      server, id: 1, name: "browser_observe",
+      arguments: ["session_id": handle.rawValue.uuidString])
+    guard let observationID = observation["observationID"] as? String,
+      let elements = observation["elements"] as? [[String: Any]], elements.count == 1,
+      let elementID = elements.first?["elementID"] as? String
+    else { throw ValidationError.expectedFieldsMissing }
+    let result = try await callTool(
+      server, id: 2, name: "browser_act",
+      arguments: [
+        "session_id": handle.rawValue.uuidString, "observation_id": observationID,
+        "element_id": elementID, "operation": "click", "approval_mode": "native",
+        "idempotency_key": UUID().uuidString,
+        "postcondition": [
+          "type": "attribute_equals", "attribute": "data-state", "value": "trusted",
+        ],
+      ])
+    guard result["confirmation_mode"] as? String == "native",
+      result["dispatch_mode"] as? String == "native_appkit",
+      result["trusted_gesture_state"] as? String == "trusted",
+      result["confirmation_and_dispatch_are_distinct"] as? Bool == true,
+      (result["verification"] as? [String: Any])?["verified"] != nil,
+      try await runtime.webView.evaluateJavaScript("document.querySelector('button').dataset.state")
+        as? String == "trusted"
+    else { throw ValidationError.postFillVerificationFailed }
+    print(
+      "{\"native_action\":\"verified\",\"synthetic_only\":true,\"trusted_dom_receipt\":true,\"credential_access\":false}"
+    )
+  }
+
   private static func parseArguments() throws -> ValidationMode {
     switch Array(CommandLine.arguments.dropFirst()) {
     case []:
@@ -187,6 +242,8 @@ struct CredentialBrokerPhysicalValidation {
       .expectUserPresenceUnavailable
     case ["--rotation"]:
       .rotation
+    case ["--native-action"]:
+      .nativeAction
     default:
       throw ValidationError.invalidArguments
     }
@@ -251,9 +308,12 @@ private enum ValidationMode: Equatable {
   case fill
   case expectUserPresenceUnavailable
   case rotation
+  case nativeAction
 
   var html: String {
     switch self {
+    case .nativeAction:
+      ""
     case .fill, .expectUserPresenceUnavailable:
       """
       <!doctype html>

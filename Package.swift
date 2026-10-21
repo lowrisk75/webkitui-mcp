@@ -36,7 +36,7 @@ let package = Package(
     ),
     .target(
       name: "WebKitUIMCPServer",
-      dependencies: ["WebKitUIMCPRuntime"]
+      dependencies: ["WebKitUIMCPRuntime", "WebKitUIMCPConfirmPolicy"]
     ),
     .executableTarget(
       name: "WebKitUIMCPCLI",

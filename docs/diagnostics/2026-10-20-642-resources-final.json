@@ -1,0 +1,293 @@
+[
+  {
+    "id": "0C2D3682-0BEE-41E2-91AE-4427C6B05762",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814190675.462077,
+    "identity": "16777244:42723837:1792496223:44737127",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-0C2D3682-0BEE-41E2-91AE-4427C6B05762"
+  },
+  {
+    "id": "21959C6C-2621-43A7-9B51-8AC335138AAF",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.638529,
+    "identity": "16777244:43595104:1792519141:405510855",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-21959C6C-2621-43A7-9B51-8AC335138AAF"
+  },
+  {
+    "id": "290EB9A3-81AC-4468-A2CB-B5C514AE56B5",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814190675.452114,
+    "identity": "16777244:42717738:1792496086:782110400",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-290EB9A3-81AC-4468-A2CB-B5C514AE56B5"
+  },
+  {
+    "id": "32D90D9B-B20A-4CA8-A1C9-F99DE7972052",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.642407,
+    "identity": "16777244:43165918:1792503870:648115188",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052"
+  },
+  {
+    "id": "35A24EC3-F919-4687-BE2D-F04A9D852EF5",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814211941.368556,
+    "identity": "501:44068:1792518965:604492",
+    "kind": "process",
+    "locator": "44068"
+  },
+  {
+    "id": "45F2336A-DD67-4712-9311-B1552B4A2755",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814190675.475601,
+    "identity": "16777244:42717744:1792496086:799055009",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-45F2336A-DD67-4712-9311-B1552B4A2755"
+  },
+  {
+    "id": "496C242C-A95C-490B-A4E6-3C934A57CF78",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.646072,
+    "identity": "16777244:43595103:1792519141:399598833",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-496C242C-A95C-490B-A4E6-3C934A57CF78"
+  },
+  {
+    "id": "5044306D-F4DE-4319-ACDA-F7C31DB67BE7",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814190675.446408,
+    "identity": "16777244:42717249:1792496039:699252369",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7"
+  },
+  {
+    "id": "622AD528-9A14-49B3-A6E7-7CB2BC5CA8BB",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.649247,
+    "identity": "16777244:43649515:1792519929:349713635",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-622AD528-9A14-49B3-A6E7-7CB2BC5CA8BB"
+  },
+  {
+    "id": "672A13B5-A162-4583-99E4-1BA08204E55C",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814190675.481672,
+    "identity": "16777244:42717745:1792496086:802766344",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-672A13B5-A162-4583-99E4-1BA08204E55C"
+  },
+  {
+    "id": "716D3A31-2CDC-4EBE-ACC4-0A218ADF980F",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.652239,
+    "identity": "16777244:43649513:1792519929:340954267",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-716D3A31-2CDC-4EBE-ACC4-0A218ADF980F"
+  },
+  {
+    "id": "736EEDDE-8A0D-4188-B5FE-16BBB189E1A9",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814211322.314303,
+    "identity": "501:26459:1792518497:742839",
+    "kind": "process",
+    "locator": "26459"
+  },
+  {
+    "id": "738A27CA-DC0A-445A-B4B7-398FFFB61E9B",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814212330.143016,
+    "identity": "501:56906:1792519511:271376",
+    "kind": "process",
+    "locator": "56906"
+  },
+  {
+    "id": "84357A79-391A-47E2-A6BD-A652F75C0EDA",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.655396,
+    "identity": "16777244:43595101:1792519141:388604572",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-84357A79-391A-47E2-A6BD-A652F75C0EDA"
+  },
+  {
+    "id": "8A480E17-5D1D-49F9-9B20-FC585FE221A7",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814190675.49004,
+    "identity": "16777244:42723838:1792496223:50102194",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-8A480E17-5D1D-49F9-9B20-FC585FE221A7"
+  },
+  {
+    "id": "924E039E-B23F-4277-861B-4ACE5F3387F8",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.659227,
+    "identity": "16777244:43649514:1792519929:345708843",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-924E039E-B23F-4277-861B-4ACE5F3387F8"
+  },
+  {
+    "id": "A14985C0-E08E-4996-B289-AFF4BC39AA85",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814212316.269047,
+    "identity": "501:56864:1792519500:581800",
+    "kind": "process",
+    "locator": "56864"
+  },
+  {
+    "id": "A43052BA-9457-4DB2-8B65-E8292E291FDB",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814211770.131596,
+    "identity": "501:43955:1792518951:518592",
+    "kind": "process",
+    "locator": "43955"
+  },
+  {
+    "id": "A4784536-A65C-4B20-A9E6-EA33A46034CC",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "retained",
+    "updatedAt": 814213094.972291,
+    "identity": "501:68230:1792520288:69075",
+    "kind": "process",
+    "locator": "68230"
+  },
+  {
+    "id": "B37CFA6D-6F0F-4D99-9DAE-C9C360768552",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814189023.034424,
+    "identity": "16777244:42717742:1792496086:791993419",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-B37CFA6D-6F0F-4D99-9DAE-C9C360768552"
+  },
+  {
+    "id": "BC05A8F6-3655-4647-AD2F-76DFFD198EA1",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.663527,
+    "identity": "16777244:43595099:1792519141:375235501",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-BC05A8F6-3655-4647-AD2F-76DFFD198EA1"
+  },
+  {
+    "id": "C25EF3A8-3E8E-42FA-8AEF-D66E7619B646",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.668828,
+    "identity": "16777244:43316897:1792506186:109978990",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-C25EF3A8-3E8E-42FA-8AEF-D66E7619B646"
+  },
+  {
+    "id": "D269C554-7E04-4EB7-8DBD-47FF6ED20A20",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.672365,
+    "identity": "16777244:43595100:1792519141:382093805",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-D269C554-7E04-4EB7-8DBD-47FF6ED20A20"
+  },
+  {
+    "id": "DB1205A3-73FB-470F-B809-483C13314CEB",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814190675.458013,
+    "identity": "16777244:42717741:1792496086:787055889",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-DB1205A3-73FB-470F-B809-483C13314CEB"
+  },
+  {
+    "id": "DD0710EE-4D59-402F-8219-B05F22414F8A",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814190675.467423,
+    "identity": "16777244:42717743:1792496086:795355507",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-5044306D-F4DE-4319-ACDA-F7C31DB67BE7/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-DD0710EE-4D59-402F-8219-B05F22414F8A"
+  },
+  {
+    "id": "DED72D1E-21AC-41A6-872B-A306E7487564",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814212694.657089,
+    "identity": "501:57612:1792519519:297566",
+    "kind": "process",
+    "locator": "57612"
+  },
+  {
+    "id": "E490C919-AE40-4146-A508-E37730926F87",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "retained",
+    "updatedAt": 814211301.924302,
+    "identity": "501:25762:1792518412:587975",
+    "kind": "process",
+    "locator": "25762"
+  },
+  {
+    "id": "EAD78147-E609-46D9-B6EC-39FFA0750B9F",
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814213094.977774,
+    "identity": "501:7217:1792497628:525973",
+    "kind": "process",
+    "locator": "7217"
+  },
+  {
+    "id": "F7AB9E38-F5C3-4608-A9E4-1CBAEA845C1A",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.67628,
+    "identity": "16777244:43595105:1792519141:411829539",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-F7AB9E38-F5C3-4608-A9E4-1CBAEA845C1A"
+  },
+  {
+    "id": "FF0DF453-F157-4789-9E7C-76900B4DA5CD",
+    "managedDirectory": true,
+    "missionID": "745E07FF-D6F9-449B-85D7-487CDD58231D",
+    "state": "released",
+    "updatedAt": 814215130.680599,
+    "identity": "16777244:43595102:1792519141:393697644",
+    "kind": "temporaryDirectory",
+    "locator": "/Volumes/DeveloperStorage/BuildScratch/Auto/webkitui-mcp/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-32D90D9B-B20A-4CA8-A1C9-F99DE7972052/throttle-mission-745E07FF-D6F9-449B-85D7-487CDD58231D-FF0DF453-F157-4789-9E7C-76900B4DA5CD"
+  }
+]

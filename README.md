@@ -44,6 +44,13 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   server-owned native macOS confirmation dialog; the model cannot supply or
   forge the approval value.
 - Local human handoff: `handoff_start` immediately returns an opaque session-bound resume token while the actual WebKit session becomes a visible window. `handoff_status` is non-blocking; `handoff_resume` consumes the token only after local confirmation and returns a fresh observation. The agent remains locked out throughout human control.
+
+  Handoff replies include the localized `return_control_button_label`. Returning
+  control confirms the human step, not remote saving. Arguments are specific to
+  each operation: `handoff_start` accepts only operation/session ID; status adds
+  the resume token; resume additionally accepts compact/maximum_elements. Timing
+  arguments belong to back/forward/reload, not handoff. Discovery remains
+  composition-free for clients that cannot safely parse conditional schemas.
 - An active human-control window can be brought forward again with `handoff_focus` without changing who controls the page. Session status says whether that surface is currently presented, and restricted authentication status exposes only bounded rendering booleans—never page text, field values, private URL components, or network payloads.
 - The packaged handoff app installs a native Edit menu, so standard first-responder
   shortcuts such as Command-X/C/V/A work inside WebKit form controls.
@@ -67,7 +74,11 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - While a person holds the human control window, a pop-up the page opens (a sign-in
   with Google or Apple, say) is a real window sharing the page's profile, protected
   proxy and `window.opener`, at most four; all close when the agent resumes. Under
-  agent control new windows stay refused and reported.
+  agent control ordinary new windows stay refused and reported. An explicitly
+  approved download can retain one request-scoped export view, with the original
+  configuration/profile, without replacing the page. Only same-origin GET
+  attachment responses or Blob downloads are accepted there; it is closed at the
+  request's terminal outcome and is never an agent-visible tab.
 - The app broker owns one live browser across MCP client reconnects. Every
   reconnect invalidates observations, pending approvals, capabilities, and
   transaction coordinators before returning the preserved session handle.
@@ -99,7 +110,8 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - `browser_act` exposes click, native submit-control click, bounded non-sensitive input/textarea fill, Enter/Tab/Escape, blur, explicit input commit, and answering the one JavaScript `alert`/`confirm`/`prompt` dialog a page is suspended on (`dialog_accept`, `dialog_dismiss`, `dialog_accept_value`). A pending dialog is reported in the observation as untrusted site content, blocks every other operation until it is answered, is never answered automatically, and resolves to an explicit indeterminate outcome if nobody answers it. `beforeunload` is out of scope: the public macOS SDK exposes no before-unload panel to an embedder. Native approval also routes public text fills through AppKit insertion with a measured trusted `input` receipt. Fill verifies both the freshly re-resolved semantic target's exact value and that its live validation state is not invalid. Other actions support exact URL or URL prefix, title, heading, exact/contains semantic text, checked, selected, enabled, semantic target absence (`target_absent` with `value="true"`), value, validation state, character count, bounded state attributes, dialog, named panel, or selected-option postconditions. A same-URL SPA mutation returns `same_url_page_state_changed` guidance instead of implying success. UI state never proves backend commit.
 - `browser_download` converts authenticated attachment responses to `WKDownload` from either a fresh observed control or a protected same-origin URL fallback. It requires exact native confirmation plus a save-panel destination, never overwrites an existing file, and succeeds only after an on-disk receipt reports the HTTP status, suggested/final filename, MIME type, byte count, SHA-256, and decoded provisioning-profile UUID when available. Cookies, headers, and the absolute local destination path stay outside MCP.
 - macOS file inputs use WebKit's native open-panel delegate. Selected regular files are bounded to 10 files and 50 MiB each; receipts may expose filenames, byte counts and SHA-256 values, but never local paths or file contents. A file-selection receipt is not provider acceptance: the action's independent postcondition must still verify the uploaded preview or saved state.
-- Fill dispatches normal `input`/`change` events, so site handlers may autosave or cause server effects. It is destructive and human-confirmed; password controls require local human handoff.
+- Call `browser_upload` directly on the freshly observed file input or chooser-opening label/button, including a menu's upload button. Opening its file panel with `browser_act` first leaves a pending chooser that `browser_upload` refuses without another click. Use human handoff to finish or cancel that chooser, return control and reconcile before a new upload. Missing gesture evidence remains uncertain even when a separate receipt proves file selection; never replay automatically.
+- Fill dispatches normal `input`/`change` events, so site handlers may autosave or cause server effects. It requires human authorization (exact approval or an explicitly remembered interaction scope); password controls require local human handoff.
 - `approval_mode: "native"` sends confirmed click/submit and Enter/Tab/Escape through public AppKit `NSEvent` handling on the freshly re-resolved `WKWebView` target. An isolated message handler must observe the matching DOM event with `event.isTrusted == true` before the receipt reports trust. Missing/mismatched receipts fail indeterminate; no flag is synthesized. `approval_mode: "mcp"`, blur, and commit remain JavaScript-dispatched and report untrusted. Native public-text fill reports trust only when its matching AppKit insertion receipt is observed.
 - Action results separately expose `confirmation_mode`, `dispatch_mode`, and `trusted_gesture_state`. Native confirmation alone never establishes event trust.
 - Navigation readiness and rendered-content availability are separate. A document can
@@ -108,7 +120,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   explicitly forbid treating the absence as page truth. A rendered textless canvas or
   media document remains `usable`.
 - `browser_read_text` reads only currently rendered virtualized lines. Use bounded scroll plus another read for additional ranges.
-- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim. A gate an agent can step around is not a gate: one JavaScript-evaluation call would do anything the confirmation exists to authorize one action at a time. Browserbase's MCP server also refuses JavaScript, so refusing it is not distinctive on its own; the combination surveyed for and not found elsewhere on 2026-09-09 is no JavaScript tool *and* a per-action gate *and* a real authenticated session.
+- No arbitrary JavaScript, raw CDP escape hatch, coordinate retry, proxy fleet, anti-bot bypass, or headless claim. Exact per-action confirmation is the default; users can explicitly opt into the bounded remembered permissions described below. This changes the default authority boundary only for the site, profile and operations the user selects.
 - Viewport resizing changes desktop CSS layout only. It does not emulate a mobile
   device—the public macOS SDK exposes no `WKWebView` `ContentMode` API—and
   `set_emulated_media` is deliberately absent because it does not help operate a
@@ -117,7 +129,7 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
   Requests are denied and reported in the next observation instead of leaving a page
   failure silent; use human control in a complete browser when the workflow requires
   one of those permissions.
-- No multiple tabs and no new-window handling. One session holds one exclusive host lease, which is what lets an approval refer to an unambiguous page.
+- No multiple agent-visible tabs. A request-bound export view is reserved for managed downloads; ordinary popup refusals and human-controlled sign-in windows remain distinct. One session holds one exclusive host lease, keeping approvals tied to an unambiguous page.
 - No subresource or XHR request inspection. It is possible and it is not offered. `WKWebsiteDataStore.proxyConfigurations` is public from macOS 14 and is Apple DTS's own recommendation for reading a `WKWebView`'s request contents, and a bundled `WKWebExtension` with the `webRequest` permission is public from macOS 15.4. Neither is free: the proxy route needs a trusted root certificate to see inside HTTPS, and the extension route reports no headers and cannot block. What is reported instead is narrow — the download receipt's HTTP status, and the egress proxy's accepted, blocked, pinned and timed-out connection counts. A main-frame navigation result carries no HTTP status today, and the proxy does not name the hosts it allowed or refused.
 - Native AppKit dispatch is not a distinguishing feature and is not claimed as one. `safaridriver` dispatches `NSEvent` through `[window sendEvent:]` exactly as this does, and the WebDriver specification requires every conformant driver to produce trusted events. What differs is the measurement: an action whose trusted DOM receipt is missing or mismatched fails indeterminate here, where Playwright's hit-target interceptor treats an absent event as success.
 - The `WKFormInfo` submission gate is implemented, unit-tested, and does not fire. WebKit did not call `webView(_:willSubmitForm:submissionHandler:)` on either macOS 27.0 build measured here, `26A5416b` and `26A5419a` — not for `submit()`, not for `requestSubmit()`, and not for a native trusted-gesture click. It is therefore not a second live gate and must not be read as one; it will decide if WebKit begins delivering the callback. The live defence against a submit control that posts to another site is the destination line in the confirmation.
@@ -137,9 +149,11 @@ This repository is a Swift rewrite. The retained TypeScript/Playwright files are
 - Some identity providers require a complete browser surface and do not render
   inside an app-embedded `WKWebView` (for example a WebAuthn-only step without the
   browser passkey entitlement). Those return `full_browser_required` with an internal
-  `safari_compatibility` requirement. Any already-restricted authentication origin may
-  also use `compatibility_start` as an explicit manual fallback when its native human
-  handoff is present but unusable. The operation opens the exact private URL in Safari
+  `safari_compatibility` requirement. Any HTTP(S) page may also use `compatibility_start` as an explicit manual fallback
+  for native rendering problems. `browser_session` with `operation: "diagnose"` returns
+  bounded structural loading and error counts, without console messages or request URLs.
+  Script counts describe structure; they do not prove the cause of a stalled load.
+  Use `start` or `focus` to present the native window; `handoff` toggles control. The operation opens the exact private URL in Safari
   only after native confirmation; it never auto-switches merely because a page timed out,
   never replaces the native handoff, provides no Safari observation/control, and cannot
   return a Safari login to this MCP session. Complete the blocked workflow manually in
@@ -286,9 +300,19 @@ Queued Return/Escape input is checked against its original event timestamp. Init
 stray Return/Space press nothing, and Escape
 is ignored until armed. Deliberately selecting a button with Tab and Space or
 clicking still works. In `none` mode Escape stays disabled.
-Approve is never a keyboard default and cannot be made one. No per-project or
-per-session auto-approval exists; the design constraints for one are recorded
-in `docs/research/2026-09-01-goal-delegation-and-browser-addressing-sota.md`.
+Approve is never a keyboard default and cannot be made one. The local **Always
+Allow…** menu lets the person choose navigation only or navigation plus clicks/
+typing, either for this client/session or remembered for the exact site and browser
+profile. Nothing is remembered by Cancel or Approve Once. Permanent permissions
+apply to **all agents using that profile**, not to a self-reported client identity;
+private profiles offer session choices only. An origin includes scheme and port.
+Interactions can send, modify or delete data even when a site does not label their
+effects. Native form submissions, downloads/uploads, dialogs, authentication and
+control transfers retain their separate approval gates. MCP arguments cannot grant
+permissions. Use **Revoke Remembered Site Permissions** in the status menu to clear
+session and permanent grants; it affects future actions and cannot undo one already
+dispatched. Receipts distinguish remembered authorization from exact confirmation
+with `authorization_source`; event trust still needs its independent receipt.
 
 For authenticated sessions that must survive Codex conversation reconnects,
 build the self-contained app instead:
@@ -298,7 +322,17 @@ scripts/package-preview.sh dist
 scripts/verify-package-preview.sh dist
 ```
 
-Unzip `WebKitUI-MCP-0.6.24-preview.zip`, move `WebKitUI MCP.app` to the
+During human control, ⌘F opens local native page search; ⌘G and ⇧⌘G move between
+matches, and Escape closes search. Queries are not exposed through MCP. Search is
+disabled outside human control and while a native save sheet is attached.
+
+Managed downloads require approval followed by a native destination choice:
+select the folder and click **Save**. This is not proof of transfer completion;
+only a verified download receipt confirms delivery. Cancellation, request revocation
+or closing the source window dismisses the destination sheet. Unmanaged manual
+downloads remain unsupported; do not replay a refused managed download blindly.
+
+Unzip `WebKitUI-MCP-0.6.42-preview.zip`, move `WebKitUI MCP.app` to the
 Applications folder, and open it. In the status window:
 
 1. Enable **Launch at Login**. macOS may require approval in System Settings.
@@ -306,6 +340,22 @@ Applications folder, and open it. In the status window:
    app bundle and the owner-only local Unix socket.
 3. Keep the app in Applications after registration so the saved relay path
    remains valid.
+
+The app bundle also carries the pinned SiliconPass vault MCP connector at
+`Contents/Resources/CredentialBroker/siliconpass-vault-mcp`. It remains a thin,
+secretless client of SiliconPass's separately installed and unlocked credential
+broker; WebKitUI does not contain the vault, its keys, or a credential export.
+Configure it only after installing the matching SiliconPass broker manager:
+
+This source pins the locally verified manager 0.2.5 (22), vault MCP 0.3.0
+contract (ten tools), exact connector bytes and machine-code hash. Package checks
+list tools and reject an invalid secret argument; they do not read or modify a vault.
+This is an installed-version pin, not a claim about the latest upstream release.
+
+```bash
+codex mcp add siliconpass-vault -- \
+  "/Applications/WebKitUI MCP.app/Contents/Resources/CredentialBroker/siliconpass-vault-mcp"
+```
 
 The **Activity journal** button opens the local privacy-safe event history.
 Its files live under `~/Library/Application Support/WebkitUIMCP/Activity` with
@@ -327,7 +377,39 @@ the live browser; quitting the app destroys that in-memory page session.
 Restart conversations opened before registration: MCP tool catalogs are fixed
 for a running conversation and are not retroactively replaced.
 
+Confirmation timeouts do not prove that a person saw a panel. `queue_timed_out`
+means no helper was launched; otherwise `confirmation_presented` is unknown
+(`null`) unless the verified helper supplied a bounded native presentation receipt.
+The receipt contains only an opaque request ID, process/window IDs, timing and
+AppKit visibility/focus/screen flags and lifecycle/decision enums, never the requested action or destination.
+Pending metadata is available while the helper runs; samples repeat every five seconds.
+Parsing is bounded to 16 KiB and 32 records, with exact request/PID binding.
+It is diagnostic evidence, not approval or proof of human perception.
+Human-control windows and confirmations show the same short session label;
+`owned_by_this_client` identifies a transport connection, not an individual task.
+
+Tool discovery publishes composition-free typed object schemas for clients that
+cannot import JSON Schema intersections/unions. Conditional operation requirements
+are still enforced strictly at runtime. For example, a native click needs fresh
+`session_id`, `observation_id`, `element_id`, an `idempotency_key`,
+`operation: "click"`, `approval_mode: "native"`, and a postcondition such as
+`{"type":"checked_equals","value":"true"}`. A fill instead supplies
+`operation: "fill"` and `value`, and forbids a custom postcondition: exact value
+and DOM validation are checked automatically. These examples confer no authority
+to act on another task's session or to bypass confirmation.
+
+SiliconPass control requests have a 15-second transport budget; credential delivery
+allows 330 seconds for the provider's native interaction (300 seconds plus a reply
+margin). Ending an invocation invalidates its callback sink: late callbacks cannot
+start a fill. Failures expose only a fixed stage/category and conservative recovery
+guidance, never remote error text or credential bytes. A transport failure does not
+prove that no fill occurred: inspect or hand off to the person, never retry automatically.
+
 ## MCP flow
+
+For long dialogs, targeted list scrolling, exact pending-confirmation focus and
+safe wizard postconditions, see [bounded interaction workflows](docs/scoped-interaction-workflows.md).
+DOM readiness is not business readiness or proof of a remote save.
 
 1. List the secretless persistent profile with `browser_session { operation: "profiles" }`, then `browser_session { operation: "open", profile_id: "default" }`.
 2. `browser_navigate` opens a native exact-destination approval dialog by
@@ -470,3 +552,17 @@ seconds of an action. It is diagnostic evidence, not proof of causality or
 authorization: autonomous or more delayed navigation can be misattributed.
 
 A disappearing or renamed Save/Done control cannot satisfy `enabled_equals=false`: that predicate requires the original semantic target to remain present and disabled. Use `target_absent` with `value="true"` for disappearance, or a heading/text predicate for the resulting page. Absence is proved only by a complete observation; it means the original semantic identity is no longer observed, and does not prove server-side persistence. An indeterminate result after dispatch requires inspection or receipt reconciliation, never automatic replay.
+
+### Human handoff recovery
+
+Safari and WebKitUI have separate sign-in sessions; explain that a new login may be required before transferring a workflow. In the visible WebKitUI window, finish the private step and select **Done — Return Control** (French: **Terminé — Rendre le contrôle**). Use `handoff_focus` if hidden. A spoken completion or a finished navigation does not authorize agent control. Navigation only suggests checking whether the step is complete; it does not prove a remote save. Resume still requires local approval and returns a fresh observation.
+
+After a SiliconPass delivery failure, do not automatically retry: delivery may already have occurred. Offer `handoff_start` immediately so the user can inspect and finish privately. For CAPTCHA, keep resolution with the user and facilitate the site's official accessibility options, including audio, without transcribing or solving the challenge.
+
+The human window includes **CAPTCHA / accessibility** help and **Focus website** to move keyboard focus back to the page without activating or submitting anything. Help explains Tab/Shift-Tab and the provider's official audio/accessibility controls, when offered. Known widget navigation URLs can reveal a possible challenge and open this help automatically; this metadata hint is non-exhaustive and never establishes completion. Help remains available for unrecognized or embedded challenges. No widget text, image, audio, response token or answer is extracted by this assistance.
+
+### Returning control when privacy extraction fails
+
+An explicitly authorized human return remains effective if the fresh observation exceeds the bounded privacy inventory. Resume then returns `resumed=true`, `control_state=agent_controlled`, `status=resumed_observation_unavailable`, `observation_available=false` and no observation. Old targets are invalidated. Use `browser_navigate` with an exact destination and its normal confirmation to leave the document, or request another human handoff. No write is retried and no site save is inferred.
+
+`privacy_budget` exposes only a fixed category (`values`, `characters`, `roots`, or `unknown`), its unchanged limit and a saturated lower-bound counter. It never contains scanned values or raw exception text. Closing with `browser_preserved=true` releases ownership and preserves the live page and control state; reopening a `reused=true` browser does not reset a handoff or bypass privacy filtering. The human window has no URL address bar; use confirmed agent navigation after returning control, or the site's own links during human control.

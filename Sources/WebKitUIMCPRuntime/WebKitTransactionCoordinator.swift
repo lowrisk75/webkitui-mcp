@@ -21,6 +21,7 @@ public final class WebKitTransactionCoordinator {
   /// against the embedded security origin. Kept by idempotency key so later
   /// reconciliation evaluates the same authority boundary without exposing it as data.
   private var actionOrigins: [String: SecurityOrigin] = [:]
+  private var observationScopes: [String: WebKitObservationScope] = [:]
 
   /// How long a settled state is still accepted after the verification deadline. The
   /// deadline decides when to stop waiting; it must not decide whether the write
@@ -52,6 +53,9 @@ public final class WebKitTransactionCoordinator {
       elementID: plan.target.elementID
     )
     guard liveRecipe == plan.target else { throw WebKitRuntimeError.staleObservation }
+    if let scope = try runtime.observationScope(observationID: observation.observationID) {
+      observationScopes[plan.idempotencyKey] = scope
+    }
     let resolvedActionOrigin: SecurityOrigin
     if let actionOrigin {
       resolvedActionOrigin = actionOrigin
@@ -61,7 +65,8 @@ public final class WebKitTransactionCoordinator {
     actionOrigins[plan.idempotencyKey] = resolvedActionOrigin
     let transactionObservation = TransactionObservation(
       state: try transactionState(observation, origin: resolvedActionOrigin),
-      completeness: observation.isComplete ? .complete : .partial)
+      completeness: observation.isStructurallyComplete ? .complete : .partial,
+      textComplete: !observation.semanticTextTruncated)
     _ = try await ledger.prepare(
       plan,
       observation: transactionObservation,
@@ -137,12 +142,13 @@ public final class WebKitTransactionCoordinator {
 
     while true {
       do {
-        let latest = try await runtime.observe(hydrationTimeout: .zero)
+        let latest = try await verificationObservation(idempotencyKey: plan.idempotencyKey)
         let verification = try await ledger.verify(
           idempotencyKey: plan.idempotencyKey,
           observation: TransactionObservation(
             state: try transactionState(latest, origin: resolvedActionOrigin),
-            completeness: latest.isComplete ? .complete : .partial
+            completeness: latest.isStructurallyComplete ? .complete : .partial,
+            textComplete: !latest.semanticTextTruncated
           ),
           monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
         )
@@ -206,7 +212,12 @@ public final class WebKitTransactionCoordinator {
       // History and viewport validation happen before WebKit receives a navigation or
       // layout change. These errors cannot make an action indeterminate.
       .historyEntryUnavailable, .historyDestinationChanged, .formSubmissionReloadRefused,
-      .invalidViewportSize:
+      .invalidViewportSize,
+      // Both are guards checked before the gesture is built: a person holds the
+      // window, or the origin is one only a person may act on. Nothing reached the
+      // page, so the key stays replayable. Recording these as unknown left a key the
+      // agent never dispatched reported as "already used, indeterminate" after a handoff.
+      .humanControlActive, .authenticationOriginRequiresHuman:
       .notDispatched
     case .targetNotActionable, .nativeGestureReceiptUnavailable,
       .webContentProcessTerminated, .malformedInstrumentationResult, .noDocument,
@@ -215,7 +226,7 @@ public final class WebKitTransactionCoordinator {
       .tailnetDestinationRequiresApproval,
       .unsupportedURLScheme, .crossOriginRedirectRequiresHuman,
       .invalidQuietWindow, .invalidCredentialOrigin, .invalidCredentialBinding,
-      .invalidCredentialSecret, .humanControlActive, .authenticationOriginRequiresHuman,
+      .invalidCredentialSecret,
       .noPendingCrossOriginNavigation, .invalidControlTransition,
       .downloadInProgress, .downloadCancelled, .downloadReceiptTimedOut,
       .unsupportedDownload, .downloadHTTPFailure, .downloadFailed,
@@ -255,7 +266,7 @@ public final class WebKitTransactionCoordinator {
     fallbackObservation: TransactionObservation
   ) async throws -> TransactionVerification {
     do {
-      let current = try await runtime.observe(hydrationTimeout: .zero)
+      let current = try await verificationObservation(idempotencyKey: idempotencyKey)
       let currentState = try current.canonicalState()
       let origin = actionOrigins[idempotencyKey] ?? currentState.securityOrigin
       return try await ledger.reconcile(
@@ -264,7 +275,8 @@ public final class WebKitTransactionCoordinator {
           state: try transactionState(
             current,
             origin: origin),
-          completeness: current.isComplete ? .complete : .partial),
+          completeness: current.isStructurallyComplete ? .complete : .partial,
+          textComplete: !current.semanticTextTruncated),
         monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds)
     } catch {
       return try await ledger.reconcile(
@@ -278,7 +290,7 @@ public final class WebKitTransactionCoordinator {
   /// Re-observes an indeterminate write and may prove its postcondition later.
   /// It never dispatches or retries the action.
   public func reconcile(idempotencyKey: String) async throws -> TransactionVerification {
-    let observation = try await runtime.observe(hydrationTimeout: .zero)
+    let observation = try await verificationObservation(idempotencyKey: idempotencyKey)
     let origin: SecurityOrigin
     if let actionOrigin = actionOrigins[idempotencyKey] {
       origin = actionOrigin
@@ -289,9 +301,19 @@ public final class WebKitTransactionCoordinator {
       idempotencyKey: idempotencyKey,
       observation: TransactionObservation(
         state: try transactionState(observation, origin: origin),
-        completeness: observation.isComplete ? .complete : .partial),
+        completeness: observation.isStructurallyComplete ? .complete : .partial,
+        textComplete: !observation.semanticTextTruncated),
       monotonicNowNanoseconds: DispatchTime.now().uptimeNanoseconds
     )
+  }
+
+  private func verificationObservation(idempotencyKey: String) async throws -> WebKitPageObservation
+  {
+    let scope = observationScopes[idempotencyKey]
+    return try await runtime.observe(
+      maximumElements: scope?.maximumElements ?? 200,
+      maximumFieldCharacters: scope?.maximumFieldCharacters ?? 4_096,
+      hydrationTimeout: .zero, scope: scope)
   }
 
   private func transactionState(

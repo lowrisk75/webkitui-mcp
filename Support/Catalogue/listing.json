@@ -1,0 +1,13 @@
+{
+  "displayName": "WebKitUI MCP — Native WebKit for Mac",
+  "shortDescription": "Connect AI agents to native WebKit on Mac, with persistent sign-ins and human approval.",
+  "glamaDescription": "Native WebKit browser automation for MCP agents on Apple silicon Macs (macOS 15+), with persistent sign-ins, human approval and local handoff. Runs locally through a companion app; Developer Preview under BUSL-1.1, with a separate agreement required for commercial production use.",
+  "repositoryUrl": "https://github.com/lowrisk75/webkitui-mcp",
+  "releaseUrl": "https://github.com/lowrisk75/webkitui-mcp/releases/tag/v0.6.24",
+  "categories": ["Browser Automation", "Developer Tools"],
+  "platforms": ["macOS 15+", "Apple silicon"],
+  "transport": "Local stdio relay to the running companion app",
+  "stage": "Developer Preview",
+  "license": "BUSL-1.1; commercial production use requires a separate agreement",
+  "description": "Give your AI agent a native WebKit browser on your Mac. WebKitUI MCP supports website navigation, rendered-page inspection, bounded interaction with controls and authenticated downloads. Persistent WebKit profiles retain sign-ins, while native confirmations and human handoff keep you involved in browser actions and private steps. Safari sign-ins are separate and are not imported. Requires an Apple silicon Mac with macOS 15 or later and the running WebKitUI MCP companion app. Developer Preview; source available under Business Source License 1.1. Commercial production use requires a separate agreement."
+}

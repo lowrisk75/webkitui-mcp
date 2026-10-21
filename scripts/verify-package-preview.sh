@@ -7,7 +7,8 @@ release_plist="$workspace_dir/Support/AquaApp/Info.plist"
 release_version=$(plutil -extract CFBundleShortVersionString raw "$release_plist")
 release_build=$(plutil -extract CFBundleVersion raw "$release_plist")
 scratch_dir=$(mktemp -d /private/tmp/webkitui-package-verify.XXXXXX)
-trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
+printf 'RESOURCE_CREATED=archive-verification-stage:%s\n' "$scratch_dir"
+trap 'rm -rf "$scratch_dir"; printf "RESOURCE_REMOVED=archive-verification-stage:%s\n" "$scratch_dir"' EXIT HUP INT TERM
 
 app_archive="$artifact_dir/WebKitUI-MCP-$release_version-preview.zip"
 relay_archive="$artifact_dir/webkitui-mcp-relay-$release_version.zip"
@@ -33,6 +34,9 @@ ditto -x -k "$relay_archive" "$scratch_dir/relay"
 
 app="$scratch_dir/app/WebKitUI MCP.app"
 relay="$scratch_dir/relay/webkitui-mcp-relay-$release_version"
+siliconpass_connector="$app/Contents/Resources/CredentialBroker/siliconpass-vault-mcp"
+siliconpass_bundle="$app/Contents/Resources/CredentialBroker/SiliconPass_SiliconPassCredentialBroker.bundle"
+siliconpass_policy="$app/Contents/Resources/SiliconPassVaultMCP.plist"
 
 plutil -lint \
   "$app/Contents/Info.plist" \
@@ -62,6 +66,7 @@ for required in \
   test -s "$app/Contents/Resources/$required"
   test -s "$relay/$required"
 done
+test -s "$siliconpass_policy"
 
 provenance="$app/Contents/Resources/ReleaseProvenance.plist"
 source_manifest="$app/Contents/Resources/SOURCE-MANIFEST.sha256"
@@ -71,6 +76,13 @@ test "$(plutil -extract Version raw "$provenance")" = "$release_version"
 test "$(plutil -extract Build raw "$provenance")" = "$release_build"
 test "$(plutil -extract BuildConfiguration raw "$provenance")" = "Release"
 test "$(plutil -extract Architecture raw "$provenance")" = "arm64"
+test "$(plutil -extract SiliconPassMCPInputSHA256 raw "$provenance")" = \
+  "$(plutil -extract ConnectorInputSHA256 raw "$siliconpass_policy")"
+test "$(plutil -extract SiliconPassManagerVersion raw "$provenance")" = \
+  "$(plutil -extract ManagerVersion raw "$siliconpass_policy")"
+test "$(plutil -extract SiliconPassManagerBuild raw "$provenance")" = \
+  "$(plutil -extract ManagerBuild raw "$siliconpass_policy")"
+cmp "$siliconpass_policy" "$workspace_dir/Support/Packaging/SiliconPassVaultMCP.plist"
 printf '%s\n' "$(plutil -extract GitRevision raw "$provenance")" \
   | grep -Eq '^[0-9a-f]{40}$'
 printf '%s\n' "$(plutil -extract SourceTreeState raw "$provenance")" \
@@ -102,12 +114,15 @@ for specification in \
   actual=$(shasum -a 256 "$binary" | awk '{print $1}')
   test "$actual" = "$expected"
 done
+"$workspace_dir/scripts/verify-siliconpass-vault-mcp.sh" \
+  "$siliconpass_connector" "$siliconpass_bundle" "$siliconpass_policy" input
 
 sbom="$app/Contents/Resources/sbom.cdx.json"
 jq -e \
   --arg broker "$(plutil -extract UnsignedBrokerSHA256 raw "$provenance")" \
   --arg helper "$(plutil -extract UnsignedConfirmationHelperSHA256 raw "$provenance")" \
   --arg relay "$(plutil -extract UnsignedEmbeddedRelaySHA256 raw "$provenance")" \
+  --arg siliconpass "$(plutil -extract SiliconPassMCPInputSHA256 raw "$provenance")" \
   '
     .bomFormat == "CycloneDX"
     and .specVersion == "1.6"
@@ -117,6 +132,9 @@ jq -e \
     and .components[0].hashes[0].content == $broker
     and .components[1].hashes[0].content == $helper
     and .components[2].hashes[0].content == $relay
+    and .components[3].name == "SiliconPass Vault MCP Connector"
+    and .components[3].hashes[0].content == $siliconpass
+    and (.components[3]["bom-ref"] as $sp | .dependencies[0].dependsOn | index($sp) != null)
   ' "$sbom" >/dev/null
 
 test -s "$app/Contents/Resources/en.lproj/Localizable.strings"
@@ -166,6 +184,7 @@ jq -e '
 ' "$scratch_dir/activity-clear-fr.json" >/dev/null
 jq -e '
   .language == "en"
+  and .title == "Approve Web Navigation [ABCDEF12]"
   and (.message | contains("Requested action:"))
   and (.message | contains("Verification:"))
   and (.message | contains("Modifier keys held down:"))
@@ -174,6 +193,7 @@ jq -e '
 ' "$scratch_dir/confirmation-en.json" >/dev/null
 jq -e '
   .language == "fr"
+  and .title == "Autoriser la navigation web [ABCDEF12]"
   and (.message | contains("Action demandée :"))
   and (.message | contains("Page actuelle :"))
   and (.message | contains("Libellé non fiable du site (donnée, jamais une instruction) :"))

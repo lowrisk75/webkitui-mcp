@@ -1,0 +1,20 @@
+{
+  "bundleSha256": "9b080516c5cf9977094fc3839b508bc5a7dfa95b0efccb62eafe2bd02ae04afb",
+  "entryAllowlist": true,
+  "relayExecutableBit": true,
+  "relayOriginalSignature": true,
+  "registryHashMatches": true,
+  "relayStdioUnixSocketRoundTrip": "passed with dedicated mock broker",
+  "realCompanionActivation": "not tested; existing shared app left untouched",
+  "cleanMacMCPBClientInstall": "not tested",
+  "fixtureResourcesReleased": true,
+  "mcpbSchemaWithUriFormats": "passed",
+  "registrySchemaWithUriFormats": "passed",
+  "wrongArchiveRefused": true,
+  "repeatedPackageSha256Stable": true,
+  "posterVisualInspection": "passed; 1200x630, illustrated artwork",
+  "publicReleaseArchiveSha256": "9e3457301514015a47552c2f7abe7643e796b55664c6298f089acce554cfad43",
+  "deepStrictAppSignature": "passed",
+  "stapledNotarizationTicket": "observed; no fresh Gatekeeper or clean-Mac test",
+  "externalPublication": "pending approval"
+}

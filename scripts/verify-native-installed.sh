@@ -12,6 +12,9 @@ for candidate in "/Applications/WebKitUI MCP.app" "$HOME/Applications/WebKitUI M
 done
 [[ -n "$installed_app" ]] || { print -u2 "WebKitUI MCP.app is not installed"; exit 1; }
 installed_app_confirm="$installed_app/Contents/MacOS/webkitui-mcp-confirm"
+installed_siliconpass_connector="$installed_app/Contents/Resources/CredentialBroker/siliconpass-vault-mcp"
+installed_siliconpass_bundle="$installed_app/Contents/Resources/CredentialBroker/SiliconPass_SiliconPassCredentialBroker.bundle"
+installed_siliconpass_policy="$installed_app/Contents/Resources/SiliconPassVaultMCP.plist"
 installed_cli="$HOME/.local/bin/webkitui-mcp"
 installed_cli_confirm="$HOME/.local/bin/webkitui-mcp-confirm"
 installed_relay="$HOME/.local/bin/webkitui-mcp-relay"
@@ -113,6 +116,11 @@ done
 
 test -x "$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker"
 test -x "$installed_app_confirm"
+"$project_root/scripts/verify-siliconpass-vault-mcp.sh" \
+  "$installed_siliconpass_connector" "$installed_siliconpass_bundle" \
+  "$installed_siliconpass_policy" embedded
+cmp "$installed_siliconpass_policy" \
+  "$project_root/Support/Packaging/SiliconPassVaultMCP.plist"
 if (( cli_installed )); then
   test -x "$installed_cli"
   test -x "$installed_cli_confirm"
@@ -129,6 +137,7 @@ shasum -a 256 \
   "$installed_app/Contents/MacOS/webkitui-mcp-aqua-broker" \
   "$installed_app_confirm" \
   "$installed_app/Contents/MacOS/webkitui-mcp-relay"
+shasum -a 256 "$installed_siliconpass_connector"
 if (( cli_installed )); then
   shasum -a 256 "$installed_cli" "$installed_cli_confirm" "$installed_relay"
 fi
