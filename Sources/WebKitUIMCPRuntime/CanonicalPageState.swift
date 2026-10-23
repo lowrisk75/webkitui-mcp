@@ -67,6 +67,25 @@ extension WebKitPageObservation {
         let dialogName = element.accessibleName ?? element.label ?? element.text
       {
         entries.append(.init(key: elementKey(element, "@dialog_name"), value: dialogName))
+        let frameID = element.verificationFrameID ?? "main"
+        entries.append(
+          .init(
+            key: .init(
+              frameID: frameID, elementID: element.elementID, field: "@context_dialog_complete"),
+            value: try ProvenancedText(
+              text: String(element.contextualDialogTextComplete == true), source: toolSource)))
+        entries.append(
+          .init(
+            key: .init(
+              frameID: frameID, elementID: element.elementID, field: "@context_dialog_name"),
+            value: dialogName))
+        if let content = element.text {
+          entries.append(
+            .init(
+              key: .init(
+                frameID: frameID, elementID: element.elementID, field: "@context_dialog_text"),
+              value: content))
+        }
       }
       if role == "dialog" || role == "alertdialog" || role == "region",
         let panelName = element.accessibleName ?? element.label ?? element.text

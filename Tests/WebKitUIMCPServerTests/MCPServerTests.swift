@@ -554,9 +554,11 @@ struct MCPServerTests {
     let fields = try object(postcondition["properties"])
     #expect(try object(fields["value"])["type"] == .string("string"))
     let types = try array(try object(fields["type"])["enum"])
-    #expect(types.count == 21)
+    #expect(types.count == 22)
     #expect(postcondition["oneOf"] == nil)
-    for type in ["url_prefix", "validation_state", "character_count_equals", "panel_open"] {
+    for type in [
+      "url_prefix", "validation_state", "character_count_equals", "panel_open", "dialog_contains",
+    ] {
       #expect(types.contains(.string(type)))
     }
     #expect(postcondition["required"] == .array([.string("type"), .string("value")]))
@@ -5042,6 +5044,79 @@ struct MCPServerTests {
       try await runtime.webView.evaluateJavaScript(
         "document.querySelector('button').dataset.dispatchCount") as? String
     #expect(dispatchCount == "1")
+  }
+
+  @Test(
+    "Contextual dialog verification requires the requested item inside that dialog",
+    arguments: ["Device ID", "Audio"])
+  func contextualDialogAppears(openedItem: String) async throws {
+    let registry = try WebKitSessionRegistry()
+    let handle = try registry.open()
+    let runtime = try registry.runtime(for: handle)
+    runtime.webView.loadHTMLString(
+      """
+      <p>Device ID outside a dialog is not evidence.</p>
+      <div role='region' aria-label='Long footer'>\(String(repeating: "footer ", count: 1000))</div>
+      <iframe srcdoc="<div role='dialog' aria-label='Configure'>Device ID</div>"></iframe>
+      <div role='dialog' aria-label='Configure'>Audio</div>
+      <button aria-label='Configure device' onclick="
+        document.body.dataset.clicks=String(Number(document.body.dataset.clicks||0)+1);
+        const panel=document.createElement('div'); panel.setAttribute('role','dialog');
+        panel.setAttribute('aria-label','Configure'); panel.textContent='\(openedItem)';
+        document.body.appendChild(panel);">Configure device</button>
+      """, baseURL: URL(string: "https://example.test/items"))
+    while runtime.webView.isLoading { try await Task.sleep(for: .milliseconds(10)) }
+    let server = WebKitMCPServer(registry: registry)
+    let observed = try await toolCall(
+      server, id: 1, name: "browser_observe",
+      arguments: [
+        "session_id": .string(handle.rawValue.uuidString), "maximum_field_characters": .int(4096),
+      ])
+    let fresh = try object(try object(observed["result"])["structuredContent"])
+    let button = try #require(
+      try array(fresh["elements"]).compactMap(\.objectValue).first {
+        (try? provenancedText($0["accessibleName"])) == "Configure device"
+      })
+    let arguments: [String: JSONValue] = [
+      "session_id": .string(handle.rawValue.uuidString),
+      "observation_id": .string(try string(fresh["observationID"])),
+      "element_id": .string(try string(button["elementID"])), "operation": .string("click"),
+      "approval_mode": .string("mcp"), "idempotency_key": .string("configure-right-item"),
+      "postcondition": .object([
+        "type": .string("dialog_contains"), "value": .string("Configure"),
+        "item_text": .string("Device ID"),
+      ]),
+    ]
+    let prepared = try await toolCall(server, id: 2, name: "browser_act", arguments: arguments)
+    let required = try object(prepared["result"])
+    let completed = try await roundTripToolCall(
+      server, id: 3, name: "browser_act", arguments: arguments,
+      requestState: try string(required["requestState"]), action: "accept", confirm: true)
+    let result = try object(try object(completed["result"])["structuredContent"])
+    #expect((try object(result["verification"])["verified"] != nil) == (openedItem == "Device ID"))
+    let recovery = try object(result["recovery"])
+    #expect(recovery["automatic_replay_allowed"] == .bool(false))
+    if openedItem == "Device ID" {
+      #expect(recovery["next_read"] == .null)
+    } else {
+      let next = try object(recovery["next_read"])
+      #expect(next["tool"] == .string("browser_transaction"))
+      #expect(try object(next["arguments"])["idempotency_key"] == .string("configure-right-item"))
+    }
+    #expect(recovery["verification_proves_remote_save"] == .bool(false))
+    if openedItem != "Device ID" {
+      let reconciled = try await toolCall(
+        server, id: 4, name: "browser_transaction",
+        arguments: [
+          "session_id": .string(handle.rawValue.uuidString), "operation": .string("reconcile"),
+          "idempotency_key": .string("configure-right-item"),
+        ])
+      let final = try object(try object(reconciled["result"])["structuredContent"])
+      #expect(final["action_replayed"] == .bool(false))
+    }
+    #expect(
+      try await runtime.webView.evaluateJavaScript("document.body.dataset.clicks") as? String == "1"
+    )
   }
 
   @Test("A modern client that names no approval mode still gets the native dialog")

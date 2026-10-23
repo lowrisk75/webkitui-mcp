@@ -41,6 +41,8 @@ public enum ObservationTextField: String, Codable, CaseIterable, Sendable {
   case text = "@text"
   case value = "@value"
   case dialogName = "@dialog_name"
+  case contextualDialogName = "@context_dialog_name"
+  case contextualDialogText = "@context_dialog_text"
   case panelName = "@panel_name"
   case heading = "@heading"
 }
@@ -66,6 +68,11 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
   /// Matches an exact UTF-8 substring without storing that caller-supplied text.
   /// A rolling hash selects candidates in linear time; SHA-256 confirms the match.
   case anyEntryTextContainsDigest([ObservationTextField], String, Int, UInt64)
+  /// Name and item text must belong to the same unique rendered container in
+  /// the action's frame. Two independent global predicates cannot prove this.
+  case namedContainerTextContains(
+    frameID: String, nameField: ObservationTextField, nameDigest: String,
+    textDigest: String, length: Int, rolling: UInt64)
 
   public static func digest(of value: ProvenancedText) throws -> String {
     SHA256.hash(data: try value.canonicalJSONData())
@@ -98,6 +105,42 @@ public enum ObservationPredicate: Codable, Equatable, Sendable {
     )
 
     switch self {
+    case .namedContainerTextContains(
+      let frameID, let nameField, let nameDigest, let textDigest, let length, let rolling):
+      guard observation.completeness == .complete else { return .unknown }
+      if nameField != .contextualDialogName && !observation.textComplete { return .unknown }
+      var matchingContainers = 0
+      for entry in observation.state.entries
+      where entry.key.frameID == frameID && entry.key.field == nameField.rawValue {
+        if nameField == .contextualDialogName {
+          let completeKey = ObservationFieldKey(
+            frameID: frameID, elementID: entry.key.elementID, field: "@context_dialog_complete")
+          guard values[completeKey]?.segments.map(\.text).joined() == "true" else {
+            return .unknown
+          }
+        }
+        guard Self.textDigest(of: entry.value.segments.map(\.text).joined()) == nameDigest else {
+          continue
+        }
+        let key = ObservationFieldKey(
+          frameID: frameID, elementID: entry.key.elementID,
+          field: nameField == .contextualDialogName
+            ? ObservationTextField.contextualDialogText.rawValue
+            : ObservationTextField.text.rawValue)
+        guard let content = values[key] else { continue }
+        let scopedState = try CanonicalObservationState(
+          generation: observation.state.generation, documentID: observation.state.documentID,
+          securityOrigin: observation.state.securityOrigin,
+          entries: [.init(key: key, value: content)])
+        let contentField: ObservationTextField =
+          nameField == .contextualDialogName ? .contextualDialogText : .text
+        let result = try Self.anyEntryTextContainsDigest(
+          [contentField], textDigest, length, rolling
+        )
+        .evaluate(in: TransactionObservation(state: scopedState, completeness: .complete))
+        if result == .satisfied { matchingContainers += 1 }
+      }
+      return matchingContainers > 1 ? .unknown : matchingContainers == 1 ? .satisfied : .unsatisfied
     case .entryPresent(let key):
       if values[key] != nil { return .satisfied }
       return observation.completeness == .complete ? .unsatisfied : .unknown
@@ -204,6 +247,16 @@ public struct TransactionalWritePlan: Codable, Sendable {
       throw TransactionError.invalidVerificationTimeout
     }
     for predicate in preconditions + postconditions {
+      if case .namedContainerTextContains(
+        let frameID, let field, let nameDigest, let textDigest, let length, _) = predicate
+      {
+        guard !frameID.isEmpty, [.dialogName, .panelName, .contextualDialogName].contains(field),
+          (1...2_048).contains(length),
+          [nameDigest, textDigest].allSatisfy({ digest in
+            digest.count == 64 && digest.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+          })
+        else { throw TransactionError.invalidExpectedDigest }
+      }
       let digest: String?
       switch predicate {
       case .entryValueDigest(_, let value), .entryTextDigest(_, let value),
@@ -250,6 +303,23 @@ public struct TransactionalWritePlan: Codable, Sendable {
     return SHA256.hash(data: try encoder.encode(self))
       .map { String(format: "%02x", $0) }
       .joined()
+  }
+
+  /// The plan with its observation-scoped handles blanked: what the caller meant to do,
+  /// independent of which observation they were looking at. Two plans with the same
+  /// intent digest ask for the same action on the same semantic target with the same
+  /// postconditions; only the element ID, observation ID and generation differ, which a
+  /// fresh observation changes every time.
+  public func intentDigest() throws -> String {
+    let target = try LocatorRecipe(
+      elementID: "-", observationID: "-", observationGeneration: 0,
+      clauses: self.target.clauses, opaqueSemanticIdentity: self.target.opaqueSemanticIdentity)
+    let intent = try TransactionalWritePlan(
+      idempotencyKey: idempotencyKey, target: target, requiredCapability: requiredCapability,
+      inputProvenance: inputProvenance, expectedOrigin: expectedOrigin,
+      preconditions: preconditions, postconditions: postconditions,
+      verificationTimeoutNanoseconds: verificationTimeoutNanoseconds)
+    return try intent.digest()
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -349,6 +419,7 @@ public enum TransactionError: Error, Equatable, Sendable {
   case capabilityDenied(CapabilityDenial)
   case preconditionUnsatisfied
   case preconditionUnknown
+  case postconditionBaselineUnknown
   case postconditionAlreadySatisfied
   case targetResolutionMismatch
   case targetNotUnique(Int)
@@ -434,10 +505,20 @@ public actor TransactionalWriteLedger {
   ) async throws -> TransactionPreparation {
     let planDigest = try plan.digest()
     if let existing = records[plan.idempotencyKey] {
-      guard existing.planDigest == planDigest else {
+      if existing.planDigest == planDigest {
+        return .alreadyExists(receipt(for: existing))
+      }
+      // A key whose gesture never reached the page — refused at a guard while a person
+      // held the window, say — is still unspent. After a handoff the caller must observe
+      // again, and a fresh observation changes every element ID and observation ID in
+      // the plan. The same intent on the same semantic target under the same key is the
+      // same request, so the record is replaced; at-most-once holds because nothing was
+      // dispatched. Anything dispatched, or a different intent, stays a conflict.
+      let neverDispatched =
+        existing.phase == .prepared && existing.dispatchedAtNanoseconds == nil
+      guard neverDispatched, try existing.plan.intentDigest() == plan.intentDigest() else {
         throw TransactionError.idempotencyKeyConflict
       }
-      return .alreadyExists(receipt(for: existing))
     }
 
     guard observation.state.securityOrigin == plan.expectedOrigin else {
@@ -457,6 +538,11 @@ public actor TransactionalWriteLedger {
     }
     try requireSatisfied(plan.preconditions, in: observation)
     let initialPostconditions = try evaluate(plan.postconditions, in: observation)
+    for evidence in initialPostconditions {
+      if case .namedContainerTextContains = evidence.predicate, evidence.result == .unknown {
+        throw TransactionError.postconditionBaselineUnknown
+      }
+    }
     if initialPostconditions.allSatisfy({ $0.result == .satisfied }) {
       throw TransactionError.postconditionAlreadySatisfied
     }

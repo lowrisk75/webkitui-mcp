@@ -74,6 +74,22 @@ candidate or pointer cursor is not proof its handler will perform the desired ac
   support. Redaction is rechecked after export, not inferred from the filename.
 - Production telemetry is absent by default. Any future funnel instrumentation
   requires consent, a documented event schema and a separate privacy review.
+- **Site report** (Status window, "Report this site…", notice version 2026-10-22):
+  a voluntary report in the LorisReports envelope shape. It carries the page's
+  scheme and host, this app's version and build, macOS version, locale, the
+  reason chosen from a fixed list, the person's own description, the load
+  counters `browser_session diagnose` reports, and, when a visible label is
+  given, the structure around that label: allowlisted tag names, roles and attribute *names*,
+  fixed cursor/display categories and shadow-root membership. CSS class values and
+  arbitrary custom tags/attribute names are omitted; hidden and sensitive matches
+  are excluded. The global privacy inventory must complete, and artifacts are
+  limited to 65,536 bytes each.
+  It never carries page text, field values, attribute values, cookies, paths,
+  query strings, titles, screenshots, receipts or any identifier of the
+  session. The whole report is shown before a Mail draft to
+  support@lorislab.fr is opened; the app has no sending path of its own. The
+  files stay under `~/Library/Application Support/WebkitUIMCP/SiteReports/`
+  with owner-only permissions until the person deletes them.
 
 ## Open product work
 

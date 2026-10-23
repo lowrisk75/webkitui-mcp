@@ -20,6 +20,8 @@ signed installation using the published fixture and method.
 | Name filter | none | at most 128 characters | Server argument validation |
 | Default observation MCP response | — | at most 1 MiB for the 300-control long-name fixture | Automated wire-size regression test |
 | Navigation and observation load | 30 s | fixed runtime default | Runtime deadline |
+| Global privacy inventory | full scan before output | 512 roots, 20,000 element nodes; 256 sensitive values, 65,536 sensitive characters | Runtime fail-closed fixtures |
+| Site report artifact | structural metadata only | 65,536 bytes per artifact | Bundle validation |
 | Local ranker | 10 s | positive explicit deadline | Deterministic fallback after deadline |
 
 The one-mebibyte observation budget is a regression fixture, not a universal

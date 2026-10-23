@@ -242,6 +242,62 @@ struct TransactionalWriteTests {
     }
   }
 
+  /// After a handoff the agent must observe again, which changes every element ID and
+  /// observation ID in the plan. A key whose click was refused before dispatch has to
+  /// survive that, or "not dispatched, retry safely" is a promise the ledger breaks.
+  @Test("An undispatched key accepts the same intent from a fresh observation")
+  func undispatchedKeySurvivesReobservation() async throws {
+    let authority = CapabilityAuthority()
+    let handle = await grant(authority: authority)
+    let ledger = TransactionalWriteLedger()
+    let observation = TransactionObservation(
+      state: try state(generation: 1, entries: []), completeness: .complete)
+    let first = try makePlan()
+    _ = try await prepare(
+      first, ledger: ledger, observation: observation, authority: authority, handle: handle)
+    _ = try await ledger.beginDispatch(
+      idempotencyKey: first.idempotencyKey, observation: observation,
+      resolution: resolution(count: 1), capabilityAuthority: authority,
+      capabilityHandle: handle, wallClockNow: wallClock, monotonicNowNanoseconds: 20)
+    _ = try await ledger.recordDispatchOutcome(
+      idempotencyKey: first.idempotencyKey, outcome: .notDispatched,
+      monotonicNowNanoseconds: 30)
+
+    let refreshed = try makePlan(
+      target: try recipe(elementID: "e9", observationID: "obs-2", generation: 2))
+    #expect(try refreshed.digest() != first.digest())
+    #expect(try refreshed.intentDigest() == first.intentDigest())
+    let again = try await prepare(
+      refreshed, ledger: ledger, observation: observation, authority: authority, handle: handle)
+    guard case .prepared(let receipt) = again else {
+      Issue.record("Expected a fresh preparation, got \(again)")
+      return
+    }
+    #expect(receipt.planDigest == (try refreshed.digest()))
+    #expect(receipt.phase == .prepared)
+
+    // A different intent under the same key is still a conflict, even undispatched.
+    await #expect(throws: TransactionError.idempotencyKeyConflict) {
+      try await self.prepare(
+        try makePlan(
+          target: try recipe(elementID: "e9", observationID: "obs-3", generation: 3),
+          postconditions: [.entryAbsent(key)]),
+        ledger: ledger, observation: observation, authority: authority, handle: handle)
+    }
+    // And once dispatched, a fresh observation of the same intent is a conflict too.
+    _ = try await ledger.beginDispatch(
+      idempotencyKey: first.idempotencyKey, observation: observation,
+      resolution: resolution(count: 1, elementID: "e9"), capabilityAuthority: authority,
+      capabilityHandle: handle, wallClockNow: wallClock, monotonicNowNanoseconds: 40)
+    _ = try await ledger.recordDispatchOutcome(
+      idempotencyKey: first.idempotencyKey, outcome: .dispatched, monotonicNowNanoseconds: 50)
+    await #expect(throws: TransactionError.idempotencyKeyConflict) {
+      try await self.prepare(
+        try makePlan(target: try recipe(elementID: "e10", observationID: "obs-4", generation: 4)),
+        ledger: ledger, observation: observation, authority: authority, handle: handle)
+    }
+  }
+
   @Test("Dispatch rechecks capability, preconditions and unique resolution")
   func dispatchRevalidates() async throws {
     let authority = CapabilityAuthority()
@@ -798,11 +854,72 @@ struct TransactionalWriteTests {
     )
   }
 
-  private func recipe() throws -> LocatorRecipe {
+  @Test("Contextual dialogs bind name and item text to one unique container and frame")
+  func contextualDialogIdentity() async throws {
+    let params = ObservationPredicate.containsParameters(of: "Device ID")
+    let predicate = ObservationPredicate.namedContainerTextContains(
+      frameID: "main", nameField: .dialogName,
+      nameDigest: ObservationPredicate.textDigest(of: "Configure"),
+      textDigest: params.digest, length: params.length, rolling: params.rolling)
+    func observation(_ contents: [(String, String, String)], complete: Bool = true) throws
+      -> TransactionObservation
+    {
+      var entries: [ObservationStateEntry] = []
+      for (frame, id, content) in contents {
+        entries.append(
+          .init(
+            key: .init(frameID: frame, elementID: id, field: "@dialog_name"),
+            value: try text("Configure")))
+        entries.append(
+          .init(
+            key: .init(frameID: frame, elementID: id, field: "@text"),
+            value: try text(content)))
+      }
+      return TransactionObservation(
+        state: try state(generation: 1, entries: entries.map { ($0.key, $0.value) }),
+        completeness: .complete,
+        textComplete: complete)
+    }
+    #expect(try predicate.evaluate(in: observation([])) == .unsatisfied)
+    #expect(
+      try predicate.evaluate(in: observation([("main", "a", "Configure Audio")])) == .unsatisfied)
+    #expect(
+      try predicate.evaluate(in: observation([("embedded", "a", "Device ID")])) == .unsatisfied)
+    let matching = try observation([("main", "a", "Configure Device ID"), ("main", "b", "Audio")])
+    #expect(try predicate.evaluate(in: matching) == .satisfied)
+    #expect(
+      try predicate.evaluate(in: observation([("main", "a", "Device ID")], complete: false))
+        == .unknown)
+    let ambiguous = try observation([("main", "a", "Device ID"), ("main", "b", "Device ID")])
+    #expect(try predicate.evaluate(in: ambiguous) == .unknown)
+    let authority = CapabilityAuthority()
+    let handle = await grant(authority: authority)
+    let plan = try makePlan(postconditions: [predicate])
+    await #expect(throws: TransactionError.postconditionAlreadySatisfied) {
+      try await prepare(
+        plan, ledger: TransactionalWriteLedger(), observation: matching,
+        authority: authority, handle: handle)
+    }
+    await #expect(throws: TransactionError.postconditionBaselineUnknown) {
+      try await prepare(
+        plan, ledger: TransactionalWriteLedger(), observation: ambiguous,
+        authority: authority, handle: handle)
+    }
+    // Predicate plans survive receipt serialization without storing the item text.
+    let encoded = try JSONEncoder().encode(plan)
+    #expect(!String(decoding: encoded, as: UTF8.self).contains("Device ID"))
+    #expect(
+      try JSONDecoder().decode(TransactionalWritePlan.self, from: encoded).digest() == plan.digest()
+    )
+  }
+
+  private func recipe(
+    elementID: String = "submit", observationID: String = "obs-1", generation: UInt64 = 1
+  ) throws -> LocatorRecipe {
     try LocatorRecipe(
-      elementID: "submit",
-      observationID: "obs-1",
-      observationGeneration: 1,
+      elementID: elementID,
+      observationID: observationID,
+      observationGeneration: generation,
       clauses: [
         LocatorClause(fact: .role, expectedValue: "button", strength: .required),
         LocatorClause(
@@ -816,6 +933,7 @@ struct TransactionalWriteTests {
 
   private func makePlan(
     idempotencyKey: String = "write-1",
+    target: LocatorRecipe? = nil,
     preconditions: [ObservationPredicate] = [],
     postconditions: [ObservationPredicate]? = nil,
     timeout: UInt64 = 100
@@ -823,7 +941,7 @@ struct TransactionalWriteTests {
     let saved = try text("saved")
     return try TransactionalWritePlan(
       idempotencyKey: idempotencyKey,
-      target: recipe(),
+      target: target ?? recipe(),
       requiredCapability: .submitForm,
       inputProvenance: [.userIntent],
       expectedOrigin: origin,
@@ -846,9 +964,9 @@ struct TransactionalWriteTests {
     )
   }
 
-  private func resolution(count: Int) -> LocatorResolution {
+  private func resolution(count: Int, elementID: String = "submit") -> LocatorResolution {
     LocatorResolution(
-      recipeElementID: "submit",
+      recipeElementID: elementID,
       evaluations: (0..<count).map {
         LocatorCandidateEvaluation(
           candidateID: "candidate-\($0)",

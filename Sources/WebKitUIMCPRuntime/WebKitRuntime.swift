@@ -270,6 +270,11 @@ public struct WebKitObservedElement: Codable, Equatable, Sendable {
   /// budget. The origin contains no path, query, fragment, or credentials.
   public let frameOrigin: String?
   public let frameIsMain: Bool?
+  /// Opaque document-scoped frame identity for contextual verification; nil is
+  /// the main document. Never an origin, URL or native frame capability.
+  public var verificationFrameID: String? = nil
+  /// Per-dialog evidence completeness, independent of unrelated truncated page text.
+  public var contextualDialogTextComplete: Bool? = nil
   public let tag: ProvenancedText
   public let role: ProvenancedText?
   public let accessibleName: ProvenancedText?
@@ -1880,10 +1885,24 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
           frameID: "embedded",
           securityOrigin: embeddedOrigin)
         : pageSource
+      let verificationFrameID: String?
+      if let capabilityID = element.frameCapabilityID ?? group.frameCapabilityID {
+        let isMain = registeredFrameCapabilities.contains {
+          $0.capabilityID == capabilityID && $0.isMainFrame
+        }
+        verificationFrameID =
+          isMain
+          ? nil
+          : frameSemanticIdentity(capabilityID: capabilityID, privateIdentity: "verification-frame")
+      } else {
+        verificationFrameID = element.ownerDocumentIsRoot == false ? "unregistered" : nil
+      }
       return try WebKitObservedElement(
         elementID: elementID,
         frameOrigin: embedded ? reportedFrameOrigin : nil,
         frameIsMain: embedded ? false : nil,
+        verificationFrameID: verificationFrameID,
+        contextualDialogTextComplete: element.contextualDialogTextComplete,
         tag: ProvenancedText(text: element.tag, source: contentSource),
         role: try element.role.map { try ProvenancedText(text: $0, source: contentSource) },
         accessibleName: try element.accessibleName.map {
@@ -2138,7 +2157,9 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
   {
     guard isPrivacyInventoryLimit(error) else { return nil }
     let message = (error as NSError).userInfo["WKJavaScriptExceptionMessage"] as? String ?? ""
-    for (category, limit) in [("values", 256), ("characters", 65536), ("roots", 64)] {
+    for (category, limit) in [
+      ("values", 256), ("characters", 65536), ("roots", 512), ("nodes", 20000),
+    ] {
       let marker = "privacy_scan_limit_exceeded:" + category
       if message == marker || message == "Error: " + marker {
         return WebKitPrivacyInventoryLimitDiagnostic(
@@ -3845,6 +3866,11 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     else { throw WebKitRuntimeError.malformedInstrumentationResult }
     return try JSONDecoder().decode(BrowserLoadDiagnostics.self, from: data)
   }
+
+  /// Internal doorway for diagnostic collectors that live in their own files: the same
+  /// agent-control gate and instrumentation world every read goes through.
+  func requireAgentControlForDiagnostics() throws { try requireAgentControl() }
+  var diagnosticsContentWorld: WKContentWorld { instrumentationWorld }
 
   public func authenticationEnvironmentSnapshot() -> AuthenticationEnvironmentSnapshot {
     AuthenticationEnvironmentSnapshot(
@@ -6446,7 +6472,15 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
     }
     for name in ["href", "data-testid", "id", "name", "title"] {
       guard let value = element.stableAttributes[name], !value.isEmpty else { continue }
-      let strongIdentity = ["href", "data-testid", "id"].contains(name)
+      // An unlabeled editor's public HTML name can distinguish it from peers and
+      // survive a controlled-input replacement. A shared name is never enough.
+      let uniqueUnnamedFieldName =
+        name == "name"
+        && element.accessibleName == nil && element.label == nil
+        && peers.filter { $0.stableAttributes["name"] == value }.count == 1
+      let strongIdentity =
+        ["href", "data-testid", "id"].contains(name)
+        || uniqueUnnamedFieldName
       clauses.append(
         .init(
           fact: .stableAttribute(name),
@@ -7210,7 +7244,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         || inputButtonName(element)
         || collapse(element.getAttribute('placeholder'))
         || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
-        || (element.isContentEditable ? null
+        || (element.isContentEditable || element.localName === 'textarea' ? null
           : collapse(element.innerText) || shadowTextOf(element) || null);
       const directLabelledText = element => {
         const labelledBy = collapse(element?.getAttribute?.('aria-labelledby'));
@@ -7575,6 +7609,10 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             frameCapabilityID: frameCapabilityIDOf(element),
             tag: element.localName,
             role: roleOf(element),
+            contextualDialogTextComplete: ['dialog','alertdialog'].includes(roleOf(element))
+              ? !sensitive && !withheldForInvisibility
+                && collapse(explicitName || nameOf(element)).length <= maximumFieldCharacters
+                && collapse(element.innerText).length <= maximumFieldCharacters : null,
             accessibleName: explicitName ? bounded(explicitName) : scopedText(nameOf(element)),
             submissionDestination: sanitizedDestination((() => {
               // formaction wins over the owning form's action, which is the precedence
@@ -7606,6 +7644,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
             submitsForm,
             contentEditable: Boolean(element.isContentEditable),
             scrollable: isScrollableContainer(element) ? true : null,
+            ownerDocumentIsRoot: element.ownerDocument === document,
             fillCapability: ['input','textarea'].includes(element.localName)
               || element.isContentEditable || ['textbox','combobox'].includes(roleOf(element))
               ? (sensitive ? 'sensitive' : measuredFillCapability(element)) : null,
@@ -7881,7 +7920,7 @@ public final class WebKitRuntime: NSObject, WKNavigationDelegate, WKDownloadDele
         || inputButtonName(element)
         || collapse(element.getAttribute('placeholder'))
         || collapse(element.getAttribute('alt')) || collapse(element.getAttribute('title'))
-        || (element.isContentEditable ? null
+        || (element.isContentEditable || element.localName === 'textarea' ? null
           : collapse(element.innerText) || shadowTextOf(element) || null);
       let obscuredByAncestorOpacity = false;
       const isRendered = element => {
@@ -9277,6 +9316,8 @@ private struct RawElement: Decodable {
   let physicalIdentity: String
   let frameCapabilityID: String?
   let tag: String
+  let ownerDocumentIsRoot: Bool?
+  let contextualDialogTextComplete: Bool?
   let role: String?
   let accessibleName: String?
   let submissionDestination: String?

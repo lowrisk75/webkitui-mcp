@@ -232,3 +232,27 @@
 "Focus website" = "Activer le site";
 
 "Solve the CAPTCHA yourself on the website. Use Tab and Shift-Tab to reach its controls, then Return or Space. If offered, choose the site's audio or accessibility option; audio availability depends on the provider. If it fails, use the site's help or contact support. The agent does not read, transcribe or solve the challenge. When the site confirms completion, select Done — Return Control." = "Résolvez vous-même le CAPTCHA sur le site. Utilisez Tab et Maj-Tab pour atteindre ses commandes, puis Entrée ou Espace. Si elle est proposée, choisissez l’option audio ou d’accessibilité du site ; sa disponibilité dépend du fournisseur. En cas d’échec, utilisez l’aide du site ou contactez son assistance. L’agent ne lit, ne transcrit et ne résout pas le défi. Quand le site confirme la réussite, cliquez sur Terminé — Rendre le contrôle.";
+
+/* Site report */
+"Report this site…" = "Signaler ce site…";
+"Prepare a privacy-safe report about the current site for LorisLabs support. You review it, then send it from Mail." = "Préparer un rapport respectueux de la vie privée sur le site actuel pour le support LorisLabs. Vous le relisez, puis vous l'envoyez depuis Mail.";
+"A visible control is not observed" = "Un contrôle visible n'est pas observé";
+"A postcondition is refused or never verified" = "Une postcondition est refusée ou jamais vérifiée";
+"The page is empty or does not load" = "La page est vide ou ne se charge pas";
+"A confirmation or handoff problem" = "Un problème de confirmation ou de passage de main";
+"Something else" = "Autre chose";
+"Visible label the agent needed (optional)" = "Libellé visible dont l'agent avait besoin (facultatif)";
+"What happened? (optional)" = "Que s'est-il passé ? (facultatif)";
+"Reason" = "Motif";
+"Visible label" = "Libellé visible";
+"Description" = "Détails";
+"Report this site to LorisLabs" = "Signaler ce site à LorisLabs";
+"The report contains the site's origin, this app's version, load counters and the structure around the label you give (tags, roles, attribute names). It never contains page text, field values, cookies, paths or query strings. You will see the whole report before anything is sent." = "Le rapport contient l'origine du site, la version de cette app, des compteurs de chargement et la structure autour du libellé indiqué (balises, rôles, noms d'attributs). Il ne contient jamais de texte de page, de valeurs de champs, de cookies, de chemins ni de paramètres d'URL. Vous verrez le rapport complet avant tout envoi.";
+"Report could not be prepared" = "Le rapport n'a pas pu être préparé";
+"No browser session is open." = "Aucune session de navigateur n'est ouverte.";
+"The page has no reportable origin." = "La page n'a pas d'origine à signaler.";
+"Review the report before sending" = "Relisez le rapport avant l'envoi";
+"This is everything that will be attached. Opening the draft adds nothing: Mail sends only what you see here, from your own address, when you choose." = "Voici tout ce qui sera joint. Ouvrir le brouillon n'ajoute rien : Mail n'envoie que ce que vous voyez ici, depuis votre propre adresse, quand vous le décidez.";
+"Open Mail draft" = "Ouvrir un brouillon Mail";
+"Mail is unavailable" = "Mail est indisponible";
+"The report files were kept here; attach them to a message to support@lorislab.fr yourself:" = "Les fichiers du rapport ont été conservés ici ; joignez-les vous-même à un message à support@lorislab.fr :";

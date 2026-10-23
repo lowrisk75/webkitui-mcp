@@ -332,7 +332,7 @@ only a verified download receipt confirms delivery. Cancellation, request revoca
 or closing the source window dismisses the destination sheet. Unmanaged manual
 downloads remain unsupported; do not replay a refused managed download blindly.
 
-Unzip `WebKitUI-MCP-0.6.42-preview.zip`, move `WebKitUI MCP.app` to the
+Unzip `WebKitUI-MCP-0.6.43-preview.zip`, move `WebKitUI MCP.app` to the
 Applications folder, and open it. In the status window:
 
 1. Enable **Launch at Login**. macOS may require approval in System Settings.
@@ -356,6 +356,13 @@ This is an installed-version pin, not a claim about the latest upstream release.
 codex mcp add siliconpass-vault -- \
   "/Applications/WebKitUI MCP.app/Contents/Resources/CredentialBroker/siliconpass-vault-mcp"
 ```
+
+**Report this site…** prepares a voluntary report about a site the agent could not
+drive: origin, version, load counters and the DOM structure around a label you
+type (tags, roles, attribute names; never values or page text), in the
+LorisReports envelope format. You read the whole report, then a Mail draft to
+support@lorislab.fr opens; the app itself sends nothing. See
+`docs/privacy-retention.md`.
 
 The **Activity journal** button opens the local privacy-safe event history.
 Its files live under `~/Library/Application Support/WebkitUIMCP/Activity` with
@@ -535,13 +542,38 @@ The first measured local lane uses 30 runs of the same deterministic fixture at 
 
 ## Licensing
 
-WebKitUI MCP 0.6.22 Developer Preview is available under the
+WebKitUI MCP 0.6.43 Developer Preview is available under the
 [Business Source License 1.1](LICENSE). The source is readable, auditable and
 modifiable; production use is granted for personal noncommercial, qualifying
 noncommercial organization and evaluation use, and commercial production use
 requires an agreement with the Licensor. This version converts to Apache 2.0 on
 2030-08-28. See [`LICENSING.md`](LICENSING.md) for the exact scope, third-party
 boundary and treatment of earlier revisions.
+
+### Contextual verification and recovery
+
+Use `postcondition: {"type":"dialog_contains", "value":"Configure", "item_text":"Device ID"}`
+when a generic dialog name alone cannot identify the item. The exact accessible name
+and case-sensitive rendered substring must occur on the same unique dialog in the
+acted frame. The combined condition must be false before dispatch. Incomplete dialog text,
+missing scope, or duplicate matching dialogs cannot prove it. This is an observed UI
+transition, not proof of causality or backend persistence. Legacy `dialog_appears`
+continues to mean an exact-name appearance only.
+
+Transactional action results include `recovery`: dispatch certainty, per-predicate
+evidence, and an exact read-only `browser_transaction` reconciliation call using the
+original session and key when verification remains unproved. It never authorizes a
+replay or a fresh key to repeat a possibly completed write.
+
+Unlabeled textareas do not borrow their editable contents as an accessible name.
+An observed, unique HTML `name` can preserve their semantic identity across a
+controlled replacement. Missing or duplicated identity remains unverifiable.
+
+The global privacy inventory accepts at most 512 document/shadow/frame roots and
+20,000 element nodes, plus the existing 256 sensitive values and 65,536 sensitive
+characters. It must finish before any filtered output; exhaustion never returns a
+partially filtered page. Larger bounds are local capability limits, not a claim that
+new Reddit or every complex site has been qualified.
 
 ## Safety
 
@@ -565,4 +597,4 @@ The human window includes **CAPTCHA / accessibility** help and **Focus website**
 
 An explicitly authorized human return remains effective if the fresh observation exceeds the bounded privacy inventory. Resume then returns `resumed=true`, `control_state=agent_controlled`, `status=resumed_observation_unavailable`, `observation_available=false` and no observation. Old targets are invalidated. Use `browser_navigate` with an exact destination and its normal confirmation to leave the document, or request another human handoff. No write is retried and no site save is inferred.
 
-`privacy_budget` exposes only a fixed category (`values`, `characters`, `roots`, or `unknown`), its unchanged limit and a saturated lower-bound counter. It never contains scanned values or raw exception text. Closing with `browser_preserved=true` releases ownership and preserves the live page and control state; reopening a `reused=true` browser does not reset a handoff or bypass privacy filtering. The human window has no URL address bar; use confirmed agent navigation after returning control, or the site's own links during human control.
+`privacy_budget` exposes only a fixed category (`values`, `characters`, `roots`, `nodes`, or `unknown`), its enforced limit and a saturated lower-bound counter. It never contains scanned values or raw exception text. Closing with `browser_preserved=true` releases ownership and preserves the live page and control state; reopening a `reused=true` browser does not reset a handoff or bypass privacy filtering. The human window has no URL address bar; use confirmed agent navigation after returning control, or the site's own links during human control.

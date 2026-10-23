@@ -84,6 +84,7 @@ public final class WebKitMCPServer {
     case attributeEquals(name: String, value: String)
     case dialogAppears(String)
     case panelOpen(String)
+    case dialogContains(name: String, itemText: String)
     case optionSelected(String)
 
     var confirmationDescription: String {
@@ -108,6 +109,8 @@ public final class WebKitMCPServer {
       case .attributeEquals(let name, let value): "target \(name) equals \(value)"
       case .dialogAppears(let value): "dialog appears with accessible name \(value)"
       case .panelOpen(let value): "panel opens with accessible name \(value)"
+      case .dialogContains(let name, let itemText):
+        "one dialog named \(name) contains item text \(itemText)"
       case .optionSelected(let value): "target selected option equals \(value)"
       }
     }
@@ -181,6 +184,12 @@ public final class WebKitMCPServer {
       case .characterCountEquals(let value): return targetField("@character_count", String(value))
       case .attributeEquals(let name, let value):
         return targetField("@attribute:\(name)", value)
+      case .dialogContains(let name, let itemText):
+        let parameters = ObservationPredicate.containsParameters(of: itemText)
+        return .namedContainerTextContains(
+          frameID: target.verificationFrameID ?? "main",
+          nameField: .contextualDialogName, nameDigest: ObservationPredicate.textDigest(of: name),
+          textDigest: parameters.digest, length: parameters.length, rolling: parameters.rolling)
       case .dialogAppears(let value):
         return .anyEntryTextDigest([.dialogName], ObservationPredicate.textDigest(of: value))
       case .panelOpen(let value):
@@ -991,6 +1000,9 @@ public final class WebKitMCPServer {
             structured: .object([
               "verification": try .encoded(verification),
               "reconcile_state": .string(state),
+              "recovery": try TransactionRecovery.guidance(
+                sessionID: handle.rawValue.uuidString, key: key,
+                verification: verification, dispatchState: "previous_attempt_not_replayed"),
               "safe_next_step": .string(nextStep),
               "action_replayed": .bool(false),
             ]),
@@ -3666,6 +3678,10 @@ public final class WebKitMCPServer {
             + "commit_input")
       }
       try validatePostconditionBaseline(postcondition, observation: observation)
+      if case .dialogContains = postcondition, target.verificationFrameID == "unregistered" {
+        throw MCPServerError.invalidParams(
+          "dialog_contains requires a registered frame identity; re-observe or use human handoff")
+      }
       // A sensitive control publishes no selected option, so this postcondition has
       // nothing to be verified against and never will have. Refused here, with the
       // reason, rather than dispatched and left to fail as an unverifiable comparison —
@@ -4851,7 +4867,11 @@ public final class WebKitMCPServer {
     let expected = try requireString(object["value"], named: "postcondition.value")
     let ordinaryKeys: Set<String> = ["type", "value"]
     let attributeKeys: Set<String> = ["type", "attribute", "value"]
-    guard Set(object.keys) == (type == "attribute_equals" ? attributeKeys : ordinaryKeys) else {
+    let expectedKeys =
+      type == "dialog_contains"
+      ? ordinaryKeys.union(["item_text"])
+      : type == "attribute_equals" ? attributeKeys : ordinaryKeys
+    guard Set(object.keys) == expectedKeys else {
       throw MCPServerError.invalidParams("postcondition contains unsupported fields")
     }
     switch type {
@@ -4933,6 +4953,18 @@ public final class WebKitMCPServer {
           "attribute_equals attribute is not an observable state attribute")
       }
       return .attributeEquals(name: name, value: expected)
+    case "dialog_contains":
+      let itemText = try requireString(object["item_text"], named: "postcondition.item_text")
+      guard !expected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        expected.count <= 512,
+        !itemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        itemText.count <= 512, itemText.utf8.count <= 2048
+      else {
+        throw MCPServerError.invalidParams(
+          "dialog_contains requires an exact accessible name and nonempty item_text, each at most 512 characters"
+        )
+      }
+      return .dialogContains(name: expected, itemText: itemText)
     case "dialog_appears":
       guard !expected.isEmpty, expected.count <= 512 else {
         throw MCPServerError.invalidParams("dialog_appears requires a bounded accessible name")
@@ -4959,7 +4991,7 @@ public final class WebKitMCPServer {
   ) throws {
     if observation.aggregateTextOmitted == true, let postcondition {
       switch postcondition {
-      case .semanticTextAppears, .semanticTextContains:
+      case .semanticTextAppears, .semanticTextContains, .dialogContains:
         throw MCPServerError.invalidParams(
           "postcondition_baseline_incomplete: oversized aggregate text was explicitly omitted in this dialog scope. Use a heading or target-local structural condition, not a semantic-text claim."
         )
@@ -4972,7 +5004,7 @@ public final class WebKitMCPServer {
       // needs both, because the words may sit in the part that was cut.
       let baselineSufficient: Bool
       switch postcondition {
-      case .targetAbsent, .dialogAppears, .panelOpen:
+      case .targetAbsent, .dialogAppears, .panelOpen, .dialogContains:
         baselineSufficient = observation.isStructurallyComplete
       case .semanticTextAppears, .semanticTextContains:
         baselineSufficient = observation.isComplete
@@ -5186,6 +5218,9 @@ public final class WebKitMCPServer {
         "action_state": .string(state),
         "verification": try .encoded(verification),
         "dispatch_error": .string(underlyingDescription),
+        "recovery": try TransactionRecovery.guidance(
+          sessionID: pending.session.rawValue.uuidString, key: pending.idempotencyKey,
+          verification: verification, dispatchState: "unknown"),
         "action_replayed": .bool(false),
         "safe_next_step": .string(
           state == "verified_by_immediate_reconciliation"
@@ -5209,6 +5244,9 @@ public final class WebKitMCPServer {
         ?? .null,
       "verification_proves_remote_save": .bool(false),
       "verification": try .encoded(result.verification),
+      "recovery": try TransactionRecovery.guidance(
+        sessionID: pending.session.rawValue.uuidString, key: pending.idempotencyKey,
+        verification: result.verification, dispatchState: "dispatched"),
       "confirmation_mode": .string(pending.approvalMode),
       "authorization_source": .string(pending.authorizationSource),
       "dispatch_mode": .string(result.action.dispatchMode.rawValue),
@@ -5888,12 +5926,20 @@ public final class WebKitMCPServer {
         .string("aria-disabled"), .string("aria-expanded"), .string("data-state"), .string("open"),
       ]),
     ])
-    func branch(_ types: [String], value: JSONValue, attribute: Bool = false) -> JSONValue {
+    func branch(
+      _ types: [String], value: JSONValue, attribute: Bool = false, itemText: Bool = false
+    ) -> JSONValue {
       var properties: [String: JSONValue] = [
         "type": .object(["type": .string("string"), "enum": .array(types.map { .string($0) })]),
         "value": value,
       ]
       var required = [JSONValue.string("type"), .string("value")]
+      if itemText {
+        properties["item_text"] = .object([
+          "type": .string("string"), "minLength": .int(1), "maxLength": .int(512),
+        ])
+        required.append(.string("item_text"))
+      }
       if attribute {
         properties["attribute"] = attributes
         required.append(.string("attribute"))
@@ -5914,12 +5960,12 @@ public final class WebKitMCPServer {
       "semantic_text_appears", "semantic_text_contains", "checked_equals", "selected_equals",
       "enabled_equals", "value_equals", "validation_state", "character_count_equals",
       "title_equals", "title_contains", "heading_equals", "heading_contains", "dialog_appears",
-      "panel_open", "option_selected", "attribute_equals",
+      "panel_open", "option_selected", "attribute_equals", "dialog_contains",
     ]
     return .object([
       "type": .string("object"),
       "description": .string(
-        "Required for click, submit, press_key, blur and commit_input; forbidden for fill and select_option, whose target value or selected label is verified automatically. Shape: {type: string, value: string}; only attribute_equals adds attribute. State booleans and character counts are strings. target_absent requires value=\"true\" and a complete observation in its explicit scope (global by default). panel_open/dialog_appears require the exact accessible NAME as a string, never true. semantic_text_appears is exact; semantic_text_contains is substring. A condition already true is not a transition. For a wizard whose Next button persists, verify a new observed heading rather than target absence. Oversized aggregate text omitted in a dialog scope cannot support semantic-text predicates. Verification does not prove backend persistence."
+        "Required for click, submit, press_key, blur and commit_input; forbidden for fill and select_option, whose target value or selected label is verified automatically. Shape: {type: string, value: string}; attribute_equals adds attribute; dialog_contains adds item_text (a case-sensitive rendered substring on the same unique dialog in the action frame). State booleans and character counts are strings. target_absent requires value=\"true\" and a complete observation in its explicit scope (global by default). panel_open/dialog_appears require the exact accessible NAME as a string, never true. semantic_text_appears is exact; semantic_text_contains is substring. A condition already true is not a transition. For a wizard whose Next button persists, verify a new observed heading rather than target absence. Oversized aggregate text omitted in a dialog scope cannot support semantic-text predicates. Verification does not prove backend persistence."
       ),
       // Explicit properties let clients display the object even when they cannot
       // render oneOf. Branches retain precise per-type validation constraints.
@@ -5932,6 +5978,9 @@ public final class WebKitMCPServer {
           ),
         ]),
         "attribute": attributes,
+        "item_text": .object([
+          "type": .string("string"), "minLength": .int(1), "maxLength": .int(512),
+        ]),
       ]),
       "required": .array([.string("type"), .string("value")]),
       "additionalProperties": .bool(false),
@@ -5950,6 +5999,7 @@ public final class WebKitMCPServer {
             "description": .string("Absolute URL prefix; runtime also limits UTF-8 to 2048 bytes."),
           ])),
         branch(["semantic_text_appears"], value: text(512)),
+        branch(["dialog_contains"], value: text(512, minimum: 1), itemText: true),
         branch(
           [
             "semantic_text_contains", "url_contains", "title_equals", "title_contains",

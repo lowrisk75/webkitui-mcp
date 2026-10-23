@@ -1630,6 +1630,50 @@ struct WebKitRuntimeTests {
     #expect(after.elements.contains { $0.accessibleName?.segments.first?.text == "Configured" })
   }
 
+  /// A site report carries the structure around a label, never the page. The ASC case:
+  /// a label-looking paragraph with a click handler, nothing else to find it by.
+  @Test("A DOM shape around a label reports tags, roles and attribute names only")
+  func domShapeAroundLabel() async throws {
+    let runtime = WebKitRuntime(websiteDataStore: .nonPersistent())
+    _ = try await runtime.loadHTML(
+      """
+      <main><section class="privacy-card secret-class-name-that-is-long-enough extra fourth">
+        <h2>Identifiant de l'appareil</h2>
+        <input name="apiToken" value="sk_live_SECRET">
+        <p id="configure" data-track="abc" style="cursor:pointer" tabindex="0">Configurer l'identifiant</p>
+        <div><span>Configurer l'identifiant</span></div>
+      </section></main>
+      <script>document.getElementById('configure').addEventListener('click', () => {});</script>
+      """, baseURL: URL(string: "https://fixture.invalid/privacy?token=QUERY_SECRET"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let shape = try await runtime.domShape(aroundLabel: "  configurer   l'identifiant ")
+    #expect(shape.matchCount == 2)
+    #expect(shape.matches.count == 2)
+    #expect(!shape.truncated)
+    let paragraph = try #require(shape.matches.first { $0.chain.first?.tag == "p" })
+    let node = try #require(paragraph.chain.first)
+    #expect(node.cursor == "pointer")
+    #expect(node.hasTabIndex)
+    #expect(!node.hasHref)
+    #expect(node.attributeNames == ["id", "style", "tabindex"])
+    #expect(paragraph.chain.map(\.tag) == ["p", "section", "main", "body", "html"])
+    let section = paragraph.chain[1]
+    #expect(section.classTokens.isEmpty)
+    // Nothing of the page's values is in the payload.
+    let json = String(decoding: try JSONEncoder().encode(shape), as: UTF8.self)
+    for forbidden in [
+      "sk_live", "apiToken", "QUERY_SECRET", "abc", "appareil", "secret-class", "privacy-card",
+      "data-track",
+    ] {
+      #expect(!json.contains(forbidden), "found \(forbidden)")
+    }
+    // The wrapper div whose only text is the same label is an ancestor, not a match.
+    let span = try #require(shape.matches.first { $0.chain.first?.tag == "span" })
+    #expect(span.chain[1].tag == "div")
+    let none = try await runtime.domShape(aroundLabel: "not on this page")
+    #expect(none.matchCount == 0 && none.matches.isEmpty)
+  }
+
   @Test(
     "A pointer card with a rich-text leaf remains observable and addressable",
     arguments: [false, true], ["strong", "em", "small"])
@@ -5054,6 +5098,121 @@ struct WebKitRuntimeTests {
     #expect(after.elements[0].value?.segments.first?.text == value.segments.first?.text)
   }
 
+  @Test(
+    "An unlabeled named textarea is verified through replacement without using a decoy",
+    arguments: [false, true], ["text", "decoy"])
+  func unnamedTextareaRerender(native: Bool, replacementName: String) async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <textarea name='text'>old</textarea><textarea name='decoy'>untouched</textarea>
+      <script>document.querySelector('textarea').addEventListener('input', event => {
+        const replacement = event.target.cloneNode(true);
+        replacement.value = event.target.value;
+        replacement.name = '\(replacementName)';
+        event.target.replaceWith(replacement);
+      });</script>
+      """, baseURL: URL(string: "https://fixture.invalid/unnamed-editor"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let before = try await runtime.observe()
+    let target = try #require(
+      before.elements.first { $0.stableAttributes["name"]?.segments.first?.text == "text" })
+    #expect(target.accessibleName == nil)
+    let authority = CapabilityAuthority()
+    let origin = SecurityOrigin(scheme: "https", host: "fixture.invalid")
+    let handle = await authority.issue(
+      CapabilityScope(
+        actions: [.fillForm], origins: [origin], acceptedInputProvenance: [.userIntent],
+        expiresAt: Date().addingTimeInterval(60)))
+    let value = "A public reply"
+    let key = ObservationFieldKey(
+      frameID: "main", elementID: target.locatorRecipe.semanticIdentity, field: "@value")
+    let plan = try TransactionalWritePlan(
+      idempotencyKey: "unnamed-editor", target: target.locatorRecipe, requiredCapability: .fillForm,
+      inputProvenance: [.userIntent], expectedOrigin: origin, preconditions: [],
+      postconditions: [.entryTextDigest(key, ObservationPredicate.textDigest(of: value))],
+      verificationTimeoutNanoseconds: 1_000_000_000)
+    do {
+      let result = try await WebKitTransactionCoordinator(runtime: runtime).execute(
+        plan: plan,
+        operation: .fill(
+          try ProvenancedText(text: value, source: .init(classification: .userIntent))),
+        dispatchMode: native ? .nativeAppKit : .javascript, observation: before,
+        capabilityAuthority: authority, capabilityHandle: handle)
+      let verified: Bool
+      if case .verified = result.verification { verified = true } else { verified = false }
+      #expect(verified == (replacementName == "text"))
+    } catch WebKitTransactionExecutionError.uncertainDispatch(let verification, _) {
+      #expect(replacementName == "decoy")
+      if case .verified = verification { Issue.record("A different replacement was verified") }
+    }
+    #expect(
+      try await runtime.webView.evaluateJavaScript(
+        "Array.from(document.querySelectorAll('[name=decoy]')).at(-1).value") as? String
+        == "untouched")
+  }
+
+  @Test("Many small shadow roots remain usable and redact a late secret globally")
+  func boundedShadowPrivacyInventory() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<p id='echo'>private-shadow-canary</p><button>Public</button>",
+      baseURL: URL(string: "https://fixture.invalid/many-roots"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    _ = try await runtime.webView.evaluateJavaScript(
+      """
+      for (let i=0;i<100;i++) {
+        const host=document.body.appendChild(document.createElement('div'));
+        host.attachShadow({mode:'open'}).innerHTML = i === 99
+          ? '<input type="password" value="private-shadow-canary">' : '<span>Public component</span>';
+      };null
+      """)
+    let observation = try await runtime.observe()
+    let json = String(decoding: try JSONEncoder().encode(observation), as: UTF8.self)
+    #expect(!json.contains("private-shadow-canary"))
+    let read = try await runtime.readText()
+    #expect(!read.bodyText.contains("private-shadow-canary"))
+    #expect(read.bodyText.contains("Public"))
+  }
+
+  @Test("Site report refuses excessive ancestor depth instead of claiming zero matches")
+  func domShapeDepthBudget() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      "<main></main>",
+      baseURL: URL(string: "https://fixture.invalid/deep-report"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    _ = try await runtime.webView.evaluateJavaScript(
+      """
+      let parent=document.querySelector('main');
+      for(let i=0;i<260;i++) parent=parent.appendChild(document.createElement('div'));
+      parent.textContent='Configure item';null
+      """)
+    await #expect(throws: (any Error).self) {
+      _ = try await runtime.domShape(aroundLabel: "Configure item")
+    }
+  }
+
+  @Test("Site report shape omits hidden matches and arbitrary site identifiers")
+  func domShapeExcludesHiddenAndSiteIdentifiers() async throws {
+    let runtime = WebKitRuntime()
+    _ = try await runtime.loadHTML(
+      """
+      <div hidden><p>Configure item</p></div>
+      <div class='PRIVATE_CLASS' data-private-canary='secret'>
+        <p style='cursor:pointer' role='PRIVATE_ROLE'>Configure item</p>
+      </div>
+      <private-tag-canary><span>Configure item</span></private-tag-canary>
+      """, baseURL: URL(string: "https://fixture.invalid/report"),
+      timeout: fixtureNavigationTimeout, quietWindow: .milliseconds(40))
+    let shape = try await runtime.domShape(aroundLabel: "Configure item")
+    #expect(shape.matchCount == 2)
+    let json = String(decoding: try JSONEncoder().encode(shape), as: UTF8.self)
+    for forbidden in ["PRIVATE_CLASS", "PRIVATE_ROLE", "private-canary", "private-tag-canary"] {
+      #expect(!json.contains(forbidden))
+    }
+  }
+
   @Test("AppKit fill commits validation in the same trusted action")
   func nativeFillCommitsValidation() async throws {
     let runtime = WebKitRuntime()
@@ -5896,7 +6055,7 @@ struct WebKitRuntimeTests {
 
   @Test(
     "Privacy budget exhaustion returns authority without exposing semantics",
-    arguments: ["values", "characters", "roots"])
+    arguments: ["values", "characters", "roots", "nodes"])
   func privacyFailedResumeReturnsAuthority(category: String) async throws {
     let runtime = makeWindowHandoffRuntime()
     _ = try await runtime.loadHTML(
@@ -5914,9 +6073,13 @@ struct WebKitRuntimeTests {
     case "characters":
       _ = try await runtime.webView.evaluateJavaScript(
         "document.querySelector('input').value='private-canary-'.repeat(6000)")
+    case "nodes":
+      _ = try await runtime.webView.evaluateJavaScript(
+        "document.body.appendChild(document.createElement('div')).innerHTML='<span></span>'.repeat(20001);null"
+      )
     default:
       _ = try await runtime.webView.evaluateJavaScript(
-        "for(let i=0;i<64;i++){const h=document.createElement('div');document.body.appendChild(h);h.attachShadow({mode:'open'}).innerHTML='<p>Local root</p>'};null"
+        "for(let i=0;i<512;i++){const h=document.createElement('div');document.body.appendChild(h);h.attachShadow({mode:'open'}).innerHTML='<p>Local root</p>'};null"
       )
     }
     try runtime.requestHumanHandoff()
@@ -5936,6 +6099,7 @@ struct WebKitRuntimeTests {
     }
     #expect(runtime.interactionControlState() == .agentControlled)
     await #expect(throws: (any Error).self) { _ = try await runtime.readText() }
+    await #expect(throws: (any Error).self) { _ = try await runtime.domShape(aroundLabel: "Save") }
     await #expect(throws: (any Error).self) {
       _ = try await runtime.perform(
         observationID: old.observationID,

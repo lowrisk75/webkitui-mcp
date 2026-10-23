@@ -232,3 +232,27 @@
 "Focus website" = "Focus website";
 
 "Solve the CAPTCHA yourself on the website. Use Tab and Shift-Tab to reach its controls, then Return or Space. If offered, choose the site's audio or accessibility option; audio availability depends on the provider. If it fails, use the site's help or contact support. The agent does not read, transcribe or solve the challenge. When the site confirms completion, select Done — Return Control." = "Solve the CAPTCHA yourself on the website. Use Tab and Shift-Tab to reach its controls, then Return or Space. If offered, choose the site's audio or accessibility option; audio availability depends on the provider. If it fails, use the site's help or contact support. The agent does not read, transcribe or solve the challenge. When the site confirms completion, select Done — Return Control.";
+
+/* Site report */
+"Report this site…" = "Report this site…";
+"Prepare a privacy-safe report about the current site for LorisLabs support. You review it, then send it from Mail." = "Prepare a privacy-safe report about the current site for LorisLabs support. You review it, then send it from Mail.";
+"A visible control is not observed" = "A visible control is not observed";
+"A postcondition is refused or never verified" = "A postcondition is refused or never verified";
+"The page is empty or does not load" = "The page is empty or does not load";
+"A confirmation or handoff problem" = "A confirmation or handoff problem";
+"Something else" = "Something else";
+"Visible label the agent needed (optional)" = "Visible label the agent needed (optional)";
+"What happened? (optional)" = "What happened? (optional)";
+"Reason" = "Reason";
+"Visible label" = "Visible label";
+"Description" = "Description";
+"Report this site to LorisLabs" = "Report this site to LorisLabs";
+"The report contains the site's origin, this app's version, load counters and the structure around the label you give (tags, roles, attribute names). It never contains page text, field values, cookies, paths or query strings. You will see the whole report before anything is sent." = "The report contains the site's origin, this app's version, load counters and the structure around the label you give (tags, roles, attribute names). It never contains page text, field values, cookies, paths or query strings. You will see the whole report before anything is sent.";
+"Report could not be prepared" = "Report could not be prepared";
+"No browser session is open." = "No browser session is open.";
+"The page has no reportable origin." = "The page has no reportable origin.";
+"Review the report before sending" = "Review the report before sending";
+"This is everything that will be attached. Opening the draft adds nothing: Mail sends only what you see here, from your own address, when you choose." = "This is everything that will be attached. Opening the draft adds nothing: Mail sends only what you see here, from your own address, when you choose.";
+"Open Mail draft" = "Open Mail draft";
+"Mail is unavailable" = "Mail is unavailable";
+"The report files were kept here; attach them to a message to support@lorislab.fr yourself:" = "The report files were kept here; attach them to a message to support@lorislab.fr yourself:";

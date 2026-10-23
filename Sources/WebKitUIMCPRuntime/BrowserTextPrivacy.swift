@@ -77,15 +77,20 @@ enum BrowserTextPrivacy {
     };
     const privacyRoots = [document];
     const privacySeen = new Set(privacyRoots);
+    let privacyNodeCount = 0;
     for (let rootIndex = 0; rootIndex < privacyRoots.length; rootIndex++) {
       const root = privacyRoots[rootIndex];
-      for (const host of root.querySelectorAll('*')) {
+      // Count before collecting selector results. A shared node budget bounds
+      // many small web components as well as a single enormous light DOM.
+      const walker = (root.ownerDocument || root).createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      for (let host = walker.nextNode(); host; host = walker.nextNode()) {
+        if (++privacyNodeCount > 20000) throw new Error('privacy_scan_limit_exceeded:nodes');
         const nested = [host.shadowRoot];
         if (host.localName === 'iframe' || host.localName === 'frame') {
           try { nested.push(host.contentDocument); } catch (_) { /* opaque foreign frame */ }
         }
         for (const next of nested) if (next && !privacySeen.has(next)) {
-          if (privacyRoots.length >= 64) throw new Error('privacy_scan_limit_exceeded:roots');
+          if (privacyRoots.length >= 512) throw new Error('privacy_scan_limit_exceeded:roots');
           privacySeen.add(next); privacyRoots.push(next);
         }
       }

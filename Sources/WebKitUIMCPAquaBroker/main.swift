@@ -182,6 +182,35 @@ struct WebKitUIMCPAquaBroker {
                 || state == .handoffRequested)
           }
         },
+        collectSiteReport: { [weak registry] label, report in
+          guard let registry, let handle = registry.openSessionHandles().first,
+            let runtime = try? registry.runtime(for: handle)
+          else {
+            report(.failure(WebKitUISiteReportError.noOpenSession))
+            return
+          }
+          guard let origin = runtime.agentSafeCurrentOrigin() else {
+            report(.failure(WebKitUISiteReportError.noOrigin))
+            return
+          }
+          Task { @MainActor in
+            do {
+              let encoder = JSONEncoder()
+              encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+              let diagnostics = try encoder.encode(try await runtime.loadDiagnostics())
+              let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+              let shape =
+                trimmed.isEmpty
+                ? nil : try encoder.encode(try await runtime.domShape(aroundLabel: trimmed))
+              report(
+                .success(
+                  WebKitUISiteReportDraft(
+                    origin: origin, diagnosticsJSON: diagnostics, domShapeJSON: shape)))
+            } catch {
+              report(.failure(error))
+            }
+          }
+        },
         releaseHostLease: { [weak registry] report in
           // Sessions this host owns first, so a lease held by the host itself goes away.
           if let registry {

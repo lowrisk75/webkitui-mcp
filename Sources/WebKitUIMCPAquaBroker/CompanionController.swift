@@ -5,6 +5,7 @@ import ServiceManagement
 import WebKitUIMCPLicensing
 import WebKitUIMCPRuntime
 import WebKitUIMCPServer
+import WebKitUIMCPSiteReport
 
 private final class TopAnchoredDocumentView: NSView {
   override var isFlipped: Bool { true }
@@ -306,7 +307,17 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
     releaseLease.contentTintColor = .systemOrange
     releaseLease.toolTip = text("Close this host's sessions so another client can open one.")
     releaseLease.setAccessibilityIdentifier("webkitui.action.release-lease")
-    let recoveryButtons = NSStackView(views: [forceRender, clearData, releaseLease])
+    // A site the agent cannot drive is a collector bug this product cannot see from
+    // here. The report carries structure, never content, and leaves only by the
+    // person's own mail client after they have read it.
+    let reportSite = NSButton(
+      title: text("Report this site…"), target: self, action: #selector(reportSiteAction))
+    reportSite.bezelStyle = .rounded
+    reportSite.toolTip = text(
+      "Prepare a privacy-safe report about the current site for LorisLabs support. You review it, then send it from Mail."
+    )
+    reportSite.setAccessibilityIdentifier("webkitui.action.report-site")
+    let recoveryButtons = NSStackView(views: [forceRender, clearData, releaseLease, reportSite])
     recoveryButtons.orientation = .horizontal
     recoveryButtons.spacing = 8
     recoveryButtons.alignment = .centerY
@@ -513,6 +524,147 @@ final class WebKitUICompanionController: NSObject, NSApplicationDelegate, NSWind
     else { return }
     maintenance?.clearBrowsingData()
     refreshStatus()
+  }
+
+  // MARK: - Site report
+
+  private func reasonTitle(_ reason: SiteReportReason) -> String {
+    switch reason {
+    case .controlNotObserved: text("A visible control is not observed")
+    case .postconditionRefused: text("A postcondition is refused or never verified")
+    case .pageEmptyOrNotLoading: text("The page is empty or does not load")
+    case .confirmationProblem: text("A confirmation or handoff problem")
+    case .other: text("Something else")
+    }
+  }
+
+  @objc private func reportSiteAction() {
+    let reasons = NSPopUpButton(frame: .zero, pullsDown: false)
+    for reason in SiteReportReason.allCases { reasons.addItem(withTitle: reasonTitle(reason)) }
+    let labelField = NSTextField(string: "")
+    labelField.placeholderString = text("Visible label the agent needed (optional)")
+    let descriptionField = NSTextField(wrappingLabelWithString: "")
+    descriptionField.isEditable = true
+    descriptionField.isSelectable = true
+    descriptionField.isBezeled = true
+    descriptionField.drawsBackground = true
+    descriptionField.placeholderString = text("What happened? (optional)")
+    descriptionField.maximumNumberOfLines = 6
+    let form = NSStackView(views: [
+      NSTextField(labelWithString: text("Reason")), reasons,
+      NSTextField(labelWithString: text("Visible label")), labelField,
+      NSTextField(labelWithString: text("Description")), descriptionField,
+    ])
+    form.orientation = .vertical
+    form.alignment = .leading
+    form.spacing = 6
+    form.translatesAutoresizingMaskIntoConstraints = false
+    form.widthAnchor.constraint(equalToConstant: 420).isActive = true
+    labelField.widthAnchor.constraint(equalTo: form.widthAnchor).isActive = true
+    descriptionField.widthAnchor.constraint(equalTo: form.widthAnchor).isActive = true
+    descriptionField.heightAnchor.constraint(greaterThanOrEqualToConstant: 72).isActive = true
+
+    let alert = NSAlert()
+    alert.messageText = text("Report this site to LorisLabs")
+    alert.informativeText = text(
+      "The report contains the site's origin, this app's version, load counters and the structure around the label you give (tags, roles, attribute names). It never contains page text, field values, cookies, paths or query strings. You will see the whole report before anything is sent."
+    )
+    alert.accessoryView = form
+    alert.addButton(withTitle: text("Continue"))
+    alert.addButton(withTitle: text("Cancel"))
+    guard alert.runModal() == .alertFirstButtonReturn else { return }
+    let reason = SiteReportReason.allCases[max(0, reasons.indexOfSelectedItem)]
+    let label = labelField.stringValue
+    let description = descriptionField.stringValue
+
+    guard let maintenance else {
+      presentError(
+        title: text("Report could not be prepared"), message: text("No browser session is open."))
+      return
+    }
+    maintenance.collectSiteReport(label) { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .failure(let error):
+        let message: String
+        switch error {
+        case WebKitUISiteReportError.noOpenSession: message = text("No browser session is open.")
+        case WebKitUISiteReportError.noOrigin:
+          message = text("The page has no reportable origin.")
+        default: message = error.localizedDescription
+        }
+        presentError(title: text("Report could not be prepared"), message: message)
+      case .success(let draft):
+        reviewAndSendSiteReport(
+          draft: draft, reason: reason, label: label, description: description)
+      }
+    }
+  }
+
+  private func reviewAndSendSiteReport(
+    draft: WebKitUISiteReportDraft, reason: SiteReportReason, label: String, description: String
+  ) {
+    let bundle: SiteReportBundle
+    do {
+      bundle = try SiteReportBundle.make(
+        SiteReportInput(
+          origin: draft.origin, reason: reason, userDescription: description, label: label,
+          diagnosticsJSON: draft.diagnosticsJSON, domShapeJSON: draft.domShapeJSON,
+          appVersion: WebKitUIRelease.version, appBuild: WebKitUIRelease.build,
+          osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+          locale: Locale.current.identifier))
+    } catch {
+      presentError(title: text("Report could not be prepared"), message: "\(error)")
+      return
+    }
+    let preview = NSTextView(frame: NSRect(x: 0, y: 0, width: 560, height: 320))
+    preview.isEditable = false
+    preview.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    let attachments =
+      String(decoding: bundle.envelopeJSON, as: UTF8.self)
+      + "\n\n"
+      + bundle.artifacts.map { "---- \($0.filename)\n" + String(decoding: $0.data, as: UTF8.self) }
+      .joined(separator: "\n\n")
+    preview.string = attachments
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 560, height: 320))
+    scroll.documentView = preview
+    scroll.hasVerticalScroller = true
+    scroll.borderType = .bezelBorder
+    let review = NSAlert()
+    review.messageText = text("Review the report before sending")
+    review.informativeText = text(
+      "This is everything that will be attached. Opening the draft adds nothing: Mail sends only what you see here, from your own address, when you choose."
+    )
+    review.accessoryView = scroll
+    review.addButton(withTitle: text("Open Mail draft"))
+    review.addButton(withTitle: text("Cancel"))
+    guard review.runModal() == .alertFirstButtonReturn else { return }
+
+    let directory = FileManager.default.homeDirectoryForCurrentUser.appending(
+      path:
+        "Library/Application Support/WebkitUIMCP/SiteReports/\(bundle.envelope.clientReportID.uuidString)",
+      directoryHint: .isDirectory)
+    let files: [URL]
+    do {
+      files = try bundle.write(into: directory)
+    } catch {
+      presentError(title: text("Report could not be prepared"), message: error.localizedDescription)
+      return
+    }
+    let items: [Any] = [bundle.mailBody as NSString] + files
+    if let service = NSSharingService(named: .composeEmail), service.canPerform(withItems: items) {
+      service.recipients = [SiteReportContract.supportAddress]
+      service.subject = bundle.envelope.title
+      service.perform(withItems: items)
+    } else {
+      NSWorkspace.shared.activateFileViewerSelecting(files)
+      presentError(
+        title: text("Mail is unavailable"),
+        message: text(
+          "The report files were kept here; attach them to a message to support@lorislab.fr yourself:"
+        )
+          + "\n" + directory.path)
+    }
   }
 
   @objc private func releaseHostLeaseAction() {

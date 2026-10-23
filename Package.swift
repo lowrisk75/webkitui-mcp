@@ -12,6 +12,7 @@ let package = Package(
     .library(name: "WebKitUIMCPRuntime", targets: ["WebKitUIMCPRuntime"]),
     .library(name: "WebKitUIMCPServer", targets: ["WebKitUIMCPServer"]),
     .library(name: "WebKitUIMCPLicensing", targets: ["WebKitUIMCPLicensing"]),
+    .library(name: "WebKitUIMCPSiteReport", targets: ["WebKitUIMCPSiteReport"]),
     .executable(name: "webkitui-mcp", targets: ["WebKitUIMCPCLI"]),
     .executable(name: "webkitui-mcp-confirm", targets: ["WebKitUIMCPConfirm"]),
     .executable(name: "webkitui-mcp-aqua-broker", targets: ["WebKitUIMCPAquaBroker"]),
@@ -26,6 +27,9 @@ let package = Package(
   targets: [
     .systemLibrary(name: "CLaunchShim"),
     .target(name: "WebKitUIMCPCore"),
+    // Voluntary site reports in the LorisReports envelope shape. Dependency-free on
+    // purpose: the LorisLabsKit manifest pulls a private package.
+    .target(name: "WebKitUIMCPSiteReport"),
     .target(
       name: "WebKitUIMCPLicensing",
       resources: [.process("Resources")]
@@ -51,6 +55,7 @@ let package = Package(
       name: "WebKitUIMCPAquaBroker",
       dependencies: [
         "CLaunchShim", "WebKitUIMCPLicensing", "WebKitUIMCPRuntime", "WebKitUIMCPServer",
+        "WebKitUIMCPSiteReport",
       ]
     ),
     .executableTarget(name: "WebKitUIMCPRelay"),
@@ -74,6 +79,10 @@ let package = Package(
     .testTarget(
       name: "WebKitUIMCPLicensingTests",
       dependencies: ["WebKitUIMCPLicensing"]
+    ),
+    .testTarget(
+      name: "WebKitUIMCPSiteReportTests",
+      dependencies: ["WebKitUIMCPSiteReport"]
     ),
     .testTarget(
       name: "WebKitUIMCPRuntimeTests",
