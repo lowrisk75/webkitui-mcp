@@ -33,10 +33,16 @@ struct LicenceCoherenceTests {
         "\(path) names the MIT License while LICENSE is the Business Source License")
     }
 
-    let manifest = try Self.text("package.json")
-    #expect(
-      manifest.contains("\"license\": \"BUSL-1.1\""),
-      "package.json does not declare BUSL-1.1")
+    // The native public checkout deliberately excludes the retained npm prior art.
+    // Check its licence if present locally, without making native builds depend on it.
+    if FileManager.default.fileExists(
+      atPath: Self.projectRoot.appendingPathComponent("package.json").path)
+    {
+      let manifest = try Self.text("package.json")
+      #expect(
+        manifest.contains("\"license\": \"BUSL-1.1\""),
+        "package.json does not declare BUSL-1.1")
+    }
 
     let sbom = try Self.text("Support/Packaging/sbom.cdx.json")
     #expect(

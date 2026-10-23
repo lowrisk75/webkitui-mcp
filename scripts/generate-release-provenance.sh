@@ -20,13 +20,14 @@ trap 'rm -f "$inputs"; printf "RESOURCE_REMOVED=provenance-input-list:%s\n" "$in
 cd "$workspace_dir"
 mkdir -p "$output_dir"
 
-find \
-  Package.swift package.json package-lock.json \
+# Only public release inputs belong in provenance. Retained, ignored npm/CDP
+# prior art and local evidence must not affect a clean native checkout.
+git ls-files --cached --others --exclude-standard -z -- \
+  Package.swift \
   README.md LICENSE LICENSING.md THIRD_PARTY_NOTICES.md \
   docs/network-boundary.md docs/release-maintenance-policy.md \
   docs/scoped-interaction-workflows.md docs/examples \
   Sources Tests Support/AquaApp Support/Packaging scripts \
-  \( -type f -o -type l \) ! -name '.DS_Store' ! -name '*.pyc' ! -path '*/__pycache__/*' -print0 \
   | LC_ALL=C sort -zu > "$inputs"
 
 : > "$manifest"
